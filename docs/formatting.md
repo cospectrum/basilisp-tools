@@ -7,8 +7,40 @@ runtime variables, or imports dependencies from the formatted project.
 
 Configuration loading lives in the same namespace. `load-config` takes a file
 or a directory; without an argument it starts at the current working directory.
-The nearest `.cljfmt.edn` or `cljfmt.edn` is used, without merging parent files.
-An explicit CLI `--config` must refer to an existing file.
+An explicit CLI `--config` selects an existing file and bypasses discovery.
+Otherwise the nearest ancestor `project.clj` selects Leiningen configuration;
+without a project, the nearest `.cljfmt.edn` or `cljfmt.edn` is used.
+
+## Leiningen configuration
+
+A literal `:cljfmt` map in the top-level `defproject` form is supported:
+
+```clojure
+(defproject example "0.1.0"
+  :cljfmt {:load-config-file? true
+           :extra-indents {with-session [[:block 1]]
+                           #"^with-" [[:inner 0]]}})
+```
+
+Precedence follows the cljfmt Leiningen plugin:
+
+- Project options alone are used by default, even when an EDN file exists.
+- `:load-config-file? true` enables EDN discovery from the project root upward.
+  The nearest directory wins; `.cljfmt.edn` precedes `cljfmt.edn`. Parent files
+  are not merged.
+- Project options override file options with a shallow merge: a nested map is
+  replaced as a whole. File validation and legacy-key conversion happen first.
+- Project `:cljfmt :paths` wins over `:source-paths` and `:test-paths` (defaults
+  `src` and `test`, restricted to existing directories). File-config paths do
+  not override this selection. Configured project paths are relative to its
+  root; explicit CLI paths remain relative to the working directory.
+
+`project.clj` is parsed as data without running Leiningen or project code.
+Symbols, regex literals, collections, and explicit namespaced maps are supported.
+Unquoted computations and metadata in selected settings are rejected. Inline
+profiles affecting formatter settings are rejected; external Leiningen profiles
+are not loaded. Use top-level literal settings or an explicit EDN file.
+The static configuration scope does not reproduce Leiningen project evaluation.
 
 ## Indentation
 
@@ -87,9 +119,9 @@ fault injection. A JVM or Clojure installation is not required to run `blt`.
 Compatibility covers the supported Basilisp syntax and options above, rather
 than every Clojure reader feature. The comparison explicitly excludes legacy
 `#^` metadata, read-eval `#=`, aliased namespaced maps, and Clojure array-class
-symbols such as `String/1`. Executable `.clj` configuration, Leiningen config
-discovery, namespaced-map shorthand in EDN config, and cljfmt's CLI entry points
-are not supported. Use ordinary EDN maps, qualified keys, and `blt format`.
+symbols such as `String/1`. `.cljfmt.clj` / `cljfmt.clj` discovery, auto-resolved
+namespaces in configuration, and cljfmt's CLI entry points are not supported.
+Use EDN or literal `project.clj` settings and `blt format`.
 
 The formatter preserves token spelling and literal text, including multiline
 strings and f-string interpolation text. Reader conditionals retain all
@@ -128,6 +160,7 @@ commit above. The separate shell supplies Clojure and Java:
 
 ```sh
 nix develop .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt /path/to/cljfmt
+nix develop .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt /path/to/cljfmt
 ```
 
 Add `--corpus /path/to/basilisp` to compare real `.lpy` files, or

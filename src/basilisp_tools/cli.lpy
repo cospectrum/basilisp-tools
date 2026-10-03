@@ -23,8 +23,10 @@
                                          "  blt format --check .\n"
                                          "  blt format --diff .\n"
                                          "  blt format - < file.lpy\n\n"
-                                         "Configuration: discovers the nearest .cljfmt.edn or cljfmt.edn\n"
-                                         "from the current directory upward; --config overrides discovery.\n\n"
+                                         "Configuration: discovers project.clj with Leiningen precedence,\n"
+                                         "otherwise the nearest .cljfmt.edn or cljfmt.edn. Project settings\n"
+                                         "load EDN only with :load-config-file? true; project values win.\n"
+                                         "--config selects a file directly. Project code is never evaluated.\n\n"
                                          "Exit codes: 0 success, 1 changes needed (--check/--diff), 2 error."))
         modes (.add_mutually_exclusive_group format)]
     (.add_argument p "--version" ** :action "version"
@@ -119,7 +121,11 @@
 
 (defn- format-command [args]
   (let [options (configuration args)
-        paths (or (seq (.-paths args)) (seq (:paths options)) ["."])
+        explicit-paths (seq (.-paths args))
+        paths (or explicit-paths (:paths options) ["."])
+        paths (if (and (not explicit-paths) (:project-root options))
+                (mapv #(if (= "-" %) % (str (.joinpath (pathlib/Path (:project-root options)) %))) paths)
+                paths)
         check? (or (.-check args) (.-diff args))]
     (if (some #(= "-" %) paths)
       (do

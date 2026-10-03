@@ -143,31 +143,161 @@
            :aligned-forms (merge (:aligned-forms opts) (:extra-aligned-forms opts))
            :blank-line-forms (merge (:blank-line-forms opts) (:extra-blank-line-forms opts)))))
 
+(defn- config-error [file message]
+  (invalid (str file ": " message) {:path (str file) :code :unsupported-config}))
+
+(defn- config-map [pairs file]
+  (reduce (fn [result [k v]]
+            (when (contains? result k) (config-error file (str "Duplicate configuration key: " k)))
+            (assoc result k v))
+          {} pairs))
+
+(defn- config-value [node file clj?]
+  ;; Decode data from our syntax tree. Never invoke the compiler, project code,
+  ;; reader evaluation, or user-defined tagged-literal readers.
+  (let [kind (:kind node)
+        forms (node-forms node)]
+    (cond
+      (#{:nil :boolean :number :symbolic-number :character :keyword :symbol :string} kind)
+      (edn/read-string (syntax/text node))
+
+      (#{:map :vector :set :list} kind)
+      (let [values (mapv #(config-value % file clj?) forms)]
+        (case kind
+          :map (config-map (partition 2 values) file)
+          :vector values
+          :set (do (when (not= (count values) (count (set values)))
+                     (config-error file "Duplicate set element"))
+                   (set values))
+          :list (apply list values)))
+
+      (op/eq :namespaced-map kind)
+      (let [prefix (:text (first (:children node)))
+            ns-name (subs prefix 2)
+            values (config-value (first forms) file clj?)]
+        (when (.startswith prefix "#::")
+          (config-error file "Auto-resolved namespaces are not supported in configuration"))
+        (config-map
+         (for [[k v] values]
+           [(if (or (keyword? k) (symbol? k))
+              (let [constructor (if (keyword? k) keyword symbol)]
+                (case (namespace k)
+                  nil (constructor (str ns-name "/" (name k)))
+                  "_" (constructor (name k))
+                  k))
+              k)
+            v])
+         file))
+
+      (and clj? (op/eq :regex kind) (.startswith (syntax/text node) "#\""))
+      (let [source (syntax/text node)]
+        (re/compile (subs source 2 (dec (count source)))))
+
+      (and (not clj?) (op/eq :tagged kind)
+           (op/eq "#re" (:text (first (:children node))))
+           (op/eq :string (:kind (first forms))))
+      (re/compile (config-value (first forms) file false))
+
+      :else (config-error file
+                          (str "Unsupported configuration form " (name kind)
+                               "; use literal data (computed values and reader macros are not evaluated)")))))
+
+(defn- config-tree [file]
+  (let [parsed (syntax/parse (.read_text file ** :encoding "utf-8"))]
+    (when (seq (:diagnostics parsed))
+      (invalid (str file ": Invalid configuration syntax")
+               {:path (str file) :diagnostics (:diagnostics parsed)}))
+    (:root parsed)))
+
+(defn- read-edn-config [file]
+  (let [forms (node-forms (config-tree file))]
+    (when-not (and (op/eq 1 (count forms))
+                   (#{:map :namespaced-map} (:kind (first forms))))
+      (config-error file "Expected exactly one EDN map"))
+    (let [value (config-value (first forms) file false)]
+      ;; cljfmt validates a file before merging project overrides and converts
+      ;; legacy keys at this point, rather than after the cross-file merge.
+      (resolve-options (dissoc value :legacy/merge-indents?))
+      (if (:legacy/merge-indents? value)
+        (-> value
+            (assoc :extra-indents (:indents value default-indents))
+            (dissoc :indents :legacy/merge-indents?))
+        value))))
+
+(defn- find-config [directory names]
+  (loop [dir directory]
+    (or (first (filter #(.is_file %) (map #(.joinpath dir %) names)))
+        (when (not (op/eq dir (.-parent dir))) (recur (.-parent dir))))))
+
+(defn- project-fields [file]
+  (let [projects (filter #(and (op/eq :list (:kind %))
+                               (#{"defproject" "leiningen.core.project/defproject"} (head %)))
+                         (node-forms (config-tree file)))]
+    (when-not (op/eq 1 (count projects))
+      (config-error file "Expected one top-level defproject form"))
+    (let [forms (node-forms (first projects))
+          fields (drop 3 forms)]
+      (when-not (and (>= (count forms) 3) (even? (count fields))
+                     (every? #(op/eq :keyword (:kind %)) (take-nth 2 fields)))
+        (config-error file "Expected literal defproject keyword/value pairs"))
+      (config-map (map (fn [[k v]] [(:text k) v]) (partition 2 fields)) file))))
+
+(defn- project-paths [fields options root file]
+  (if (some? (:paths options))
+    (:paths options)
+    (let [paths (mapcat (fn [[key fallback]]
+                          (let [value (if-let [node (get fields key)]
+                                        (config-value node file true) fallback)
+                                value (if (nil? value) fallback value)]
+                            (when-not (or (nil? value)
+                                          (and (sequential? value) (every? string? value)))
+                              (config-error file (str key " must contain literal paths")))
+                            value))
+                        [[":source-paths" ["src"]] [":test-paths" ["test"]]])]
+      (when (empty? paths)
+        (config-error file "No source or test paths defined in project map"))
+      (filterv #(.is_dir (.joinpath root %)) paths))))
+
+(defn- read-project-config [file]
+  (let [fields (project-fields file)
+        root (.-parent file)
+        profiles (get fields ":profiles")
+        _ (when (and profiles
+                     (some #(and (op/eq :keyword (:kind %))
+                                 (#{":cljfmt" ":source-paths" ":test-paths"} (:text %)))
+                           (syntax/nodes profiles)))
+            (config-error file "Leiningen profiles affecting formatter settings are unsupported; use top-level configuration or --config"))
+        project (if-let [node (get fields ":cljfmt")] (config-value node file true) {})
+        project (if (nil? project) {} project)
+        _ (when-not (map? project) (config-error file ":cljfmt must be a literal map"))
+        ;; Lein selects paths before loading the optional config file.
+        project (assoc project :paths (project-paths fields project root file)
+                       :project-root (str root))
+        config-file (when (:load-config-file? project)
+                      (find-config root [".cljfmt.edn" "cljfmt.edn"]))
+        from-file (if config-file (read-edn-config config-file) {})]
+    ;; This is deliberately shallow: a project map replaces the corresponding
+    ;; file map, exactly as lein-cljfmt's merge-file-options does.
+    (dissoc (merge from-file project) :load-config-file? :legacy/merge-indents?)))
+
 (defn load-config
-  "Read safe EDN from a file, or discover .cljfmt.edn / cljfmt.edn from a
-  directory upward. Returns an options map; no configuration is {}.
-  Tagged #re strings are supported. No project code is executed."
+  "Load literal project.clj settings with Leiningen precedence, or discover
+  .cljfmt.edn / cljfmt.edn upward when there is no project. An explicit EDN
+  file bypasses project discovery. Project code is never evaluated."
   ([] (load-config (.cwd pathlib/Path)))
   ([path]
    (let [p (.absolute (pathlib/Path path))
-         file (if (.is_file p) p
-                  (loop [dir p]
-                    (or (first (filter #(.is_file %) [(.joinpath dir ".cljfmt.edn") (.joinpath dir "cljfmt.edn")]))
-                        (when (not (op/eq dir (.-parent dir))) (recur (.-parent dir))))))]
-     (if-not file {}
-             (let [source (.read_text file ** :encoding "utf-8")
-                   parsed (syntax/parse source)
-                   forms (node-forms (:root parsed))
-                   _ (when-not (and (empty? (:diagnostics parsed))
-                                    (op/eq 1 (count forms)) (op/eq :map (:kind (first forms))))
-                       (invalid (str file " must contain exactly one EDN map") {:path (str file)}))
-                   value (edn/read-string source
-                                          {:default (fn [tag value]
-                                                      (if (op/eq 're tag)
-                                                        (re/compile value)
-                                                        (invalid (str "Unsupported EDN tag: " tag) {:tag tag})))})]
-               (resolve-options value)
-               value)))))
+         file (cond
+                (.is_file p) p
+                (.is_dir p) (or (find-config p ["project.clj"])
+                                (find-config p [".cljfmt.edn" "cljfmt.edn"]))
+                :else (config-error p "Configuration path does not exist"))
+         value (cond
+                 (nil? file) {}
+                 (op/eq "project.clj" (.-name file)) (read-project-config file)
+                 :else (read-edn-config file))]
+     (resolve-options value)
+     value)))
 
 (defn- semantic-forms [node]
   (mapv bare (node-forms (bare node))))

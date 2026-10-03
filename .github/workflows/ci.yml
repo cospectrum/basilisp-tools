@@ -83,3 +83,5 @@ jobs:
       - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
       - name: Compare upstream cases and verify idempotence
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference
+      - name: Compare configuration precedence with Leiningen plugin
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt .cljfmt-reference

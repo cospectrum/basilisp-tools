@@ -1,0 +1,199 @@
+(ns basilisp-tools.config-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.cli :as cli]
+            [basilisp-tools.format :as fmt])
+  (:import [io] [os] [pathlib] [tempfile]
+           [unittest.mock :as mock]))
+
+(defn- in-project [f]
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))]
+    (try (f root) (finally (.cleanup temp)))))
+
+(defn- put! [root name source]
+  (let [file (.joinpath root name)]
+    (.mkdir (.-parent file) ** :parents true :exist_ok true)
+    (.write_text file source ** :encoding "utf-8")
+    file))
+
+(defn- project! [root options]
+  (put! root "project.clj" (str "(defproject example/tool \"0.1.0\" " options ")")))
+
+(defn- error-message [f]
+  (try (f) nil (catch python/Exception e (str e))))
+
+(defn- invoke [cwd args]
+  (let [previous (os/getcwd)
+        out (io/StringIO) err (io/StringIO)
+        patches [(mock/patch "sys.stdout" out) (mock/patch "sys.stderr" err)]]
+    (doseq [p patches] (.start p))
+    (try
+      (os/chdir cwd)
+      {:code (cli/main args) :out (.getvalue out) :err (.getvalue err)}
+      (finally
+        (os/chdir previous)
+        (doseq [p (reverse patches)] (.stop p))))))
+
+(deftest project-config-is-opt-in-to-edn-test
+  (in-project
+   (fn [root]
+     (let [nested (.joinpath root "src" "nested")]
+       (.mkdir nested ** :parents true)
+       (put! root ".cljfmt.edn" "{:indentation? true}")
+       (doseq [option ["" ":cljfmt nil" ":cljfmt {}"
+                       ":cljfmt {:load-config-file? false}"
+                       ":cljfmt {:load-config-file? nil}"]]
+         (testing option
+           (project! root option)
+           (let [options (fmt/load-config nested)]
+             (is (= (str root) (:project-root options)))
+             (is (not (contains? options :indentation?)))
+             (is (not (contains? options :load-config-file?))))))
+       (testing "Ignored config files need not even be valid"
+         (put! root ".cljfmt.edn" "{:broken")
+         (project! root ":cljfmt {:indentation? false}")
+         (is (false? (:indentation? (fmt/load-config nested)))))
+       (testing "Opting in makes errors in the selected EDN visible"
+         (project! root ":cljfmt {:load-config-file? true}")
+         (is (thrown? python/Exception (fmt/load-config nested))))))))
+
+(deftest project-options-win-with-shallow-merge-test
+  (in-project
+   (fn [root]
+     (put! root ".cljfmt.edn"
+           "{:indentation? true :sort-ns-references? true :max-column-alignment-gap 4 :extra-indents {file-only [[:inner 0]]}}")
+     (project! root
+               ":cljfmt {:load-config-file? true :indentation? false :max-column-alignment-gap nil :extra-indents {project-only [[:block 1]]}}")
+     (let [options (fmt/load-config root)]
+       (is (false? (:indentation? options)))
+       (is (true? (:sort-ns-references? options)))
+       (is (contains? options :max-column-alignment-gap))
+       (is (nil? (:max-column-alignment-gap options)))
+       (is (= {'project-only [[:block 1]]} (:extra-indents options)))
+       (is (not (contains? options :load-config-file?))))
+     (testing "The Lein flag follows Clojure truthiness"
+       (project! root ":cljfmt {:load-config-file? 0}")
+       (is (true? (:sort-ns-references? (fmt/load-config root))))))))
+
+(deftest nearest-project-and-file-discovery-test
+  (in-project
+   (fn [outer]
+     (let [root (.joinpath outer "project")
+           nested (.joinpath root "work" "nested")]
+       (.mkdir nested ** :parents true)
+       (project! outer ":cljfmt {:indentation? false}")
+       (project! root ":cljfmt {:load-config-file? true}")
+       (put! outer ".cljfmt.edn" "{:sort-ns-references? false}")
+       (put! root "cljfmt.edn" "{:sort-ns-references? true}")
+       (put! nested ".cljfmt.edn" "{:indentation? false}")
+       (testing "Lein file discovery starts at the nearest project root"
+         (let [options (fmt/load-config nested)]
+           (is (= (str root) (:project-root options)))
+           (is (true? (:sort-ns-references? options)))
+           (is (not (contains? options :indentation?)))))
+       (testing "Dot config wins over plain config in the same directory"
+         (put! root ".cljfmt.edn" "{:sort-ns-references? false}")
+         (is (false? (:sort-ns-references? (fmt/load-config nested)))))))))
+
+(deftest explicit-config-selection-test
+  (in-project
+   (fn [root]
+     (let [edn-file (put! root "chosen.edn" "{:indentation? false}")
+           project-file (project! root ":cljfmt {:indentation? true}")]
+       (put! root ".cljfmt.edn" "{:indentation? false}")
+       (is (true? (:indentation? (fmt/load-config project-file))))
+       (is (= {:indentation? false} (fmt/load-config edn-file)))
+       (testing "Explicit EDN bypasses project discovery and project parse errors"
+         (put! root "project.clj" "(defproject")
+         (is (= {:indentation? false} (fmt/load-config edn-file))))))))
+
+(deftest project-path-precedence-test
+  (in-project
+   (fn [root]
+     (doseq [name ["src" "test" "code" "spec" "chosen"]]
+       (.mkdir (.joinpath root name)))
+     (project! root "")
+     (is (= ["src" "test"] (:paths (fmt/load-config root))))
+     (project! root ":source-paths [\"code\" \"missing\"] :test-paths [\"spec\"]")
+     (is (= ["code" "spec"] (:paths (fmt/load-config root))))
+     (put! root ".cljfmt.edn" "{:paths [\"chosen\"]}")
+     (project! root ":source-paths [\"code\"] :test-paths [\"spec\"] :cljfmt {:load-config-file? true}")
+     (is (= ["code" "spec"] (:paths (fmt/load-config root))))
+     (project! root ":source-paths [\"code\"] :test-paths [\"spec\"] :cljfmt {:load-config-file? true :paths [\"chosen\"]}")
+     (is (= ["chosen"] (:paths (fmt/load-config root)))))))
+
+(deftest literal-project-config-and-inert-code-test
+  (in-project
+   (fn [root]
+     (let [marker (.joinpath root "must-not-exist")
+           project (str "(spit " (pr-str (str marker)) " \"unsafe\")\n"
+                        "#_(defproject discarded \"0\" :cljfmt (computed))\n"
+                        "(defproject example/tool \"0.1.0\"\n"
+                        "  :description ~(str \"computed but unused\")\n"
+                        "  #_:cljfmt #_(computed)\n"
+                        "  :cljfmt {:extra-indents {example/action [[:inner 0]] #\"^wrap-\" [[:block 1]]}"
+                        " :file-pattern #\"\\.lpy$\"})")]
+       (put! root "project.clj" project)
+       (let [options (fmt/load-config root)]
+         (is (= [[:inner 0]] (get (:extra-indents options) 'example/action)))
+         (is (= "\\.lpy$" (.-pattern (:file-pattern options))))
+         (is (= "(example/action x\n  (body))"
+                (fmt/format-string "(example/action x\n(body))" options)))
+         (is (= "(wrap-action x\n  (body))"
+                (fmt/format-string "(wrap-action x\n(body))" options))))
+       (is (not (.exists marker)))))))
+
+(deftest unsupported-project-config-is-explicit-test
+  (in-project
+   (fn [root]
+     (doseq [[config expected] [["(load-settings)" "literal"]
+                                ["~(load-settings)" "unsupported"]
+                                ["{:extra-indents (make-indents)}" "must be a map"]
+                                ["{:extra-indents #unsafe {}}" "unsupported"]
+                                ["^:replace {:indentation? false}" "unsupported"]]]
+       (testing config
+         (project! root (str ":cljfmt " config))
+         (let [message (error-message #(fmt/load-config root))]
+           (is (some? message))
+           (is (and message (>= (.find (.lower message) expected) 0)))))))))
+
+(deftest formatter-profile-overrides-are-rejected-test
+  (in-project
+   (fn [root]
+     (project! root ":profiles {:dev {:dependencies [[some/library \"1.0\"]]}}")
+     (is (map? (fmt/load-config root)))
+     (doseq [profile ["{:dev {:cljfmt {:indentation? false}}}"
+                      "{:dev {:source-paths [\"generated\"]}}"
+                      "{:dev {:test-paths [\"integration\"]}}"]]
+       (project! root (str ":profiles " profile))
+       (is (thrown? python/Exception (fmt/load-config root)))))))
+
+(deftest project-relative-paths-and-cli-overrides-test
+  (in-project
+   (fn [root]
+     (let [nested (.joinpath root "work")
+           source "(defn f []\n(answer))\n"
+           expected "(defn f []\n  (answer))\n"
+           project-source (put! root "code/main.lpy" source)
+           local-source (put! root "work/local.lpy" source)]
+       (put! root "unselected.lpy" "(")
+       (project! root ":source-paths [\"code\"] :test-paths []")
+       (let [result (invoke nested ["format" "--quiet"])]
+         (is (= 0 (:code result)) (:err result)))
+       (is (= expected (.read_text project-source ** :encoding "utf-8")))
+       (is (= source (.read_text local-source ** :encoding "utf-8")))
+       (let [result (invoke nested ["format" "--quiet" "local.lpy"])]
+         (is (= 0 (:code result)) (:err result)))
+       (is (= expected (.read_text local-source ** :encoding "utf-8")))))))
+
+(deftest explicit-namespaced-map-config-test
+  (in-project
+   (fn [root]
+     (let [source "{:extra-indents #:example{action [[:inner 0]]}}"
+           file (put! root "chosen.edn" source)]
+       (project! root (str ":cljfmt " source))
+       (doseq [path [file root]]
+         (let [options (fmt/load-config path)]
+           (is (= {'example/action [[:inner 0]]} (:extra-indents options)))
+           (is (= "(example/action x\n  (body))"
+                  (fmt/format-string "(example/action x\n(body))" options)))))))))
