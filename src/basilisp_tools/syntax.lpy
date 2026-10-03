@@ -1,0 +1,486 @@
+(ns basilisp-tools.syntax
+  "Lossless, non-evaluating Basilisp syntax for editors and formatters.
+
+  Nodes are immutable maps with :kind and half-open :start/:end Unicode
+  code-point offsets. Leaves have :text; branches have :children. Delimiters,
+  prefixes, whitespace and comments are leaves, so concatenating leaf text
+  reproduces the input exactly, including invalid input. No runtime symbol
+  resolution, macro expansion, imports or tagged-literal evaluation occurs."
+  (:require [basilisp.string :as str])
+  (:import [re] [bisect] [operator :as op]))
+
+(def ^:private atom-re (re/compile "[^\\s,()\\[\\]{}\";@^~\u0060\\\\]+"))
+(def ^:private number-start-re (re/compile "-*[0-9]"))
+(def ^:private number-body-re (re/compile "-*[0-9][0-9A-Za-z/.+\\-]*"))
+(def ^:private identifier-re (re/compile "([^\\d/]\\S*/)?(/|[^\\d/][^/]*)"))
+(def ^:private integer-re (re/compile "-?(?:\\d|[1-9]\\d+)N?"))
+(def ^:private decimal-re (re/compile "-?(?:\\d|[1-9]\\d+)(?:\\.\\d*)?M?"))
+(def ^:private scientific-re (re/compile "-?\\d+(?:\\.\\d*)?[Ee][+-]?\\d+M?"))
+(def ^:private complex-re (re/compile "-?\\d+(?:\\.\\d*)?J"))
+(def ^:private octal-re (re/compile "-?0[0-7]+N?"))
+(def ^:private hex-re (re/compile "-?0[Xx][0-9A-Fa-f]+N?"))
+(def ^:private ratio-re (re/compile "(-?\\d+)/(\\d+)"))
+(def ^:private radix-re (re/compile "-?(\\d{1,2})r([0-9A-Za-z]+)"))
+(def ^:private hex-digit-re (re/compile "[0-9A-Fa-f]"))
+(def ^:private close-chars #{")" "]" "}"})
+(def ^:private trivia-kinds #{:whitespace :newline :comment})
+(def ^:private non-form-kinds
+  #{:whitespace :newline :comment :delimiter :prefix :discard :string-text})
+
+(defn trivia?
+  "Whether a node is whitespace, a newline, or a line/shebang comment."
+  [node]
+  (contains? trivia-kinds (:kind node)))
+
+(defn forms
+  "Direct syntactic forms, excluding trivia, punctuation and reader discards.
+  Reader conditionals remain unexpanded. This is not runtime reader output."
+  [node]
+  (filterv #(not (contains? non-form-kinds (:kind %))) (:children node)))
+
+(defn nodes
+  "All nodes in source order, including the supplied root."
+  [node]
+  (tree-seq #(seq (:children %)) :children node))
+
+(defn tokens
+  "Leaf tokens in source order, including trivia and invalid text."
+  [node]
+  (filter #(contains? % :text) (nodes node)))
+
+(defn text
+  "Reconstruct source from a node, without normalizing spelling or whitespace."
+  [node]
+  (str/join "" (map :text (tokens node))))
+
+(defn node-at
+  "Deepest node containing offset. Ranges are half-open; EOF returns nil."
+  [node offset]
+  (when (and (<= (:start node) offset) (< offset (:end node)))
+    (loop [n node]
+      (if-let [child (first (filter #(and (<= (:start %) offset)
+                                          (< offset (:end %)))
+                                    (:children n)))]
+        (recur child)
+        n))))
+
+(defn- char-at [s i]
+  (when (< i (count s)) (subs s i (inc i))))
+
+(defn- peek-char [state]
+  (char-at (:source state) (:offset state)))
+
+(defn- starts? [state value]
+  (.startswith (:source state) value (:offset state)))
+
+(defn- issue [state code message start end]
+  (update state :diagnostics conj
+          {:code code :message message :severity :error :start start :end end}))
+
+(defn- leaf [state kind end]
+  (let [start (:offset state)]
+    [{:kind kind :start start :end end
+      :text (subs (:source state) start end)}
+     (assoc state :offset end)]))
+
+(defn- branch [kind start children state]
+  [{:kind kind :start start :end (:offset state) :children children} state])
+
+(defn- match-end [pattern state]
+  (when-let [m (.match pattern (:source state) (:offset state))]
+    (.end m)))
+
+(defn- take-trivia [state]
+  (let [s (:source state) i (:offset state) c (peek-char state)]
+    (cond
+      (or (op/eq c "\r") (op/eq c "\n"))
+      (leaf state :newline (+ i (if (starts? state "\r\n") 2 1)))
+
+      (or (op/eq c ";") (starts? state "#!"))
+      (leaf state :comment
+            (loop [j i]
+              (if (or (>= j (count s)) (contains? #{"\r" "\n"} (char-at s j)))
+                j (recur (inc j)))))
+
+      (and c (or (op/eq c ",") (.isspace c)))
+      (leaf state :whitespace
+            (loop [j i]
+              (let [ch (char-at s j)]
+                (if (and ch (not (contains? #{"\r" "\n"} ch))
+                         (or (op/eq ch ",") (.isspace ch)))
+                  (recur (inc j)) j))))
+      :else nil)))
+
+(defn- consume-trivia [state children]
+  (loop [state state children children]
+    (if-let [[node next-state] (take-trivia state)]
+      (recur next-state (conj children node))
+      [children state])))
+
+(defn- valid-number? [s]
+  (or (some #(.fullmatch % s)
+            [integer-re decimal-re scientific-re complex-re octal-re hex-re])
+      (when-let [m (.fullmatch ratio-re s)]
+        (or (empty? (.strip (.group m 1) "-0"))
+            (seq (.strip (.group m 2) "0"))))
+      (when-let [m (.fullmatch radix-re s)]
+        (let [base (python/int (.group m 1))]
+          (and (<= 2 base 36)
+               (every? #(< (python/int % 36) base) (.group m 2)))))))
+
+(defn- atom-kind [s]
+  (cond
+    (op/eq s "nil") :nil
+    (contains? #{"true" "false"} s) :boolean
+    (.startswith s ":") :keyword
+    (.match number-start-re s) :number
+    :else :symbol))
+
+(defn- atom-error [kind s]
+  (cond
+    (op/eq kind :number) (when-not (valid-number? s) "Invalid numeric literal")
+    (op/eq kind :keyword)
+    (let [body (subs s (if (.startswith s "::") 2 1))]
+      (when-not (or (and (not (.startswith s "::")) (.isnumeric body))
+                    (.fullmatch identifier-re body))
+        "Invalid keyword"))
+    (op/eq kind :symbol)
+    (when-not (.fullmatch identifier-re s) "Invalid symbol")
+    :else nil))
+
+(defn- read-atom [state]
+  (let [i (:offset state)
+        source (:source state)
+        numeric? (.match number-start-re source i)
+        numeric-keyword? (and (op/eq ":" (peek-char state))
+                              (some-> (char-at source (inc i)) .isnumeric))
+        end (cond
+              numeric? (match-end number-body-re state)
+              numeric-keyword? (loop [j (inc i)]
+                                 (if (some-> (char-at source j) .isnumeric)
+                                   (recur (inc j)) j))
+              :else (or (match-end atom-re state) (inc i)))
+        [node state] (leaf state :symbol end)
+        kind (atom-kind (:text node))
+        problem (atom-error kind (:text node))]
+    [(assoc node :kind kind)
+     (if problem (issue state :invalid-token problem i end) state)]))
+
+(defn- read-character [state]
+  (let [s (:source state) start (:offset state) first-pos (inc start)
+        end (if (>= first-pos (count s))
+              first-pos
+              (loop [j (inc first-pos)]
+                (if-let [c (char-at s j)]
+                  (if (.isalnum c) (recur (inc j)) j) j)))
+        body (subs s first-pos end)
+        valid? (or (op/eq 1 (count body))
+                   (contains? #{"newline" "space" "tab" "formfeed" "backspace" "return"} body)
+                   (and (.startswith body "u")
+                        (try (let [v (python/int (subs body 1) 16)]
+                               (and (seq (subs body 1)) (<= 0 v 1114111)))
+                             (catch python/ValueError _ false))))
+        [node state] (leaf state :character end)]
+    [node (if valid? state
+              (issue state :invalid-character "Invalid character literal" start end))]))
+
+(defn- escape-end
+  "Consume a string escape, keeping spelling and reporting invalid escapes."
+  [state kind]
+  (let [s (:source state) i (:offset state) c (char-at s (inc i))
+        basic-end (min (count s) (+ i 2))]
+    (cond
+      (nil? c)
+      (issue (assoc state :offset basic-end) :invalid-escape
+             "Incomplete escape sequence" i basic-end)
+
+      (op/eq kind :regex) (assoc state :offset basic-end)
+
+      (and (op/eq kind :bytes) (op/eq c "x"))
+      (let [end (loop [j (+ i 2)]
+                  (if (and (< j (+ i 4)) (char-at s j)
+                           (.fullmatch hex-digit-re (char-at s j)))
+                    (recur (inc j)) j))
+            state (assoc state :offset end)]
+        (if (op/eq end (+ i 4)) state
+            (issue state :invalid-escape "Expected two hexadecimal digits" i end)))
+
+      (op/eq kind :bytes) (assoc state :offset basic-end)
+
+      (contains? #{"\"" "\\" "a" "b" "f" "n" "r" "t" "v"} c)
+      (assoc state :offset basic-end)
+
+      (and (op/eq kind :f-string) (op/eq c "{")) (assoc state :offset basic-end)
+
+      (contains? #{"u" "U"} c)
+      (let [end (loop [j (+ i 2)]
+                  (if (and (char-at s j) (.fullmatch hex-digit-re (char-at s j)))
+                    (recur (inc j)) j))
+            digits (subs s (+ i 2) end)
+            valid? (and (contains? #{4 8} (count digits))
+                        (<= (python/int digits 16) 1114111))
+            state (assoc state :offset end)]
+        (if valid? state
+            (issue state :invalid-escape
+                   "Unicode escape requires 4 or 8 hex digits and a valid code point" i end)))
+
+      :else
+      (issue (assoc state :offset basic-end) :invalid-escape
+             "Unknown string escape" i basic-end))))
+
+(declare read-form read-collection read-prefix read-string)
+
+(defn- check-collection [node state]
+  (let [children (forms node) kind (:kind node)
+        conditional? (contains? #{:reader-conditional :reader-splice} kind)
+        map? (op/eq kind :map)
+        ;; Splices/conditionals can change the form count; resolution is analysis.
+        dynamic? (some #(contains? #{:reader-conditional :reader-splice} (:kind %)) children)
+        state (if (and (or map? conditional?) (not dynamic?) (odd? (count children)))
+                (issue state :odd-form-count
+                       "Expected an even number of forms" (:start node) (:end node)) state)]
+    (if conditional?
+      (loop [pairs (partition 2 children) seen #{} state state]
+        (if-let [[feature _] (first pairs)]
+          (let [spelling (text feature)]
+            (recur (rest pairs) (conj seen spelling)
+                   (cond
+                     (op/ne :keyword (:kind feature))
+                     (issue state :invalid-feature "Reader feature must be a keyword"
+                            (:start feature) (:end feature))
+                     (contains? seen spelling)
+                     (issue state :duplicate-feature "Duplicate reader feature"
+                            (:start feature) (:end feature))
+                     :else state)))
+          state))
+      state)))
+
+(defn- read-collection [state kind opener closer]
+  (let [start (:offset state)
+        old-closers (:closers state)
+        [open state] (leaf state :delimiter (+ start (count opener)))]
+    (loop [state (update state :closers conj closer) children [open]]
+      (let [c (peek-char state)]
+        (cond
+          (op/eq c closer)
+          (let [[close state] (leaf state :delimiter (inc (:offset state)))
+                [node state] (branch kind start (conj children close)
+                                     (assoc state :closers old-closers))]
+            [node (check-collection node state)])
+
+          (or (nil? c) (some #(op/eq c %) old-closers))
+          (let [state (issue state :missing-delimiter (str "Expected " closer)
+                             (:offset state) (:offset state))]
+            (let [[node state] (branch kind start children
+                                       (assoc state :closers old-closers))]
+              [(assoc node :incomplete? true) state]))
+
+          :else
+          (let [[child next-state] (read-form state)]
+            (recur next-state (conj children child))))))))
+
+(defn- read-prefix
+  "Read N non-discarded forms. Comments and nested #_ remain in the tree."
+  [state kind prefix n]
+  (let [start (:offset state)
+        [head state] (leaf state :prefix (+ start (count prefix)))]
+    (loop [state state children [head] left n]
+      (let [[children state] (if (zero? left) [children state]
+                                (consume-trivia state children))]
+        (cond
+          (zero? left) (branch kind start children state)
+          (or (nil? (peek-char state)) (contains? close-chars (peek-char state)))
+          (let [[node state] (branch kind start children
+                                     (issue state :missing-form "Expected a form after reader prefix"
+                                            (:offset state) (:offset state)))]
+            [(assoc node :incomplete? true) state])
+          :else
+          (let [[child state] (read-form state)]
+            (recur state (conj children child)
+                   (if (op/eq :discard (:kind child)) left (dec left)))))))))
+
+(defn- flush-string [children source start end]
+  (if (< start end)
+    (conj children {:kind :string-text :start start :end end :text (subs source start end)})
+    children))
+
+(defn- read-string [state kind]
+  (let [start (:offset state) s (:source state)
+        [open state] (leaf state :delimiter (inc start))]
+    (loop [state state children [open] segment-start (inc start)]
+      (let [i (:offset state) c (peek-char state)]
+        (cond
+          (nil? c)
+          (let [children (flush-string children s segment-start i)
+                [node state] (branch kind start children
+                                     (issue state :unterminated-string
+                                            "Unterminated string" start i))]
+            [(assoc node :incomplete? true) state])
+
+          (op/eq c "\"")
+          (let [children (flush-string children s segment-start i)
+                [close state] (leaf state :delimiter (inc i))]
+            (branch kind start (conj children close) state))
+
+          (op/eq c "\\") (recur (escape-end state kind) children segment-start)
+
+          (and (op/eq kind :f-string) (op/eq c "{"))
+          (let [children (flush-string children s segment-start i)
+                [expr state] (read-collection (update state :depth inc) :interpolation "{" "}")
+                state (update state :depth dec)
+                state (if (op/eq 1 (count (forms expr))) state
+                          (issue state :invalid-interpolation
+                                 "F-string interpolation requires exactly one form"
+                                 (:start expr) (:end expr)))]
+            (recur state (conj children expr) (:offset state)))
+
+          :else
+          (let [state (if (and (op/eq kind :bytes) (not (<= 1 (python/ord c) 127)))
+                        (issue state :invalid-byte "Byte strings require ASCII characters" i (inc i))
+                        state)]
+            (recur (update state :offset inc) children segment-start)))))))
+
+(defn- read-prefixed-string [state kind prefix]
+  (let [start (:offset state)
+        [head state] (leaf state :prefix (+ start (count prefix)))
+        [children state] (consume-trivia state [head])]
+    (if (op/eq "\"" (peek-char state))
+      (let [[node state] (read-string state kind)
+            [result state] (branch kind start (into children (:children node)) state)]
+        [(cond-> result (:incomplete? node) (assoc :incomplete? true)) state])
+      (let [[node state] (branch kind start children
+                                 (issue state :missing-string "Expected a string after prefix"
+                                        (:offset state) (:offset state)))]
+        [(assoc node :incomplete? true) state]))))
+
+(defn- read-namespaced-map [state]
+  (let [start (:offset state)
+        auto? (starts? state "#::")
+        base (+ start (if auto? 3 2))
+        end (or (match-end atom-re (assoc state :offset base)) base)
+        ns-text (subs (:source state) base end)
+        [head state] (leaf state :prefix end)
+        ;; Basilisp supports #:name and #::, not Clojure's #::alias.
+        valid? (if auto? (empty? ns-text)
+                   (and (seq ns-text) (.fullmatch identifier-re ns-text)
+                        (op/eq -1 (.find ns-text "/"))))
+        state (if valid? state
+                  (issue state :invalid-map-namespace "Invalid namespaced-map prefix" start end))
+        [children state] (consume-trivia state [head])]
+    (if (op/eq "{" (peek-char state))
+      (let [[node state] (read-collection state :map "{" "}")
+            [result state] (branch :namespaced-map start (conj children node) state)]
+        [(cond-> result (:incomplete? node) (assoc :incomplete? true)) state])
+      (let [[node state] (branch :namespaced-map start children
+                                 (issue state :missing-map "Expected a map after namespace prefix"
+                                        (:offset state) (:offset state)))]
+        [(assoc node :incomplete? true) state]))))
+
+(defn- read-dispatch [state]
+  (let [i (:offset state)]
+    (cond
+      (starts? state "#{") (read-collection state :set "#{" "}")
+      (starts? state "#(") (read-collection state :anonymous-function "#(" ")")
+      (starts? state "#?@(") (read-collection state :reader-splice "#?@(" ")")
+      (starts? state "#?(") (read-collection state :reader-conditional "#?(" ")")
+      (starts? state "#_") (read-prefix state :discard "#_" 1)
+      (starts? state "#'") (read-prefix state :var-quote "#'" 1)
+      (starts? state "#:") (read-namespaced-map state)
+      (starts? state "#\"") (read-prefixed-string state :regex "#")
+      (starts? state "##")
+      (let [end (or (match-end atom-re (assoc state :offset (+ i 2))) (+ i 2))
+            [node state] (leaf state :symbolic-number end)]
+        [node (if (contains? #{"##Inf" "##-Inf" "##NaN"} (:text node)) state
+                  (issue state :invalid-number "Unknown symbolic numeric constant" i end))])
+      :else
+      (let [end (or (match-end atom-re (assoc state :offset (inc i))) (inc i))
+            tag (subs (:source state) (inc i) end)]
+        (cond
+          (op/eq tag "b") (read-prefixed-string state :bytes "#b")
+          (op/eq tag "f") (read-prefixed-string state :f-string "#f")
+          (or (empty? tag) (not (.fullmatch identifier-re tag))
+              (.startswith tag "?") (.startswith tag "="))
+          (let [[node state] (leaf state :error end)]
+            [node (issue state :invalid-dispatch "Unknown or incomplete reader dispatch" i end)])
+          :else (read-prefix state :tagged (str "#" tag) 1))))))
+
+(defn- read-form* [state]
+  (or (take-trivia state)
+      (let [c (peek-char state) i (:offset state)]
+        (cond
+          (> (:depth state) (:max-depth state))
+          (let [[node state] (leaf state :error (inc i))]
+            [node (issue state :nesting-limit "Maximum syntax nesting depth exceeded" i (inc i))])
+          (op/eq c "(") (read-collection state :list "(" ")")
+          (op/eq c "[") (read-collection state :vector "[" "]")
+          (op/eq c "{") (read-collection state :map "{" "}")
+          (op/eq c "\"") (read-string state :string)
+          (op/eq c "\\") (read-character state)
+          (op/eq c "#") (read-dispatch state)
+          (op/eq c "'") (read-prefix state :quote "'" 1)
+          (op/eq c "\u0060") (read-prefix state :syntax-quote "\u0060" 1)
+          (op/eq c "~") (if (starts? state "~@")
+                      (read-prefix state :unquote-splicing "~@" 1)
+                      (read-prefix state :unquote "~" 1))
+          (op/eq c "@") (read-prefix state :deref "@" 1)
+          (op/eq c "^") (read-prefix state :metadata "^" 2)
+          (contains? close-chars c)
+          (let [[node state] (leaf state :error (inc i))]
+            [node (issue state :unexpected-delimiter "Unexpected closing delimiter" i (inc i))])
+          :else (read-atom state)))))
+
+(defn- read-form [state]
+  (let [depth (:depth state)
+        [node state] (read-form* (assoc state :depth (inc depth)))]
+    [node (assoc state :depth depth)]))
+
+(defn parse
+  "Parse all source into {:root node :diagnostics [...] :source s :line-starts [...]}.
+
+  Invalid/incomplete text is retained and reported, not thrown away. :max-depth
+  (default 64, range 1..64) bounds recursive parsing of adversarial input.
+  Diagnostics cover lexical/structural errors; runtime-sensitive reader checks,
+  duplicate collection values, symbol resolution and type checks belong to analysis."
+  ([source] (parse source {}))
+  ([source {:keys [max-depth] :or {max-depth 64}}]
+   (when-not (string? source)
+     (throw (python/TypeError "source must be a string")))
+   (when-not (and (integer? max-depth) (<= 1 max-depth 64))
+     (throw (python/ValueError "max-depth must be an integer between 1 and 64")))
+   (loop [state {:source source :offset 0 :diagnostics [] :depth 0
+                 :max-depth max-depth :closers []}
+          children []]
+     (if (op/eq (:offset state) (count source))
+       {:source source
+        :root {:kind :root :start 0 :end (count source) :children children}
+        :diagnostics (:diagnostics state)
+        :line-starts (into [0] (map #(.end %) (iterator-seq (re/finditer "\r\n|\r|\n" source))))}
+       (let [[node next-state] (read-form state)]
+         (recur next-state (conj children node)))))))
+
+(defn offset->position
+  "Convert a code-point offset to zero-based {:line :character}.
+  CRLF is one line ending; :character counts code points, not UTF-16 units."
+  [parsed offset]
+  (when-not (and (integer? offset) (<= 0 offset (count (:source parsed))))
+    (throw (python/ValueError "Offset outside source")))
+  (let [line (dec (bisect/bisect_right (:line-starts parsed) offset))]
+    {:line line :character (- offset (nth (:line-starts parsed) line))}))
+
+(defn position->offset
+  "Convert a zero-based code-point position to an offset.
+  End-of-line is valid; positions inside line-ending characters are rejected."
+  [parsed {:keys [line character]}]
+  (let [starts (:line-starts parsed) source (:source parsed)]
+    (when-not (and (integer? line) (integer? character)
+                   (<= 0 line) (< line (count starts)) (<= 0 character))
+      (throw (python/ValueError "Invalid source position")))
+    (let [start (nth starts line)
+          raw-end (if (< (inc line) (count starts)) (nth starts (inc line)) (count source))
+          end (loop [i raw-end]
+                (if (and (> i start) (contains? #{"\r" "\n"} (char-at source (dec i))))
+                  (recur (dec i)) i))
+          offset (+ start character)]
+      (when (> offset end)
+        (throw (python/ValueError "Character outside line")))
+      offset)))

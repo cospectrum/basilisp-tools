@@ -1,0 +1,252 @@
+(ns basilisp-tools.syntax-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp.string :as str]
+            [basilisp-tools.syntax :as syntax])
+  (:import [random]))
+
+(defn- first-form [source]
+  (first (syntax/forms (:root (syntax/parse source)))))
+
+(defn- codes [source]
+  (set (map :code (:diagnostics (syntax/parse source)))))
+
+(defn- assert-lossless [source]
+  (let [result (syntax/parse source)
+        root (:root result)
+        leaves (vec (syntax/tokens root))]
+    (is (= source (syntax/text root)))
+    (is (= 0 (:start root)))
+    (is (= (count source) (:end root)))
+    (is (= (mapv :end (butlast leaves)) (mapv :start (rest leaves))))
+    (doseq [node (syntax/nodes root)]
+      (is (<= 0 (:start node) (:end node) (count source)))
+      (when (contains? node :text)
+        (is (= (:text node) (subs source (:start node) (:end node)))))
+      (when-let [children (seq (:children node))]
+        (is (= (:start node) (:start (first children))))
+        (is (= (:end node) (:end (last children))))
+        (is (= (mapv :end (butlast children)) (mapv :start (rest children))))))
+    (doseq [diagnostic (:diagnostics result)]
+      (is (<= 0 (:start diagnostic) (:end diagnostic) (count source))))
+    result))
+
+(deftest basic-node-shapes-test
+  (is (= {:kind :root :start 0 :end 0 :children []}
+         (:root (syntax/parse ""))))
+  (let [node (first-form "(f 42)")]
+    (is (= :list (:kind node)))
+    (is (= [0 6] [(:start node) (:end node)]))
+    (is (= [:delimiter :symbol :whitespace :number :delimiter]
+           (mapv :kind (:children node))))
+    (is (= ["f" "42"] (mapv syntax/text (syntax/forms node))))))
+
+(deftest trivia-test
+  (let [s ", \t\u00a0\r\n; hi\r#! another\nx"
+        result (assert-lossless s)]
+    (is (empty? (:diagnostics result)))
+    (is (= [:whitespace :newline :comment :newline :comment :newline :symbol]
+           (mapv :kind (:children (:root result)))))
+    (is (= ["x"] (mapv syntax/text (syntax/forms (:root result)))))))
+
+(deftest literal-kinds-test
+  (doseq [[kind examples]
+          {:nil ["nil"]
+           :boolean ["true" "false"]
+           :symbol ["foo" "foo/bar" "some/ns/sym" "ns//" ".method" ".-field"
+                    "+" "-" "->>" "foo'" "div#id" "%1" "%&" "&" "привет" "😀"]
+           :keyword [":k" "::k" "::alias/k" ":ns/k" ":123" ":ns//" ":div#id"]
+           :number ["0" "-42" "42N" "0.1" "-1." "1M" "2.5M" "0755"
+                    "-0755N" "0xFF" "-0XFFN" "2r101" "36rZ" "-16rFF"
+                    "1/3" "-3/2" "1e+3" "1e-3" "1.2E3M" "2J" "-2.5J"]
+           :symbolic-number ["##Inf" "##-Inf" "##NaN"]
+           :character ["\\a" "\\[" "\\]" "\\," "\\ " "\\newline"
+                       "\\return" "\\space" "\\u03A9" "\\u1F40D"]}]
+    (doseq [source examples]
+      (testing source
+        (let [result (assert-lossless source)]
+          (is (empty? (:diagnostics result)))
+          (is (= kind (:kind (first (syntax/forms (:root result)))))))))))
+
+(deftest collections-test
+  (doseq [[source kind]
+          [["()" :list] ["[]" :vector] ["{}" :map] ["#{}" :set]
+           ["#(+ %1 %2)" :anonymous-function]
+           ["(a [b {:c #{d}}])" :list]]]
+    (let [result (assert-lossless source)]
+      (is (empty? (:diagnostics result)))
+      (is (= kind (:kind (first-form source)))))))
+
+(deftest prefixes-test
+  (doseq [[source kind]
+          [["'x" :quote] ["\u0060x" :syntax-quote] ["~x" :unquote]
+           ["~@xs" :unquote-splicing] ["@x" :deref] ["#'x" :var-quote]
+           ["^:private x" :metadata] ["^{:a 1} x" :metadata]
+           ["^[int] x" :metadata] ["#_ x" :discard]
+           ["#inst \"2026-01-01\"" :tagged] ["#py [1 2]" :tagged]
+           ["#unknown/tag {:a 1}" :tagged]]]
+    (let [result (assert-lossless source)]
+      (is (empty? (:diagnostics result)))
+      (is (= kind (:kind (first (:children (:root result))))))))
+  (testing "Trailing trivia belongs to the surrounding form"
+    (is (= "'x" (syntax/text (first-form "'x y")))))
+  (testing "Comments do not satisfy a prefix operand"
+    (is (= ["x"] (mapv syntax/text (syntax/forms (first-form "' ; note\n x"))))))
+  (testing "Nested discards consume the next non-discarded form"
+    (let [result (assert-lossless "#_ #_ a b c")]
+      (is (empty? (:diagnostics result)))
+      (is (= ["c"] (mapv syntax/text (syntax/forms (:root result)))))))
+  (testing "Metadata has two operands"
+    (is (= [":private" "x"]
+           (mapv syntax/text (syntax/forms (first-form "^:private x")))))))
+
+(deftest strings-test
+  (doseq [[source kind]
+          [["\"\"" :string] ["\"line one\nline two\"" :string]
+           ["\"\\\" \\\\ \\a \\b \\f \\n \\r \\t \\v\"" :string]
+           ["\"\\u03A9 \\U0001F40D\"" :string]
+           ["#\"\\d+\"" :regex] ["#b \"\\x00\\xff\\q\"" :bytes]
+           ["#f \"hello\"" :f-string] ["#f\"hello {name}!\"" :f-string]
+           ["#f \"{(+ 1 2)} {[\"inner\"]} {#f \"{x}\"}\"" :f-string]
+           ["#f \"\\{literal}\"" :f-string]]]
+    (let [result (assert-lossless source)]
+      (is (empty? (:diagnostics result)))
+      (is (= kind (:kind (first-form source))))))
+  (testing "Interpolation remains analyzable syntax"
+    (let [node (first-form "#f \"hi {(+ x 1)}!\"")
+          expr (first (filter #(= :interpolation (:kind %)) (:children node)))]
+      (is (= "{(+ x 1)}" (syntax/text expr)))
+      (is (= :list (:kind (first (syntax/forms expr))))))))
+
+(deftest reader-conditionals-test
+  (doseq [source ["#?(:lpy a :default b)" "[#?@(:lpy [a b])]"
+                  "{#?@(:lpy [:a 1])}" "#?(:lpy #unknown/tag [] :default nil)"]]
+    (is (empty? (:diagnostics (assert-lossless source)))))
+  (is (= :reader-splice (:kind (first-form "#?@(:lpy [a])"))))
+  (is (contains? (codes "#?(:lpy 1 :lpy 2)") :duplicate-feature))
+  (is (contains? (codes "#?(lpy 1)") :invalid-feature))
+  (is (contains? (codes "#?(:lpy)") :odd-form-count)))
+
+(deftest namespaced-maps-test
+  (doseq [source ["#:person{:name \"A\"}" "#:person {:_/id 1}" "#::{:a 1}"]]
+    (is (empty? (:diagnostics (assert-lossless source)))))
+  (is (= :namespaced-map (:kind (first-form "#:a {:b 1}"))))
+  (is (contains? (codes "#:a/b {}") :invalid-map-namespace))
+  (is (contains? (codes "#::alias {}") :invalid-map-namespace))
+  (is (contains? (codes "#:a []") :missing-map)))
+
+(deftest incomplete-and-invalid-test
+  (doseq [[source code]
+          [["(" :missing-delimiter] ["[a" :missing-delimiter]
+           ["{:a" :missing-delimiter] ["#{a" :missing-delimiter]
+           ["' " :missing-form] ["^:private" :missing-form]
+           ["#_ " :missing-form] ["#some/tag" :missing-form]
+           ["#" :invalid-dispatch] ["#=" :invalid-dispatch]
+           ["#?" :invalid-dispatch] ["#?[]" :invalid-dispatch]
+           ["\"abc" :unterminated-string] ["#b\"abc" :unterminated-string]
+           ["#f\"abc" :unterminated-string] ["#b []" :missing-string]
+           ["#f []" :missing-string]
+           ["\"\\q\"" :invalid-escape] ["\"\\u123\"" :invalid-escape]
+           ["\"\\UFFFFFFFF\"" :invalid-escape] ["\"abc\\" :invalid-escape]
+           ["#b\"\\x0g\"" :invalid-escape] ["#b\"é\"" :invalid-byte]
+           ["#f\"{}\"" :invalid-interpolation] ["#f\"{a b}\"" :invalid-interpolation]
+           ["\\" :invalid-character] ["\\blah" :invalid-character]
+           ["\\uFFFFFFFF" :invalid-character] ["\\u12zz" :invalid-character]
+           ["1/0" :invalid-token] ["2r2" :invalid-token] ["37rZ" :invalid-token]
+           ["08" :invalid-token] ["1.2.3" :invalid-token] [":" :invalid-token]
+           ["::" :invalid-token] ["//" :invalid-token]
+           ["##Other" :invalid-number] ["{:a}" :odd-form-count]
+           [") next" :unexpected-delimiter]]]
+    (testing source
+      (let [result (assert-lossless source)]
+        (is (contains? (set (map :code (:diagnostics result))) code))))))
+
+(deftest recovery-test
+  (let [result (assert-lossless "([x) next")
+        forms (syntax/forms (:root result))]
+    (is (= [:list :symbol] (mapv :kind forms)))
+    (is (= "next" (syntax/text (last forms))))
+    (is (= #{:missing-delimiter} (set (map :code (:diagnostics result))))))
+  (let [result (assert-lossless ") (def x 1) [a} b] after")]
+    (is (= [:error :list :vector :symbol]
+           (mapv :kind (syntax/forms (:root result))))))
+  (doseq [source ["#_ #_ x" "([)]" "^ ; hi\n)" "#:a" "'#_x" "#f \"{a"]]
+    (is (seq (:diagnostics (assert-lossless source))))))
+
+(deftest map-discard-test
+  (doseq [source ["{#_:a}" "{#_ #_:a 3 :b 5}" "{:a #_2 1}"]]
+    (is (empty? (:diagnostics (assert-lossless source)))))
+  (is (contains? (codes "{:a #_1}") :odd-form-count)))
+
+(deftest source-position-test
+  (let [parsed (syntax/parse "a😀\r\nβ\rc\n")]
+    (is (= [0 4 6 8] (:line-starts parsed)))
+    (is (= {:line 0 :character 2} (syntax/offset->position parsed 2)))
+    (is (= {:line 1 :character 0} (syntax/offset->position parsed 4)))
+    (is (= {:line 3 :character 0} (syntax/offset->position parsed 8)))
+    (doseq [position [{:line 0 :character 0} {:line 0 :character 2}
+                     {:line 1 :character 1} {:line 3 :character 0}]]
+      (is (= position (syntax/offset->position parsed (syntax/position->offset parsed position)))))
+    (is (thrown? python/ValueError (syntax/offset->position parsed -1)))
+    (is (thrown? python/ValueError (syntax/offset->position parsed 9)))
+    (is (thrown? python/ValueError (syntax/position->offset parsed {:line 0 :character 3})))
+    (is (thrown? python/ValueError (syntax/position->offset parsed {:line 4 :character 0})))))
+
+(deftest node-at-test
+  (let [root (:root (syntax/parse "(foo 1)"))]
+    (is (= :symbol (:kind (syntax/node-at root 2))))
+    (is (= :whitespace (:kind (syntax/node-at root 4))))
+    (is (= :delimiter (:kind (syntax/node-at root 6))))
+    (is (nil? (syntax/node-at root 7)))
+    (is (nil? (syntax/node-at root -1)))))
+
+(deftest bounded-nesting-test
+  (let [source (str (str/join (repeat 1000 "(")) "x" (str/join (repeat 1000 ")")))
+        parsed (assert-lossless source)]
+    (is (some #(= :nesting-limit (:code %)) (:diagnostics parsed))))
+  (is (contains? (set (map :code (:diagnostics (syntax/parse "(x)" {:max-depth 1}))))
+                 :nesting-limit))
+  (is (thrown? python/ValueError (syntax/parse "" {:max-depth 0})))
+  (is (thrown? python/TypeError (syntax/parse nil))))
+
+(deftest never-evaluate-test
+  (doseq [source ["#never.import.this/side-effect {:x 1}"
+                  "#some.Type [1 2]" "#=(throw (Exception. \"boom\"))"]]
+    (assert-lossless source)))
+
+(deftest generated-editor-input-test
+  (let [rng (random/Random 20261003)
+        alphabet "()[]{}#_'\"\\;:^@~\u0060, \t\r\nabc012.-/😀"]
+    (dotimes [_ 400]
+      (let [source (str/join "" (repeatedly (.randrange rng 0 100)
+                                          #(.choice rng alphabet)))]
+        (assert-lossless source)))))
+
+(deftest adjacent-reader-forms-test
+  (doseq [[source expected]
+          [["1:kw" ["1" ":kw"]]
+           ["1'foo" ["1" "'foo"]]
+           ["1#_2 3" ["1" "3"]]
+           [":123abc" [":123" "abc"]]
+           ["foo'bar" ["foo'bar"]]]]
+    (let [result (assert-lossless source)]
+      (is (empty? (:diagnostics result)))
+      (is (= expected (mapv syntax/text (syntax/forms (:root result)))))))
+  (is (contains? (codes "--1") :invalid-token)))
+
+(deftest large-literals-test
+  (doseq [source [(str (str/join (repeat 5000 "1")) "/3")
+                  (str "16r" (str/join (repeat 5000 "F")))]]
+    (is (empty? (:diagnostics (syntax/parse source)))))
+  (is (contains? (codes (str "1/" (str/join (repeat 5000 "0")))) :invalid-token)))
+
+(deftest incomplete-string-flags-test
+  (doseq [source ["\"x" "#b\"x" "#f\"x" "#\"x"]]
+    (is (:incomplete? (first-form source)))))
+
+(deftest error-range-test
+  (let [result (syntax/parse "[x")
+        diagnostic (first (:diagnostics result))]
+    (is (= {:code :missing-delimiter :message "Expected ]" :severity :error
+            :start 2 :end 2}
+           diagnostic))
+    (is (:incomplete? (first (syntax/forms (:root result)))))))
