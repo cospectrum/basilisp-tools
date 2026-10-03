@@ -12,15 +12,25 @@
 
 (defn- parser []
   (let [p (argparse/ArgumentParser ** :prog "blt"
-                                   :description "Development tools for Basilisp.")
+                                   :description "Development tools for Basilisp."
+                                   :epilog "Run blt format --help for formatter options and examples.")
         commands (.add_subparsers p ** :dest "command" :required true)
         format (.add_parser commands "format" ** :help "Format Basilisp source."
-                            :description "Format files in place, or use - for stdin/stdout.")
+                            :description "Format files in place, or use - for stdin/stdout. Directories are searched recursively for .lpy files."
+                            :formatter_class argparse/RawDescriptionHelpFormatter
+                            :epilog (str "Examples:\n"
+                                         "  blt format src tests\n"
+                                         "  blt format --check .\n"
+                                         "  blt format --diff .\n"
+                                         "  blt format - < file.lpy\n\n"
+                                         "Configuration: discovers the nearest .cljfmt.edn or cljfmt.edn\n"
+                                         "from the current directory upward; --config overrides discovery.\n\n"
+                                         "Exit codes: 0 success, 1 changes needed (--check/--diff), 2 error."))
         modes (.add_mutually_exclusive_group format)]
     (.add_argument p "--version" ** :action "version"
                    :version (str "blt " (metadata/version "basilisp-tools")))
     (.add_argument format "paths" ** :nargs "*" :metavar "PATH"
-                   :help "Files/directories, or - for stdin. Defaults to the current directory.")
+                   :help "Files/directories, or - for stdin. Defaults to configured :paths, then the current directory.")
     (.add_argument modes "--check" ** :action "store_true"
                    :help "Report files that need formatting without changing them.")
     (.add_argument modes "--diff" ** :action "store_true"
