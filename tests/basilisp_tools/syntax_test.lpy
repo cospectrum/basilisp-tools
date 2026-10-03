@@ -184,7 +184,7 @@
     (is (= {:line 1 :character 0} (syntax/offset->position parsed 4)))
     (is (= {:line 3 :character 0} (syntax/offset->position parsed 8)))
     (doseq [position [{:line 0 :character 0} {:line 0 :character 2}
-                     {:line 1 :character 1} {:line 3 :character 0}]]
+                      {:line 1 :character 1} {:line 3 :character 0}]]
       (is (= position (syntax/offset->position parsed (syntax/position->offset parsed position)))))
     (is (thrown? python/ValueError (syntax/offset->position parsed -1)))
     (is (thrown? python/ValueError (syntax/offset->position parsed 9)))
@@ -218,7 +218,7 @@
         alphabet "()[]{}#_'\"\\;:^@~\u0060, \t\r\nabc012.-/😀"]
     (dotimes [_ 400]
       (let [source (str/join "" (repeatedly (.randrange rng 0 100)
-                                          #(.choice rng alphabet)))]
+                                            #(.choice rng alphabet)))]
         (assert-lossless source)))))
 
 (deftest adjacent-reader-forms-test

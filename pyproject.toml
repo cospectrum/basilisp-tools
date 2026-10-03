@@ -1,17 +1,16 @@
 [project]
 name = "basilisp-tools"
-description = "Development tooling for Basilisp (initial scaffold)"
-version = "0.0.1"
+description = "A cljfmt-compatible formatter and development tools for Basilisp"
+version = "0.1.0"
 dependencies = [
-  "basilisp[pytest]",
+  "basilisp>=0.5.1",
 ]
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 classifiers = [
-  "Development Status :: 1 - Planning",
-  # "Programming Language :: Basilisp",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python",
 ]
 
@@ -19,7 +18,7 @@ classifiers = [
 Homepage = "https://github.com/cospectrum/basilisp-tools"
 
 [project.scripts]
-blt = "basilisp_tools.core:main"
+blt = "basilisp_tools.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -30,3 +29,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.package-data]
 "*" = ["*.lpy"]
+
+[dependency-groups]
+dev = ["basilisp[pytest]>=0.5.1"]

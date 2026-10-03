@@ -1,0 +1,152 @@
+(ns basilisp-tools.cli
+  "The blt command line interface."
+  (:require [basilisp.string :as str]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.syntax :as syntax])
+  (:import [argparse] [difflib] [os] [os.path :as pathutil] [pathlib] [re] [stat] [sys] [tempfile]
+           [importlib.metadata :as metadata]))
+
+(def ^:private skipped-directories
+  #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" "node_modules"
+    "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
+
+(defn- parser []
+  (let [p (argparse/ArgumentParser ** :prog "blt"
+                                   :description "Development tools for Basilisp.")
+        commands (.add_subparsers p ** :dest "command" :required true)
+        format (.add_parser commands "format" ** :help "Format Basilisp source."
+                            :description "Format files in place, or use - for stdin/stdout.")
+        modes (.add_mutually_exclusive_group format)]
+    (.add_argument p "--version" ** :action "version"
+                   :version (str "blt " (metadata/version "basilisp-tools")))
+    (.add_argument format "paths" ** :nargs "*" :metavar "PATH"
+                   :help "Files/directories, or - for stdin. Defaults to the current directory.")
+    (.add_argument modes "--check" ** :action "store_true"
+                   :help "Report files that need formatting without changing them.")
+    (.add_argument modes "--diff" ** :action "store_true"
+                   :help "Print unified diffs without changing files.")
+    (.add_argument format "--config" ** :metavar "FILE"
+                   :help "Use an EDN configuration file instead of discovery.")
+    (.add_argument format "--quiet" "-q" ** :action "store_true"
+                   :help "Suppress file status messages.")
+    p))
+
+(defn- error [message] (throw (python/ValueError message)))
+(defn- report [message] (.write sys/stderr (str message "\n")))
+
+(defn- configuration [args]
+  (if-let [path (.-config args)]
+    (let [p (pathlib/Path path)]
+      (when-not (.is_file p) (error (str "Configuration file does not exist: " path)))
+      (fmt/load-config p))
+    (fmt/load-config)))
+
+(defn- walk-files [path pattern]
+  (let [result (atom [])]
+    (doseq [[root dirs files]
+            (iterator-seq (os/walk path ** :followlinks false
+                                   :onerror (fn [e] (throw e))))]
+      ;; Mutating os.walk's directory list prunes generated and hidden trees.
+      (.clear dirs)
+      (doseq [entry (iterator-seq (.iterdir (pathlib/Path root)))
+              :when (and (.is_dir entry) (not (.is_symlink entry))
+                         (not (contains? skipped-directories (.-name entry))))]
+        (.append dirs (.-name entry)))
+      (.sort dirs)
+      (doseq [name (sort files)
+              :let [p (.joinpath (pathlib/Path root) name)]
+              :when (and (re/search pattern name) (.is_file p) (not (.is_symlink p)))]
+        (swap! result conj p)))
+    @result))
+
+(defn- collect-files [paths options]
+  (let [pattern (:file-pattern options (re/compile "\\.lpy$"))]
+    (->> paths
+         (mapcat (fn [path]
+                   (let [p (.absolute (pathlib/Path path))]
+                     (cond
+                       (.is_symlink p) (error (str "Refusing symbolic link: " path))
+                       (.is_file p) [p]
+                       (.is_dir p) (walk-files p pattern)
+                       :else (error (str "Path does not exist: " path))))))
+         distinct
+         (sort-by str)
+         vec)))
+
+(defn- format-source [source options label]
+  (try
+    (fmt/format-string source options)
+    (catch python/Exception e
+      (if-let [diagnostic (first (:diagnostics (ex-data e)))]
+        (let [pos (syntax/offset->position (syntax/parse source) (:start diagnostic))]
+          (error (str label ":" (inc (:line pos)) ":" (inc (:character pos))
+                      ": " (:message diagnostic))))
+        (throw e)))))
+
+(defn- diff [source formatted label]
+  (str/join ""
+            (map (fn [line]
+                   (if (.endswith line "\n") line
+                       (str line "\n\\ No newline at end of file\n")))
+                 (iterator-seq
+                  (difflib/unified_diff (.splitlines source true) (.splitlines formatted true)
+                                        ** :fromfile (str "a/" label) :tofile (str "b/" label))))))
+
+(defn- replace-file! [path original formatted]
+  (when-not (= original (.read_bytes path))
+    (error (str "File changed while formatting: " path)))
+  (let [[fd name] (tempfile/mkstemp ** :prefix (str "." (.-name path) ".")
+                                    :dir (str (.-parent path)))]
+    (try
+      (with-open [stream (os/fdopen fd "wb")]
+        (.write stream (.encode formatted "utf-8")))
+      (os/chmod name (stat/S_IMODE (.-st_mode (.stat path))))
+      (os/replace name path)
+      (finally
+        (when (pathutil/exists name) (os/unlink name))))))
+
+(defn- format-command [args]
+  (let [options (configuration args)
+        paths (or (seq (.-paths args)) (seq (:paths options)) ["."])
+        check? (or (.-check args) (.-diff args))]
+    (if (some #(= "-" %) paths)
+      (do
+        (when-not (= 1 (count paths)) (error "Stdin (-) cannot be combined with other paths."))
+        (let [source (.read sys/stdin)
+              formatted (format-source source options "<stdin>")
+              changed? (not= source formatted)]
+          (cond
+            (.-diff args) (.write sys/stdout (diff source formatted "stdin"))
+            (not check?) (.write sys/stdout formatted))
+          (if (and check? changed?) 1 0)))
+      (let [files (collect-files paths options)
+            _ (when (empty? files) (error "No matching source files found."))
+            ;; Validate and format the entire selection before writing anything.
+            changes (->> files
+                         (mapv (fn [path]
+                                 (let [original (.read_bytes path)
+                                       source (.decode original "utf-8")
+                                       label (pathutil/relpath path)
+                                       formatted (format-source source options label)]
+                                   {:path path :original original :source source
+                                    :formatted formatted :label label})))
+                         (filterv #(not= (:source %) (:formatted %))))]
+        (doseq [{:keys [path original source formatted label]} changes]
+          (cond
+            (.-diff args) (.write sys/stdout (diff source formatted label))
+            (not check?) (replace-file! path original formatted))
+          (when-not (.-quiet args)
+            (report (str (if check? "Would format " "Formatted ") label))))
+        (if (and check? (seq changes)) 1 0)))))
+
+(defn main
+  "Run blt. Exit status: 0 success, 1 formatting required, 2 invalid input/error."
+  ([] (main nil))
+  ([argv]
+   (let [args (.parse_args (parser) argv)]
+     (try
+       (format-command args)
+       (catch python/BrokenPipeError _ 0)
+       (catch python/Exception e
+         (report (str "blt: " (or (ex-message e) (str e))))
+         2)))))

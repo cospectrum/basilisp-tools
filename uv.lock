@@ -34,14 +34,22 @@ pytest = [
 
 [[package]]
 name = "basilisp-tools"
-version = "0.0.1"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "basilisp" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "basilisp", extra = ["pytest"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "basilisp", extras = ["pytest"] }]
+requires-dist = [{ name = "basilisp", specifier = ">=0.5.1" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "basilisp", extras = ["pytest"], specifier = ">=0.5.1" }]
 
 [[package]]
 name = "colorama"

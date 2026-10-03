@@ -1,0 +1,524 @@
+(ns basilisp-tools.format
+  "Pure, lossless formatting with cljfmt-compatible EDN options."
+  (:require [basilisp.edn :as edn]
+            [basilisp.string :as str]
+            [basilisp-tools.syntax :as syntax])
+  (:import [pathlib] [re] [operator :as op]))
+
+(def ^:private containers
+  #{:root :list :vector :map :set :anonymous-function
+    :reader-conditional :reader-splice :interpolation})
+(def ^:private literals #{:string :bytes :regex :f-string})
+(def ^:private punctuation #{:delimiter :prefix :string-text})
+(def ^:private gap-kinds #{:whitespace :newline :gap})
+(defn- gap? [n] (contains? gap-kinds (:kind n)))
+(defn- form? [n]
+  (not (or (gap? n) (syntax/trivia? n)
+           (contains? punctuation (:kind n)) (op/eq :discard (:kind n)))))
+(defn- node-forms [node] (filterv form? (:children node)))
+(defn- leaf [kind text] {:kind kind :text text})
+(defn- spaces [n] (op/mul " " (max 0 n)))
+(defn- newline? [s] (boolean (re/search "[\r\n]" s)))
+(defn- bare [n]
+  (if (op/eq :metadata (:kind n)) (recur (last (node-forms n))) n))
+(defn- head [n]
+  (let [f (bare (first (node-forms n)))]
+    (when (op/eq :symbol (:kind f)) (:text f))))
+
+(def ^:private rule-groups
+  {[:inner 0] "bound-fn def defmacro defmethod defmulti defn defn- defonce deftest fdef fn use-fixtures ANY DELETE GET HEAD OPTIONS PATCH POST PUT context defroutes rfn"
+   [:block 0] "alt! alt!! comment cond delay do finally future go thread try with-out-str"
+   [:block 1] "binding case cond-> cond->> defstruct doseq dotimes doto extend for go-loop if if-let if-not if-some let let* locking loop match ns struct-map testing when when-first when-let when-not when-some while with-local-vars with-open with-precision with-redefs let-routes"
+   [:block 2] "are as-> catch condp"})
+
+(def default-indents
+  (merge
+   (into {} (for [[rule names] rule-groups
+                  n (str/split names #" ")]
+              [(symbol n) [rule]]))
+   {'defprotocol [[:block 1] [:inner 1]]
+    'defrecord [[:block 2] [:inner 1]]
+    'deftype [[:block 2] [:inner 1]]
+    'proxy [[:block 2] [:inner 1]]
+    'extend-protocol [[:block 1] [:inner 1]]
+    'extend-type [[:block 1] [:inner 1]]
+    'reify [[:inner 0] [:inner 1]]
+    'letfn [[:block 1] [:inner 2 0]]
+    (re/compile "^def(?!ault)(?!late)(?!er)") [[:inner 0]]
+    (re/compile "^with-") [[:inner 0]]}))
+
+(def ^:private binding-forms
+  (zipmap '[let doseq go-loop binding with-open loop for with-local-vars with-redefs]
+          (repeat #{0})))
+
+(def default-options
+  {:alias-map {} :refer-map {}
+   :function-arguments-indentation :community
+   :indent-line-comments? false :indentation? true
+   :indents default-indents :extra-indents {}
+   :normalize-newlines-at-file-end? false
+   :insert-missing-whitespace? true
+   :remove-blank-lines-in-forms? false
+   :remove-consecutive-blank-lines? true
+   :remove-multiple-non-indenting-spaces? false
+   :remove-surrounding-whitespace? true
+   :remove-trailing-whitespace? true
+   :sort-ns-references? false :split-keypairs-over-multiple-lines? false
+   :align-map-columns? false :align-form-columns? false
+   :align-binding-columns? false :align-single-column-lines? false
+   :aligned-forms binding-forms :extra-aligned-forms {}
+   :blank-line-forms (assoc binding-forms 'comment :all 'cond :all)
+   :extra-blank-line-forms {}
+   :blank-lines-separate-alignment? false
+   :max-column-alignment-gap nil :max-column-alignment-width nil})
+
+(def ^:private runtime-options #{:paths :file-pattern :project-root})
+(defn- invalid [message data] (throw (ex-info message data)))
+
+(defn- regex? [x] (instance? re/Pattern x))
+(defn- matcher? [x] (or (symbol? x) (string? x) (regex? x)))
+(defn- rule-key? [k]
+  (or (matcher? k)
+      (and (vector? k) (op/eq 2 (count k)) (every? matcher? k))))
+
+(defn resolve-options
+  "Validate options and merge cljfmt defaults. :indents replaces defaults;
+  :extra-indents extends them. Unknown options fail instead of being ignored."
+  [options]
+  (when-not (map? options)
+    (invalid "Formatter options must be a map" {:options options}))
+  (let [legacy? (:legacy/merge-indents? options)
+        options (cond-> (dissoc options :legacy/merge-indents?)
+                  legacy? (-> (dissoc :indents)
+                              (assoc :extra-indents
+                                     (merge (:indents options) (:extra-indents options)))))
+        opts (merge default-options options)]
+    (doseq [[k v] options]
+      (when-not (or (contains? default-options k) (contains? runtime-options k))
+        (invalid (str "Unknown formatter option: " k) {:option k}))
+      (when (and (contains? default-options k) (.endswith (name k) "?")
+                 (not (boolean? v)))
+        (invalid (str k " must be a boolean") {:option k})))
+    (when-not (#{:community :cursive :zprint} (:function-arguments-indentation opts))
+      (invalid "Invalid :function-arguments-indentation" {}))
+    (doseq [k [:indents :extra-indents :alias-map :refer-map
+               :aligned-forms :extra-aligned-forms :blank-line-forms :extra-blank-line-forms]]
+      (when-not (map? (get opts k)) (invalid (str k " must be a map") {:option k})))
+    (doseq [k [:max-column-alignment-gap :max-column-alignment-width]
+            :let [v (get opts k)]]
+      (when-not (or (nil? v) (and (integer? v) (>= v 0)))
+        (invalid (str k " must be nil or a nonnegative integer") {:option k})))
+    (doseq [[k rules] (merge (:indents opts) (:extra-indents opts))]
+      (when-not (and (rule-key? k) (sequential? rules)
+                     (every? (fn [r]
+                               (and (vector? r)
+                                    (case (first r)
+                                      :default (op/eq 1 (count r))
+                                      :block (and (op/eq 2 (count r))
+                                                  (integer? (second r)) (>= (second r) 0))
+                                      :inner (and (<= 2 (count r) 3)
+                                                  (every? #(and (integer? %) (>= % 0)) (rest r)))
+                                      false))) rules))
+        (invalid (str "Invalid indentation rule for " k) {:key k})))
+    (doseq [k [:aligned-forms :extra-aligned-forms :blank-line-forms :extra-blank-line-forms]
+            [key v] (get opts k)]
+      (when-not (and (rule-key? key)
+                     (or (op/eq :all v)
+                         (and (set? v) (every? #(and (integer? %) (>= % 0)) v))))
+        (invalid (str "Invalid " k " rule for " key) {:key key})))
+    (when (and (:file-pattern opts) (not (regex? (:file-pattern opts))))
+      (invalid ":file-pattern must be a #re regular expression" {}))
+    (when (and (:paths opts) (not (and (sequential? (:paths opts)) (every? string? (:paths opts)))))
+      (invalid ":paths must be a vector of paths" {}))
+    (assoc opts :indents (merge (:indents opts) (:extra-indents opts))
+           :aligned-forms (merge (:aligned-forms opts) (:extra-aligned-forms opts))
+           :blank-line-forms (merge (:blank-line-forms opts) (:extra-blank-line-forms opts)))))
+
+(defn load-config
+  "Read safe EDN from a file, or discover .cljfmt.edn / cljfmt.edn from a
+  directory upward. Returns an options map; no configuration is {}.
+  Tagged #re strings are supported. No project code is executed."
+  ([] (load-config (.cwd pathlib/Path)))
+  ([path]
+   (let [p (.absolute (pathlib/Path path))
+         file (if (.is_file p) p
+                  (loop [dir p]
+                    (or (first (filter #(.is_file %) [(.joinpath dir ".cljfmt.edn") (.joinpath dir "cljfmt.edn")]))
+                        (when (not (op/eq dir (.-parent dir))) (recur (.-parent dir))))))]
+     (if-not file {}
+             (let [source (.read_text file ** :encoding "utf-8")
+                   parsed (syntax/parse source)
+                   forms (node-forms (:root parsed))
+                   _ (when-not (and (empty? (:diagnostics parsed))
+                                    (op/eq 1 (count forms)) (op/eq :map (:kind (first forms))))
+                       (invalid (str file " must contain exactly one EDN map") {:path (str file)}))
+                   value (edn/read-string source
+                                          {:default (fn [tag value]
+                                                      (if (op/eq 're tag)
+                                                        (re/compile value)
+                                                        (invalid (str "Unsupported EDN tag: " tag) {:tag tag})))})]
+               (resolve-options value)
+               value)))))
+
+(defn- namespace-context [root opts]
+  (let [ns-form (first (filter #(op/eq "ns" (head %)) (node-forms root)))
+        ns-name (some-> ns-form node-forms second bare syntax/text)
+        refs (filter #(op/eq :vector (:kind %)) (syntax/nodes ns-form))
+        inferred
+        (reduce (fn [ctx n]
+                  (let [xs (node-forms n) target (syntax/text (first xs))]
+                    (reduce (fn [c [key value]]
+                              (case (syntax/text key)
+                                ":as" (assoc-in c [:aliases (syntax/text value)] target)
+                                ":as-alias" (assoc-in c [:aliases (syntax/text value)] target)
+                                ":refer" (reduce #(assoc-in %1 [:refers (syntax/text %2)] target)
+                                                 c (node-forms value))
+                                c))
+                            ctx (partition 2 (rest xs)))))
+                {:ns ns-name :aliases {} :refers {} :rule-cache (atom {})} refs)]
+    (-> inferred
+        (update :aliases merge (into {} (map (fn [[k v]] [(str k) (str v)]) (:alias-map opts))))
+        (update :refers merge (into {} (map (fn [[k v]] [(str k) (str v)]) (:refer-map opts)))))))
+
+(defn- symbol-parts [s ctx]
+  (let [parts (.rsplit s "/" 1)]
+    (if (op/eq 2 (count parts))
+      [(get (:aliases ctx) (first parts) (first parts)) (second parts)]
+      [(get (:refers ctx) s (:ns ctx)) s])))
+
+(defn- matches? [pattern value]
+  (and value (if (regex? pattern) (boolean (re/search pattern value))
+                 (op/eq (str pattern) value))))
+
+(defn- key-matches? [key s ctx]
+  (when s
+    (let [[namespace name] (symbol-parts s ctx)]
+      (cond
+        (vector? key) (and (matches? (first key) namespace) (matches? (second key) name))
+        (regex? key) (matches? key name)
+        :else ;; qualified/unqualified symbols handled below
+        (let [parts (.rsplit (str key) "/" 1)]
+          (if (op/eq 2 (count parts))
+            (and (op/eq (first parts) namespace) (op/eq (second parts) name))
+            (op/eq (str key) name)))))))
+
+(defn- rule-priority [[k rules]]
+  [(- (apply max 0 (map #(if (op/eq :inner (first %)) (second %) 0) rules)))
+   (cond (regex? k) 2
+         (or (vector? k) (str/includes? (str k) "/")) 0
+         :else 1)
+   (str k)])
+
+(defn- matching-rules [node opts ctx]
+  (when (#{:list :anonymous-function} (:kind node))
+    (let [s (head node) cache (:rule-cache ctx)]
+      (if (contains? @cache s)
+        (get @cache s)
+        (let [rules (vec (mapcat second
+                                 (sort-by rule-priority
+                                          (filter #(key-matches? (first %) s ctx) (:indents opts)))))]
+          (swap! cache assoc s rules)
+          rules)))))
+
+(defn- configured-form? [frame parent rules ctx]
+  (or (some (fn [[k v]] (and (op/eq :all v) (key-matches? k (head (:node frame)) ctx))) rules)
+      (and parent
+           (some (fn [[k v]]
+                   (and (key-matches? k (head (:node parent)) ctx)
+                        (or (op/eq :all v) (contains? v (dec (:parent-index frame))))))
+                 rules))))
+
+(defn- combine-gaps [children]
+  (reduce (fn [xs n]
+            (if (gap? n)
+              (if (gap? (peek xs))
+                (conj (pop xs) (update (peek xs) :text str (if (op/eq :newline (:kind n)) "\n" (:text n))))
+                (conj xs (assoc n :kind :gap :text (if (op/eq :newline (:kind n)) "\n" (:text n)))))
+              (conj xs n))) [] children))
+
+(declare prepare)
+(defn- normalize-children [node opts]
+  (let [xs (combine-gaps (mapv #(prepare % opts) (:children node)))
+        bounded? (or (op/eq :discard (:kind node))
+                     (and (contains? containers (:kind node)) (not (op/eq :root (:kind node)))))
+        trim? (and bounded? (:remove-surrounding-whitespace? opts))
+        xs (if (and trim? (gap? (get xs 1)) (not (op/eq :comment (:kind (get xs 2)))))
+             (into [(first xs)] (drop 2 xs)) xs)
+        n (count xs)
+        xs (if (and trim? (gap? (get xs (- n 2))))
+             (let [before (get xs (- n 3)) gap (get xs (- n 2))]
+               (if (op/eq :comment (:kind before))
+                 (assoc xs (- n 2) (leaf :gap (or (some-> (re/search "\r\n|\r|\n" (:text gap)) .group) "\n")))
+                 (conj (vec (take (- n 2) xs)) (last xs)))) xs)]
+    (loop [result [] remaining xs form-index 0]
+      (if-let [n (first remaining)]
+        (let [previous (peek result)
+              split? (and (op/eq :map (:kind node)) (:split-keypairs-over-multiple-lines? opts)
+                          (form? n) (pos? form-index) (even? form-index))
+              result (cond
+                       (and split? (not (and (gap? previous) (newline? (:text previous)))))
+                       (if (gap? previous)
+                         (conj (pop result) (leaf :gap "\n"))
+                         (conj result (leaf :gap "\n")))
+                       (and (:insert-missing-whitespace? opts)
+                            previous (not (gap? previous))
+                            (or (and (form? previous) (form? n))
+                                (and (op/eq :discard (:kind previous)) (form? n))))
+                       (conj result (leaf :gap " "))
+                       :else result)]
+          (recur (conj result n) (rest remaining) (+ form-index (if (form? n) 1 0))))
+        result))))
+
+(defn- sort-references [node]
+  (if-not (op/eq "ns" (head node)) node
+          (update node :children
+                  (fn [children]
+                    (mapv (fn [clause]
+                            (if (and (op/eq :list (:kind clause))
+                                     (#{":require" ":require-macros" ":import" ":use"}
+                                      (some-> clause node-forms first syntax/text))
+                                     (not-any? #(#{:comment :discard} (:kind %)) (syntax/nodes clause)))
+                              (let [forms (rest (node-forms clause))
+                                    sorted (atom (sort-by #(str/lower-case (re/sub "[\\[\\](){}]" "" (syntax/text (bare %)))) forms))
+                                    seen (atom false)]
+                                (update clause :children
+                                        #(mapv (fn [n]
+                                                 (if (form? n)
+                                                   (if-not @seen (do (reset! seen true) n)
+                                                           (let [next (first @sorted)]
+                                                             (swap! sorted rest) next))
+                                                   n)) %)))
+                              clause))
+                          children)))))
+
+(defn- prepare [node opts]
+  (cond
+    (contains? literals (:kind node)) node
+    (:children node)
+    (cond-> (assoc node :children (normalize-children node opts))
+      (:sort-ns-references? opts) sort-references)
+    :else node))
+
+(defn- ordinary-indent [frame opts]
+  (let [node (:node frame) i (:index frame) pos (:positions frame)
+        body (:body frame)
+        list? (#{:list :anonymous-function} (:kind node))
+        style (:function-arguments-indentation opts)
+        first-kind (:kind (bare (first (node-forms node))))
+        extra? (and (not (op/eq style :community))
+                    (if (op/eq style :cursive)
+                      (not (#{:list :vector :map :set} first-kind))
+                      (#{:symbol :keyword :list :number :nil :boolean :symbolic-number :character} first-kind)))]
+    (cond
+      (op/eq :root (:kind node)) 0
+      (not list?) body
+      (<= i 1) (+ body (if extra? 1 0))
+      :else (or (:col (get pos 1)) body))))
+
+(defn- indentation [frames opts ctx]
+  (let [frame (peek frames) ancestors (reverse frames)
+        rules (map-indexed
+               (fn [depth ancestor]
+                 (some
+                  (fn [[kind n arg]]
+                    (case kind
+                      :inner (when (and (op/eq n depth)
+                                        (or (nil? arg)
+                                            (let [child (nth ancestors (dec depth) nil)]
+                                              (and child (op/eq arg (dec (:parent-index child)))))))
+                               (inc (:body frame)))
+                      :block (when (zero? depth)
+                               (if (<= (:index frame) n)
+                                 (ordinary-indent frame opts)
+                                 (let [p (get (:positions frame) (inc n))
+                                       before (get (:positions frame) n)]
+                                   (if (or (nil? p) (not (op/eq (:line p) (:line before))))
+                                     (inc (:body frame))
+                                     (ordinary-indent frame opts)))))
+                      :default (when (zero? depth) (ordinary-indent frame opts))
+                      nil))
+                  (matching-rules (:node ancestor) opts ctx)))
+               ancestors)]
+    (or (first (remove nil? rules)) (ordinary-indent frame opts))))
+
+(defn- write! [state s]
+  (swap! state
+         (fn [{:keys [parts line col] :as current}]
+           (let [lines (re/split "\r\n|\r|\n" s)]
+             (assoc current :parts (conj parts s)
+                    :line (+ line (dec (count lines)))
+                    :col (if (> (count lines) 1) (count (last lines)) (+ col (count s))))))))
+
+(defn- format-gap [text previous next frames opts ctx]
+  (let [frame (peek frames)
+        root? (op/eq :root (:kind (:node frame)))
+        comment? (op/eq :comment (:kind next))
+        indent-comment? (and (:indent-line-comments? opts)
+                             (re/fullmatch ";;(?:[^;].*)?" (or (:text next) "")))
+        text (if (and (:remove-consecutive-blank-lines? opts) (or next (not root?)))
+               (re/sub "((?:\r\n|\r|\n))[ \t]*(?:(?:\r\n|\r|\n)[ \t]*){2,}" "\\1\\1" text) text)
+        text (if (and (:remove-blank-lines-in-forms? opts)
+                      (not (#{:root :map} (:kind (:node frame))))
+                      (not (configured-form? frame (peek (pop frames)) (:blank-line-forms opts) ctx)))
+               (re/sub "((?:\r\n|\r|\n))[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)+" "\\1" text) text)
+        text (if (:remove-trailing-whitespace? opts)
+               (re/sub "[ \t]+(?=\r\n|\r|\n)" "" text) text)
+        text (if (and (:remove-trailing-whitespace? opts) root? (nil? next))
+               (re/sub "[ \t]+$" "" text) text)]
+    (cond
+      (and (:indentation? opts) (newline? text) next
+           (or (not comment?) indent-comment?))
+      (re/sub "[ \t]*\\Z" (spaces (indentation frames opts ctx)) text ** :count 1)
+
+      (and (:remove-multiple-non-indenting-spaces? opts)
+           previous next (not comment?) (not (newline? text))
+           (re/fullmatch "[ \t]+" text)) " "
+
+      :else text)))
+
+(declare render!)
+(defn- render-children! [state node frames opts ctx]
+  (let [collection? (contains? containers (:kind node))
+        body (+ (:col @state)
+                (if (op/eq :root (:kind node)) 0 (count (:text (first (:children node))))))
+        frame {:node node :body body :positions [] :index 0
+               :parent-index (:index (peek frames))}
+        frames (if collection? (conj frames frame) frames)]
+    (loop [xs (:children node) frames frames previous nil]
+      (when-let [n (first xs)]
+        (let [next (second xs)
+              frame (peek frames)
+              current-form? (and collection? (form? n))
+              frames (if current-form?
+                       (conj (pop frames)
+                             (update frame :positions conj (select-keys @state [:col :line])))
+                       frames)]
+          (if (gap? n)
+            (write! state (format-gap (:text n) previous next frames opts ctx))
+            (render! state n frames opts ctx))
+          (recur (rest xs)
+                 (if current-form?
+                   (conj (pop frames) (update (peek frames) :index inc)) frames)
+                 n))))))
+
+(defn- render! [state node frames opts ctx]
+  (cond
+    (contains? literals (:kind node)) (write! state (syntax/text node))
+    (:children node) (render-children! state node frames opts ctx)
+    :else (write! state (:text node))))
+
+(defn- render [root opts ctx]
+  (let [state (atom {:parts [] :line 0 :col 0})]
+    (render! state root [] opts ctx)
+    (str/join "" (:parts @state))))
+
+(declare align-columns)
+
+(defn format-string
+  "Format Basilisp source without evaluation. Defaults and indentation rules
+  follow cljfmt. Invalid syntax/configuration raises ExceptionInfo."
+  ([source] (format-string source {}))
+  ([source options]
+   (let [opts (resolve-options options)
+         parsed (syntax/parse source)
+         _ (when (seq (:diagnostics parsed))
+             (invalid "Cannot format invalid syntax" {:diagnostics (:diagnostics parsed)}))
+         ctx (namespace-context (:root parsed) opts)
+         result (render (prepare (:root parsed) opts) opts ctx)
+         result (if (or (:align-map-columns? opts) (:align-form-columns? opts)
+                        (:align-binding-columns? opts))
+                  (align-columns result opts ctx) result)]
+     (if (:normalize-newlines-at-file-end? opts)
+       (let [trimmed (re/sub "[ \t\r\n]+$" "" result)]
+         (if (empty? trimmed) "" (str trimmed "\n")))
+       result))))
+
+(def reformat-string format-string)
+
+(defn- apply-edits [source edits]
+  (reduce (fn [s [start end replacement]]
+            (str (subs s 0 start) replacement (subs s end)))
+          source (reverse (sort-by first edits))))
+
+(defn- position [parsed offset]
+  (syntax/offset->position parsed offset))
+
+(defn- alignment-targets [root opts ctx]
+  (letfn [(walk [node parent index]
+            (let [frame {:node node :parent-index index}
+                  selected? (or (and (:align-map-columns? opts) (op/eq :map (:kind node)))
+                                (and (or (:align-form-columns? opts) (:align-binding-columns? opts))
+                                     (configured-form? frame {:node parent} (:aligned-forms opts) ctx)))]
+              (concat (when selected? [node])
+                      (mapcat (fn [[i n]] (walk n node i))
+                              (map-indexed vector (filter form? (:children node)))))))]
+    (walk root nil 0)))
+
+(defn- column-rows [node parsed opts]
+  (let [forms (filter #(or (form? %) (op/eq :comment (:kind %))) (:children node))]
+    (loop [xs forms rows [] row [] previous-line nil group 0]
+      (if-let [n (first xs)]
+        (let [line (:line (position parsed (:start n)))
+              split? (and previous-line (not (op/eq line previous-line)))
+              group (if (and split? (:blank-lines-separate-alignment? opts)
+                             (> line (inc previous-line))) (inc group) group)]
+          (recur (rest xs)
+                 (if (and split? (seq row)) (conj rows row) rows)
+                 (conj (if split? [] row) {:node n :group group})
+                 (:line (position parsed (:end n))) group))
+        (cond-> rows (seq row) (conj row))))))
+
+(defn- column-edits [source parsed node column opts]
+  (let [rows (column-rows node parsed opts)
+        starts
+        (reduce (fn [m row]
+                  (if-let [prior (get row (dec column))]
+                    (if (or (get row column) (:align-single-column-lines? opts))
+                      (update m (:group prior) (fnil conj [])
+                              (:character (position parsed (:end (:node prior))))) m) m))
+                {} rows)]
+    (mapcat
+     (fn [row]
+       (when-let [entry (get row column)]
+         (let [n (:node entry)
+               previous (:node (get row (dec column)))
+               from (:end previous) to (:start n)
+               gap (subs source from to)
+               widths (get starts (:group entry))
+               widths (if-let [limit (:max-column-alignment-width opts)]
+                        (filter #(<= % limit) widths) widths)
+               target (inc (apply max 0 widths))
+               old (:character (position parsed to))
+               new-gap (- target (:character (position parsed from)))
+               new-gap (if (or (< new-gap 1)
+                               (and (:max-column-alignment-gap opts)
+                                    (> new-gap (:max-column-alignment-gap opts))))
+                         1 new-gap)
+               delta (- new-gap (count gap))]
+           (when (and (not (zero? delta)) (re/fullmatch "[ \t]+" gap))
+             (cons [from to (spaces new-gap)]
+                    ;; Keep multiline children in the same position relative to
+                    ;; their first line, without touching literal contents.
+                   (keep (fn [[a b]]
+                           (when (and (op/eq :newline (:kind a)) (op/eq :whitespace (:kind b))
+                                      (re/fullmatch "[ \t]+" (:text b)))
+                             [(:start b) (:end b) (spaces (+ (count (:text b)) delta))]))
+                         (partition 2 1 (syntax/tokens n))))))))
+     rows)))
+
+(defn- align-columns [source opts ctx]
+  ;; Resolve one column at a time so padding in earlier columns is included
+  ;; in later column widths. Each collection is processed outside-in.
+  (loop [source source target-index 0]
+    (let [parsed (syntax/parse source)
+          targets (vec (alignment-targets (:root parsed) opts ctx))]
+      (if-let [target (get targets target-index)]
+        (let [columns (apply max 0 (map count (column-rows target parsed opts)))
+              source
+              (reduce (fn [s column]
+                        (let [p (syntax/parse s)
+                              n (nth (alignment-targets (:root p) opts ctx) target-index)]
+                          (apply-edits s (column-edits s p n column opts))))
+                      source (range 1 columns))]
+          (recur source (inc target-index)))
+        source))))

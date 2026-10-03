@@ -1,5 +1,0 @@
-(ns basilisp-tools.core)
-
-(defn main
-  []
-  (println "Hello, world!"))

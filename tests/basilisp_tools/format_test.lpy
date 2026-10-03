@@ -1,0 +1,74 @@
+(ns basilisp-tools.format-test
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.syntax :as syntax])
+  (:import [pathlib] [re] [tempfile]))
+
+(deftest cljfmt-compatibility-test
+  (let [path (pathlib/Path "tests/basilisp_tools/format_cases.edn")
+        cases (edn/read-string (.read_text path ** :encoding "utf-8")
+                               {:default (fn [tag value]
+                                           (assert (= 're tag))
+                                           (re/compile value))})]
+    (doseq [{:keys [name source options expected]} cases]
+      (testing name
+        (let [actual (fmt/format-string source options)]
+          (is (= expected actual))
+          (is (= actual (fmt/format-string actual options))))))))
+
+(defn- payload [source]
+  (->> (syntax/tokens (:root (syntax/parse source)))
+       (remove syntax/trivia?)
+       (mapv (juxt :kind :text))))
+
+(deftest basilisp-literal-preservation-test
+  (doseq [source ["(python/print #b\"a  b\\x20\"\n#py {:x [1\n2]})"
+                  "(f #f\"value: {(+ x 1)}  end\"\n#r\"a  b\")"
+                  "(python/complex 2J\n-1.5J)"
+                  "(f #unknown {:x 1\n:y 2})"
+                  "#?(:lpy (python/print\n\"yes\")\n:default nil)"
+                  "(f \"a\r\n  b\"\n#\"a\\s+b\")"
+                  "#!/usr/bin/env blt\n(let [x 1]\n(python/print x))"]]
+    (testing source
+      (let [formatted (fmt/format-string source)]
+        (is (= (payload source) (payload formatted)))
+        (is (= formatted (fmt/format-string formatted)))))))
+
+(deftest invalid-input-test
+  (doseq [source ["(foo" "[1 2)" "\"unterminated" "{:x [1}" "#_"]]
+    (is (thrown? python/Exception (fmt/format-string source))))
+  (doseq [options [{:typo true} {:indentation? 2}
+                   {:function-arguments-indentation :unknown}
+                   {:extra-indents {'x [[:inner -1]]}}
+                   {:extra-indents {'x [[:block 1 2]]}}
+                   {:file-pattern "plain string"}
+                   {:aligned-forms {'let [0]}}
+                   {:paths ["ok" 1]}]]
+    (is (thrown? python/Exception (fmt/format-string "(x)" options)))))
+
+(deftest configuration-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        nested (.joinpath root "sub" "nested")]
+    (try
+      (.mkdir nested ** :parents true)
+      (.write_text (.joinpath root ".cljfmt.edn")
+                   "{:extra-indents {example/action [[:inner 0]] #re \"^wrap-\" [[:block 1]]}}"
+                   ** :encoding "utf-8")
+      (let [opts (fmt/load-config nested)]
+        (is (= "(example/action x\n  (body))"
+               (fmt/format-string "(example/action x\n(body))" opts))))
+      (.write_text (.joinpath nested "cljfmt.edn") "{:indentation? false}" ** :encoding "utf-8")
+      (is (= {:indentation? false} (fmt/load-config nested)))
+      (.write_text (.joinpath nested ".cljfmt.edn") "{:indentation? true}" ** :encoding "utf-8")
+      (is (= {:indentation? true} (fmt/load-config nested)))
+      (doseq [bad ["{}{}" "{} x" "[]" "{:extra-indents #evil {}}"
+                   "{:indentation? \"yes\"}" "#=(python/print \"bad\")"]]
+        (.write_text (.joinpath nested ".cljfmt.edn") bad ** :encoding "utf-8")
+        (is (thrown? python/Exception (fmt/load-config nested))))
+      (finally (.cleanup temp)))))
+
+(deftest api-alias-test
+  (is (= (fmt/format-string "(let [x 1]\nx)")
+         (fmt/reformat-string "(let [x 1]\nx)"))))

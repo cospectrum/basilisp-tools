@@ -286,7 +286,7 @@
         [head state] (leaf state :prefix (+ start (count prefix)))]
     (loop [state state children [head] left n]
       (let [[children state] (if (zero? left) [children state]
-                                (consume-trivia state children))]
+                                 (consume-trivia state children))]
         (cond
           (zero? left) (branch kind start children state)
           (or (nil? (peek-char state)) (contains? close-chars (peek-char state)))
@@ -420,8 +420,8 @@
           (op/eq c "'") (read-prefix state :quote "'" 1)
           (op/eq c "\u0060") (read-prefix state :syntax-quote "\u0060" 1)
           (op/eq c "~") (if (starts? state "~@")
-                      (read-prefix state :unquote-splicing "~@" 1)
-                      (read-prefix state :unquote "~" 1))
+                          (read-prefix state :unquote-splicing "~@" 1)
+                          (read-prefix state :unquote "~" 1))
           (op/eq c "@") (read-prefix state :deref "@" 1)
           (op/eq c "^") (read-prefix state :metadata "^" 2)
           (contains? close-chars c)

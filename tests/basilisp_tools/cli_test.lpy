@@ -1,0 +1,71 @@
+(ns basilisp-tools.cli-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.cli :as cli])
+  (:import [io] [os] [pathlib] [stat] [tempfile]
+           [unittest.mock :as mock]))
+
+(defn- run-cli [args input]
+  (let [out (io/StringIO) err (io/StringIO)
+        patches [(mock/patch "sys.stdin" (io/StringIO input))
+                 (mock/patch "sys.stdout" out)
+                 (mock/patch "sys.stderr" err)]]
+    (doseq [p patches] (.start p))
+    (try
+      (let [code (cli/main args)]
+        {:code code :out (.getvalue out) :err (.getvalue err)})
+      (finally (doseq [p (reverse patches)] (.stop p))))))
+
+(deftest stdin-test
+  (let [source "(defn f [x]\n(+ x 1))"
+        expected "(defn f [x]\n  (+ x 1))"]
+    (is (= {:code 0 :out expected :err ""} (run-cli ["format" "-"] source)))
+    (is (= 1 (:code (run-cli ["format" "--check" "-"] source))))
+    (is (= "" (:out (run-cli ["format" "--check" "-"] source))))
+    (is (= 0 (:code (run-cli ["format" "--check" "-"] expected))))
+    (let [result (run-cli ["format" "--diff" "-"] source)]
+      (is (= 1 (:code result)))
+      (is (.startswith (:out result) "--- a/stdin\n+++ b/stdin\n")))
+    (let [result (run-cli ["format" "-"] "(broken")]
+      (is (= 2 (:code result)))
+      (is (= "" (:out result)))
+      (is (.startswith (:err result) "blt: <stdin>:1:")))
+    (is (= 2 (:code (run-cli ["format" "-" "."] source))))))
+
+(deftest file-workflow-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        file (.joinpath root "sample.lpy")
+        config (.joinpath root "config.edn")
+        source "(let [x 1]\n(python/print x))\n"
+        expected "(let [x 1]\n  (python/print x))\n"
+        invoke (fn [flags] (run-cli (concat ["format" "--config" (str config)] flags [(str root)]) ""))]
+    (try
+      (.write_text config "{}" ** :encoding "utf-8")
+      (.write_text file source ** :encoding "utf-8")
+      (os/chmod file 0640)
+      (.mkdir (.joinpath root ".venv"))
+      (.write_text (.joinpath root ".venv" "ignored.lpy") "(invalid" ** :encoding "utf-8")
+      (.write_text (.joinpath root "ignored.txt") "(invalid" ** :encoding "utf-8")
+      (is (= 1 (:code (invoke ["--check"]))))
+      (is (= source (.read_text file ** :encoding "utf-8")))
+      (is (= 1 (:code (invoke ["--diff"]))))
+      (is (= source (.read_text file ** :encoding "utf-8")))
+      (is (= 0 (:code (invoke []))))
+      (is (= expected (.read_text file ** :encoding "utf-8")))
+      (is (= 0640 (stat/S_IMODE (.-st_mode (.stat file)))))
+      (is (= 0 (:code (invoke ["--check"]))))
+      (testing "A malformed file prevents writes to the whole selection"
+        (.write_text file source ** :encoding "utf-8")
+        (.write_text (.joinpath root "broken.lpy") "(" ** :encoding "utf-8")
+        (is (= 2 (:code (invoke []))))
+        (is (= source (.read_text file ** :encoding "utf-8"))))
+      (finally (.cleanup temp)))))
+
+(deftest missing-input-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))]
+    (try
+      (is (= 2 (:code (run-cli ["format" (str root)] ""))))
+      (is (= 2 (:code (run-cli ["format" (str (.joinpath root "missing"))] ""))))
+      (is (= 2 (:code (run-cli ["format" "--config" (str (.joinpath root "missing")) "-"] "(x)"))))
+      (finally (.cleanup temp)))))

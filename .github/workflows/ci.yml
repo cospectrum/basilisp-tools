@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+        python: ["3.10", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - name: Test
+        run: nix develop --no-update-lock-file --command uv run --locked basilisp test -p tests --include-unsafe-path=false
+
+  checks:
+    name: Format, workflows, and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - name: Check formatting
+        run: nix develop --no-update-lock-file --command uv run --locked blt format --check src tests
+      - name: Check workflows
+        run: nix develop --no-update-lock-file --command actionlint
+      - name: Build distribution
+        run: nix develop --no-update-lock-file --command uv build
+      - name: Test installed wheel
+        shell: bash
+        run: |
+          wheel="$(realpath dist/*.whl)"
+          cd "$(mktemp -d)"
+          nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt --version
+          printf '(let [x 1]\n  x)\n' | nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt format --check -
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
