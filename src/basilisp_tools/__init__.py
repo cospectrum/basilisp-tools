@@ -1,1 +1,3 @@
-"""Development tooling for Basilisp; initial scaffold."""
+import basilisp.main
+
+basilisp.main.init()

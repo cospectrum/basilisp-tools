@@ -1,0 +1,2 @@
+;; This file is used by CIDER and Calva (among others) to detect Basilisp projects
+;; for nREPL connections. The contents of the file are ignored.

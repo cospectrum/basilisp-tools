@@ -1,0 +1,8 @@
+(ns basilisp-tools.core-test
+  (:require
+   [basilisp.test :refer [deftest is testing]]
+   [basilisp-tools.core :as core]))
+
+(deftest main-test
+  (testing "The scaffold entry point prints its greeting."
+    (is (= "Hello, world!\n" (with-out-str (core/main))))))
