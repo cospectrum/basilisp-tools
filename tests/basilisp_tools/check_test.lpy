@@ -1,0 +1,102 @@
+(ns basilisp-tools.check-test
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.check :as check])
+  (:import [json] [os] [pathlib] [re] [tempfile] [unittest.mock :as mock]))
+
+(defn- write! [root name content]
+  (let [path (.joinpath root name)]
+    (.mkdir (.-parent path) ** :parents true :exist_ok true)
+    (.write_text path content ** :encoding "utf-8")
+    path))
+
+(deftest literal-configuration-test
+  (let [config (check/read-config "{:linters #:demo{:test {:level :off}} :config-paths ^:replace [] :lint-as {app/let basilisp.core/let} :pattern #\"a.*\"}")]
+    (is (= :off (get-in config [:linters :demo/test :level])))
+    (is (:replace (meta (:config-paths config))))
+    (is (= 'basilisp.core/let (get-in config [:lint-as 'app/let])))
+    (is (some? (re/fullmatch (:pattern config) "abc"))))
+  (doseq [source ["{} {}" "[]" "{:x 1 :x 2}" "{:x #=(python/print 1)}" "{:x #evil 1}" "{:x #::alias{:k 1}}"]]
+    (is (thrown? python/Exception (check/read-config source)))))
+
+(deftest config-merging-test
+  (is (= {:linters {:x {:level :off :exclude ['keep 'also]}}}
+         (check/merge-config {:linters {:x {:level :error :exclude ['keep]}}}
+                             {:linters {:x {:level :off :exclude ['also]}}})))
+  (is (= {:a [] :b 2}
+         (check/merge-config {:a [1] :b 2} (check/read-config "{:a ^:replace []}")))))
+
+(deftest configuration-precedence-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        project (.joinpath root "project") home (.joinpath root "home") extra (.joinpath root "extra")
+        env (.dict mock/patch os/environ #py {"XDG_CONFIG_HOME" (str home)
+                                              "CLJ_KONDO_EXTRA_CONFIG_DIR" (str extra)})]
+    (.start env)
+    (try
+      (write! home "clj-kondo/config.edn" "{:home true :order [:home] :value :home}")
+      (write! project ".clj-kondo/vendor/config.edn" "{:order [:import] :value :import}")
+      (write! project ".clj-kondo/library/export/config.edn" "{:order [:autoload] :value :autoload}")
+      (write! project ".clj-kondo/config.edn" "{:config-paths [\"vendor\"] :order [:project] :value :project}")
+      (write! extra "config.edn" "{:order [:env] :value :env}")
+      (.mkdir (.joinpath project "src" "nested") ** :parents true)
+      (let [config (check/load-config {:cwd (str (.joinpath project "src" "nested"))
+                                       :config ["{:order [:cli-1] :value :cli-1}" "{:order [:cli-2] :value :cli-2}"]})]
+        (is (= [:home :import :autoload :project :env :cli-1 :cli-2] (:order config)))
+        (is (= :cli-2 (:value config)))
+        (is (= (str (.resolve (.joinpath project ".clj-kondo"))) (:cfg-dir config))))
+      (write! project ".clj-kondo/config.edn" "{:config-paths ^:replace [] :auto-load-configs false}")
+      (is (nil? (:home (check/load-config {:cwd (str project)}))))
+      (is (= [:env] (:order (check/load-config {:cwd (str project)}))))
+      (write! project ".clj-kondo/config.edn" "{:config-paths [\"loop\"]}")
+      (write! project ".clj-kondo/loop/config.edn" "{:config-paths [\"..\"]}")
+      (is (thrown? python/ValueError (check/load-config {:cwd (str project)})))
+      (is (thrown? python/ValueError
+                   (check/load-config {:config-dir (str extra) :repro true
+                                       :config "{:hooks {:analyze-call {app/macro app.hook/expand}}}"})))
+      (finally (.stop env) (.cleanup temp)))))
+
+(deftest runner-project-and-input-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        config (.joinpath root "config")
+        opts {:paths [(str (.joinpath root "src"))] :config-dir (str config)
+              :repro true :python-inspection? false}]
+    (try
+      (write! root "src/lib.lpy" "(ns sample.lib)\n(defn greet [name] name)\n")
+      (write! root "src/app.lpy" "(ns sample.app (:require [sample.lib :as lib]))\n(lib/greet)\n")
+      (write! root "src/.venv/bad.lpy" "(")
+      (write! root "src/ignored.txt" "(")
+      (let [result (check/run opts)]
+        (is (= 2 (get-in result [:summary :files])))
+        (is (= [:invalid-arity] (mapv :type (:findings result))))
+        (is (= 3 (check/exit-status result))))
+      (write! root "src/broken.lpy" "(")
+      (let [result (check/run opts)]
+        (is (= 3 (get-in result [:summary :files])))
+        (is (some #(= :syntax (:type %)) (:findings result)))
+        (is (some #(= :invalid-arity (:type %)) (:findings result))))
+      (let [result (check/run (assoc opts :paths [(str (.joinpath root "missing.lpy"))]))]
+        (is (= [:file] (mapv :type (:findings result))))
+        (is (= 3 (check/exit-status result))))
+      (let [result (check/run (assoc opts :paths ["-"] :stdin "unresolved-name" :filename "virtual.lpy"))]
+        (is (= "virtual.lpy" (:filename (first (:findings result)))))
+        (is (= :unresolved-symbol (:type (first (:findings result))))))
+      (is (thrown? python/ValueError (check/run (assoc opts :paths ["-" "."] :stdin ""))))
+      (finally (.cleanup temp)))))
+
+(deftest output-and-exit-code-test
+  (let [finding {:filename "example.lpy" :row 2 :col 3 :end-row 2 :end-col 4
+                 :start 10 :end 11 :type :unused-binding :level :warning :message "unused binding x"}
+        result {:findings [finding] :summary {:error 0 :warning 1 :info 0 :duration 1 :files 1 :type :summary}
+                :config {:output {:summary true}}}]
+    (is (= 2 (check/exit-status result)))
+    (is (= 0 (check/exit-status result :error)))
+    (is (= 3 (check/exit-status (assoc-in result [:summary :error] 1))))
+    (is (= "example.lpy:2:3: warning: unused binding x\nlinting took 1ms, errors: 0, warnings: 1\n"
+           (check/output result :text)))
+    (is (= "linting took 1ms, errors: 0\n" (check/output result :text :error)))
+    (let [data (json/loads (check/output result :json :error))]
+      (is (= 1 (python/len (.get data "findings")))))
+    (is (= [(dissoc finding :start :end)] (:findings (edn/read-string (check/output result :edn)))))
+    (is (= "EXAMPLE example.lpy warning unused-binding\n"
+           (check/output (assoc-in result [:config :output]
+                                   {:summary false :pattern "EXAMPLE {{filename}} {{level}} {{type}}"}) :text)))))

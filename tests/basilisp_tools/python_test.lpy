@@ -1,0 +1,127 @@
+(ns basilisp-tools.python-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.python :as bridge])
+  (:import [pathlib] [subprocess] [sys] [tempfile]
+           [unittest.mock :as mock]))
+
+(deftest installed-module-test
+  (let [modules (bridge/inspect-modules ["builtins" "math" "json" "pathlib" "os.path"])
+        math (get modules "math")
+        sin (bridge/resolve-member math "sin")
+        json (get modules "json")
+        loads (bridge/resolve-member json "loads")]
+    (is (= :known (:status math)))
+    (is (= :function (:kind (bridge/resolve-member (get modules "os.path") "join"))))
+    (is (= :runtime (:inspection math)))
+    (is (= :positional-only (:kind (first (:parameters sin)))))
+    (is (= [] (bridge/check-call sin 1 [])))
+    (is (= :invalid-arity (:type (first (bridge/check-call sin 0 [])))))
+    (is (= :invalid-arity (:type (first (bridge/check-call sin 2 [])))))
+    (is (= :invalid-arity (:type (first (bridge/check-call sin 0 ["x"])))))
+    (is (nil? (bridge/resolve-member math "surely_not_a_math_function")))
+    (is (= [] (bridge/check-call loads 1 ["object_hook"])))
+    (is (= :class (:kind (bridge/resolve-member (get modules "pathlib") "Path"))))
+    (is (= :function (:kind (bridge/resolve-member (get modules "builtins") "len"))))
+    (is (= [] (bridge/check-call (bridge/inspect-path "pathlib" ["Path" "read_text"]
+                                                      {:instance? true}) 0 [])))))
+
+(deftest static-project-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        file (.joinpath root "sample.py")
+        sentinel (.joinpath root "executed")
+        opts {:python-paths [(str root)]}]
+    (try
+      (.write_text file
+                   (str "from pathlib import Path\n"
+                        "Path(" (python/repr (str sentinel)) ").touch()\n"
+                        "def convert(value: str, /, count=1, *, strict: bool, **extras) -> int:\n"
+                        "    \"\"\"Convert a value.\"\"\"\n"
+                        "    return 1\n"
+                        "class Widget:\n"
+                        "    def __init__(self, name): pass\n"
+                        "    def update(self, value, *, flush=False): pass\n"
+                        "    @staticmethod\n"
+                        "    def fresh(value): pass\n"
+                        "    @classmethod\n"
+                        "    def make(cls, value): pass\n"
+                        "    @property\n"
+                        "    def dangerous(self):\n"
+                        "        raise RuntimeError('descriptor executed')\n")
+                   ** :encoding "utf-8")
+      (let [module (bridge/inspect-module "sample" opts)
+            convert (bridge/resolve-member module "convert")
+            widget (bridge/resolve-member module "Widget")]
+        (is (= :static (:inspection module)))
+        (is (= (str (.resolve file)) (:filename convert)))
+        (is (= 3 (:row convert)))
+        (is (= "int" (:return-type convert)))
+        (is (= [] (bridge/check-call convert 1 ["strict"])))
+        (is (= :invalid-arity (:type (first (bridge/check-call convert 1 [])))))
+        (is (= [] (bridge/check-call convert 1 ["strict" "value"])))
+        (is (= :invalid-arity (:type (first (bridge/check-call convert 1 ["strict" "count" "count"])))))
+        (is (= [] (bridge/check-call widget 1 [])))
+        (is (= "sample.Widget" (:return-type widget)))
+        (is (= [] (bridge/check-call (bridge/bind-member (bridge/resolve-member widget "update")) 1 [])))
+        (is (= [] (bridge/check-call (bridge/resolve-member widget "fresh") 1 [])))
+        (is (= [] (bridge/check-call (bridge/resolve-member widget "make") 1 [])))
+        (is (= :property (:kind (bridge/resolve-member widget "dangerous"))))
+        (is (not (.exists sentinel))))
+      (testing "Local static inspection stays available when runtime imports are disabled"
+        (is (= :static (:inspection (bridge/inspect-module "sample" (assoc opts :python-inspection? false))))))
+      (testing "Source edits invalidate the cached static metadata"
+        (.write_text file "def replacement(): pass\n" ** :encoding "utf-8")
+        (let [module (bridge/inspect-module "sample" opts)]
+          (is (nil? (bridge/resolve-member module "convert")))
+          (is (= :function (:kind (bridge/resolve-member module "replacement"))))))
+      (finally (.cleanup temp)))))
+
+(deftest stub-and-dynamic-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "module.py") "raise RuntimeError('never import')\n" ** :encoding "utf-8")
+      (.write_text (.joinpath root "module.pyi")
+                   "def supported(value: str) -> int: ...\ndef __getattr__(name): ...\n"
+                   ** :encoding "utf-8")
+      (let [module (bridge/inspect-module "module" opts)]
+        (is (= :known (:status module)))
+        (is (.endswith (:filename module) ".pyi"))
+        (is (= :function (:kind (bridge/resolve-member module "supported"))))
+        (is (= :unknown (:status (bridge/resolve-member module "generated_at_runtime")))))
+      (finally (.cleanup temp)))))
+
+(deftest inspection-boundary-test
+  (is (= :unknown (:status (bridge/inspect-module "math" {:python-inspection? false}))))
+  (is (= :missing (:status (bridge/inspect-module "blt_module_that_does_not_exist_92831"))))
+  (is (= :unknown (:status (bridge/inspect-module "math" {:python-executable "/does/not/exist"}))))
+  (is (nil? (bridge/check-call {:status :unknown} 100 ["anything"])))
+  (let [patch (mock/patch "subprocess.run"
+                          ** :side_effect (subprocess/TimeoutExpired "python" 0.01))]
+    (.start patch)
+    (try
+      (is (= "inspection-timeout"
+             (:reason (bridge/inspect-module "timeout_probe" {:python-timeout 0.01}))))
+      (finally (.stop patch)))))
+
+(deftest inspection-cache-test
+  (bridge/clear-cache!)
+  (let [original subprocess/run
+        patch (mock/patch "subprocess.run" ** :wraps original)
+        wrapped (.start patch)]
+    (try
+      (bridge/inspect-modules ["math" "json"])
+      (bridge/inspect-module "math")
+      (bridge/inspect-module "json")
+      (is (= 1 (.-call_count wrapped)))
+      (finally (.stop patch)))))
+
+(deftest static-descriptor-inspection-test
+  (let [script "import importlib.util, sys\nspec = importlib.util.spec_from_file_location(\"worker\", sys.argv[1])\nworker = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(worker)\ncalls = []\nclass Descriptor:\n    def __get__(self, *args):\n        calls.append(\"descriptor\")\n        raise AssertionError(\"descriptor executed\")\nclass Sample:\n    __signature__ = Descriptor()\n    value = Descriptor()\n    @property\n    def property_value(self):\n        calls.append(\"property\")\n        raise AssertionError(\"property executed\")\nclass Meta(type):\n    @property\n    def __signature__(cls):\n        calls.append(\"metaclass\")\n        raise AssertionError(\"metaclass executed\")\nclass MetaSample(metaclass=Meta):\n    pass\nclass Callable:\n    @property\n    def __signature__(self):\n        calls.append(\"callable\")\n        raise AssertionError(\"callable executed\")\n    def __call__(self):\n        pass\nfor value in [Sample, MetaSample, Callable()]:\n    metadata = worker.runtime_member(\"sample\", value)\n    assert \"parameters\" not in metadata\nassert not calls, calls\nprint(\"safe\")\n"
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python")))
+                           "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])
+                               ** :text true :capture_output true :timeout 5)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "safe\n" (.-stdout result)))))

@@ -1,7 +1,7 @@
 (ns basilisp-tools.cli-test
   (:require [basilisp.test :refer [deftest is testing]]
             [basilisp-tools.cli :as cli])
-  (:import [io] [os] [pathlib] [stat] [tempfile]
+  (:import [io] [json] [os] [pathlib] [stat] [tempfile]
            [unittest.mock :as mock]))
 
 (defn- run-cli [args input]
@@ -68,4 +68,39 @@
       (is (= 2 (:code (run-cli ["format" (str root)] ""))))
       (is (= 2 (:code (run-cli ["format" (str (.joinpath root "missing"))] ""))))
       (is (= 2 (:code (run-cli ["format" "--config" (str (.joinpath root "missing")) "-"] "(x)"))))
+      (finally (.cleanup temp)))))
+
+(deftest checker-output-and-status-test
+  (let [args ["check" "--repro" "--no-python-inspection" "--format" "json"
+              "--filename" "sample.lpy"]
+        source "(ns sample)\n(let [unused 1] :ok)\n"
+        result (run-cli (conj args "-") source)
+        data (json/loads (:out result))]
+    (is (= 2 (:code result)))
+    (is (= "" (:err result)))
+    (is (= 1 (.get (.get data "summary") "warning")))
+    (is (= "unused-binding" (.get (first (.get data "findings")) "type")))
+    (is (= 0 (:code (run-cli (concat args ["--fail-level" "error" "-"]) source))))
+    (is (= 3 (:code (run-cli (conj args "-") "(ns sample)\nmissing"))))
+    (is (= 3 (:code (run-cli (conj args "-") "(ns sample)\n("))))
+    (is (= 0 (:code (run-cli (conj args "-") "(ns sample)\n(let [value 1] value)"))))
+    (testing "Later explicit configs override earlier values"
+      (let [result (run-cli (concat args
+                                    ["--config" "{:linters {:unused-binding {:level :error}}}"
+                                     "--config" "{:linters {:unused-binding {:level :off}}}"
+                                     "-"]) source)]
+        (is (= 0 (:code result)))
+        (is (empty? (.get (json/loads (:out result)) "findings")))))))
+
+(deftest checker-file-is-read-only-test
+  (let [temp (tempfile/TemporaryDirectory)
+        file (.joinpath (pathlib/Path (.-name temp)) "sample.lpy")
+        source "(ns sample)\r\n(let [unused  1] :ok)\r\n"]
+    (try
+      (.write_bytes file (.encode source "utf-8"))
+      (let [result (run-cli ["check" "--repro" "--no-python-inspection"
+                             "--format" "edn" (str file)] "")]
+        (is (= 2 (:code result)))
+        (is (.startswith (:out result) "{"))
+        (is (= (.encode source "utf-8") (.read_bytes file))))
       (finally (.cleanup temp)))))

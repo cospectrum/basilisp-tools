@@ -1,0 +1,212 @@
+(ns basilisp-tools.python
+  "Cached Python metadata for analysis and editor queries.
+
+  Local .py/.pyi files are read as ASTs without importing them. Installed
+  dependencies can be inspected in an isolated, time-limited subprocess.
+  This process boundary contains failures; it is not a security sandbox.
+  No analyzed Basilisp forms are evaluated."
+  (:require [basilisp.string :as str])
+  (:import [json] [operator :as op] [pathlib] [subprocess] [sys] [tempfile]
+           [basilisp.lang.map :as lmap] [basilisp.lang.vector :as lvec]))
+
+(def ^:private cache (atom {}))
+
+(defn clear-cache!
+  "Discard metadata after interpreter/dependency changes."
+  []
+  (reset! cache {}))
+
+(defn- decode-object [raw]
+  ;; JSON visits objects bottom-up. Convert each metadata map once, preserving
+  ;; string keys in member tables without a second recursive sequence walk.
+  (if (or (op/contains raw "status") (op/contains raw "required?"))
+    (let [result #py {}]
+      (doseq [[key value] (iterator-seq (python/iter (.items raw)))]
+        (op/setitem result (keyword key)
+                    (case key
+                      "members" (lmap/map value)
+                      "parameters" (lvec/vector value)
+                      ("status" "kind" "inspection") (when value (keyword value))
+                      value)))
+      (lmap/map result))
+    raw))
+
+(defn- options [opts]
+  {:python-executable (or (:python-executable opts) sys/executable)
+   :python-paths (mapv #(str (.resolve (pathlib/Path %))) (:python-paths opts))
+   :python-inspection? (get opts :python-inspection? true)
+   :python-timeout (get opts :python-timeout 5)})
+
+(defn- local-file [module paths]
+  (first
+   (for [root paths
+         :let [stem (.joinpath (pathlib/Path root) (str/replace module "." "/"))]
+         candidate [(.with_suffix stem ".pyi") (.joinpath stem "__init__.pyi")
+                    (.with_suffix stem ".py") (.joinpath stem "__init__.py")]
+         :when (.is_file candidate)]
+     candidate)))
+
+(defn- cache-key [module opts]
+  (let [file (local-file module (:python-paths opts))
+        fingerprint (when file
+                      (let [stat (.stat file)]
+                        [(str file) (.-st_mtime_ns stat) (.-st_size stat)]))]
+    [module opts fingerprint]))
+
+(defn- unknown [module reason]
+  {:status :unknown :name module :reason reason})
+
+(defn- inspect-batch [modules opts]
+  (let [temp (tempfile/TemporaryDirectory)
+        worker (.with_name (pathlib/Path
+                            (.-__file__ (get sys/modules "basilisp_tools.python")))
+                           "_inspect.py")]
+    (try
+      (let [request {:modules modules :paths (:python-paths opts)
+                     :enabled (:python-inspection? opts)}
+            process (subprocess/run
+                     (lisp->py [(:python-executable opts) "-I" (str worker)])
+                     ** :input (json/dumps (lisp->py request))
+                     :text true :capture_output true :cwd (.-name temp)
+                     :timeout (:python-timeout opts))]
+        (if (= 0 (.-returncode process))
+          (lmap/map (json/loads (.-stdout process) ** :object_hook decode-object))
+          (into {} (map #(vector % (unknown % "inspection-failed")) modules))))
+      (catch subprocess/TimeoutExpired _
+        (into {} (map #(vector % (unknown % "inspection-timeout")) modules)))
+      (catch python/OSError _
+        (into {} (map #(vector % (unknown % "interpreter-unavailable")) modules)))
+      (catch python/ValueError _
+        (into {} (map #(vector % (unknown % "invalid-inspection-output")) modules)))
+      (finally (.cleanup temp)))))
+
+(defn inspect-modules
+  "Inspect modules in one subprocess, returning a string-keyed metadata map.
+
+  Options: :python-executable, :python-paths (static project search roots),
+  :python-inspection? (default true), :python-timeout (seconds, default 5).
+  Results are cached by interpreter/options and local source mtime and size.
+  Unavailable signatures and dynamic members remain unknown."
+  ([modules] (inspect-modules modules {}))
+  ([modules opts]
+   (let [opts (options opts)
+         keyed (mapv #(vector % (cache-key % opts)) (distinct modules))
+         missing (filterv #(not (contains? @cache (second %))) keyed)]
+     (when (seq missing)
+       (let [results (inspect-batch (mapv first missing) opts)]
+         (swap! cache into (map (fn [[module key]]
+                                  [key (get results module (unknown module "missing-result"))])
+                                missing))))
+     (into {} (map (fn [[module key]] [module (get @cache key)]) keyed)))))
+
+(defn inspect-module
+  "Inspect one module; use inspect-modules to prefetch a file's imports."
+  ([module] (inspect-module module {}))
+  ([module opts] (get (inspect-modules [module] opts) module)))
+
+(defn resolve-member
+  "Return member metadata, nil for a certainly missing member, or :unknown.
+
+  Dynamic modules/classes and unavailable metadata never imply absence."
+  [metadata member]
+  (or (get (:members metadata) member)
+      (when (or (.startswith member "_")
+                (not= :known (:status metadata))
+                (not (:members-complete? metadata)))
+        (unknown member "dynamic-or-unavailable"))))
+
+(defn- signature-text [params returns]
+  (loop [remaining (seq params) parts [] star? false]
+    (if-let [param (first remaining)]
+      (let [kind (:kind param)
+            variadic? (contains? #{:var-positional :var-keyword} kind)
+            parts (if (and (= :keyword-only kind) (not star?)) (conj parts "*") parts)
+            part (str (case kind :var-positional "*" :var-keyword "**" "")
+                      (:name param)
+                      (when (:annotation param) (str ": " (:annotation param)))
+                      (when (and (not (:required? param)) (not variadic?)) "=..."))
+            parts (conj parts part)
+            parts (if (and (= :positional-only kind)
+                           (not= :positional-only (:kind (second remaining))))
+                    (conj parts "/") parts)]
+        (recur (next remaining) parts (or star? variadic? (= :keyword-only kind))))
+      (str "(" (str/join ", " parts) ")" (when returns (str " -> " returns))))))
+
+(defn bind-member
+  "Remove the receiver from an instance method's parameters and signature."
+  [metadata]
+  (if (:instance-method? metadata)
+    (let [metadata (assoc metadata :instance-method? false :bound? true)]
+      (if (contains? metadata :parameters)
+        (let [params (vec (rest (:parameters metadata)))]
+          (assoc metadata :parameters params
+                 :signature (signature-text params (:return-type metadata))))
+        metadata))
+    metadata))
+
+(defn inspect-path
+  "Resolve module members without executing descriptors.
+
+  :instance? binds the final method to an inferred receiver. Module-valued
+  members are inspected lazily and cached."
+  ([module path] (inspect-path module path {}))
+  ([module path opts]
+   (loop [metadata (inspect-module module opts) remaining (seq path)]
+     (if-let [part (first remaining)]
+       (let [metadata (if (and (:target metadata) (not (:members metadata)))
+                        (inspect-module (:target metadata) opts)
+                        metadata)
+             child (resolve-member metadata part)]
+         (if child
+           (recur child (next remaining))
+           nil))
+       (if (:instance? opts) (bind-member metadata) metadata)))))
+
+(defn check-call
+  "Validate positional/keyword binding only when a signature is known.
+
+  Return clj-kondo-shaped :invalid-arity problems. Types are deliberately
+  not guessed, and missing runtime signature metadata is not an error."
+  [metadata positional-count keyword-names]
+  (when (contains? metadata :parameters)
+    (let [params (:parameters metadata)
+          positional (filterv #(contains? #{:positional-only :positional-or-keyword}
+                                          (:kind %)) params)
+          by-name (into {} (map #(vector (:name %) %) params))
+          assigned (set (map :name (take positional-count positional)))
+          keys (set keyword-names)
+          var-positional? (some #(= :var-positional (:kind %)) params)
+          var-keyword? (some #(= :var-keyword (:kind %)) params)
+          problem (cond
+                    (and (not var-positional?) (> positional-count (count positional)))
+                    (str "Expected at most " (count positional)
+                         " positional arguments, received " positional-count)
+
+                    (not= (count keys) (count keyword-names))
+                    "Duplicate Python keyword argument"
+
+                    :else
+                    (or
+                     (some (fn [key]
+                             (let [param (get by-name key)]
+                               (cond
+                                 (and param (= :positional-or-keyword (:kind param))
+                                      (contains? assigned key))
+                                 (str "Multiple values for Python argument '" key "'")
+
+                                 (and (not var-keyword?)
+                                      (or (nil? param)
+                                          (not (contains? #{:positional-or-keyword :keyword-only}
+                                                          (:kind param)))))
+                                 (str "Unexpected Python keyword argument '" key "'"))))
+                           keyword-names)
+                     (some (fn [param]
+                             (when (and (:required? param)
+                                        (not (contains? assigned (:name param)))
+                                        (not (and (not= :positional-only (:kind param))
+                                                  (contains? keys (:name param)))))
+                               (str "Missing required Python argument '" (:name param) "'")))
+                           params)))]
+      (if problem
+        [{:type :invalid-arity :message problem}]
+        []))))

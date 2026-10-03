@@ -547,7 +547,7 @@
       (<= i 1) (+ body (if extra? 1 0))
       :else (or (:col (get pos 1)) body))))
 
-(defn- indentation [frames opts ctx]
+(defn- indentation [frames opts _ctx]
   (let [frame (peek frames)
         ancestors (vec (reverse frames))
         candidates

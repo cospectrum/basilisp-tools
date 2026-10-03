@@ -3,17 +3,51 @@
   (:require [basilisp.string :as str]
             [basilisp-tools.format :as fmt]
             [basilisp-tools.syntax :as syntax])
-  (:import [argparse] [difflib] [os] [os.path :as pathutil] [pathlib] [re] [stat] [sys] [tempfile]
+  (:import [argparse] [importlib] [difflib] [os] [os.path :as pathutil] [pathlib] [re] [stat] [sys] [tempfile]
            [importlib.metadata :as metadata]))
 
 (def ^:private skipped-directories
   #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" "node_modules"
     "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
 
+(defn- add-check-options! [commands]
+  (let [p (.add_parser commands "check" ** :help "Check Basilisp source and Python interop."
+                       :description "Analyze source without evaluating it. Use - for stdin."
+                       :formatter_class argparse/RawDescriptionHelpFormatter
+                       :epilog (str "Examples:\n"
+                                    "  blt check src tests\n"
+                                    "  blt check --format json src\n"
+                                    "  blt check --filename example.lpy - < example.lpy\n\n"
+                                    "Configuration: .clj-kondo/config.edn; --config accepts an\n"
+                                    "EDN map or filename and can be repeated. Later values win.\n"
+                                    "Exit codes: 0 clean, 2 warnings, 3 errors."))]
+    (.add_argument p "paths" ** :nargs "*" :metavar "PATH"
+                   :help "Files/directories, or - for stdin. Defaults to the current directory.")
+    (.add_argument p "--config" ** :action "append" :metavar "EDN_OR_FILE"
+                   :help "Additional checker configuration; repeat to merge multiple sources.")
+    (.add_argument p "--config-dir" ** :metavar "DIR"
+                   :help "Use this .clj-kondo configuration directory.")
+    (.add_argument p "--repro" ** :action "store_true"
+                   :help "Ignore home configuration for reproducible checks.")
+    (.add_argument p "--format" ** :choices #py ["text" "json" "edn"]
+                   :help "Output format; overrides configuration.")
+    (.add_argument p "--filename" ** :metavar "NAME"
+                   :help "Filename used for stdin diagnostics and namespace context.")
+    (.add_argument p "--fail-level" ** :choices #py ["warning" "error"] :default "warning"
+                   :help "Minimum severity causing a nonzero exit (default: warning).")
+    (.add_argument p "--report-level" ** :choices #py ["info" "warning" "error"] :default "info"
+                   :help "Minimum displayed diagnostic severity (default: info).")
+    (.add_argument p "--python" ** :dest "python_executable" :metavar "EXECUTABLE"
+                   :help "Python environment to inspect; defaults to the project .venv, then this interpreter.")
+    (.add_argument p "--no-python-inspection" ** :dest "python_inspection" :action "store_false"
+                   :help "Disable runtime inspection of installed Python dependencies.")
+    (.add_argument p "--python-timeout" ** :type python/float :default 5.0 :metavar "SECONDS"
+                   :help "Timeout for Python inspection (default: 5).")))
+
 (defn- parser []
   (let [p (argparse/ArgumentParser ** :prog "blt"
                                    :description "Development tools for Basilisp."
-                                   :epilog "Run blt format --help for formatter options and examples.")
+                                   :epilog "Run blt COMMAND --help for command options and examples.")
         commands (.add_subparsers p ** :dest "command" :required true)
         format (.add_parser commands "format" ** :help "Format Basilisp source."
                             :description "Format files in place, or use - for stdin/stdout. Directories are searched recursively for .lpy files."
@@ -29,6 +63,7 @@
                                          "--config selects a file directly. Project code is never evaluated.\n\n"
                                          "Exit codes: 0 success, 1 changes needed (--check/--diff), 2 error."))
         modes (.add_mutually_exclusive_group format)]
+    (add-check-options! commands)
     (.add_argument p "--version" ** :action "version"
                    :version (str "blt " (metadata/version "basilisp-tools")))
     (.add_argument format "paths" ** :nargs "*" :metavar "PATH"
@@ -157,13 +192,34 @@
             (report (str (if check? "Would format " "Formatted ") label))))
         (if (and check? (seq changes)) 1 0)))))
 
+(defn- check-command [args]
+  (let [checker (importlib/import_module "basilisp_tools.check")
+        paths (vec (or (seq (.-paths args)) ["."]))
+        options {:paths paths
+                 :config (vec (or (.-config args) []))
+                 :config-dir (.-config_dir args)
+                 :repro (.-repro args)
+                 :filename (or (.-filename args) (when (some #(= "-" %) paths) "stdin.lpy"))
+                 :python-executable (.-python_executable args)
+                 :python-inspection? (.-python_inspection args)
+                 :python-timeout (.-python_timeout args)}
+        options (cond-> options
+                  (some #(= "-" %) paths) (assoc :stdin (.read sys/stdin)))
+        result (.run checker options)
+        output (.output checker result (.-format args) (keyword (.-report_level args)))]
+    (.write sys/stdout output)
+    (.exit_status checker result (keyword (.-fail_level args)))))
+
 (defn main
-  "Run blt. Exit status: 0 success, 1 formatting required, 2 invalid input/error."
+  "Run blt. Format: 0 success, 1 changes required, 2 error.
+  Check: 0 clean, 2 warnings, 3 analysis errors; invalid CLI input returns 2."
   ([] (main nil))
   ([argv]
    (let [args (.parse_args (parser) argv)]
      (try
-       (format-command args)
+       (case (.-command args)
+         "format" (format-command args)
+         "check" (check-command args))
        (catch python/BrokenPipeError _ 0)
        (catch python/Exception e
          (report (str "blt: " (or (ex-message e) (str e))))

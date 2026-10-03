@@ -1,0 +1,143 @@
+(ns basilisp-tools.analyzer-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- findings [source]
+  (:findings (analyzer/analyze source {:python-options {:python-inspection? false}})))
+
+(defn- types [source] (mapv :type (findings source)))
+
+(deftest lexical-resolution-test
+  (doseq [source ["(let [x 1 y (inc x)] (+ x y))"
+                  "(let [x 1] ((fn [y] (+ x y)) 2))"
+                  "(fn named [x] (if x (named nil) x))"
+                  "(letfn [(a [x] (b x)) (b [y] y)] (a 1))"
+                  "(let [[x & rest :as all] [1 2]] [x rest all])"
+                  "(let [{:keys [x] :strs [y] :syms [z] :as m} {}] [x y z m])"
+                  "(let [{:example/keys [x]} {}] x)"
+                  "(for [x [1] :let [y (inc x)] :when y] (+ x y))"
+                  "(doseq [x [1]] (println x))"
+                  "(dotimes [i 2] (println i))"
+                  "(if-let [x 1] x nil)"
+                  "(try (throw nil) (catch python/Exception e e) (finally (println :done)))"
+                  "(case :a (unknown-symbol other-symbol) 1 2)"
+                  "(-> 1 inc (+ 2))"
+                  "(cond-> {} true (-> (dissoc :old) (assoc :new 1)))"
+                  "(as-> 1 value (+ value 2))"
+                  "#(+ % %2)"
+                  "(loop [x 1] (if x (recur nil) x))"
+                  "(fn [x & xs] (if x (recur nil xs) xs))"
+                  "#?(:clj missing :lpy (+ 1 2))"
+                  "'(missing foo/bar)"
+                  "#_ (missing) :ok"
+                  "(defrecord Person [name age]) (->Person \"a\" 1)"
+                  "(defn f [] :ok) (var f)"]]
+    (testing source (is (empty? (findings source)))))
+  (is (= [:unresolved-symbol] (types "(let [x missing] x)")))
+  (is (= [:unresolved-symbol] (types "(var missing)")))
+  (is (= [:unused-binding] (types "(let [unused 1] :ok)")))
+  (is (empty? (findings "(let [_ignored 1] :ok)")))
+  (is (= [:unresolved-symbol] (types "(if-let [x 1] x x)")))
+  (is (= [:unresolved-symbol] (types "`(data ~missing)"))))
+
+(deftest declaration-and-arity-test
+  (let [defs (:definitions (analyzer/declarations "(def values [1 2]) (def greeting \"hello\")"))]
+    (is (nil? (:arglists (get defs "values"))))
+    (is (nil? (:doc (get defs "greeting")))))
+  (is (= [:invalid-arity] (types "(defn f [x] x) (f)")))
+  (is (= [:invalid-arity] (types "(defn f ([x] x) ([x y] [x y])) (f 1 2 3)")))
+  (is (empty? (findings "(defn f [x & xs] [x xs]) (f 1) (f 1 2 3)")))
+  (is (= [:invalid-arity] (types "(let [f (fn [x] x)] (f))")))
+  (is (= [:invalid-arity] (types "(def f (fn [x] x)) (f)")))
+  (is (= [:invalid-arity] (types "(inc)")))
+  (is (= [:redefined-var] (types "(def x 1) (def x 2)")))
+  (is (= [:unexpected-recur] (types "(recur 1)")))
+  (is (= [:invalid-arity] (types "(loop [x 1] (recur x x))")))
+  (let [result (analyzer/declarations "(ns demo) (defn ^:private f \"Docs\" [x] x)"
+                                      {:filename "demo.lpy"})
+        info (get (:definitions result) "f")]
+    (is (= "demo" (:namespace result)))
+    (is (= "Docs" (:doc info)))
+    (is (:private info))
+    (is (= #{1} (:fixed-arities info)))
+    (is (= ["[x]"] (:arglists info)))))
+
+(deftest namespaces-and-project-test
+  (is (empty? (findings "(ns example (:require [basilisp.test :refer [deftest is]])) (deftest demo (is (= 1 1)))")))
+  (is (empty? (findings "(ns example (:require [basilisp.test :as t])) (t/deftest demo (t/is (= 1 1)))")))
+  (is (empty? (findings "(ns example (:require [basilisp.string :as text])) (text/join [])")))
+  (is (empty? (findings "(ns example (:require [basilisp.string :refer [join]])) (join [])")))
+  (is (empty? (findings "(ns example (:require [basilisp.string :refer [join] :rename {join join-text}])) (join-text [])")))
+  (is (= [:unused-namespace] (types "(ns example (:require [basilisp.string :as text]))")))
+  (is (= [:unresolved-namespace] (types "(absent/f)")))
+  (is (= [:unresolved-symbol] (types "(ns n (:refer-basilisp :exclude [inc])) (inc 1)")))
+  (is (empty? (findings "(ns n (:refer-basilisp :rename {inc add-one})) (add-one 1)")))
+  (let [decls (analyzer/declarations "(ns library) (defn f [x] x)" {:filename "library.lpy"})
+        result (analyzer/analyze "(ns client (:require [library :as lib])) (lib/f)"
+                                 {:project {"library" (:definitions decls)}})]
+    (is (= [:invalid-arity] (mapv :type (:findings result))))
+    (is (= "library.lpy" (get-in result [:var-usages 0 :definition :filename])))))
+
+(deftest analysis-locations-and-bindings-test
+  (let [source "(ns demo)\n(let [x 1] (let [x 2] x) x)"
+        result (analyzer/analyze source {:filename "demo.lpy"})
+        locals (:locals result) usages (:local-usages result)]
+    (is (empty? (:findings result)))
+    (is (= 2 (count locals)))
+    (is (= 2 (count (set (map :id locals)))))
+    (is (= (mapv :id (reverse locals)) (mapv :id usages)))
+    (doseq [entry (concat locals usages (:namespace-definitions result))]
+      (is (= "demo.lpy" (:filename entry)))
+      (is (pos? (:row entry)))
+      (is (pos? (:col entry)))
+      (is (= (:name entry) (subs source (:start entry) (:end entry)))))))
+
+(deftest literals-and-invalid-input-test
+  (is (= [:duplicate-map-key] (types "{:key 1 :key 2}")))
+  (is (= [:duplicate-set-key] (types "#{1 1}")))
+  (is (= [:unresolved-symbol] (types "#f\"hello {missing}\"")))
+  (is (= [:unresolved-symbol] (types "#py [missing]")))
+  (doseq [source ["(" "(ns" "(ns)" "(let [x" "(fn [" "{:x" "^:private"]]
+    (testing source
+      (is (map? (analyzer/analyze source)))))
+  (is (some #{:syntax} (types "("))))
+
+(deftest linter-configuration-test
+  (is (empty? (:findings (analyzer/analyze "missing" {:config {:ignore true}}))))
+  (is (empty? (:findings (analyzer/analyze "missing" {:config {:ignore [:unresolved-symbol]}}))))
+  (is (empty? (:findings (analyzer/analyze "missing" {:config {:linters {:unresolved-symbol {:level :off}}}}))))
+  (is (= :warning (:level (first (:findings (analyzer/analyze "missing" {:config {:linters {:unresolved-symbol {:level :warning}}}}))))))
+  (is (empty? (:findings (analyzer/analyze "(ns example) missing"
+                                           {:config {:config-in-ns {'example {:ignore true}}}})))))
+
+(deftest python-inspection-test
+  (let [result (analyzer/analyze "(ns sample (:import [math :as m])) (m/sqrt 4)")]
+    (is (empty? (:findings result)))
+    (is (= "sqrt" (:name (first (:python-usages result)))))
+    (is (= :function (get-in result [:python-usages 0 :definition :kind]))))
+  (is (= [:invalid-arity]
+         (mapv :type (:findings (analyzer/analyze "(ns sample (:import math)) (math/sqrt)")))))
+  (is (= [:unresolved-symbol]
+         (mapv :type (:findings (analyzer/analyze "(ns sample (:import math)) (math/not_a_real_member 1)")))))
+  (is (empty? (:findings (analyzer/analyze "(ns sample (:import pathlib)) (let [p (pathlib/Path \".\")] (.exists p))"))))
+  (is (= [:unresolved-symbol]
+         (mapv :type (:findings (analyzer/analyze "(ns sample (:import pathlib)) (let [p (pathlib/Path \".\")] (.not_a_real_method p))"))))))
+
+(deftest utf16-diagnostic-columns-test
+  (let [source "(do \"😀\" missing)"
+        findings (findings source)
+        missing (last findings)]
+    (is (= [:unused-value :unresolved-symbol] (mapv :type findings)))
+    (is (= 10 (:col missing)))
+    (is (= 17 (:end-col missing)))
+    (is (= "missing" (subs source (:start missing) (:end missing))))))
+
+(deftest core-form-identity-test
+  (doseq [source ["(ns sample (:refer-basilisp :rename {let my-let})) (my-let [x 1] x)"
+                  "(ns sample (:refer-basilisp :exclude [let])) (defn let [x] x) (let 1)"
+                  "(let [let (fn [x] x)] (let 1))"
+                  "(ns sample (:refer-basilisp :rename {fn my-fn})) ((my-fn [x] x) 1)"
+                  "(ns sample (:require [basilisp.core :as c])) (c/let [x 1] x)"]]
+    (testing source (is (empty? (findings source)))))
+  (is (= [:unresolved-symbol] (types "(ns sample (:refer-basilisp :exclude [let])) (let 1)")))
+  (is (= [:invalid-arity] (types "(ns sample (:refer-basilisp :exclude [let])) (defn let [x] x) (let)"))))

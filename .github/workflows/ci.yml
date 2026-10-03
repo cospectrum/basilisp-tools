@@ -47,6 +47,8 @@ jobs:
       - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
       - name: Check formatting
         run: nix develop --no-update-lock-file --command uv run --locked blt format --check src tests
+      - name: Check source
+        run: nix develop --no-update-lock-file --command uv run --locked blt check --repro --no-python-inspection src
       - name: Check workflows
         run: nix develop --no-update-lock-file --command actionlint
       - name: Build distribution
@@ -58,6 +60,7 @@ jobs:
           cd "$(mktemp -d)"
           nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt --version
           printf '(let [x 1]\n  x)\n' | nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt format --check -
+          printf '(ns wheel-smoke (:import [math])) (math/sqrt 4)\n' | nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt check --repro -
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: distributions
@@ -65,7 +68,7 @@ jobs:
           if-no-files-found: error
 
   compatibility:
-    name: Compare with pinned cljfmt
+    name: Compare with upstream tools
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -85,3 +88,5 @@ jobs:
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference
       - name: Compare configuration precedence with Leiningen plugin
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt .cljfmt-reference
+      - name: Compare checker diagnostics with clj-kondo
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo.py

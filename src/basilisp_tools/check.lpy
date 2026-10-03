@@ -1,0 +1,332 @@
+(ns basilisp-tools.check
+  "Project linting, clj-kondo data configuration, and diagnostic output."
+  (:require [basilisp.edn :as edn]
+            [basilisp.string :as str]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.syntax :as syntax])
+  (:import [json] [os] [pathlib] [re] [sys] [time]))
+
+(def ^:private skipped-directories
+  #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" ".clj-kondo"
+    "node_modules" "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
+
+(defn- error [message] (throw (python/ValueError message)))
+
+(defn merge-config
+  "Merge clj-kondo data: maps recursively, collections cumulatively, ^:replace literally."
+  [a b]
+  (cond
+    (nil? b) a
+    (:replace (meta b)) b
+    (and (map? a) (map? b)) (merge-with merge-config a b)
+    (and (or (sequential? a) (set? a)) (or (sequential? b) (set? b))) (into a b)
+    :else b))
+
+(defn- literal-map [values label]
+  (let [pairs (mapv vec (partition 2 values)) result (into {} pairs)]
+    (when (not= (count pairs) (count result))
+      (error (str label ": duplicate configuration key")))
+    result))
+
+(defn- config-value [node label]
+  (let [kind (:kind node) forms (syntax/forms node)]
+    (cond
+      (#{:nil :boolean :number :symbolic-number :character :keyword :symbol :string} kind)
+      (edn/read-string (syntax/text node))
+
+      (#{:map :vector :set :list} kind)
+      (let [values (mapv #(config-value % label) forms)]
+        (case kind
+          :map (literal-map values label)
+          :vector values
+          :set (do (when (not= (count values) (count (set values)))
+                     (error (str label ": duplicate set value")))
+                   (set values))
+          :list (apply list values)))
+
+      (= :metadata kind)
+      (let [[metadata value] forms
+            metadata (config-value metadata label)
+            metadata (if (keyword? metadata) {metadata true} metadata)]
+        (when-not (map? metadata) (error (str label ": configuration metadata must be a map or keyword")))
+        (with-meta (config-value value label) metadata))
+
+      (= :namespaced-map kind)
+      (let [prefix (:text (first (:children node))) namespace-name (subs prefix 2)]
+        (when (.startswith prefix "#::")
+          (error (str label ": auto-resolved configuration namespaces are unsupported")))
+        (literal-map
+         (mapcat (fn [[k v]]
+                   [(if (or (keyword? k) (symbol? k))
+                      (let [constructor (if (keyword? k) keyword symbol)]
+                        (case (namespace k)
+                          nil (constructor (str namespace-name "/" (name k)))
+                          "_" (constructor (name k))
+                          k)) k) v])
+                 (config-value (first forms) label)) label))
+
+      (= :regex kind)
+      (let [text (syntax/text node)] (re/compile (subs text 2 (dec (count text)))))
+
+      :else (error (str label ": unsupported configuration form " (name kind)
+                        "; configuration is data and is never evaluated")))))
+
+(defn read-config
+  "Read one literal clj-kondo configuration map, without evaluating reader or project code."
+  ([source] (read-config source "configuration"))
+  ([source label]
+   (let [parsed (syntax/parse source) forms (syntax/forms (:root parsed))]
+     (when (seq (:diagnostics parsed))
+       (error (str label ": " (:message (first (:diagnostics parsed))))))
+     (when-not (= 1 (count forms)) (error (str label ": expected one configuration map")))
+     (let [value (config-value (first forms) label)]
+       (when-not (map? value) (error (str label ": expected a configuration map")))
+       value))))
+
+(defn- read-config-file [path]
+  (read-config (.read_text (pathlib/Path path) ** :encoding "utf-8") (str path)))
+
+(defn- find-config-dir [start]
+  (let [start (.absolute (pathlib/Path start))
+        start (if (.is_file start) (.-parent start) start)]
+    (loop [directory start]
+      (let [candidate (.joinpath directory ".clj-kondo")]
+        (cond
+          (.is_dir candidate) candidate
+          (.exists candidate) (error (str candidate " must be a directory"))
+          (= directory (.-parent directory)) nil
+          :else (recur (.-parent directory)))))))
+
+(declare config-directory)
+
+(defn- directory-config [directory cfg seen]
+  (let [canonical (str (.resolve directory))
+        _ (when (contains? seen canonical) (error (str "Cyclic :config-paths at " directory)))
+        paths (or (:config-paths cfg) [])]
+    (when-not (and (sequential? paths) (every? string? paths))
+      (error (str directory ": :config-paths must contain directory names")))
+    (merge-config
+     (reduce (fn [result name]
+               (let [path (.joinpath directory name)]
+                 (if (.is_dir path)
+                   (merge-config result (config-directory path (conj seen canonical))) result)))
+             {} paths)
+     cfg)))
+
+(defn- config-directory [directory seen]
+  (let [file (.joinpath directory "config.edn")]
+    (directory-config directory (if (.is_file file) (read-config-file file) {}) seen)))
+
+(defn- discovered-configs [directory explicit]
+  (->> (concat (iterator-seq (.glob directory "*/*/config.edn"))
+               (iterator-seq (.glob directory "imports/*/*/config.edn")))
+       (filter #(.is_file %))
+       (map #(str (.relative_to (.-parent %) directory)))
+       (remove (set explicit)) distinct sort vec))
+
+(defn- explicit-config [cfg]
+  (cond
+    (nil? cfg) {}
+    (map? cfg) cfg
+    (string? cfg) (let [s (.lstrip cfg)]
+                    (if (or (.startswith s "{") (.startswith s "^") (.startswith s "#:"))
+                      (read-config cfg) (read-config-file cfg)))
+    :else (error "--config expects an EDN map or a file name")))
+
+(defn load-config
+  "Resolve home, imported, project, environment, and explicit clj-kondo data configuration."
+  ([] (load-config {}))
+  ([options]
+   (let [directory (if-let [path (:config-dir options)]
+                     (.absolute (pathlib/Path path))
+                     (find-config-dir (or (:filename options) (:cwd options) (.cwd pathlib/Path))))
+         _ (when (and directory (.exists directory) (not (.is_dir directory)))
+             (error (str directory " must be a directory")))
+         file (when directory (.joinpath directory "config.edn"))
+         local (if (and file (.is_file file)) (read-config-file file) {})
+         paths (or (:config-paths local) [])
+         skip-home? (or (:repro options) (:replace (meta paths)))
+         home (.joinpath (pathlib/Path (or (os/getenv "XDG_CONFIG_HOME")
+                                           (str (.joinpath (.home pathlib/Path) ".config")))) "clj-kondo")
+         imports (when (and directory (not (false? (:auto-load-configs local))))
+                   (discovered-configs directory paths))
+         local (if (seq imports) (update local :config-paths #(into (or % []) imports)) local)
+         explicit (:config options)
+         explicit (if (sequential? explicit) explicit [explicit])
+         config (reduce merge-config
+                        {:output {:format :text :summary true}}
+                        (concat [(when (and (not skip-home?) (.is_dir home)) (config-directory home #{}))
+                                 (when directory (directory-config directory local #{}))
+                                 (when-let [extra (os/getenv "CLJ_KONDO_EXTRA_CONFIG_DIR")]
+                                   (config-directory (pathlib/Path extra) #{}))]
+                                (map explicit-config explicit)))]
+     (when (seq (:hooks config))
+       (error "clj-kondo :hooks are unsupported: blt does not execute Clojure hooks"))
+     (cond-> config directory (assoc :cfg-dir (str (.resolve directory)))))))
+
+(defn- walk-files [directory]
+  (let [files (atom [])]
+    (doseq [[root dirs names] (iterator-seq (os/walk directory ** :followlinks false
+                                                     :onerror (fn [e] (throw e))))]
+      (let [kept (filter #(and (not (contains? skipped-directories %))
+                               (not (.is_symlink (.joinpath (pathlib/Path root) %)))) (vec dirs))]
+        (.clear dirs)
+        (doseq [name (sort kept)] (.append dirs name)))
+      (doseq [name (sort names) :let [file (.joinpath (pathlib/Path root) name)]
+              :when (and (.endswith name ".lpy") (.is_file file) (not (.is_symlink file)))]
+        (swap! files conj file)))
+    @files))
+
+(defn- file-finding [filename message]
+  {:filename filename :row 1 :col 1 :end-row 1 :end-col 1
+   :type :file :level :error :message message})
+
+(defn- collect-files [paths]
+  (let [result (atom []) problems (atom []) seen (atom #{})]
+    (doseq [name paths]
+      (try
+        (let [path (pathlib/Path name)
+              files (cond
+                      (.is_symlink path) (error (str "Refusing symbolic link: " name))
+                      (.is_file path) [path]
+                      (.is_dir path) (walk-files path)
+                      :else (error (str "Path does not exist: " name)))]
+          (doseq [file files :let [canonical (str (.resolve file))]
+                  :when (not (contains? @seen canonical))]
+            (swap! seen conj canonical)
+            (swap! result conj file)))
+        (catch python/Exception e (swap! problems conj (file-finding name (str e))))))
+    {:files (vec (sort-by str @result)) :findings @problems}))
+
+(defn- matches? [patterns filename]
+  (some #(re/search % (.replace filename "\\" "/")) patterns))
+
+(defn- file-level [config finding]
+  (if (= :file (:type finding))
+    (let [ignore (:ignore config)
+          level (if (or (true? ignore) (and (sequential? ignore) (some #{:file} ignore)))
+                  :off (get-in config [:linters :file :level] :error))]
+      (when-not (= :off level) (assoc finding :level level)))
+    finding))
+
+(defn- visible-finding? [config finding]
+  (let [filename (:filename finding) output (:output config)
+        include (:include-files output) exclude (:exclude-files output)]
+    (and (or (empty? include) (matches? include filename))
+         (not (matches? exclude filename)))))
+
+(defn- default-python [options config]
+  (let [root (if-let [dir (:cfg-dir config)] (.-parent (pathlib/Path dir))
+                     (pathlib/Path (or (:cwd options) (.cwd pathlib/Path))))]
+    (or (:python-executable options)
+        (some (fn [name] (let [path (.joinpath root name)] (when (.is_file path) (str path))))
+              [".venv/bin/python" ".venv/Scripts/python.exe"])
+        sys/executable)))
+
+(defn run
+  "Analyze files as one project. '-' reads :stdin (or sys.stdin). No source is executed."
+  ([] (run {}))
+  ([options]
+   (let [started (time/perf_counter) config (load-config options)
+         paths (or (seq (:paths options)) (if (some? (:stdin options)) ["-"] ["."]))
+         stdin? (some #(= "-" %) paths)
+         _ (when (and stdin? (not= 1 (count paths))) (error "Stdin (-) cannot be combined with other paths"))
+         collected (if stdin? {:files [] :findings []} (collect-files paths))
+         problems (atom (:findings collected))
+         sources (if stdin?
+                   [{:filename (or (:filename options) "<stdin>")
+                     :source (if (contains? options :stdin) (:stdin options) (.read sys/stdin))}]
+                   (->> (:files collected)
+                        (keep (fn [path]
+                                (let [filename (if (get-in config [:output :canonical-paths])
+                                                 (str (.resolve path)) (str path))]
+                                  (when-not (and (:exclude-files config)
+                                                 (re/search (:exclude-files config) (.replace filename "\\" "/")))
+                                    (try
+                                      {:filename filename :source (.read_text path ** :encoding "utf-8")}
+                                      (catch python/Exception e
+                                        (swap! problems conj (file-finding filename (str e))) nil)))))) vec))
+         sources (mapv (fn [{:keys [source filename] :as item}]
+                         (try
+                           (assoc item :declarations (analyzer/declarations source {:filename filename}))
+                           (catch python/Exception e
+                             (assoc item :declaration-error (file-finding filename (str "Analysis failed: " e))))))
+                       sources)
+         project (reduce (fn [result {:keys [declarations]}]
+                           (if declarations
+                             (update result (:namespace declarations) merge (:definitions declarations)) result))
+                         {} sources)
+         root (if-let [dir (:cfg-dir config)] (.-parent (pathlib/Path dir))
+                      (pathlib/Path (or (:cwd options) (.cwd pathlib/Path))))
+         python-options {:python-executable (default-python options config)
+                         :python-inspection? (:python-inspection? options true)
+                         :python-paths (or (:python-paths options) [(str root) (str (.joinpath root "src"))])
+                         :python-timeout (:python-timeout options 5)}
+         analysis (mapv (fn [{:keys [source filename declarations declaration-error]}]
+                          (if declaration-error
+                            {:filename filename :findings [declaration-error]}
+                            (try
+                              (analyzer/analyze source {:filename filename :config config :project project
+                                                        :declarations declarations :python-options python-options})
+                              (catch python/Exception e
+                                {:filename filename :findings [(file-finding filename (str "Analysis failed: " e))]})))) sources)
+         findings (->> (concat @problems (mapcat :findings analysis))
+                       (keep #(file-level config %))
+                       (filter #(visible-finding? config %))
+                       (sort-by (juxt :filename :row :col :message)) distinct vec)
+         summary (reduce #(update %1 (:level %2) (fnil inc 0))
+                         {:error 0 :warning 0 :info 0 :type :summary
+                          :files (count sources) :duration (python/int (* 1000 (- (time/perf_counter) started)))} findings)]
+     {:findings findings :summary summary :config config :analysis analysis
+      :report-level (:report-level options :info)})))
+
+(defn exit-status
+  "clj-kondo exit codes: 0 success, 2 warnings, 3 errors."
+  ([result] (exit-status result :warning))
+  ([result fail-level]
+   (cond
+     (pos? (get-in result [:summary :error] 0)) 3
+     (and (not= "error" (name fail-level)) (pos? (get-in result [:summary :warning] 0))) 2
+     :else 0)))
+
+(defn- json-value [value]
+  (cond
+    (map? value) (python/dict (python/list (map (fn [[k v]] (python/tuple [(if (keyword? k) (name k) (str k))
+                                                                           (json-value v)])) value)))
+    (or (sequential? value) (set? value)) (python/list (map json-value value))
+    (or (keyword? value) (symbol? value)) (str/replace (str value) #"^:" "")
+    :else value))
+
+(defn- output-finding [finding]
+  (select-keys finding [:filename :row :col :end-row :end-col :type :level :message]))
+
+(defn- text-finding [finding config]
+  (let [pattern (get-in config [:output :pattern])
+        text (if pattern
+               (reduce (fn [text [key value]]
+                         (.replace text (str "{{" (name key) "}}") (if (keyword? value) (name value) (str value))))
+                       (.replace pattern "{{LEVEL}}" (.upper (name (:level finding)))) finding)
+               (str (:filename finding) ":" (:row finding) ":" (:col finding) ": "
+                    (name (:level finding)) ": " (:message finding)))]
+    (str text (when (get-in config [:output :linter-name]) (str " [" (name (:type finding)) "]")))))
+
+(defn output
+  "Render deterministic text, JSON, or EDN. Report level filters text, matching clj-kondo."
+  ([result] (output result nil))
+  ([result format report-level] (output (assoc result :report-level report-level) format))
+  ([result format]
+   (let [{:keys [config summary]} result
+         format (keyword (name (or format (get-in config [:output :format]) :text)))
+         findings (mapv output-finding (:findings result))
+         data (cond-> {:findings findings} (get-in config [:output :summary]) (assoc :summary summary))]
+     (case format
+       :json (str (json/dumps (json-value data) ** :ensure_ascii false) "\n")
+       :edn (str (pr-str data) "\n")
+       :text (let [level (keyword (name (:report-level result :info)))
+                   rank {:info 0 :warning 1 :error 2}
+                   lines (mapv #(text-finding % config) (filter #(>= (rank (:level %) 0) (rank level 0)) findings))
+                   lines (if (get-in config [:output :summary])
+                           (conj lines (str "linting took " (:duration summary) "ms, errors: " (:error summary)
+                                            (when (not= level :error) (str ", warnings: " (:warning summary))))) lines)]
+               (if (seq lines) (str (str/join "\n" lines) "\n") ""))
+       (error (str "Unsupported output format: " format))))))
