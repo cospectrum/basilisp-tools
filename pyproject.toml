@@ -19,7 +19,7 @@ classifiers = [
 Homepage = "https://github.com/cospectrum/basilisp-tools"
 
 [project.scripts]
-basilisp-tools = "basilisp_tools.core:main"
+blt = "basilisp_tools.core:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
