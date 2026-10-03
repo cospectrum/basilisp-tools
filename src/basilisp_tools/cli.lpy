@@ -44,6 +44,17 @@
     (.add_argument p "--python-timeout" ** :type python/float :default 5.0 :metavar "SECONDS"
                    :help "Timeout for Python inspection (default: 5).")))
 
+(defn- add-lsp-options! [commands]
+  (let [p (.add_parser commands "lsp" ** :help "Start the stdio language server."
+                       :description "Serve editor features over LSP on stdin/stdout."
+                       :epilog "Configure your editor to launch: blt lsp")]
+    (.add_argument p "--python" ** :dest "python_executable" :metavar "EXECUTABLE"
+                   :help "Python environment to inspect; defaults to the workspace .venv, then this interpreter.")
+    (.add_argument p "--no-python-inspection" ** :dest "python_inspection" :action "store_false"
+                   :help "Disable runtime inspection of installed Python dependencies.")
+    (.add_argument p "--python-timeout" ** :type python/float :default 5.0 :metavar "SECONDS"
+                   :help "Timeout for Python inspection (default: 5).")))
+
 (defn- parser []
   (let [p (argparse/ArgumentParser ** :prog "blt"
                                    :description "Development tools for Basilisp."
@@ -64,6 +75,7 @@
                                          "Exit codes: 0 success, 1 changes needed (--check/--diff), 2 error."))
         modes (.add_mutually_exclusive_group format)]
     (add-check-options! commands)
+    (add-lsp-options! commands)
     (.add_argument p "--version" ** :action "version"
                    :version (str "blt " (metadata/version "basilisp-tools")))
     (.add_argument format "paths" ** :nargs "*" :metavar "PATH"
@@ -210,6 +222,13 @@
     (.write sys/stdout output)
     (.exit_status checker result (keyword (.-fail_level args)))))
 
+(defn- lsp-command [args]
+  (let [server (importlib/import_module "basilisp_tools.lsp")
+        options (cond-> {:python-inspection? (.-python_inspection args)
+                         :python-timeout (.-python_timeout args)}
+                  (.-python_executable args) (assoc :python-executable (.-python_executable args)))]
+    (.start server options)))
+
 (defn main
   "Run blt. Format: 0 success, 1 changes required, 2 error.
   Check: 0 clean, 2 warnings, 3 analysis errors; invalid CLI input returns 2."
@@ -219,7 +238,8 @@
      (try
        (case (.-command args)
          "format" (format-command args)
-         "check" (check-command args))
+         "check" (check-command args)
+         "lsp" (lsp-command args))
        (catch python/BrokenPipeError _ 0)
        (catch python/Exception e
          (report (str "blt: " (or (ex-message e) (str e))))

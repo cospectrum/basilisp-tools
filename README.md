@@ -1,8 +1,8 @@
 # basilisp-tools
 
 Development tools for [Basilisp](https://github.com/basilisp-lang/basilisp), a
-Clojure-compatible Lisp on Python. `blt` provides formatting and static analysis
-with Python inspection.
+Clojure-compatible Lisp on Python. `blt` provides formatting, static analysis,
+and a language server with Python inspection.
 
 ## Installation
 
@@ -18,10 +18,11 @@ uv tool install git+https://github.com/cospectrum/basilisp-tools.git
 blt format .          # Format .lpy files in place
 blt format --check .  # Check without writing
 blt check .           # Check code and Python interop
+blt lsp               # Start the stdio language server
 blt --help
 blt format --help
 ```
 
-[Formatting](docs/formatting.md) · [Checking](docs/checking.md) · [Syntax API](docs/syntax.md)
+[Formatting](docs/formatting.md) · [Checking](docs/checking.md) · [Language server](docs/lsp.md) · [Syntax API](docs/syntax.md)
 
 Licensed under [Apache 2.0](LICENSE).

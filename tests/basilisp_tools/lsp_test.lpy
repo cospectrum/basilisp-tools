@@ -1,0 +1,388 @@
+(ns basilisp-tools.lsp-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.lsp :as lsp])
+  (:import [json] [pathlib] [queue] [subprocess] [sys] [tempfile] [threading]))
+
+(defn- read-messages [process messages]
+  (try
+    (loop []
+      (let [header (.readline (.-stdout process))]
+        (when (seq header)
+          (let [length (python/int (second (.split (.decode header "ascii") ":")))]
+            (loop []
+              (when-not (= "\r\n" (.decode (.readline (.-stdout process)) "ascii"))
+                (recur)))
+            (.put messages (py->lisp (json/loads (.read (.-stdout process) length))))
+            (recur)))))
+    (catch python/Exception e (.put messages {:reader-error (str e)}))))
+
+(defn- client [root]
+  (let [process (subprocess/Popen
+                 [(str (.joinpath (.-parent (pathlib/Path sys/executable)) "blt")) "lsp"]
+                 ** :stdin subprocess/PIPE :stdout subprocess/PIPE :stderr subprocess/PIPE
+                 :cwd (str root))
+        messages (queue/Queue)
+        reader (threading/Thread ** :target #(read-messages process messages) :daemon true)]
+    (.start reader)
+    {:process process :messages messages :id (atom 0) :notifications (atom [])}))
+
+(defn- send! [client message]
+  (let [body (.encode (json/dumps (lisp->py (assoc message :jsonrpc "2.0"))
+                                  ** :ensure_ascii false) "utf-8")
+        stream (.-stdin (:process client))]
+    (.write stream (.encode (str "Content-Length: " (count body) "\r\n\r\n") "ascii"))
+    (.write stream body)
+    (.flush stream)))
+
+(defn- response! [client id]
+  (loop []
+    (let [message (.get (:messages client) ** :timeout 20)]
+      (when (:reader-error message) (throw (python/RuntimeError (:reader-error message))))
+      (if (= id (:id message)) message
+          (do (swap! (:notifications client) conj message) (recur))))))
+
+(defn- request! [client method params]
+  (let [id (swap! (:id client) inc)]
+    (send! client {:id id :method method :params params})
+    (response! client id)))
+
+(defn- result! [client method params]
+  (let [response (request! client method params)]
+    (when-let [error (:error response)] (throw (python/RuntimeError (str error))))
+    (:result response)))
+
+(defn- notification! [client method params]
+  (send! client {:method method :params params}))
+
+(defn- diagnostics! [client version]
+  (let [match? #(and (= "textDocument/publishDiagnostics" (:method %))
+                     (= version (get-in % [:params :version])))]
+    (or (some #(when (match? %) (:params %)) @(:notifications client))
+        (loop []
+          (let [message (.get (:messages client) ** :timeout 20)]
+            (if (match? message) (:params message)
+                (do (swap! (:notifications client) conj message) (recur))))))))
+
+(defn- initialize! [client root]
+  (let [result (result! client "initialize"
+                        {:processId nil :rootUri (.as_uri root)
+                         :capabilities {:general {:positionEncodings ["utf-16"]}
+                                        :workspace {:workspaceEdit {:documentChanges true}}}})]
+    (notification! client "initialized" {})
+    result))
+
+(defn- open! [client uri source]
+  (notification! client "textDocument/didOpen"
+                 {:textDocument {:uri uri :languageId "basilisp" :version 1 :text source}})
+  (diagnostics! client 1))
+
+(defn- at [uri line character]
+  {:textDocument {:uri uri} :position {:line line :character character}})
+
+(defn- stop! [client]
+  (let [process (:process client)]
+    (try
+      (result! client "shutdown" nil)
+      (notification! client "exit" nil)
+      (is (= 0 (.wait process ** :timeout 10)))
+      (finally
+        (when (nil? (.poll process)) (.kill process))
+        (.wait process)
+        (.close (.-stdin process))
+        (.close (.-stdout process))
+        (.close (.-stderr process))))))
+
+(deftest protocol-lifecycle-and-incremental-unicode-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "unicode.lpy"))]
+    (try
+      (let [initialized (initialize! c root)]
+        (is (= "utf-16" (get-in initialized [:capabilities :positionEncoding])))
+        (is (= 2 (get-in initialized [:capabilities :textDocumentSync :change])))
+        (is (get-in initialized [:capabilities :hoverProvider])))
+      (let [source "(ns unicode)\n(def emoji \"😀\")\n(let [x 1] [\"😀\" missing])"
+            findings (:diagnostics (open! c uri source))
+            unresolved (first (filter #(= "unresolved-symbol" (:code %)) findings))]
+        (is (= 17 (get-in unresolved [:range :start :character])))
+        (notification! c "textDocument/didChange"
+                       {:textDocument {:uri uri :version 2}
+                        :contentChanges [{:range {:start {:line 2 :character 17}
+                                                  :end {:line 2 :character 24}}
+                                          :text "x"}]})
+        (is (empty? (:diagnostics (diagnostics! c 2)))))
+      (testing "Only the latest document version receives asynchronous diagnostics"
+        (notification! c "textDocument/didChange"
+                       {:textDocument {:uri uri :version 3} :contentChanges [{:text "("}]})
+        (notification! c "textDocument/didChange"
+                       {:textDocument {:uri uri :version 4} :contentChanges [{:text "(ns unicode)"}]})
+        (is (empty? (:diagnostics (diagnostics! c 4)))))
+      (is (= -32601 (get-in (request! c "blt/unknownMethod" {}) [:error :code])))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest project-navigation-rename-and-formatting-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        provider (.joinpath root "provider.lpy")
+        consumer (.joinpath root "consumer.lpy")
+        provider-source "(ns provider)\n(defn greet \"Return its input.\" [name] name)\n"
+        consumer-source "(ns consumer (:require [provider :as p]))\n(p/greet \"Alex\")\n"
+        _ (.write_text provider provider-source ** :encoding "utf-8")
+        _ (.write_text consumer consumer-source ** :encoding "utf-8")
+        c (client root) uri (.as_uri consumer)]
+    (try
+      (initialize! c root)
+      (is (empty? (:diagnostics (open! c uri consumer-source))))
+      (let [definition (result! c "textDocument/definition" (at uri 1 4))]
+        (is (= (.as_uri provider) (:uri definition)))
+        (is (= {:line 1 :character 6} (get-in definition [:range :start]))))
+      (let [hover (result! c "textDocument/hover" (at uri 1 4))]
+        (is (>= (.find (get-in hover [:contents :value]) "Return its input.") 0)))
+      (let [refs (result! c "textDocument/references"
+                          (assoc (at uri 1 4) :context {:includeDeclaration true}))]
+        (is (= 2 (count refs))))
+      (let [edit (result! c "textDocument/rename" (assoc (at uri 1 4) :newName "welcome"))
+            documents (:documentChanges edit)
+            use-edit (first (:edits (first (filter #(= uri (get-in % [:textDocument :uri])) documents))))]
+        (is (= 2 (count documents)))
+        (is (= 3 (get-in use-edit [:range :start :character])))
+        (is (= "welcome" (:newText use-edit))))
+      (is (= -32602 (get-in (request! c "textDocument/rename"
+                                      (assoc (at uri 1 4) :newName "other/name")) [:error :code])))
+      (is (= "greet" (:name (first (result! c "workspace/symbol" {:query "greet"})))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns consumer)\n(defn answer [x]\n(+ x 1))\n"}]})
+      (diagnostics! c 2)
+      (let [edits (result! c "textDocument/formatting"
+                           {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})]
+        (is (= "(ns consumer)\n(defn answer [x]\n  (+ x 1))\n" (:newText (first edits)))))
+      (let [symbols (result! c "textDocument/documentSymbol" {:textDocument {:uri uri}})]
+        (is (= ["answer"] (mapv :name symbols))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest python-completion-and-hover-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "interop.lpy")) c (client root)
+        source "(ns interop (:import [math]))\n(math/sin 1)\nmath/si"]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (let [items (:items (result! c "textDocument/completion" (at uri 2 7)))]
+        (is (some #(= "math/sin" (:label %)) items)))
+      (let [hover (result! c "textDocument/hover" (at uri 1 5))]
+        (is (some? hover))
+        (is (.startswith (get-in hover [:contents :value]) "sin ")))
+      (is (nil? (result! c "textDocument/prepareRename" (at uri 1 5))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest local-bindings-core-completion-and-rename-safety-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "local.lpy")) c (client root)
+        line "(let [x 1 y 2] (let [x 3] x) x)"
+        source (str "(ns local)\n" line "\nmap")]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (let [edit (result! c "textDocument/rename"
+                          (assoc (at uri 1 (.rfind line "x")) :newName "outer"))
+            edits (:edits (first (:documentChanges edit)))]
+        (is (= 2 (count edits)))
+        (is (= #{6 (.rfind line "x")} (set (map #(get-in % [:range :start :character]) edits)))))
+      (is (= -32602 (get-in (request! c "textDocument/rename"
+                                      (assoc (at uri 1 (.rfind line "x")) :newName "y"))
+                            [:error :code])))
+      (is (nil? (result! c "textDocument/prepareRename" (at uri 2 1))))
+      (is (= -32602 (get-in (request! c "textDocument/rename"
+                                      (assoc (at uri 2 1) :newName "newmap")) [:error :code])))
+      (let [items (:items (result! c "textDocument/completion" (at uri 2 3)))]
+        (is (some #(= "map" (:label %)) items)))
+      (doseq [name ["map" "if" ".method"]]
+        (is (= -32602 (get-in (request! c "textDocument/rename"
+                                        (assoc (at uri 1 (.rfind line "x")) :newName name))
+                              [:error :code]))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns local)\n(let [{:keys [x]} {:x 1}] x)"}]})
+      (diagnostics! c 2)
+      (is (nil? (result! c "textDocument/prepareRename" (at uri 1 25))))
+      (is (= -32602 (get-in (request! c "textDocument/rename"
+                                      (assoc (at uri 1 25) :newName "value")) [:error :code])))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest python-instance-method-completion-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "methods.lpy")) c (client root)
+        line "(let [p (pathlib/Path \".\")] (.read_ p))"
+        source (str "(ns methods (:import [pathlib]))\n" line)]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (let [items (:items (result! c "textDocument/completion"
+                                   (at uri 1 (+ (.find line ".read_") 6))))]
+        (is (some #(= ".read_text" (:label %)) items))
+        (is (some #(= ".read_bytes" (:label %)) items)))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest shared-config-and-project-python-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "configured.lpy")) c (client root)
+        config (.joinpath root ".clj-kondo") bin (.joinpath root ".venv" "bin")
+        marker (.joinpath root "selected-python")
+        executable (.joinpath bin "python")
+        source "(ns configured (:import [math]))\n(let [unused 1]\n(math/sin 1))"]
+    (try
+      (.mkdir config)
+      (.write_text (.joinpath config "config.edn")
+                   "{:linters {:unused-binding {:level :off}}}" ** :encoding "utf-8")
+      (.write_text (.joinpath root ".cljfmt.edn") "{:indentation? false}" ** :encoding "utf-8")
+      (.mkdir bin ** :parents true)
+      (.write_text executable
+                   (str "#!/bin/sh\nprintf selected > '" marker "'\nexec '" sys/executable "' \"$@\"\n")
+                   ** :encoding "utf-8")
+      (.chmod executable 0755)
+      (initialize! c root)
+      (is (empty? (:diagnostics (open! c uri source))))
+      (is (.is_file marker))
+      (is (empty? (result! c "textDocument/formatting"
+                           {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest close-restores-disk-and-watched-files-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        file (.joinpath root "watched.lpy") uri (.as_uri file) c (client root)
+        disk "(ns watched)\n(def disk-value 1)"]
+    (try
+      (.write_text file disk ** :encoding "utf-8")
+      (initialize! c root)
+      (open! c uri "(ns watched)\n(def unsaved-value 1)")
+      (is (= ["unsaved-value"] (mapv :name (result! c "workspace/symbol" {:query "value"}))))
+      (notification! c "textDocument/didClose" {:textDocument {:uri uri}})
+      ;; A watched-file notification is an ordered barrier for disk reloading.
+      (notification! c "workspace/didChangeWatchedFiles" {:changes [{:uri uri :type 2}]})
+      (loop [attempt 0]
+        (let [symbols (mapv :name (result! c "workspace/symbol" {:query "value"}))]
+          (if (and (< attempt 4) (empty? symbols))
+            (recur (inc attempt))
+            (is (= ["disk-value"] symbols)))))
+      (let [python-file (.joinpath root "other.py")]
+        (.write_text python-file "(def leaked-python-symbol 1)" ** :encoding "utf-8")
+        (notification! c "workspace/didChangeWatchedFiles"
+                       {:changes [{:uri (.as_uri python-file) :type 1}]})
+        (is (empty? (result! c "workspace/symbol" {:query "leaked"}))))
+      (.unlink file)
+      (notification! c "workspace/didChangeWatchedFiles" {:changes [{:uri uri :type 3}]})
+      (is (empty? (result! c "workspace/symbol" {:query "value"})))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest refer-declarations-participate-in-rename-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        provider (.joinpath root "provider.lpy") consumer (.joinpath root "consumer.lpy")
+        uri (.as_uri consumer) c (client root)
+        source "(ns consumer (:require [provider :refer [greet]]))\n(greet)"]
+    (try
+      (.write_text provider "(ns provider)\n(defn greet [] 1)" ** :encoding "utf-8")
+      (.write_text consumer source ** :encoding "utf-8")
+      (initialize! c root)
+      (open! c uri source)
+      (let [edit (result! c "textDocument/rename" (assoc (at uri 1 3) :newName "welcome"))]
+        (is (= 3 (count (mapcat :edits (:documentChanges edit))))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns consumer (:require [provider :refer [greet] :rename {greet hello}]))\n(hello)"}]})
+      (diagnostics! c 2)
+      (is (= -32602 (get-in (request! c "textDocument/rename"
+                                      (assoc (at uri 1 3) :newName "welcome")) [:error :code])))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest generated-constructor-rename-is-rejected-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "records.lpy")) c (client root)]
+    (try
+      (initialize! c root)
+      (open! c uri "(ns records)\n(defrecord Foo [x])\n(->Foo 1)")
+      (doseq [position [(at uri 1 12) (at uri 2 3)]]
+        (is (nil? (result! c "textDocument/prepareRename" position)))
+        (is (= -32602 (get-in (request! c "textDocument/rename"
+                                        (assoc position :newName "Bar")) [:error :code]))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns records)\n(defprotocol P (f [this]))\n(deftype T [] P (f [this] 1))\n(f (->T))"}]})
+      (diagnostics! c 2)
+      (is (nil? (result! c "textDocument/prepareRename" (at uri 3 1))))
+      (is (= -32602 (get-in (request! c "textDocument/rename"
+                                      (assoc (at uri 3 1) :newName "g")) [:error :code])))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest completion-respects-namespace-configuration-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "names.lpy")) c (client root)
+        source "(ns names (:refer-clojure :exclude [map] :rename {inc advance}) (:require [basilisp.string :as str :refer [upper-case]]))\nma\nad\nupper\nstr/up"]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (let [labels (fn [line column]
+                     (set (map :label (:items (result! c "textDocument/completion" (at uri line column))))))]
+        (is (not (contains? (labels 1 2) "map")))
+        (is (contains? (labels 2 2) "advance"))
+        (is (contains? (labels 3 5) "upper-case"))
+        (is (contains? (labels 4 6) "str/upper-case")))
+      (finally (stop! c) (.cleanup temp)))))
+
+(defn- next-diagnostics! [client uri predicate]
+  (loop []
+    (let [message (.get (:messages client) ** :timeout 20)
+          params (:params message)]
+      (if (and (= "textDocument/publishDiagnostics" (:method message))
+               (= uri (:uri params)) (predicate (:diagnostics params)))
+        params
+        (recur)))))
+
+(deftest edits-refresh-open-dependent-diagnostics-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        provider (.joinpath root "provider.lpy") consumer (.joinpath root "consumer.lpy")
+        provider-uri (.as_uri provider) consumer-uri (.as_uri consumer) c (client root)
+        provider-source "(ns provider)\n(defn value [] 1)"
+        consumer-source "(ns consumer (:require [provider :as p]))\n(p/value)"]
+    (try
+      (.write_text provider provider-source ** :encoding "utf-8")
+      (.write_text consumer consumer-source ** :encoding "utf-8")
+      (initialize! c root)
+      (open! c provider-uri provider-source)
+      (open! c consumer-uri consumer-source)
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri provider-uri :version 2}
+                      :contentChanges [{:text "(ns provider)\n(defn other [] 1)"}]})
+      (let [diagnostics (next-diagnostics! c consumer-uri
+                                           #(some (fn [d] (= "unresolved-var" (:code d))) %))]
+        (is (= 1 (:version diagnostics))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri provider-uri :version 3}
+                      :contentChanges [{:text provider-source}]})
+      (is (empty? (:diagnostics (next-diagnostics! c consumer-uri empty?))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest workspace-folders-and-watch-registration-test
+  (let [temp (tempfile/TemporaryDirectory) base (pathlib/Path (.-name temp))
+        root (.joinpath base "first") added (.joinpath base "second")
+        _ (.mkdir root) _ (.mkdir added)
+        _ (.write_text (.joinpath added "extra.lpy") "(ns extra)\n(def external-value 1)" ** :encoding "utf-8")
+        c (client root)]
+    (try
+      (result! c "initialize"
+               {:processId nil :rootUri (.as_uri root)
+                :capabilities {:workspace {:didChangeWatchedFiles {:dynamicRegistration true}}}})
+      (notification! c "initialized" {})
+      (let [registration (.get (:messages c) ** :timeout 20)]
+        (is (= "client/registerCapability" (:method registration)))
+        (is (= "workspace/didChangeWatchedFiles"
+               (get-in registration [:params :registrations 0 :method])))
+        (send! c {:id (:id registration) :result nil}))
+      (is (empty? (result! c "workspace/symbol" {:query "external"})))
+      (notification! c "workspace/didChangeWorkspaceFolders"
+                     {:event {:added [{:uri (.as_uri added) :name "second"}] :removed []}})
+      (is (= ["external-value"] (mapv :name (result! c "workspace/symbol" {:query "external"}))))
+      (notification! c "workspace/didChangeWorkspaceFolders"
+                     {:event {:added [] :removed [{:uri (.as_uri added) :name "second"}]}})
+      (is (empty? (result! c "workspace/symbol" {:query "external"})))
+      (finally (stop! c) (.cleanup temp)))))

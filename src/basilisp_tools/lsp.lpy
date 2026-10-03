@@ -1,0 +1,614 @@
+(ns basilisp-tools.lsp
+  "The blt stdio language server. Analysis snapshots are immutable; pygls owns
+  JSON-RPC transport, lifecycle, cancellation and negotiated position encoding."
+  (:require [basilisp.string :as str]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.check :as check]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.python :as py]
+            [basilisp-tools.syntax :as syntax])
+  (:import [asyncio] [functools] [logging] [os] [pathlib] [re] [sys]
+           [importlib.metadata :as metadata]
+           [lsprotocol.types :as lsp]
+           [pygls.exceptions :as errors]
+           [pygls.lsp.server :as server]
+           [pygls.uris :as uris]
+           [pygls.workspace :as workspace]))
+
+(def ^:private excluded-directories
+  #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" "node_modules"
+    "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
+
+(defn- failure [message]
+  (throw (errors/JsonRpcInvalidParams message)))
+
+(defn- file-path [uri]
+  (when (.startswith uri "file://")
+    (some-> (uris/to_fs_path uri) pathlib/Path)))
+
+(defn- snapshot [ls uri]
+  (let [document (.get_text_document (.-workspace ls) uri)]
+    (workspace/TextDocument uri ** :source (.-source document)
+                            :version (.-version document)
+                            :position_codec (.-position_codec (.-workspace ls)))))
+
+(defn- source-file [document]
+  (if-let [path (file-path (.-uri document))] (str path) (.-uri document)))
+
+(defn- span [document start end]
+  (lsp/Range (.client_position_at_offset document (max 0 start))
+             (.client_position_at_offset document (max start end))))
+
+(defn- location [state item]
+  (when-let [filename (:filename item)]
+    (try
+      (let [uri (.as_uri (.absolute (pathlib/Path filename)))
+            document (or (get-in @state [:documents uri])
+                         (workspace/TextDocument uri ** :position_codec (:codec @state)))]
+        (lsp/Location
+         uri (if (contains? item :start)
+               (span document (:start item) (:end item (:start item)))
+               (let [row (max 0 (dec (:row item 1))) col (max 0 (dec (:col item 1)))]
+                 (lsp/Range (.position_to_client_units document (lsp/Position row col))
+                            (.position_to_client_units document
+                                                       (lsp/Position row (+ col (count (:name item ""))))))))))
+      (catch python/OSError _ nil))))
+
+(defn- declaration-index [documents]
+  (reduce (fn [index document]
+            (let [info (analyzer/declarations (.-source document)
+                                              {:filename (source-file document)})]
+              (if-let [ns (:namespace info)]
+                (assoc index ns (:definitions info)) index)))
+          {} (vals documents)))
+
+(defn- discover [roots codec]
+  (let [documents (atom {})]
+    (doseq [root roots
+            [directory dirs files] (iterator-seq (os/walk root ** :followlinks false))]
+      (let [keep (filterv #(not (contains? excluded-directories %)) dirs)]
+        (.clear dirs)
+        (.extend dirs keep))
+      (doseq [name files :when (.endswith name ".lpy")
+              :let [path (.joinpath (pathlib/Path directory) name)]
+              :when (not (.is_symlink path))]
+        (try
+          (let [uri (.as_uri (.absolute path))]
+            (swap! documents assoc uri
+                   (workspace/TextDocument uri ** :source (.read_text path ** :encoding "utf-8")
+                                           :position_codec codec)))
+          (catch python/OSError _ nil)
+          (catch python/UnicodeError _ nil))))
+    {:documents @documents :project (declaration-index @documents)}))
+
+(defn- analyze-document [document project options]
+  (let [filename (source-file document)
+        config (check/load-config {:filename filename})]
+    (analyzer/analyze (.-source document)
+                      {:filename filename :project project :config config
+                       :python-options options})))
+
+(defn- diagnostic [document finding]
+  (lsp/Diagnostic
+   (span document (:start finding 0) (:end finding (:start finding 0)))
+   (:message finding)
+   ** :severity (case (:level finding)
+                  :warning (.-Warning lsp/DiagnosticSeverity)
+                  :info (.-Information lsp/DiagnosticSeverity)
+                  (.-Error lsp/DiagnosticSeverity))
+   :source "blt" :code (name (:type finding :syntax))))
+
+(defn- publish! [ls document analysis]
+  (.text_document_publish_diagnostics
+   ls (lsp/PublishDiagnosticsParams
+       (.-uri document) (python/list (map #(diagnostic document %) (:findings analysis)))
+       ** :version (.-version document))))
+
+(defasync ^:private wait-index! [state]
+  (when-let [task (:index-task @state)]
+    (await (asyncio/shield task))
+    (when-not (identical? task (:index-task @state)) (await (wait-index! state)))))
+
+(defasync ^:private wait-reloads! [state]
+  (when (seq (:reloads @state))
+    (await (asyncio/shield
+            (apply (functools/partial asyncio/gather ** :return_exceptions true)
+                   (vals (:reloads @state)))))))
+
+(defasync ^:private project! [state]
+  (await (wait-reloads! state))
+  (let [generation (:generation @state) cached (:project-cache @state)]
+    (if (= generation (:generation cached))
+      (:project cached)
+      (let [pending (:project-pending @state)
+            task (if (= generation (:generation pending))
+                   (:task pending)
+                   (let [task (asyncio/create_task
+                               (asyncio/to_thread declaration-index (:documents @state)))]
+                     (swap! state assoc :project-pending {:generation generation :task task})
+                     task))
+            project (await (asyncio/shield task))]
+        (when (= generation (:generation @state))
+          (swap! state assoc :project-cache {:generation generation :project project}))
+        project))))
+
+(defasync ^:private analyzed! [state uri]
+  (await (wait-index! state))
+  (let [document (get-in @state [:documents uri])
+        generation (:generation @state)
+        cached (get-in @state [:analyses uri])]
+    (when document
+      (if (and (= (.-source document) (:source cached))
+               (= generation (:generation cached)))
+        (:analysis cached)
+        (let [project (await (project! state))
+              result (await (asyncio/to_thread analyze-document document project (:options @state)))]
+          (if (and (= generation (:generation @state))
+                   (= (.-source document) (some-> (get-in @state [:documents uri]) .-source)))
+            (do (swap! state assoc-in [:analyses uri]
+                       {:source (.-source document) :generation generation :analysis result})
+                result)
+            (await (analyzed! state uri))))))))
+
+(defasync ^:private refresh! [ls state uri]
+  ;; Edits arriving during this debounce share one analysis, and a stale result
+  ;; never overwrites diagnostics from a more recent document version.
+  (await (asyncio/sleep 0.08))
+  (let [document (get-in @state [:documents uri])
+        version (some-> document .-version)]
+    (when document
+      (try
+        (let [result (await (analyzed! state uri))]
+          (when (and (contains? (:open @state) uri)
+                     (= version (some-> (get-in @state [:documents uri]) .-version))
+                     (identical? document (get-in @state [:documents uri])))
+            (publish! ls document result)))
+        (catch python/Exception e
+          (when (and (contains? (:open @state) uri)
+                     (= version (some-> (get-in @state [:documents uri]) .-version))
+                     (identical? document (get-in @state [:documents uri])))
+            (publish! ls document {:findings [{:type :configuration :level :error
+                                               :start 0 :end 0 :message (str e)}]})))))))
+
+(defn- changed! [ls state params]
+  (let [uri (.-uri (.-text_document params))]
+    (when-let [task (get-in @state [:tasks uri])] (.cancel task))
+    (swap! state (fn [value]
+                   (-> value (assoc-in [:documents uri] (snapshot ls uri))
+                       (update :generation inc) (update :open conj uri))))
+    (doseq [uri (:open @state)]
+      (when-let [task (get-in @state [:tasks uri])] (.cancel task))
+      (swap! state assoc-in [:tasks uri] (asyncio/create_task (refresh! ls state uri))))))
+
+(defasync ^:private index! [state roots]
+  (let [result (await (asyncio/to_thread discover roots (:codec @state)))]
+    (when (= (set roots) (set (:roots @state)))
+      (swap! state update :documents #(merge (:documents result) %))
+      (swap! state update :generation inc))))
+
+(defasync ^:private closed! [state uri]
+  (when-let [path (file-path uri)]
+    (when (= ".lpy" (.-suffix path))
+      (try
+        (let [source (await (asyncio/to_thread #(.read_text path ** :encoding "utf-8")))]
+          (when-not (contains? (:open @state) uri)
+            (swap! state assoc-in [:documents uri]
+                   (workspace/TextDocument uri ** :source source :position_codec (:codec @state)))
+            (swap! state update :generation inc)))
+        (catch python/OSError _ nil)
+        (catch python/UnicodeError _ nil)))))
+
+(defn- occurrence [analysis offset]
+  (first
+   (filter #(and (<= (:start % 0) offset) (< offset (:end % 0)))
+           (concat (:local-usages analysis) (:locals analysis)
+                   (:var-usages analysis) (:var-definitions analysis)
+                   (:python-usages analysis)))))
+
+(defn- identity-of [item]
+  (if-let [id (:id item)]
+    [:local id]
+    (when-let [definition (or (:definition item) (when (:ns item) item))]
+      (when (and (:ns definition) (:name definition))
+        [:var (:ns definition) (:name definition)]))))
+
+(defn- definition-of [analysis item]
+  (or (:definition item)
+      (when (:id item) (first (filter #(= (:id %) (:id item)) (:locals analysis))))
+      (when (some #(= % item) (:var-definitions analysis)) item)))
+
+(defasync ^:private query! [state params]
+  (let [uri (.-uri (.-text_document params))
+        analysis (await (analyzed! state uri))
+        document (get-in @state [:documents uri])
+        offset (.offset_at_position document (.-position params))]
+    {:uri uri :document document :analysis analysis :offset offset
+     :item (or (occurrence analysis offset)
+               (when (pos? offset) (occurrence analysis (dec offset))))}))
+
+(defasync ^:private all-analyses! [state]
+  (await (wait-index! state))
+  (await (wait-reloads! state))
+  (loop [uris (keys (:documents @state)) result {}]
+    (if-let [uri (first uris)]
+      (recur (rest uris) (assoc result uri (await (analyzed! state uri))))
+      result)))
+
+(defn- occurrences [analyses identity declarations?]
+  (for [[uri analysis] analyses
+        item (concat (:local-usages analysis) (:var-usages analysis)
+                     (for [[_alias referred] (:refers analysis)
+                           :when (not (:all referred))
+                           node (distinct (remove nil? [(:node referred) (:refer-node referred)
+                                                        (:rename-node referred)]))]
+                       (merge node {:filename (or (some-> uri file-path str) uri)
+                                    :name (:name referred) :ns (:ns referred)}))
+                     (when declarations? (concat (:locals analysis) (:var-definitions analysis))))
+        :when (= identity (identity-of item))]
+    [uri item]))
+
+(defn- markdown [definition]
+  (let [signature (or (:signature definition)
+                      (when (seq (:arglists definition))
+                        (str/join " " (:arglists definition))))
+        doc (:doc definition)]
+    (lsp/MarkupContent (.-PlainText lsp/MarkupKind)
+                       (str (:name definition "") (when signature (str " " signature)) (when (seq doc) (str "\n\n" doc))))))
+
+(defn- definition-kind [definition]
+  (if (or (:macro definition) (seq (:arglists definition)))
+    (.-Function lsp/SymbolKind) (.-Variable lsp/SymbolKind)))
+
+(defn- map-binding? [document definition]
+  (let [offset (:start definition)
+        ancestors (filter #(and (<= (:start %) offset) (< offset (:end %)))
+                          (syntax/nodes (:root (syntax/parse (.-source document)))))
+        list-start (:start (last (filter #(= :list (:kind %)) ancestors)) -1)]
+    ;; Map destructuring may encode keyword names and :or defaults. Renaming its
+    ;; token alone would silently change the lookup key, so decline the edit.
+    (some #(and (= :map (:kind %)) (> (:start %) list-start)) ancestors)))
+
+(defn- type-or-protocol-binding? [document definition]
+  (let [offset (:start definition)]
+    (some (fn [node]
+            (when (and (= :list (:kind node)) (<= (:start node) offset) (< offset (:end node)))
+              (contains? #{"defrecord" "deftype" "defprotocol"}
+                         (last (str/split (or (:text (first (syntax/forms node))) "") #"/")))))
+          (syntax/nodes (:root (syntax/parse (.-source document)))))))
+
+(defn- editable-definition? [state analysis item]
+  (when-let [definition (definition-of analysis item)]
+    (when-let [document (some #(when (= (:filename definition) (source-file %)) %)
+                              (vals (:documents @state)))]
+      (and (contains? definition :start)
+           (not (.startswith (:name definition "") "%"))
+           ;; Generated constructors share the type's declaration token. Their
+           ;; names must be renamed as a group, which this operation declines.
+           (= (:name definition) (subs (.-source document) (:start definition) (:end definition)))
+           (not (some #(and (= (:start definition) (:start %))
+                            (= (:filename definition) (:filename %))
+                            (not= (:name definition) (:name %)))
+                      (vals (get-in @state [:project-cache :project (:ns definition)]))))
+           (not (type-or-protocol-binding? document definition))
+           (not (and (:id definition) (map-binding? document definition)))))))
+
+(defn- name-span [document item]
+  ;; A qualified use edits only the name, leaving its namespace alias intact.
+  (let [end (:end item) source (.-source document)
+        token (subs source (:start item) end)
+        suffix (last (str/split token #"/"))]
+    (span document (- end (count suffix)) end)))
+
+(defn- workspace-edit [state changes]
+  (if (:document-changes? @state)
+    (lsp/WorkspaceEdit ** :document_changes (python/list changes))
+    (lsp/WorkspaceEdit
+     ** :changes (python/dict
+                  (python/list (map #(vector (.-uri (.-text_document %)) (.-edits %)) changes))))))
+
+(defn- valid-name? [name]
+  (let [tree (syntax/parse name) forms (syntax/forms (:root tree))]
+    (and (empty? (:diagnostics tree)) (= 1 (count forms))
+         (= :symbol (:kind (first forms))) (= name (:text (first forms)))
+         (not (str/includes? name "/")) (not (str/includes? name "."))
+         (not (.startswith name "%"))
+         (not (contains? #{"&" "**" "if" "do" "let*" "letfn*" "fn*" "quote" "var"
+                           "def" "set!" "try" "catch" "finally" "throw" "new" "await" "recur"}
+                         name)))))
+
+(defn- completion-item [label definition range]
+  (lsp/CompletionItem
+   label ** :kind (case (:kind definition)
+                    :class (.-Class lsp/CompletionItemKind)
+                    :module (.-Module lsp/CompletionItemKind)
+                    :function (.-Function lsp/CompletionItemKind)
+                    (if (seq (:arglists definition)) (.-Function lsp/CompletionItemKind)
+                        (.-Variable lsp/CompletionItemKind)))
+   :detail (or (:signature definition) (:ns definition))
+   :documentation (when (:doc definition) (markdown definition))
+   :text_edit (lsp/TextEdit range label)))
+
+(defn- completion-prefix [document offset]
+  (let [source (subs (.-source document) 0 offset)
+        match (re/search "[^\\s,()\\[\\]{}\";@^~\\\\]*$" source)]
+    (if match (.group match 0) "")))
+
+(defn- method-candidates [analysis offset prefix options]
+  (let [tree (syntax/parse (:source analysis))
+        form (last (filter #(and (= :list (:kind %)) (<= (:start %) offset) (<= offset (:end %)))
+                           (syntax/nodes (:root tree))))
+        receiver (:text (second (syntax/forms form)))
+        local (last (sort-by :start
+                             (filter #(and (= receiver (:name %))
+                                           (<= (:scope-start % 0) offset) (<= offset (:scope-end % offset)))
+                                     (:locals analysis))))
+        type (:python-type local)]
+    (when type
+      (let [info (py/inspect-path (:module type) (:path type) options)
+            attribute? (.startswith prefix ".-")
+            suffix (subs prefix (if attribute? 2 1))]
+        (for [[name definition] (:members info) :when (.startswith name suffix)]
+          [(str (if attribute? ".-" ".") name) (py/bind-member definition)])))))
+
+(defn- completion-candidates [analysis offset prefix options]
+  (cond
+    (.startswith prefix ".") (method-candidates analysis offset prefix options)
+    (str/includes? prefix "/")
+    (let [[alias member-prefix] (str/split prefix #"/" 2)
+          module (:name (get (:imports analysis) alias))]
+      (if module
+        (let [info (py/inspect-module module options)]
+          (for [[name definition] (:members info) :when (.startswith name member-prefix)]
+            [(str alias "/" name) definition]))
+        (let [ns (get (:aliases analysis) alias alias)]
+          (for [[name definition] (analyzer/namespace-symbols ns {:project (:project analysis)})
+                :when (and (not (:private definition)) (.startswith name member-prefix))]
+            [(str alias "/" name) definition]))))
+    :else
+    (concat
+     (for [local (:locals analysis)
+           :when (and (<= (:scope-start local 0) offset) (<= (:end local 0) offset)
+                      (<= offset (:scope-end local offset)) (.startswith (:name local) prefix))]
+       [(:name local) local])
+     (for [[name definition] (:definitions analysis) :when (.startswith name prefix)]
+       [name definition])
+     (for [[alias referred] (:refers analysis) :when (.startswith alias prefix)
+           :let [definition (get (analyzer/namespace-symbols (:ns referred) {:project (:project analysis)})
+                                 (:name referred))]
+           :when definition]
+       [alias definition])
+     (for [[alias original] (:core-renamed analysis) :when (.startswith alias prefix)]
+       [alias (get (analyzer/core-symbols) original)])
+     (for [[name definition] (analyzer/core-symbols)
+           :when (and (.startswith name prefix)
+                      (not (contains? (:core-excluded analysis) name))
+                      (not (some #{name} (vals (:core-renamed analysis))))
+                      (or (nil? (:core-only analysis)) (contains? (:core-only analysis) name)))]
+       [name definition]))))
+
+(defn create-server
+  "Create a fresh server. The options map is forwarded to Python inspection."
+  ([] (create-server {}))
+  ([options]
+   (let [ls (server/LanguageServer "blt" (metadata/version "basilisp-tools"))
+         state (atom {:documents {} :analyses {} :tasks {} :reloads {} :open #{}
+                      :generation 0 :options options})
+         feature (fn [method handler & [opts]] ((.feature ls method opts) handler))]
+     (feature lsp/INITIALIZE
+              (fn [params]
+                (let [codec (.-position_codec (.-workspace ls))
+                      roots (or (seq (keep #(some-> (.-uri %) file-path str)
+                                           (or (.-workspace_folders params) [])))
+                                (when-let [root (some-> (.-root_uri params) file-path str)] [root])
+                                [])
+                      paths (vec (mapcat #(vector % (str (.joinpath (pathlib/Path %) "src"))) roots))
+                      workspace-capabilities (.-workspace (.-capabilities params))
+                      edit-capabilities (when workspace-capabilities (.-workspace_edit workspace-capabilities))]
+                  (swap! state assoc :roots (vec roots) :watch-registration?
+                         (some-> workspace-capabilities .-did_change_watched_files .-dynamic_registration))
+                  (swap! state assoc :document-changes?
+                         (and edit-capabilities (.-document_changes edit-capabilities)))
+                  (let [executable (or (:python-executable options)
+                                       (some (fn [root]
+                                               (some (fn [name]
+                                                       (let [path (.joinpath (pathlib/Path root) name)]
+                                                         (when (.is_file path) (str path))))
+                                                     [".venv/bin/python" ".venv/Scripts/python.exe"]))
+                                             roots)
+                                       sys/executable)]
+                    (swap! state assoc :codec codec
+                           :options (assoc options :python-paths paths :python-executable executable)))
+                  (swap! state assoc :index-task (asyncio/create_task (index! state roots))))))
+     (feature lsp/INITIALIZED
+              (fn [_params]
+                (when (:watch-registration? @state)
+                  (.client_register_capability
+                   ls (lsp/RegistrationParams
+                       #py [(lsp/Registration
+                             "blt-source-files" lsp/WORKSPACE_DID_CHANGE_WATCHED_FILES
+                             (lsp/DidChangeWatchedFilesRegistrationOptions
+                              #py [(lsp/FileSystemWatcher "**/*.lpy")
+                                   (lsp/FileSystemWatcher "**/*.py")
+                                   (lsp/FileSystemWatcher "**/*.pyi")
+                                   (lsp/FileSystemWatcher "**/config.edn")
+                                   (lsp/FileSystemWatcher "**/project.clj")
+                                   (lsp/FileSystemWatcher "**/*cljfmt.edn")]))])))))
+     (feature lsp/WORKSPACE_DID_CHANGE_WORKSPACE_FOLDERS
+              (fn [params]
+                (let [event (.-event params)
+                      removed (set (keep #(some-> (.-uri %) file-path str) (.-removed event)))
+                      added (keep #(some-> (.-uri %) file-path str) (.-added event))
+                      roots (vec (distinct (concat (remove removed (:roots @state)) added)))]
+                  (swap! state
+                         (fn [value]
+                           (-> value
+                               (assoc :roots roots)
+                               (update :documents
+                                       #(into {} (remove
+                                                  (fn [[uri _document]]
+                                                    (and (not (contains? (:open value) uri))
+                                                         (some (fn [root]
+                                                                 (when-let [path (file-path uri)]
+                                                                   (.is_relative_to path (pathlib/Path root))))
+                                                               removed))) %)))
+                               (assoc :analyses {}) (update :generation inc)
+                               (assoc-in [:options :python-paths]
+                                         (vec (mapcat #(vector % (str (.joinpath (pathlib/Path %) "src"))) roots))))))
+                  (swap! state assoc :index-task (asyncio/create_task (index! state roots)))
+                  (doseq [uri (:open @state)]
+                    (when-let [task (get-in @state [:tasks uri])] (.cancel task))
+                    (swap! state assoc-in [:tasks uri] (asyncio/create_task (refresh! ls state uri)))))))
+     (feature lsp/TEXT_DOCUMENT_DID_OPEN #(changed! ls state %))
+     (feature lsp/TEXT_DOCUMENT_DID_CHANGE #(changed! ls state %))
+     (feature lsp/TEXT_DOCUMENT_DID_SAVE #(changed! ls state %))
+     (feature lsp/TEXT_DOCUMENT_DID_CLOSE
+              (fn [params]
+                (let [uri (.-uri (.-text_document params))]
+                  (when-let [task (get-in @state [:tasks uri])] (.cancel task))
+                  (swap! state (fn [value]
+                                 (-> value (update :open disj uri)
+                                     (update :documents dissoc uri)
+                                     (update :analyses dissoc uri)
+                                     (update :tasks dissoc uri)
+                                     (update :generation inc))))
+                  (.text_document_publish_diagnostics ls (lsp/PublishDiagnosticsParams uri #py []))
+                  (swap! state assoc-in [:reloads uri] (asyncio/create_task (closed! state uri))))))
+     (feature lsp/WORKSPACE_DID_CHANGE_WATCHED_FILES
+              (fn [params]
+                (doseq [change (.-changes params)
+                        :let [uri (.-uri change) path (file-path uri)]
+                        :when path]
+                  (when (and (= ".lpy" (.-suffix path)) (not (contains? (:open @state) uri)))
+                    (when-let [task (get-in @state [:reloads uri])] (.cancel task))
+                    (swap! state (fn [value]
+                                   (-> value (update :documents dissoc uri)
+                                       (update :analyses dissoc uri) (update :reloads dissoc uri))))
+                    (when-not (= (.-type change) (.-Deleted lsp/FileChangeType))
+                      (swap! state assoc-in [:reloads uri] (asyncio/create_task (closed! state uri)))))
+                  (when (#{".py" ".pyi"} (.-suffix path)) (py/clear-cache!))
+                  (swap! state update :generation inc))
+                (doseq [uri (:open @state)]
+                  (when-let [task (get-in @state [:tasks uri])] (.cancel task))
+                  (swap! state assoc-in [:tasks uri] (asyncio/create_task (refresh! ls state uri))))))
+     (feature lsp/TEXT_DOCUMENT_HOVER
+              (fn ^:async handler [params]
+                (let [{:keys [analysis document item]} (await (query! state params))]
+                  (when-let [definition (definition-of analysis item)]
+                    (lsp/Hover (markdown definition)
+                               ** :range (span document (:start item) (:end item)))))))
+     (feature lsp/TEXT_DOCUMENT_DEFINITION
+              (fn ^:async handler [params]
+                (let [{:keys [analysis item]} (await (query! state params))]
+                  (location state (definition-of analysis item)))))
+     (feature lsp/TEXT_DOCUMENT_REFERENCES
+              (fn ^:async handler [params]
+                (let [{:keys [item]} (await (query! state params))]
+                  (python/list
+                   (keep (fn [[_uri entry]] (location state entry))
+                         (when-let [identity (identity-of item)]
+                           (occurrences (await (all-analyses! state)) identity
+                                        (.-include_declaration (.-context params)))))))))
+     (feature lsp/TEXT_DOCUMENT_PREPARE_RENAME
+              (fn ^:async handler [params]
+                (let [{:keys [document item analysis]} (await (query! state params))]
+                  (when (and (identity-of item) (editable-definition? state analysis item))
+                    (name-span document item)))))
+     (feature lsp/TEXT_DOCUMENT_RENAME
+              (fn ^:async handler [params]
+                (let [{:keys [item analysis]} (await (query! state params))
+                      identity (identity-of item)
+                      name (.-new_name params)]
+                  (when-not (and identity (editable-definition? state analysis item) (valid-name? name))
+                    (failure "Only resolved Basilisp bindings can be renamed to an unqualified symbol."))
+                  (let [generation (:generation @state)
+                        analyses (await (all-analyses! state))
+                        matches (occurrences analyses identity true)
+                        uris (set (map first matches))]
+                    (doseq [[_uri analysis] analyses
+                            [_alias referred] (:refers analysis)
+                            :when (and (:renamed referred)
+                                       (= identity [:var (:ns referred) (:name referred)]))]
+                      (failure "Renaming a var used through :rename requires updating its alias declarations manually."))
+                    (when (or (contains? (analyzer/core-symbols) name)
+                              (some (fn [uri]
+                                      (or (contains? (:imports (get analyses uri)) name)
+                                          (contains? (:refers (get analyses uri)) name)))
+                                    uris))
+                      (failure (str "Rename would conflict with a core or imported binding: " name)))
+                    (doseq [uri uris
+                            definition (concat (:locals (get analyses uri))
+                                               (:var-definitions (get analyses uri)))
+                            :when (and (= name (:name definition))
+                                       (not= identity (identity-of definition)))]
+                      (failure (str "Rename would conflict with an existing binding: " name)))
+                    (when-not (= generation (:generation @state))
+                      (throw (errors/JsonRpcContentModified "The workspace changed during rename.")))
+                    (workspace-edit
+                     state (python/list
+                            (for [[uri entries] (group-by first matches)
+                                  :let [document (get-in @state [:documents uri])]]
+                              (lsp/TextDocumentEdit
+                               (lsp/OptionalVersionedTextDocumentIdentifier uri (.-version document))
+                               (python/list
+                                (map (fn [[_ entry]] (lsp/TextEdit (name-span document entry) name))
+                                     entries)))))))))
+              (lsp/RenameOptions ** :prepare_provider true))
+     (feature lsp/TEXT_DOCUMENT_COMPLETION
+              (fn ^:async handler [params]
+                (let [{:keys [document analysis offset]} (await (query! state params))
+                      prefix (completion-prefix document offset)
+                      project (await (project! state))
+                      candidates (await (asyncio/to_thread completion-candidates
+                                                           (assoc analysis :project project :source (.-source document))
+                                                           offset prefix (:options @state)))
+                      range (span document (- offset (count prefix)) offset)]
+                  (lsp/CompletionList false
+                                      (python/list
+                                       (map (fn [[label definition]]
+                                              (completion-item label definition range))
+                                            (sort-by first (into {} (reverse candidates))))))))
+              (lsp/CompletionOptions ** :trigger_characters #py ["/" "."]))
+     (feature lsp/TEXT_DOCUMENT_DOCUMENT_SYMBOL
+              (fn ^:async handler [params]
+                (let [uri (.-uri (.-text_document params))
+                      analysis (await (analyzed! state uri))
+                      document (get-in @state [:documents uri])]
+                  (python/list
+                   (for [definition (:var-definitions analysis)]
+                     (lsp/DocumentSymbol (:name definition) (definition-kind definition)
+                                         (span document (:scope-start definition (:start definition))
+                                               (:scope-end definition (:end definition)))
+                                         (span document (:start definition) (:end definition))))))))
+     (feature lsp/WORKSPACE_SYMBOL
+              (fn ^:async handler [params]
+                (let [query (.lower (.-query params))]
+                  (python/list
+                   (for [[_uri analysis] (await (all-analyses! state))
+                         definition (:var-definitions analysis)
+                         :when (str/includes? (.lower (:name definition)) query)
+                         :let [loc (location state definition)]
+                         :when loc]
+                     (lsp/SymbolInformation loc (:name definition) (definition-kind definition)
+                                            ** :container_name (:ns definition)))))))
+     (feature lsp/TEXT_DOCUMENT_FORMATTING
+              (fn ^:async handler [params]
+                (let [uri (.-uri (.-text_document params))
+                      document (get-in @state [:documents uri])
+                      source (.-source document)
+                      path (file-path uri)
+                      options (await (asyncio/to_thread fmt/load-config
+                                                        (if path (.-parent path) (.cwd pathlib/Path))))
+                      formatted (await (asyncio/to_thread fmt/format-string source options))]
+                  (when (identical? document (get-in @state [:documents uri]))
+                    (if (= source formatted) #py []
+                        #py [(lsp/TextEdit (span document 0 (count source)) formatted)])))))
+     (python/setattr ls "blt_state" state)
+     ls)))
+
+(defn start
+  "Serve LSP over stdin/stdout until the client exits."
+  ([] (start {}))
+  ([options]
+   (logging/basicConfig ** :level logging/WARNING)
+   (.start_io (create-server options))
+   0))

@@ -61,6 +61,7 @@ jobs:
           nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt --version
           printf '(let [x 1]\n  x)\n' | nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt format --check -
           printf '(ns wheel-smoke (:import [math])) (math/sqrt 4)\n' | nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv tool run --isolated --from "$wheel" blt check --repro -
+          nix develop --no-update-lock-file "$GITHUB_WORKSPACE" --command uv run --project "$GITHUB_WORKSPACE" --locked python "$GITHUB_WORKSPACE/scripts/smoke_lsp.py" uv tool run --isolated --from "$wheel" blt lsp
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: distributions
