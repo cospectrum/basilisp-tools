@@ -1,0 +1,60 @@
+(ns basilisp-tools.compatibility-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.format :as fmt]))
+
+(defn- formats-as [source expected options]
+  (let [actual (fmt/format-string source options)]
+    (is (= expected actual))
+    (is (= actual (fmt/format-string actual options)))))
+
+(deftest namespace-aware-indentation-test
+  (let [options {:extra-indents {'sample.storage/transaction [[:inner 0]]}}
+        body "\n(f/transaction :db\n(commit :db))\n(transaction :db\n(rollback :db))"
+        expected "\n(f/transaction :db\n  (commit :db))\n(transaction :db\n  (rollback :db))"]
+    (doseq [spec ["[sample.storage :as f :refer [transaction]]"
+                  "(sample.storage :as f :refer (transaction))"
+                  "[sample [storage :as f :refer [transaction]]]"
+                  "(sample (storage :as f :refer (transaction)))"
+                  "^:library [^:library sample.storage :as ^:alias f :refer ^:names [^:name transaction]]"
+                  "^:first ^:second [sample.storage :as f :refer [transaction]]"
+                  "[#_unused sample.storage :as #_old f :refer [#_old transaction]]"
+                  "#?(:lpy [sample.storage :as f :refer [transaction]])"
+                  "#?@(:lpy [[sample.storage :as f :refer [transaction]]])"]]
+      (testing spec
+        (let [declaration (str "(ns sample.app (:require " spec "))")]
+          (formats-as (str declaration body) (str declaration expected) options))))))
+
+(deftest conditional-head-indentation-test
+  (doseq [head ["#?(:lpy do :default identity)"
+                "#?(:lpy ^:chosen do :default identity)"]]
+    (formats-as (str "(" head "\n(save)\n(close))")
+                (str "(" head "\n  (save)\n  (close))") {}))
+  (formats-as "(ns sample.app (:require #?@(:lpy [[sample.storage :as f]])))\n(#?(:lpy f/transaction) :db\n(commit :db))"
+              "(ns sample.app (:require #?@(:lpy [[sample.storage :as f]])))\n(#?(:lpy f/transaction) :db\n  (commit :db))"
+              {:extra-indents {'sample.storage/transaction [[:inner 0]]}}))
+
+(deftest explicit-namespace-overrides-test
+  (formats-as "(ns sample.app (:require [ignored.storage :as f :refer [transaction]]))\n(f/transaction :db\n(commit :db))\n(transaction :db\n(commit :db))"
+              "(ns sample.app (:require [ignored.storage :as f :refer [transaction]]))\n(f/transaction :db\n  (commit :db))\n(transaction :db\n  (commit :db))"
+              {:extra-indents {'sample.storage/transaction [[:inner 0]]}
+               :alias-map {'f 'sample.storage}
+               :refer-map {'transaction 'sample.storage}}))
+
+(deftest metadata-namespace-name-test
+  (formats-as "(ns ^:app sample.storage)\n(transaction :db\n(commit :db))"
+              "(ns ^:app sample.storage)\n(transaction :db\n  (commit :db))"
+              {:extra-indents {'sample.storage/transaction [[:inner 0]]}}))
+
+(deftest unrelated-vectors-do-not-define-aliases-test
+  (formats-as "(ns sample.app {:example [sample.storage :as f]})\n(f/transaction :db\n(commit :db))"
+              "(ns sample.app {:example [sample.storage :as f]})\n(f/transaction :db\n               (commit :db))"
+              {:extra-indents {'sample.storage/transaction [[:inner 0]]}}))
+
+(deftest alternate-style-reader-heads-test
+  (doseq [head ["^:cached compute" "#_obsolete" "#_[obsolete]"]]
+    (formats-as (str "(" head "\nresult)")
+                (str "(" head "\n result)")
+                {:function-arguments-indentation :zprint})
+    (formats-as (str "(" head "\nresult)")
+                (str "(" head "\n  result)")
+                {:function-arguments-indentation :cursive})))

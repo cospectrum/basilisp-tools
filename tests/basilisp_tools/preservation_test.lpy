@@ -1,0 +1,217 @@
+(ns basilisp-tools.preservation-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.cli :as cli]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.syntax :as syntax])
+  (:import [importlib] [io] [pathlib] [tempfile] [unittest.mock :as mock]))
+
+(defn- structure
+  "Retain form nesting, token spelling, and comment placement; omit only layout."
+  [node]
+  (if (:children node)
+    [(:kind node)
+     (mapv structure
+           (remove #(#{:whitespace :newline} (:kind %)) (:children node)))]
+    [(:kind node) (:text node)]))
+
+(defn- assert-preserved [source options]
+  (let [before (syntax/parse source)
+        formatted (fmt/format-string source options)
+        after (syntax/parse formatted)]
+    (is (empty? (:diagnostics before)))
+    (is (empty? (:diagnostics after)))
+    (is (= (structure (:root before)) (structure (:root after))))
+    (is (= formatted (fmt/format-string formatted options)))))
+
+(def ^:private preservation-cases
+  ["(f ; end-of-line comment\n  x ;; another comment\n)"
+   "(f\n;;; section\n;; documentation\n; keep column\nx)"
+   "#_ #_ x y z"
+   "(f #_ #_ [a b] {:x 1} 'value)"
+   "^ ; metadata comment\n:private (def value 1)"
+   "(f ^{:doc \"text  with spaces\"} [x\n y])"
+   "~ @value"
+   "(f '\u0060(~ @value ~@items))"
+   "#:example {:key 1\n:other 2}"
+   "#:: {:key 1\n:other 2}"
+   "#?(:lpy (f\nx) :default #_(ignored) nil)"
+   "(f #?@(:lpy [a\nb] :default []))"
+   "(f #unknown {:value [1\n2]})"
+   "(f #py {:value #b\"bytes  \\x20\\n\"})"
+   "(f #f\"outside  {(+ x 1)}\nuntouched  \\{braces}\")"
+   "(f \"actual\n  multiline  text\" #\"a\\s+  b\" \\newline)"
+   "(f \\space \\; \\) \\u03bb)"
+   "(f ##Inf ##-Inf ##NaN 1J -2.5J)"
+   "#!/usr/bin/env basilisp\n(def x\n1)"
+   "(f  ; comment with trailing spaces  \r\n x)\r\n"
+   "{:a [1\n2] ; value comment\n :long [3\n4]}"
+   "(let [short [1\n2]\nlonger [3\n4]]\n[short longer])"])
+
+(deftest preservation-test
+  (doseq [source preservation-cases
+          options [{} {:indent-line-comments? true}
+                   {:remove-multiple-non-indenting-spaces? true}
+                   {:remove-blank-lines-in-forms? true}
+                   {:split-keypairs-over-multiple-lines? true}
+                   {:align-map-columns? true :align-form-columns? true}]]
+    (testing (str source " " options)
+      (assert-preserved source options))))
+
+(deftest collection-layout-preservation-test
+  ;; Deterministically vary leading/trailing layout and comments around
+  ;; reader macros and nested collections, without evaluating the source.
+  (doseq [[open close] [["(" ")"] ["[" "]"] ["#{" "}"] ["#(" ")"]]
+          gap [" " "  " "\n" "\n\n" ",\n" " ; attached\n" "\r\n"]
+          prefix ["'value" "#_ #_ a b c" "^:private value"]]
+    (assert-preserved (str open gap prefix gap "[1\n2]" gap close) {})))
+
+(deftest alignment-continuation-preservation-test
+  (doseq [source ["{:a  [1\n2] :b [3\n4]}"
+                  "{:a  (f\nx) :b (g\ny)}"
+                  "{:a  #{1\n2}  #(f\nx)  1}"
+                  "{:short [1\n2]\n:long-key [3\n4]}"
+                  "(let [a  [1\n2] b [3\n4]]\n[a b])"]]
+    (assert-preserved source {:align-map-columns? true :align-form-columns? true})))
+
+(deftest unsafe-rendering-is-rejected-test
+  (doseq [[source corrupted] [["(f \"original\")" "(f \"changed\")"]
+                              ["[#_x y]" "#_[x y]"]
+                              ["[(f) ; retain this comment\nx]" "[(f)\nx]"]
+                              ["(f)" "("]]
+          options [{} {:sort-ns-references? true}]]
+    (let [patch (mock/patch "basilisp_tools.format.render" ** :return_value corrupted)]
+      (.start patch)
+      (try
+        (is (= :unsafe-formatting
+               (try (fmt/format-string source options)
+                    nil
+                    (catch python/Exception error (:code (ex-data error))))))
+        (finally (.stop patch))))))
+
+(deftest unsafe-preparation-is-rejected-test
+  ;; Prepared and rendered output may agree with each other yet disagree
+  ;; with the source. Sorting permits reference order, never arbitrary
+  ;; reader attachment, nested argument order, or lost comments.
+  (doseq [[source corrupted]
+          [["(ns demo (:require [zeta] [alpha]\n;; keep this comment\n))"
+            "(ns demo (:require [alpha] [zeta]))"]
+           ["[#_x y]" "#_[x y]"]
+           ["[ns (:require [zeta] [alpha])]"
+            "[ns (:require [alpha] [zeta])]"]
+           ["(ns demo (:require [module #_x y]))"
+            "(ns demo (:require [module x #_y]))"]
+           ["(do (first) (second))" "(do (second) (first))"]
+           ["(ns demo (:require [module :refer [a b]]))"
+            "(ns demo (:require [module :refer [b a]]))"]
+           ["(ns demo (:refer-clojure :exclude [a b]))"
+            "(ns demo (:refer-clojure :exclude [b a]))"]]]
+    (testing source
+      (let [patch (mock/patch "basilisp_tools.format.prepare"
+                              ** :return_value (:root (syntax/parse corrupted)))]
+        (.start patch)
+        (try
+          (is (= :unsafe-formatting
+                 (try (fmt/format-string source {:sort-ns-references? true})
+                      nil
+                      (catch python/Exception error (:code (ex-data error))))))
+          (finally (.stop patch)))))))
+
+(deftest unsafe-batch-leaves-files-unchanged-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        first-file (.joinpath root "a.lpy")
+        second-file (.joinpath root "z.lpy")
+        config (.joinpath root "config.edn")
+        first-source "(let [x 1]\nx)"
+        second-source "(f \"ORIGINAL\")"
+        original-render (.-render (importlib/import_module "basilisp_tools.format"))
+        out (io/StringIO)
+        err (io/StringIO)
+        patches [(mock/patch "sys.stdout" out)
+                 (mock/patch "sys.stderr" err)
+                 (mock/patch "basilisp_tools.format.render"
+                             ** :side_effect
+                             (fn [node options context]
+                               (.replace (original-render node options context)
+                                         "\"ORIGINAL\"" "\"CHANGED\"")))]]
+    (try
+      (.write_text config "{}" ** :encoding "utf-8")
+      (.write_text first-file first-source ** :encoding "utf-8")
+      (.write_text second-file second-source ** :encoding "utf-8")
+      ;; Ensure the first file would be changed absent the later failure.
+      (is (not= first-source (fmt/format-string first-source)))
+      (doseq [patch patches] (.start patch))
+      (try
+        (is (= 2 (cli/main ["format" "--config" (str config) (str root)])))
+        (is (.startswith (.getvalue err) "blt: Refusing formatter output"))
+        (is (= "" (.getvalue out)))
+        (finally (doseq [patch (reverse patches)] (.stop patch))))
+      (is (= first-source (.read_text first-file ** :encoding "utf-8")))
+      (is (= second-source (.read_text second-file ** :encoding "utf-8")))
+      (is (= #{"a.lpy" "z.lpy" "config.edn"}
+             (set (map #(.-name %) (iterator-seq (.iterdir root))))))
+      (finally (.cleanup temp)))))
+
+(deftest sorted-references-retain-comments-test
+  (let [source (str "(ns demo\n"
+                    "  (:require\n"
+                    "    ;; section comment\n\n"
+                    "    [zeta] ; inline zeta comment\n"
+                    "    ;; alpha documentation\n"
+                    "    [alpha]\n\n"
+                    "    ;; dangling comment before closing\n"
+                    "    ))")
+        options {:sort-ns-references? true}
+        formatted (fmt/format-string source options)
+        root (:root (syntax/parse formatted))
+        clause (nth (syntax/forms (first (syntax/forms root))) 2)
+        references (rest (syntax/forms clause))
+        comments (fn [source]
+                   (->> (syntax/tokens (:root (syntax/parse source)))
+                        (filter #(= :comment (:kind %)))
+                        (map :text)
+                        frequencies))]
+    (is (= ["[alpha]" "[zeta]"] (mapv syntax/text references)))
+    (is (= (comments source) (comments formatted)))
+    (is (= formatted (fmt/format-string formatted options)))))
+
+(deftest sorting-only-changes-top-level-namespace-references-test
+  (doseq [source ["[ns (:require [zeta] [alpha])]"
+                  "'(ns demo (:require [zeta] [alpha]))"
+                  "(f (ns demo (:require [zeta] [alpha])))"
+                  "#_(ns demo (:require [zeta] [alpha]))"
+                  "#unknown (ns demo (:require [zeta] [alpha]))"
+                  "^:private (ns demo (:require [zeta] [alpha]))"
+                  "#?(:lpy (ns demo (:require [zeta] [alpha])))"]]
+    (testing source
+      (assert-preserved source {:sort-ns-references? true}))))
+
+(deftest concurrent-edit-survives-file-replacement-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        file (.joinpath root "sample.lpy")
+        config (.joinpath root "config.edn")
+        source "(let [x 1]\nx)"
+        latest "; concurrent editor change\n(def changed true)\n"
+        out (io/StringIO)
+        err (io/StringIO)
+        patches [(mock/patch "sys.stdout" out)
+                 (mock/patch "sys.stderr" err)
+                 ;; chmod occurs after the replacement file has been written
+                 ;; and after the first original-content check.
+                 (mock/patch "os.chmod" ** :side_effect
+                             (fn [path mode]
+                               (.write_text file latest ** :encoding "utf-8")))]]
+    (try
+      (.write_text config "{}" ** :encoding "utf-8")
+      (.write_text file source ** :encoding "utf-8")
+      (doseq [patch patches] (.start patch))
+      (try
+        (is (= 2 (cli/main ["format" "--config" (str config) (str file)])))
+        (is (.startswith (.getvalue err) "blt: File changed while formatting:"))
+        (is (= "" (.getvalue out)))
+        (finally (doseq [patch (reverse patches)] (.stop patch))))
+      (is (= latest (.read_text file ** :encoding "utf-8")))
+      (is (= #{"sample.lpy" "config.edn"}
+             (set (map #(.-name %) (iterator-seq (.iterdir root))))))
+      (finally (.cleanup temp)))))

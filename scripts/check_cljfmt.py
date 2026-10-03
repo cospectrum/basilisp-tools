@@ -1,0 +1,166 @@
+"""Compare with an external, pinned cljfmt checkout.
+
+Run with: uv run python scripts/check_cljfmt.py --cljfmt /path/to/cljfmt
+Requires Clojure and Java. No upstream source or generated fixtures are vendored.
+Add --corpus /path/to/basilisp to compare real .lpy files as well.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import importlib
+import json
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+CLJFMT_REVISION = "baab5008032945434cbca23ef5eda516e3ea97b0"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cljfmt", type=Path, required=True)
+    parser.add_argument("--corpus", type=Path)
+    parser.add_argument("--report", type=Path, help="Write a JSON report of all failures and skips.")
+    parser.add_argument("--report-only", action="store_true", help="Report mismatches without failing.")
+    args = parser.parse_args()
+    checkout = args.cljfmt.resolve()
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+    ).strip()
+    if revision != CLJFMT_REVISION:
+        parser.error(f"Expected cljfmt {CLJFMT_REVISION}, found {revision}")
+    dirty = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=checkout, text=True
+    ).strip()
+    if dirty:
+        parser.error("The cljfmt checkout must have no tracked changes.")
+
+    # Import the package first to initialize Basilisp's importer.
+    import basilisp_tools  # noqa: F401
+    from basilisp.lang.keyword import keyword as kw
+    from basilisp.lang.map import map as lmap
+
+    edn = importlib.import_module("basilisp.edn")
+    formatter = importlib.import_module("basilisp_tools.format")
+    syntax = importlib.import_module("basilisp_tools.syntax")
+
+    def tagged_reader(tag, value):
+        if str(tag) != "re":
+            raise ValueError(f"Unexpected oracle EDN tag: {tag}")
+        return re.compile(value)
+
+    with tempfile.TemporaryDirectory(prefix="blt-cljfmt-") as temporary:
+        output = Path(temporary) / "oracle.edn"
+        command = [
+            "clojure", "-Sdeps",
+            '{:paths ["cljfmt/src" "cljfmt/resources" "cljfmt/test"]}',
+            "-M", str(Path(__file__).with_name("capture_cljfmt.clj").resolve()),
+            str(output),
+        ]
+        if args.corpus:
+            command.append(str(args.corpus.resolve()))
+        subprocess.run(command, cwd=checkout, check=True)
+        captured = edn.read_string(
+            output.read_text(encoding="utf-8"),
+            lmap({kw("default"): tagged_reader}),
+        )
+
+    counts = collections.Counter()
+    findings = []
+
+    def field(value, name, default=None):
+        return value.val_at(kw(name), default)
+
+    def unsupported_reason(source, diagnostics):
+        """Only skip reader features that Basilisp deliberately does not support."""
+        reasons = set()
+        for diagnostic in diagnostics:
+            token = source[field(diagnostic, "start"):field(diagnostic, "end")]
+            code = field(diagnostic, "code")
+            if code == kw("invalid-dispatch") and source.startswith(("#^", "#="), field(diagnostic, "start")):
+                reasons.add("Clojure legacy metadata/read-eval dispatch")
+            elif code == kw("invalid-map-namespace") and token.startswith("#::"):
+                reasons.add("Clojure aliased namespaced map")
+            elif code == kw("invalid-token") and re.fullmatch(r"[\w.$]+/[1-9]", token):
+                reasons.add("Clojure 1.12 array class symbol")
+            else:
+                return None
+        return "; ".join(sorted(reasons)) if reasons else None
+
+    def compare(case, name=None, options=None):
+        source = field(case, "source")
+        name = name or field(case, "name")
+        options = options if options is not None else field(case, "options", lmap({}))
+        expected = field(case, "expected")
+        details = {"name": name, "source": source, "options": str(options)}
+        oracle_error = field(case, "oracle-error")
+        if oracle_error:
+            counts["oracle-unsupported"] += 1
+            findings.append({**details, "kind": "oracle-unsupported", "reason": oracle_error})
+            return
+        diagnostics = field(syntax.parse(source), "diagnostics")
+        if len(diagnostics):
+            reason = unsupported_reason(source, diagnostics)
+            parts = field(case, "fragments")
+            if reason and parts:
+                for index, part in enumerate(parts):
+                    compare(part, f"{name}/form-{index + 1}", options)
+                return
+            kind = "unsupported-syntax" if reason else "unexpected-parser-error"
+            counts[kind] += 1
+            findings.append({
+                **details, "kind": kind, "reason": reason or str(diagnostics)
+            })
+            return
+        try:
+            actual = formatter.format_string(source, options)
+            repeated = formatter.format_string(actual, options)
+        except Exception as exception:
+            counts["exception"] += 1
+            findings.append({**details, "kind": "exception", "reason": str(exception)})
+            return
+        if actual != expected:
+            counts["mismatch"] += 1
+            findings.append({
+                **details, "kind": "mismatch", "expected": expected, "actual": actual
+            })
+        else:
+            counts["match"] += 1
+        if repeated != actual:
+            counts["not-idempotent"] += 1
+            findings.append({
+                **details, "kind": "not-idempotent", "actual": actual, "repeated": repeated
+            })
+
+    cases = field(captured, "cases")
+    if not len(cases):
+        raise RuntimeError("The upstream suite did not produce any formatter cases.")
+    for index, case in enumerate(cases, 1):
+        compare(case)
+        if index % 100 == 0:
+            print(f"Compared {index} upstream cases.", flush=True)
+    for case in field(captured, "corpus"):
+        compare(case)
+
+    report = {
+        "cljfmt_revision": revision, "upstream_cases": len(cases),
+        "counts": dict(counts), "findings": findings,
+    }
+    if args.report:
+        args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print("cljfmt differential results:", json.dumps(dict(counts), sort_keys=True))
+    failed = sum(counts[key] for key in (
+        "mismatch", "not-idempotent", "exception", "unexpected-parser-error"
+    ))
+    for finding in [f for f in findings if f["kind"] not in {
+        "unsupported-syntax", "oracle-unsupported"
+    }][:10]:
+        print(finding["kind"], finding["name"], repr(finding["source"][:120]))
+    return 0 if args.report_only or not failed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -63,3 +63,23 @@ jobs:
           name: distributions
           path: dist/
           if-no-files-found: error
+
+  compatibility:
+    name: Compare with pinned cljfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: weavejester/cljfmt
+          ref: baab5008032945434cbca23ef5eda516e3ea97b0
+          path: .cljfmt-reference
+          persist-credentials: false
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - name: Compare upstream cases and verify idempotence
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference

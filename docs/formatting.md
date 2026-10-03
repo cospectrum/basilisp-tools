@@ -78,21 +78,66 @@ Unknown options and malformed rules produce errors.
 
 ## Compatibility and source preservation
 
-The test suite includes independent examples checked against cljfmt, covering
-default formatting, custom rules, whitespace options, alignment, namespace
-references, and idempotence. A JVM or Clojure installation is not required to
-run `blt`.
+CI compares output with cljfmt at commit
+`baab5008032945434cbca23ef5eda516e3ea97b0`, running its tests from an external
+checkout and checking that a second formatting pass changes nothing. Local
+tests also cover independent examples, generated preservation cases, and
+fault injection. A JVM or Clojure installation is not required to run `blt`.
 
-The formatter targets Basilisp source. It preserves spelling of numbers,
-symbols, reader tags, comments, and literal text, including multiline strings
-and f-string interpolation text. Reader conditionals retain all branches.
-Whitespace line endings become LF; line endings inside literals are preserved.
+Compatibility covers the supported Basilisp syntax and options above, rather
+than every Clojure reader feature. The comparison explicitly excludes legacy
+`#^` metadata, read-eval `#=`, aliased namespaced maps, and Clojure array-class
+symbols such as `String/1`. Executable `.clj` configuration, Leiningen config
+discovery, namespaced-map shorthand in EDN config, and cljfmt's CLI entry points
+are not supported. Use ordinary EDN maps, qualified keys, and `blt format`.
 
-Namespace sorting is opt-in. Clauses with comments or reader discards retain
-their order so annotations stay attached to the original references. Executable
-`.clj` configuration, Leiningen configuration discovery, and cljfmt's Clojure
-CLI entry points are not supported. Use `blt format` and EDN configuration.
+The formatter preserves token spelling and literal text, including multiline
+strings and f-string interpolation text. Reader conditionals retain all
+branches. Whitespace line endings become LF; line endings inside literals
+remain unchanged. Formatting columns follow cljfmt's UTF-16 convention; syntax
+offsets and positions count Unicode code points.
+
+Every result is parsed again before it is returned. The guard checks syntax,
+nesting, reader attachments, and token text against the original and prepared
+trees, allowing layout changes and comment trailing-space cleanup. With
+namespace sorting enabled, only reference-clause child ordering may change.
+The CLI prepares the entire batch before writing any file.
+
+Namespace sorting is opt-in. Attached comments move with their references;
+section and dangling comments are retained. This intentionally differs from
+upstream cases that drop dangling comments. Column alignment converges to a
+stable result in one invocation, including cases requiring multiple upstream
+runs. A cycle or failure to converge raises an error instead of returning
+unstable output.
 
 There is no automatic line-length wrapping. The parser has a nesting limit of
-64; input exceeding it is rejected. Syntax diagnostics prevent formatting, but
-formatting is not a substitute for compiler or semantic validation.
+64; input exceeding it is rejected. These checks do not replace compiler or
+semantic validation.
+
+## Development checks
+
+The normal suite and formatting check need only the default development shell:
+
+```sh
+nix develop --command uv run --locked basilisp test -p tests --include-unsafe-path=false
+nix develop --command uv run --locked blt format --check src tests
+```
+
+For the upstream comparison, use an unmodified cljfmt checkout at the pinned
+commit above. The separate shell supplies Clojure and Java:
+
+```sh
+nix develop .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt /path/to/cljfmt
+```
+
+Add `--corpus /path/to/basilisp` to compare real `.lpy` files, or
+`--report /tmp/cljfmt-report.json` to save mismatches and explicit skips.
+Upstream source and generated fixtures are not vendored in this project.
+
+Measure a fixed input corpus with warmup and repeated samples:
+
+```sh
+uv run --locked python scripts/benchmark.py src tests --repeat 3
+```
+
+Add `--profile /tmp/blt.prof` for a Python cProfile of a formatting pass.

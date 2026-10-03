@@ -111,6 +111,8 @@
       (with-open [stream (os/fdopen fd "wb")]
         (.write stream (.encode formatted "utf-8")))
       (os/chmod name (stat/S_IMODE (.-st_mode (.stat path))))
+      (when (or (.is_symlink path) (not= original (.read_bytes path)))
+        (error (str "File changed while formatting: " path)))
       (os/replace name path)
       (finally
         (when (pathutil/exists name) (os/unlink name))))))

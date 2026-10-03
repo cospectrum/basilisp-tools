@@ -6,7 +6,6 @@
   prefixes, whitespace and comments are leaves, so concatenating leaf text
   reproduces the input exactly, including invalid input. No runtime symbol
   resolution, macro expansion, imports or tagged-literal evaluation occurs."
-  (:require [basilisp.string :as str])
   (:import [re] [bisect] [operator :as op]))
 
 (def ^:private atom-re (re/compile "[^\\s,()\\[\\]{}\";@^~\u0060\\\\]+"))
@@ -22,6 +21,10 @@
 (def ^:private ratio-re (re/compile "(-?\\d+)/(\\d+)"))
 (def ^:private radix-re (re/compile "-?(\\d{1,2})r([0-9A-Za-z]+)"))
 (def ^:private hex-digit-re (re/compile "[0-9A-Fa-f]"))
+(def ^:private comment-re (re/compile "[^\\r\\n]*"))
+(def ^:private whitespace-re (re/compile "(?:[^\\S\\r\\n]|,)+"))
+(def ^:private string-segment-re (re/compile "[^\"\\\\]+"))
+(def ^:private interpolation-segment-re (re/compile "[^\"\\\\{]+"))
 (def ^:private close-chars #{")" "]" "}"})
 (def ^:private trivia-kinds #{:whitespace :newline :comment})
 (def ^:private non-form-kinds
@@ -51,7 +54,9 @@
 (defn text
   "Reconstruct source from a node, without normalizing spelling or whitespace."
   [node]
-  (str/join "" (map :text (tokens node))))
+  (if-let [leaf-text (:text node)]
+    leaf-text
+    (.join "" (python/map text (or (:children node) [])))))
 
 (defn node-at
   "Deepest node containing offset. Ranges are half-open; EOF returns nil."
@@ -65,7 +70,8 @@
         n))))
 
 (defn- char-at [s i]
-  (when (< i (count s)) (subs s i (inc i))))
+  ;; Fixed-arity Python operations avoid variadic sequence allocation per character.
+  (when (op/lt i (python/len s)) (op/getitem s i)))
 
 (defn- peek-char [state]
   (char-at (:source state) (:offset state)))
@@ -91,24 +97,16 @@
     (.end m)))
 
 (defn- take-trivia [state]
-  (let [s (:source state) i (:offset state) c (peek-char state)]
+  (let [i (:offset state) c (peek-char state)]
     (cond
       (or (op/eq c "\r") (op/eq c "\n"))
       (leaf state :newline (+ i (if (starts? state "\r\n") 2 1)))
 
       (or (op/eq c ";") (starts? state "#!"))
-      (leaf state :comment
-            (loop [j i]
-              (if (or (>= j (count s)) (contains? #{"\r" "\n"} (char-at s j)))
-                j (recur (inc j)))))
+      (leaf state :comment (match-end comment-re state))
 
       (and c (or (op/eq c ",") (.isspace c)))
-      (leaf state :whitespace
-            (loop [j i]
-              (let [ch (char-at s j)]
-                (if (and ch (not (contains? #{"\r" "\n"} ch))
-                         (or (op/eq ch ",") (.isspace ch)))
-                  (recur (inc j)) j))))
+      (leaf state :whitespace (match-end whitespace-re state))
       :else nil)))
 
 (defn- consume-trivia [state children]
@@ -168,7 +166,7 @@
 
 (defn- read-character [state]
   (let [s (:source state) start (:offset state) first-pos (inc start)
-        end (if (>= first-pos (count s))
+        end (if (op/ge first-pos (count s))
               first-pos
               (loop [j (inc first-pos)]
                 (if-let [c (char-at s j)]
@@ -198,7 +196,7 @@
 
       (and (op/eq kind :bytes) (op/eq c "x"))
       (let [end (loop [j (+ i 2)]
-                  (if (and (< j (+ i 4)) (char-at s j)
+                  (if (and (op/lt j (+ i 4)) (char-at s j)
                            (.fullmatch hex-digit-re (char-at s j)))
                     (recur (inc j)) j))
             state (assoc state :offset end)]
@@ -259,16 +257,17 @@
   (let [start (:offset state)
         old-closers (:closers state)
         [open state] (leaf state :delimiter (+ start (count opener)))]
-    (loop [state (update state :closers conj closer) children [open]]
+    (loop [state (assoc state :closers (conj old-closers closer)) children [open]]
       (let [c (peek-char state)]
         (cond
           (op/eq c closer)
           (let [[close state] (leaf state :delimiter (inc (:offset state)))
                 [node state] (branch kind start (conj children close)
                                      (assoc state :closers old-closers))]
-            [node (check-collection node state)])
+            [node (if (contains? #{:map :reader-conditional :reader-splice} kind)
+                    (check-collection node state) state)])
 
-          (or (nil? c) (some #(op/eq c %) old-closers))
+          (or (nil? c) (op/contains old-closers c))
           (let [state (issue state :missing-delimiter (str "Expected " closer)
                              (:offset state) (:offset state))]
             (let [[node state] (branch kind start children
@@ -300,7 +299,7 @@
                    (if (op/eq :discard (:kind child)) left (dec left)))))))))
 
 (defn- flush-string [children source start end]
-  (if (< start end)
+  (if (op/lt start end)
     (conj children {:kind :string-text :start start :end end :text (subs source start end)})
     children))
 
@@ -334,11 +333,16 @@
                                  (:start expr) (:end expr)))]
             (recur state (conj children expr) (:offset state)))
 
+          (op/eq kind :bytes)
+          (let [state (if (<= 1 (python/ord c) 127) state
+                          (issue state :invalid-byte "Byte strings require ASCII characters" i (inc i)))]
+            (recur (update state :offset inc) children segment-start))
+
           :else
-          (let [state (if (and (op/eq kind :bytes) (not (<= 1 (python/ord c) 127)))
-                        (issue state :invalid-byte "Byte strings require ASCII characters" i (inc i))
-                        state)]
-            (recur (update state :offset inc) children segment-start)))))))
+          (recur (assoc state :offset
+                        (match-end (if (op/eq kind :f-string)
+                                     interpolation-segment-re string-segment-re) state))
+                 children segment-start))))))
 
 (defn- read-prefixed-string [state kind prefix]
   (let [start (:offset state)
@@ -408,7 +412,7 @@
   (or (take-trivia state)
       (let [c (peek-char state) i (:offset state)]
         (cond
-          (> (:depth state) (:max-depth state))
+          (op/gt (:depth state) (:max-depth state))
           (let [[node state] (leaf state :error (inc i))]
             [node (issue state :nesting-limit "Maximum syntax nesting depth exceeded" i (inc i))])
           (op/eq c "(") (read-collection state :list "(" ")")

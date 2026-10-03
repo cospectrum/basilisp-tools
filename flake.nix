@@ -15,6 +15,9 @@
           default = pkgs.mkShellNoCC {
             packages = with pkgs; [ uv actionlint ];
           };
+          compatibility = pkgs.mkShellNoCC {
+            packages = with pkgs; [ uv clojure ];
+          };
         });
       packages = forAllSystems (system:
         let pkgs = pkgsFor system;
