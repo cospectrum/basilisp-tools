@@ -6,7 +6,7 @@ Clojure-compatible Lisp on Python. Currently provides the `blt` formatter with
 
 ## Installation
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.10+.
 
 ```sh
 uv tool install git+https://github.com/cospectrum/basilisp-tools.git
