@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 CLOJURE_LSP_REVISION = "8ad65c1d681d2fc9022b3854f6dcaf1677d29631"
 # Match the dependency used by the pinned upstream checkout, without pulling
@@ -169,13 +171,17 @@ def main() -> int:
                 elif case["mode"] == "clean":
                     actual = settings.clean_client_settings(read(case["client"]))
                 else:
-                    actual = settings.load_settings(lmap({
-                        kw("root"): str(directory / "project"),
-                        kw("home"): str(directory / "home"),
-                        kw("xdg-config-home"): None if case.get("xdg_unset") else str(directory / "xdg"),
-                        kw("client-settings"): read(case.get("client", "{}")),
-                        kw("force-settings"): read(case.get("force", "{}")),
-                    }))
+                    # Match the upstream environment stub. A nil override means
+                    # normal environment lookup, not an explicitly unset XDG.
+                    with patch.dict(os.environ):
+                        os.environ.pop("XDG_CONFIG_HOME", None)
+                        actual = settings.load_settings(lmap({
+                            kw("root"): str(directory / "project"),
+                            kw("home"): str(directory / "home"),
+                            kw("xdg-config-home"): None if case.get("xdg_unset") else str(directory / "xdg"),
+                            kw("client-settings"): read(case.get("client", "{}")),
+                            kw("force-settings"): read(case.get("force", "{}")),
+                        }))
                 matched = expected_error is None and actual == expected_settings
                 actual_text = str(actual)
             except Exception as error:
