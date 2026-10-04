@@ -19,8 +19,6 @@ blt format .          # Format .lpy files in place
 blt format --check .  # Check without writing
 blt check .           # Check code and Python interop
 blt lsp               # Start the stdio language server
-blt --help
-blt format --help
 ```
 
 [Formatting](docs/formatting.md) · [Checking](docs/checking.md) · [Language server](docs/lsp.md) · [Compatibility](docs/compatibility.md) · [Syntax API](docs/syntax.md)
