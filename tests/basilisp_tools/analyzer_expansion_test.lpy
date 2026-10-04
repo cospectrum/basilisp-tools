@@ -115,20 +115,27 @@
   (let [temporary (tempfile/TemporaryDirectory)
         root (pathlib/Path (.-name temporary))
         environment (.joinpath root "env")
-        executable (.joinpath environment "bin" "python")]
+        linked-environment (.joinpath root "linked-env")]
     (try
       (subprocess/run (lisp->py [sys/executable "-m" "venv" "--without-pip" (str environment)])
                       ** :check true :capture_output true :timeout 30)
-      (let [options {:python-executable (str executable) :python-cache (py/create-cache)}
-            package-root (first (filter #(.endswith % "site-packages") (py/environment-paths options)))]
-        (is (some? package-root))
-        (.write_text (.joinpath (pathlib/Path package-root) "selected_library.lpy")
-                     "(ns selected-library) (defn selected [value] value)" ** :encoding "utf-8")
-        (let [result (analyzer/analyze "(ns sample (:require [selected-library :as selected])) (selected/selected)"
-                                       {:python-options options :dependency-cache (analyzer/create-cache)})]
-          (is (= [:invalid-arity] (mapv :type (:findings result))))
-          (is (.startswith (get-in (first (filter #(= "selected" (:name %)) (:var-usages result)))
-                                   [:definition :filename]) (str environment)))))
+      (.symlink_to linked-environment environment ** :target_is_directory true)
+      (doseq [selected [environment linked-environment]]
+        (let [executable (.joinpath selected "bin" "python")
+              options {:python-executable (str executable) :python-cache (py/create-cache)}
+              package-root (first (filter #(.endswith % "site-packages") (py/environment-paths options)))]
+          (is (some? package-root))
+          (let [package-path (.resolve (pathlib/Path package-root))
+                file (.joinpath package-path "selected_library.lpy")]
+            (when-not (.is_relative_to package-path (.resolve environment))
+              (throw (python/AssertionError "Selected interpreter must use its own site-packages")))
+            (.write_text file "(ns selected-library) (defn selected [value] value)" ** :encoding "utf-8")
+            (let [result (analyzer/analyze "(ns sample (:require [selected-library :as selected])) (selected/selected)"
+                                           {:python-options options :dependency-cache (analyzer/create-cache)})
+                  filename (get-in (first (filter #(= "selected" (:name %)) (:var-usages result)))
+                                   [:definition :filename])]
+              (is (= [:invalid-arity] (mapv :type (:findings result))))
+              (is (= (.resolve file) (.resolve (pathlib/Path filename))))))))
       (finally (.cleanup temporary)))))
 
 (deftest python-keyword-call-test
