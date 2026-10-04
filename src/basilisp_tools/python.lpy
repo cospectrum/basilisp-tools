@@ -6,13 +6,26 @@
   This process boundary contains failures; it is not a security sandbox.
   No analyzed Basilisp forms are evaluated."
   (:require [basilisp.string :as str])
-  (:import [importlib.util :as import-util] [json] [pathlib] [subprocess] [sys] [tempfile]
+  (:import [importlib.util :as import-util] [json] [pathlib] [subprocess] [sys] [tempfile] [time]
            [basilisp.lang.map :as lmap] [basilisp.lang.vector :as lvec]))
+
+(defn- load-worker []
+  ;; Loading the stdlib-only worker directly avoids reinitializing the parent
+  ;; package while Basilisp itself is importing this namespace.
+  (let [file (.with_name (pathlib/Path
+                          (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        spec (import-util/spec-from-file-location "_blt_metadata_decoder" (str file))
+        module (import-util/module-from-spec spec)]
+    (.exec_module (.-loader spec) module)
+    module))
+
+(def ^:private worker-runtime (load-worker))
+(def ^:private decode-object (.metadata_decoder worker-runtime keyword lmap/map lvec/vector))
 
 (defn create-cache
   "Create metadata storage owned by a checker run or language server."
   []
-  (atom (with-meta {} {:generation 0})))
+  (atom (with-meta {} {:generation 0 :processes (.InspectionProcesses worker-runtime)})))
 
 (def ^:private cache (create-cache))
 (def ^:private cache-limit 256)
@@ -22,19 +35,13 @@
   ([] (clear-cache! cache))
   ([storage]
    (swap! storage (fn [entries]
-                    (with-meta {} {:generation (inc (get (meta entries) :generation 0))})))))
+                    (with-meta {} (update (meta entries) :generation (fnil inc 0)))))))
 
-(defn- metadata-decoder []
-  ;; Loading the stdlib-only worker directly avoids reinitializing the parent
-  ;; package while Basilisp itself is importing this namespace.
-  (let [file (.with_name (pathlib/Path
-                          (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
-        spec (import-util/spec-from-file-location "_blt_metadata_decoder" (str file))
-        module (import-util/module-from-spec spec)]
-    (.exec_module (.-loader spec) module)
-    (.metadata_decoder module keyword lmap/map lvec/vector)))
-
-(def ^:private decode-object (metadata-decoder))
+(defn stop-cache!
+  "Stop inspection workers owned by a checker/server and reject new work."
+  [storage]
+  (.stop (:processes (meta @storage)))
+  (clear-cache! storage))
 
 (defn- options [opts]
   {:python-executable (or (:python-executable opts) sys/executable)
@@ -61,34 +68,53 @@
 (defn- unknown [module reason]
   {:status :unknown :name module :reason reason})
 
-(defn- inspect-batch [modules opts]
+(def ^:private transient-reasons
+  #{"inspection-timeout" "inspection-failed" "interpreter-unavailable"
+    "invalid-inspection-output" "missing-result"})
+
+(defn- inspection-results [output modules reason opts]
+  (let [text (if (instance? python/bytes output) (.decode output "utf-8" "replace") (or output ""))
+        completed (reduce (fn [results line]
+                            (try
+                              (into results (lmap/map (json/loads line ** :object_hook decode-object)))
+                              (catch python/ValueError _ results)
+                              (catch python/TypeError _ results)))
+                          {} (str/split-lines text))
+        retry-at (+ (time/monotonic) (max 1 (:python-timeout opts)))]
+    (into {} (map (fn [module]
+                    [module (or (get completed module)
+                                (with-meta (unknown module reason) {:retry-at retry-at}))])
+                  modules))))
+
+(defn- inspect-batch [modules opts storage]
   (let [temp (tempfile/TemporaryDirectory)
         worker (.with_name (pathlib/Path
                             (.-__file__ (get sys/modules "basilisp_tools.python")))
                            "_inspect.py")]
     (try
       (let [request {:modules modules :paths (:python-paths opts)
-                     :enabled (:python-inspection? opts)}
-            process (subprocess/run
-                     (lisp->py [(:python-executable opts) "-I" (str worker)])
-                     ** :input (json/dumps (lisp->py request))
-                     :text true :capture_output true :cwd (.-name temp)
-                     :timeout (:python-timeout opts))]
-        (if (= 0 (.-returncode process))
-          (lmap/map (json/loads (.-stdout process) ** :object_hook decode-object))
-          (into {} (map #(vector % (unknown % "inspection-failed")) modules))))
-      (catch subprocess/TimeoutExpired _
-        (into {} (map #(vector % (unknown % "inspection-timeout")) modules)))
+                     :enabled (:python-inspection? opts) :stream true :compact "graph"}
+            process (.run (:processes (meta @storage))
+                          (lisp->py [(:python-executable opts) "-I" (str worker)])
+                          ** :input (json/dumps (lisp->py request))
+                          :text true :capture_output true :cwd (.-name temp)
+                          :timeout (:python-timeout opts))]
+        (inspection-results (.-stdout process) modules
+                            (if (= 0 (.-returncode process)) "invalid-inspection-output" "inspection-failed") opts))
+      (catch subprocess/TimeoutExpired error
+        ;; The worker flushes each module, so a slow dependency cannot discard
+        ;; useful metadata already produced by the rest of the batch.
+        (inspection-results (.-stdout error) modules "inspection-timeout" opts))
       (catch python/OSError _
-        (into {} (map #(vector % (unknown % "interpreter-unavailable")) modules)))
+        (inspection-results nil modules "interpreter-unavailable" opts))
       (catch python/ValueError _
-        (into {} (map #(vector % (unknown % "invalid-inspection-output")) modules)))
+        (inspection-results nil modules "invalid-inspection-output" opts))
       (finally (.cleanup temp)))))
 
 (defn- fresh? [metadata]
   (and metadata
-       (not (contains? #{"inspection-timeout" "inspection-failed" "interpreter-unavailable"
-                         "invalid-inspection-output" "missing-result"} (:reason metadata)))
+       (or (not (contains? transient-reasons (:reason metadata)))
+           (< (time/monotonic) (get (meta metadata) :retry-at 0)))
        (every? (fn [dependency]
                  (try
                    (let [[file modified size] dependency
@@ -114,31 +140,42 @@
                      (retain-results entries additions)
                      entries))))
 
+(defn- environment-info [opts]
+  (let [storage (or (:python-cache opts) cache)
+        executable (or (:python-executable opts) sys/executable)
+        key [:environment-info executable]
+        generation (get (meta @storage) :generation 0)]
+    (if (= executable sys/executable)
+      {:paths (vec (filter seq (vec sys/path)))
+       :version [(.-major sys/version-info) (.-minor sys/version-info)]}
+      (or (get @storage key)
+          (let [worker (.with_name (pathlib/Path
+                                    (.-__file__ (get sys/modules "basilisp_tools.python")))
+                                   "_inspect.py")
+                result (try
+                         (let [process (.run (:processes (meta @storage))
+                                             (lisp->py [executable "-I" (str worker)])
+                                             ** :input "{\"operation\":\"environment-info\"}"
+                                             :text true :capture_output true
+                                             :timeout (get opts :python-timeout 5))]
+                           (when (= 0 (.-returncode process))
+                             (let [info (json/loads (.-stdout process))]
+                               {:paths (vec (get info "paths"))
+                                :version (vec (get info "version"))})))
+                         (catch python/Exception _ nil))]
+            (when result (store-results! storage generation [[key result]]))
+            result)))))
+
 (defn environment-paths
   "Return the selected interpreter's import roots without importing dependencies."
   ([] (environment-paths {}))
-  ([opts]
-   (let [storage (or (:python-cache opts) cache)
-         executable (or (:python-executable opts) sys/executable)
-         key [:environment-paths executable]
-         generation (get (meta @storage) :generation 0)]
-     (if (= executable sys/executable)
-       (vec (filter seq (vec sys/path)))
-       (or (get @storage key)
-           (let [worker (.with_name (pathlib/Path
-                                     (.-__file__ (get sys/modules "basilisp_tools.python")))
-                                    "_inspect.py")
-                 result (try
-                          (let [process (subprocess/run
-                                         (lisp->py [executable "-I" (str worker)])
-                                         ** :input "{\"operation\":\"environment\"}"
-                                         :text true :capture_output true
-                                         :timeout (get opts :python-timeout 5))]
-                            (when (= 0 (.-returncode process))
-                              (vec (json/loads (.-stdout process)))))
-                          (catch python/Exception _ nil))]
-             (when result (store-results! storage generation [[key result]]))
-             (or result [])))))))
+  ([opts] (or (:paths (environment-info opts)) [])))
+
+(defn environment-version
+  "Return [major minor] for the selected interpreter, or nil when unavailable.
+  Shares the environment-paths query and does not import project dependencies."
+  ([] (environment-version {}))
+  ([opts] (:version (environment-info opts))))
 
 (defn inspect-modules
   "Inspect modules in one subprocess, returning a string-keyed metadata map.
@@ -146,7 +183,8 @@
   Options: :python-executable, :python-paths (static project search roots),
   :python-inspection? (default true), :python-timeout (seconds, default 5),
   :python-cache (create-cache result, otherwise a bounded shared fallback).
-  Local and imported source edits invalidate entries; transient failures retry."
+  Local and imported source edits invalidate entries; transient failures retry
+  after a short cooldown to avoid stalling every file in a workspace."
   ([modules] (inspect-modules modules {}))
   ([modules opts]
    (let [storage (or (:python-cache opts) cache)
@@ -154,7 +192,7 @@
          generation (get (meta @storage) :generation 0)
          keyed (mapv #(vector % (cache-key % opts)) (distinct modules))
          missing (filterv #(not (fresh? (get @storage (second %)))) keyed)
-         results (when (seq missing) (inspect-batch (mapv first missing) opts))
+         results (when (seq missing) (inspect-batch (mapv first missing) opts storage))
          additions (mapv (fn [[module key]]
                            [key (get results module (unknown module "missing-result"))]) missing)
          combined (into @storage additions)]
@@ -461,29 +499,55 @@
               [after])))
         (map vector original substituted))))
 
-(defn- substitute-metadata [value bindings]
-  (cond
-    (map? value)
-    (let [result (into {} (map (fn [[key item]] [key (substitute-metadata item bindings)]) value))
-          replacement (get bindings (if (:type-self? value) "__Self__" (:typevar value)))
-          result (if replacement
-                   (merge (apply dissoc result (conj type-keys :type-self?)) (type-metadata replacement))
-                   result)
-          result (cond-> result
-                   (:type-arguments value)
-                   (assoc :type-arguments (mapv type-metadata
-                                                (substitute-arguments (mapv return-type (:type-arguments value)) bindings)))
-                   (:parameters value)
-                   (assoc :parameters (forwarded-parameters (:parameters value) (:parameters result) bindings)))
-          inferred (return-type result)
-          result (cond-> result
-                   (and inferred (:annotation value)) (assoc :annotation (type-label inferred))
-                   (and inferred (:return-type value)) (assoc :return-type (type-label inferred)))]
-      (if (:parameters result)
-        (assoc result :signature (signature-text (:parameters result) (:return-type result)))
-        result))
-    (vector? value) (mapv #(substitute-metadata % bindings) value)
-    :else value))
+(defn- substitution-needed? [value bindings memo]
+  (when (or (map? value) (vector? value))
+    (let [storage (:needed memo) key (python/id value)]
+      (if-let [cached (get storage key)]
+        (second cached)
+        (let [needed (boolean (or (and (map? value)
+                                       (contains? bindings (if (:type-self? value) "__Self__" (:typevar value))))
+                                  (some #(substitution-needed? % bindings memo)
+                                        (if (map? value) (vals value) value))))]
+          (.__setitem__ storage key [value needed])
+          needed)))))
+
+(defn- substitute-metadata
+  ([value bindings] (substitute-metadata value bindings {:values (python/dict) :needed (python/dict)}))
+  ([value bindings memo]
+   ;; Inspection metadata is a shared graph. Specialize each immutable node once
+   ;; instead of expanding repeated generic declarations into a much larger tree.
+   (if-not (substitution-needed? value bindings memo)
+     value
+     (if-let [cached (get (:values memo) (python/id value))]
+       (second cached)
+       (let [result (cond
+                      (map? value)
+                      (let [result (into {} (map (fn [[key item]] [key (substitute-metadata item bindings memo)]) value))
+                            replacement (get bindings (if (:type-self? value) "__Self__" (:typevar value)))
+                            result (if replacement
+                                     (merge (apply dissoc result (conj type-keys :type-self?)) (type-metadata replacement))
+                                     result)
+                            result (cond-> result
+                                     (:type-arguments value)
+                                     (assoc :type-arguments
+                                            (vec (mapcat (fn [[before after]]
+                                                           (if (and (:unpack? before) (:type-pack? after))
+                                                             (:type-arguments after) [after]))
+                                                         (map vector (:type-arguments value) (:type-arguments result)))))
+                                     (:parameters value)
+                                     (assoc :parameters (forwarded-parameters (:parameters value) (:parameters result) bindings)))
+                            inferred (when (or (:annotation value) (:return-type value)) (return-type result))
+                            result (cond-> result
+                                     (and inferred (:annotation value)) (assoc :annotation (type-label inferred))
+                                     (and inferred (:return-type value)) (assoc :return-type (type-label inferred)))]
+                        (if (:parameters result)
+                          (assoc result :signature (signature-text (:parameters result) (:return-type result)))
+                          result))
+                      (vector? value) (mapv #(substitute-metadata % bindings memo) value)
+                      :else value)]
+         (when (or (map? value) (vector? value))
+           (.__setitem__ (:values memo) (python/id value) [value result]))
+         result)))))
 
 (defn- callable-ref? [type]
   (and (= "collections.abc" (:module type)) (= ["Callable"] (:path type))))
@@ -615,6 +679,20 @@
       (inspect-module (:target metadata) opts)
       :else metadata)))
 
+(defn- package-child [metadata member opts]
+  ;; Basilisp initialization and earlier imports can load a package child that
+  ;; is absent from the isolated worker. Resolve source files without importing.
+  (when (and (= :module (:kind metadata)) (seq (:package-paths metadata))
+             (not (str/includes? member "."))
+             (local-file member (:package-paths metadata)))
+    (let [depth (count (str/split (:name metadata) #"\."))
+          roots (mapv (fn [path]
+                        (str (nth (iterate #(.-parent %) (pathlib/Path path)) depth)))
+                      (:package-paths metadata))]
+      (inspect-module (str (:name metadata) "." member)
+                      (assoc opts :python-paths (into (vec (:python-paths opts)) roots)
+                             :python-inspection? false)))))
+
 (defn inspect-path
   "Resolve members and reexports without executing descriptors.
 
@@ -627,7 +705,10 @@
        (if-let [part (first remaining)]
          (let [owner (if (and (not (:members metadata)) (return-type metadata))
                        (or (inspect-type metadata opts) metadata) metadata)
-               child (when owner (resolve-member owner part))]
+               child (when owner
+                       (or (get (:members owner) part)
+                           (package-child owner part opts)
+                           (resolve-member owner part)))]
            (when child (recur child (next remaining))))
          (if (:instance? opts) (bind-member metadata) metadata))))))
 
@@ -742,8 +823,14 @@
              (not= [(:module actual) (:path actual)] [(:module expected) (:path expected)])
              (< (get opts :python-type-depth 0) 12))
     (let [opts (update opts :python-type-depth (fnil inc 0))
-          a (inspect-type actual opts)
-          e (inspect-type expected opts)]
+          ;; Nominal checks need bases and type flags, not a specialization of
+          ;; every method on large classes such as numpy.ndarray.
+          summary (fn [type]
+                    (some-> (inspect-path (:module type) (:path type) opts)
+                            (dissoc :members)
+                            (specialize type)))
+          a (summary actual)
+          e (summary expected)]
       (when (and (= :known (:status a)) (= :known (:status e)))
         (cond
           (:typed-dict? e)
@@ -759,13 +846,13 @@
           (:protocol? e)
           (every-compatible
            (map (fn [[name member]]
-                  (let [provided (resolve-member a name)]
+                  (let [provided (inspect-member actual name opts)]
                     (cond
                       (nil? provided) false
                       (= :unknown (:status provided)) nil
                       (= :function (:kind member)) (signature-compatible? provided member opts)
                       :else (type-compatible? (return-type provided) (return-type member) opts))))
-                (remove (fn [[name _]] (contains? #{"__init__" "__new__" "__class_getitem__"} name)) (:members e))))
+                (remove (fn [[name _]] (contains? #{"__init__" "__new__" "__class_getitem__"} name)) (:members (inspect-type expected opts)))))
           :else
           (let [results (map #(type-compatible? (return-type %) expected opts) (:bases a))]
             (when (some true? results) true)))))))
@@ -1251,6 +1338,8 @@
      (and (contains? #{"contextlib" "typing" "typing_extensions"} (:module type))
           (contains? #{"AbstractContextManager" "AbstractAsyncContextManager" "ContextManager" "AsyncContextManager"}
                      (last (:path type)))) (first (:arguments type))
+     (:async? opts) (when-let [method (inspect-member type "__aenter__" opts)]
+                      (awaited-type (call-result method [] {}) opts))
      :else (or (when-let [method (inspect-member type "__enter__" opts)]
                  (call-result method [] {}))
                (when-let [method (inspect-member type "__aenter__" opts)]

@@ -975,7 +975,9 @@
               current-form? (and collection? (form? n))
               frames (if current-form?
                        (conj (pop frames)
-                             (update frame :positions conj {:col (op/getitem state "col") :line (op/getitem state "line")}))
+                             (assoc frame :positions
+                                    (conj (:positions frame)
+                                          {:col (op/getitem state "col") :line (op/getitem state "line")})))
                        frames)]
           (if (gap? n)
             (write! state (format-gap (:text n) previous next frames
@@ -985,7 +987,7 @@
             (render! state n frames opts ctx))
           (recur (inc cursor)
                  (if current-form?
-                   (conj (pop frames) (update (peek frames) :index inc)) frames)
+                   (conj (pop frames) (assoc (peek frames) :index (inc (:index frame)))) frames)
                  n))))))
 
 (defn- render! [state node frames opts ctx]
@@ -1057,6 +1059,41 @@
         (invalid "Column alignment did not converge" {:code :unstable-formatting})
         :else (recur result (conj seen candidate) (inc passes))))))
 
+(defn- protected-offset? [node offset]
+  (or (contains? literals (:kind node)) (comment? node)
+      (when-let [child (some #(when (<= (:start %) offset (dec (:end %))) %)
+                             (:children node))]
+        (protected-offset? child offset))))
+
+(defn- closing-gap-overflow? [text]
+  (loop [gaps (seq (re/split "[)\\]}]" text)) lines 0]
+    (if-let [gap (first gaps)]
+      (let [lines (+ lines (python/len (re/findall "\\r\\n|\\r|\\n" gap)))]
+        (or (> lines 2)
+            ;; Upstream's whitespace traversal crosses a closing delimiter
+            ;; only when indentation follows the preceding newline.
+            (recur (next gaps) (if (re/search "[\\r\\n]$" gap) 0 lines))))
+      false)))
+
+(defn- normalize-closing-gaps [source root opts]
+  ;; cljfmt collapses runs of blank lines before trimming collection edges.
+  ;; A run may span indented closing delimiters; the remaining blank line
+  ;; belongs after the outermost closer. Literal and comment text stays exact.
+  (if-not (:remove-consecutive-blank-lines? opts) source
+          (re/sub "(?<![ \\t,\\r\\n])[ \\t,\\r\\n]*[)\\]}](?:[ \\t,\\r\\n]*[)\\]}])*[ \\t,\\r\\n]*"
+                  (fn [match]
+                    (let [text (.group match)]
+                      (if (and (< (.end match) (count source))
+                               (> (+ (.count text "\n") (.count text "\r")) 2)
+                               (closing-gap-overflow? text)
+                               (not (protected-offset? root (.start match)))
+                               ;; In our CST a comment's newline is separate;
+                               ;; upstream includes it in the comment node.
+                               (not (comment? (syntax/node-at root (dec (.start match))))))
+                        (str (re/sub "[ \\t,\\r\\n]+" "" text) "\n\n")
+                        text)))
+                  source)))
+
 (defn format-string
   "Format Basilisp source without evaluation. Validate source preservation
   before returning output. Invalid syntax/options or unsafe output raises
@@ -1068,8 +1105,10 @@
          _ (when (seq (:diagnostics parsed))
              (invalid "Cannot format invalid syntax" {:diagnostics (:diagnostics parsed)}))
          original (:root parsed)
-         ctx (namespace-context original opts)
-         prepared (prepare original opts)
+         normalized (normalize-closing-gaps source original opts)
+         layout-root (if (op/eq source normalized) original (:root (parse-source normalized)))
+         ctx (namespace-context layout-root opts)
+         prepared (prepare layout-root opts)
          result (render prepared opts ctx)
          result (if (or (:align-map-columns? opts) (:align-form-columns? opts))
                   (format-aligned result opts ctx) result)
@@ -1077,7 +1116,10 @@
                   (let [trimmed (re/sub "[ \t\r\n]+$" "" result)]
                     (if (empty? trimmed) "" (str trimmed "\n")))
                   result)]
-     (validate-output original prepared result opts))))
+     ;; An identical result already passed input validation. Avoid parsing
+     ;; and walking it a second time during the common --check/editor path.
+     (if (op/eq source result) result
+         (validate-output original prepared result opts)))))
 
 (def reformat-string format-string)
 

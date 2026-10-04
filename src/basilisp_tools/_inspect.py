@@ -178,14 +178,17 @@ def type_parameter_infos(value, names):
     return [found.get(name, {"typevar": name}) for name in names]
 
 
-def substitute_types(value, bindings):
-    """Apply generic arguments throughout metadata, without mutating cached declarations."""
+def substitute_types(value, bindings, variables=None):
+    """Apply generic arguments, retaining unchanged immutable declarations."""
+    if not bindings or (variables is not None and not variables(value).intersection(bindings)):
+        return value
     if isinstance(value, list):
-        return [substitute_types(item, bindings) for item in value]
+        result = [substitute_types(item, bindings, variables) for item in value]
+        return value if all(a is b for a, b in zip(value, result)) else result
     if not isinstance(value, dict):
         return value
     variable = "__Self__" if value.get("type-self?") else value.get("typevar")
-    result = {key: substitute_types(item, bindings) for key, item in value.items()}
+    result = {key: substitute_types(item, bindings, variables) for key, item in value.items()}
     if "type-arguments" in value:
         arguments = []
         for original, replaced in zip(value["type-arguments"], result["type-arguments"]):
@@ -193,11 +196,12 @@ def substitute_types(value, bindings):
                 arguments.extend(replaced.get("type-arguments", []))
             else:
                 arguments.append(replaced)
-        result["type-arguments"] = arguments
+        if any(a is not b for a, b in zip(arguments, result["type-arguments"])) or len(arguments) != len(result["type-arguments"]):
+            result["type-arguments"] = arguments
     if variable in bindings:
         result = {key: item for key, item in result.items() if key not in TYPE_KEYS}
         result.update(bindings[variable])
-    return result
+    return value if len(result) == len(value) and all(key in result and result[key] is item for key, item in value.items()) else result
 
 
 def find_typevars(value):
@@ -810,7 +814,9 @@ def runtime_member(name, value, depth=1, owner=None):
             named_fields = class_dict.get("_fields")
             if type(named_fields) is tuple and all(type(field) is str for field in named_fields):
                 result["named-tuple?"] = True
-            result["members-complete?"] = not any(
+            # super forwards through an instance-specific MRO that this class
+            # metadata cannot know without executing the analyzed program.
+            result["members-complete?"] = value is not super and not any(
                 any(key in class_attribute(base, "__dict__")
                     for key in ("__getattr__", "__dict__"))
                 for base in class_attribute(value, "__mro__"))
@@ -905,9 +911,31 @@ class StaticInspector:
         self.installed = installed
         self.modules = {}
         self.active = set()
+        self.remaining = 64
         self.dependencies = {}
         self.source_packages = set()
         self.paths = {}
+        self.variables = {}
+
+    def type_variables(self, value):
+        """Memoize variable use in finalized declarations shared by subclasses."""
+        if not isinstance(value, (dict, list)):
+            return frozenset()
+        key = id(value)
+        if key not in self.variables:
+            own = {"__Self__"} if isinstance(value, dict) and value.get("type-self?") else set()
+            if isinstance(value, dict) and value.get("typevar"):
+                own.add(value["typevar"])
+            for child in value.values() if isinstance(value, dict) else value:
+                own.update(self.type_variables(child))
+            # Retain the value as well, so Python cannot recycle its identity.
+            self.variables[key] = (value, frozenset(own))
+        return self.variables[key][1]
+
+    def substitute(self, value, bindings):
+        if not self.type_variables(value).intersection(bindings):
+            return value
+        return substitute_types(value, bindings, self.type_variables)
 
     def path(self, name):
         source = name.split(".")[0] in self.source_packages
@@ -926,11 +954,16 @@ class StaticInspector:
             self.source_packages.add(name.split(".")[0])
         if name in self.modules:
             return self.modules[name]
-        if name in self.active or len(self.modules) + len(self.active) >= 64:
+        if not self.active:
+            # Independent requested modules each get a bounded import graph;
+            # a large package must not exhaust the budget for later imports.
+            self.remaining = 64
+        if name in self.active or self.remaining <= 0:
             return {"status": "unknown", "name": name, "reason": "cyclic-or-large-import"}
         path = path or self.path(name)
         if path is None:
             return {"status": "unknown", "name": name, "reason": "external-import"}
+        self.remaining -= 1
         self.active.add(name)
         try:
             import tokenize
@@ -1329,7 +1362,7 @@ class StaticModule:
                         bindings = bind_type_parameters(base_info.get("type-parameters", []),
                                                         ref.get("type-arguments", []))
                         bindings["__Self__"] = {"type-module": self.name, "type-path": list(owner), "type-self?": True}
-                        base_info = substitute_types(base_info, bindings)
+                        base_info = self.inspector.substitute(base_info, bindings)
                         children = {**base_info.get("members", {}), **children}
                         if inherited_parameters is None and "parameters" in base_info:
                             inherited_parameters = base_info["parameters"]
@@ -1640,6 +1673,7 @@ class StaticModule:
                 "filename": str(self.path), "doc": (ast.get_docstring(self.tree) or "")[:2000],
                 "members": members, "members-complete?": complete and not partial, "partial-stub?": partial,
                 "exports": sorted(self.exports) if self.exports is not None else None,
+                "package-paths": [str(self.path.parent)] if self.path.name.startswith("__init__.") else [],
                 "inspection": "static"}
 
 
@@ -1692,12 +1726,59 @@ def inspect_module(name, roots, enabled, inspector=None, skip_stubs=False):
             # Parse these declarations instead of calling module.__getattr__.
             declared = static_module(name, Path(source), inspector).get("members", {})
             members = {**declared, **members}
+        package_paths = vars(module).get("__path__", [])
+        package_paths = [p for p in package_paths if type(p) is str] if type(package_paths) in (list, tuple) else []
         return {"status": "known", "name": name, "kind": "module", "members": members,
+                "package-paths": package_paths,
                 "members-complete?": "__getattr__" not in vars(module),
                 "filename": vars(module).get("__file__"),
                 "doc": (vars(module).get("__doc__") or "")[:2000], "inspection": "runtime"}
     except BaseException as error:
         return {"status": "unknown", "name": name, "reason": type(error).__name__}
+
+
+def encode_graph(value):
+    """Encode shared JSON dictionaries and lists without duplicating subtrees."""
+    records, known = [], {}
+    def encode(item):
+        if type(item) in (dict, list):
+            key = id(item)
+            if key not in known:
+                record = (["dict", [[name, encode(child)] for name, child in item.items()]]
+                          if type(item) is dict else ["list", [encode(child) for child in item]])
+                known[key] = (item, len(records))
+                records.append(record)
+            return {"$ref": known[key][1]}
+        return item
+    root = encode(value)
+    return {"$blt_graph": 1, "records": records, "root": root}
+
+
+def decode_graph(value, object_hook=None):
+    """Restore only JSON containers and backward references, never executable objects."""
+    if type(value) is not dict or set(value) != {"$blt_graph", "records", "root"} or value["$blt_graph"] != 1:
+        raise ValueError("Invalid metadata graph")
+    records = []
+    def resolve(item):
+        if type(item) is dict:
+            index = item.get("$ref")
+            if set(item) != {"$ref"} or type(index) is not int or not 0 <= index < len(records):
+                raise ValueError("Invalid metadata reference")
+            return records[index]
+        if type(item) is list:
+            raise ValueError("Unencoded metadata list")
+        return item
+    for kind, children in value["records"]:
+        if kind == "dict":
+            record = {key: resolve(child) for key, child in children}
+            if object_hook is not None:
+                record = object_hook(record)
+        elif kind == "list":
+            record = [resolve(child) for child in children]
+        else:
+            raise ValueError("Invalid metadata record")
+        records.append(record)
+    return resolve(value["root"])
 
 
 def metadata_decoder(keyword, persistent_map, vector):
@@ -1713,11 +1794,20 @@ def metadata_decoder(keyword, persistent_map, vector):
         return keys[value]
     vector_keys = {"parameters", "overloads", "type-path", "target-path", "type-arguments",
                    "dependencies", "bases", "unresolved-bases", "type-union", "type-parameters", "type-constraints",
-                   "literal-values", "dataclass-field-specifiers"}
+                   "literal-values", "dataclass-field-specifiers", "package-paths"}
     enum_keys = {"status", "kind", "inspection"}
+    type_shapes = {key: (bool if key.endswith("?") else list if key in vector_keys
+                         or key == "literal-values" else str)
+                   for key in TYPE_KEYS if key not in ("type-bound", "type-default")}
     def decode(raw):
-        if not ("status" in raw or "required?" in raw or any(key in raw for key in TYPE_KEYS)
-                or "type-ellipsis?" in raw):
+        if (raw.get("$blt_graph") == 1 and set(raw) == {"$blt_graph", "records", "root"}
+                and type(raw["records"]) is list):
+            return decode_graph(raw, object_hook=decode)
+        # Member tables use arbitrary Python names, including "status" and
+        # "typevar". A schema key alone cannot distinguish them from records.
+        record = (type(raw.get("status")) is str or type(raw.get("required?")) is bool
+                  or any(type(raw.get(key)) is shape for key, shape in type_shapes.items()))
+        if not record:
             return raw
         result = {}
         for key, value in raw.items():
@@ -1731,19 +1821,105 @@ def metadata_decoder(keyword, persistent_map, vector):
         return persistent_map(result)
     return decode
 
+class InspectionProcesses:
+    """Own inspection children so server shutdown cannot leave workers behind.
+
+    Admission and registration share a lock with shutdown. The calling thread
+    owns pipe communication; shutdown only signals and reaps registered children.
+    """
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._processes = set()
+        self._closed = False
+
+    def run(self, args, *, input=None, capture_output=False, timeout=None,
+            check=False, **kwargs):
+        """Run an owned child with the subprocess.run interface."""
+        import subprocess
+        if input is not None:
+            if kwargs.get("stdin") is not None:
+                raise ValueError("stdin and input arguments may not both be used.")
+            kwargs["stdin"] = subprocess.PIPE
+        if capture_output:
+            if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+                raise ValueError("stdout and stderr arguments may not be used with capture_output.")
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
+        with self._lock:
+            if self._closed:
+                raise OSError("Python inspection has stopped")
+            process = subprocess.Popen(args, **kwargs)
+            self._processes.add(process)
+        try:
+            with process:
+                try:
+                    stdout, stderr = process.communicate(input, timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    process.kill()
+                    if sys.platform == "win32":
+                        error.stdout, error.stderr = process.communicate()
+                    else:
+                        # POSIX communicate already attached partial byte output.
+                        process.wait()
+                    raise
+                except BaseException:
+                    process.kill()
+                    process.wait()
+                    raise
+                if check and process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, process.args,
+                                                        output=stdout, stderr=stderr)
+                return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+        finally:
+            with self._lock:
+                self._processes.discard(process)
+
+    def stop(self):
+        """Reject new children, then terminate, kill if needed, and reap all owned children."""
+        import subprocess
+        import time
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            processes = tuple(self._processes)
+        for process in processes:
+            process.terminate()
+        deadline = time.monotonic() + 0.2
+        for process in processes:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                process.kill()
+        for process in processes:
+            process.wait()
+
 
 def main():
     request = json.load(sys.stdin)
-    if request.get("operation") == "environment":
-        json.dump([p for p in sys.path if p], sys.stdout)
+    if request.get("operation") in ("environment", "environment-info"):
+        paths = [p for p in sys.path if p]
+        result = (paths if request["operation"] == "environment" else
+                  {"paths": paths, "version": list(sys.version_info[:2])})
+        json.dump(result, sys.stdout)
         return
     roots = request.get("paths", [])
     inspector = StaticInspector(roots, [p for p in sys.path if p])
-    results = {name: inspect_module(name, roots, request.get("enabled", True), inspector)
-               for name in request["modules"]}
-    for result in results.values():
+    results = {}
+    for name in request["modules"]:
+        result = inspect_module(name, roots, request.get("enabled", True), inspector)
         result["dependencies"] = list(inspector.dependencies.values())
-    json.dump(results, sys.stdout, ensure_ascii=True)
+        if request.get("stream"):
+            payload = {name: result}
+            if request.get("compact") == "graph":
+                payload = encode_graph(payload)
+            print(json.dumps(payload, ensure_ascii=True), flush=True)
+        else:
+            results[name] = result
+    if not request.get("stream"):
+        json.dump(results, sys.stdout, ensure_ascii=True)
 
 
 if __name__ == "__main__":

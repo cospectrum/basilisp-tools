@@ -7,7 +7,7 @@
             [basilisp-tools.python :as py]
             [basilisp-tools.regex :as regex]
             [basilisp-tools.syntax :as syntax])
-  (:import [base64] [concurrent.futures :as futures] [datetime] [decimal] [fractions] [hashlib] [json] [math] [os] [pathlib] [re] [sys] [time] [uuid] [zipfile]
+  (:import [base64] [bisect] [concurrent.futures :as futures] [datetime] [decimal] [fractions] [hashlib] [json] [math] [os] [pathlib] [re] [sys] [time] [uuid] [zipfile]
            [urllib.parse :as url] [os.path]))
 
 (def ^:private skipped-directories
@@ -252,16 +252,16 @@
                        (>= (.find value os/pathsep) 0))
                 (remove empty? (str/split value (re/escape os/pathsep))) [value]))) paths))
 
-(defn- walk-files [directory]
+(defn- walk-files [directory report-problem!]
   (let [files (atom [])]
     (doseq [[root dirs names] (iterator-seq (os/walk directory ** :followlinks false
-                                                     :onerror (fn [e] (throw e))))]
+                                                     :onerror (fn [e] (report-problem! (or (.-filename e) (str directory)) e))))]
       (let [kept (filter #(and (not (contains? skipped-directories %))
                                (not (.is_symlink (.joinpath (pathlib/Path root) %)))) (vec dirs))]
         (.clear dirs)
         (doseq [name (sort kept)] (.append dirs name)))
       (doseq [name (sort names) :let [file (.joinpath (pathlib/Path root) name)]
-              :when (and (.endswith name ".lpy") (.is_file file) (not (.is_symlink file)))]
+              :when (and (contains? #{".lpy" ".cljc"} (.-suffix file)) (.is_file file) (not (.is_symlink file)))]
         (swap! files conj file)))
     @files))
 
@@ -323,6 +323,11 @@
 (defn- collect-sources [paths options config]
   (let [sources (atom []) problems (atom []) seen (atom #{})
         canonical? (get-in config [:output :canonical-paths])
+        problem! (fn [filename exception]
+                   (swap! problems conj (-> (file-finding filename (str exception))
+                                            (assoc :row 0 :col 0)
+                                            (dissoc :end-row :end-col))))
+        label (fn [file] (if canonical? (str (.resolve (pathlib/Path file))) (str file)))
         add! (fn [filename source owner]
                (swap! sources conj {:filename filename :source source :owner owner}))]
     (doseq [name paths]
@@ -335,24 +340,25 @@
           (let [path (pathlib/Path name)
                 files (cond (.is_symlink path) (error (str "Refusing symbolic link: " name))
                             (.is_file path) [path]
-                            (.is_dir path) (walk-files path)
+                            (.is_dir path) (walk-files path #(problem! (label %1) %2))
                             :else (error "file does not exist"))]
             (doseq [file files :let [canonical (str (.resolve file))]
                     :when (not (contains? @seen canonical))]
               (swap! seen conj canonical)
-              (if (contains? #{".whl" ".zip" ".jar"} (.-suffix file))
-                (let [archive (zipfile/ZipFile file)]
-                  (try
+              ;; One unreadable file must not suppress diagnostics from the rest
+              ;; of a directory or archive.
+              (try
+                (if (contains? #{".whl" ".zip" ".jar"} (.-suffix file))
+                  (with-open [archive (zipfile/ZipFile file)]
                     (doseq [entry (sort (.namelist archive))
-                            :when (and (.endswith entry ".lpy") (not (exported? entry)))]
-                      (add! (str (when canonical? (str canonical ":")) entry)
-                            (.decode (.read archive entry) "utf-8") canonical))
-                    (finally (.close archive))))
-                (add! (if canonical? canonical (str file)) (.read_text file ** :encoding "utf-8") canonical)))))
-        (catch python/Exception e
-          (swap! problems conj (-> (file-finding (if canonical? (str (.resolve (pathlib/Path name))) name) (str e))
-                                   (assoc :row 0 :col 0)
-                                   (dissoc :end-row :end-col))))))
+                            :when (and (contains? #{".lpy" ".cljc"} (.-suffix (pathlib/Path entry))) (not (exported? entry)))
+                            :let [filename (str (when canonical? (str canonical ":")) entry)]]
+                      (try
+                        (add! filename (.decode (.read archive entry) "utf-8") canonical)
+                        (catch python/Exception e (problem! filename e)))))
+                  (add! (label file) (.read_text file ** :encoding "utf-8") canonical))
+                (catch python/Exception e (problem! (label file) e))))))
+        (catch python/Exception e (problem! (label name) e))))
     {:sources @sources :findings @problems}))
 
 (defn- cache-directory [options config]
@@ -361,7 +367,7 @@
                         (when (string? (:cache options)) (:cache options))
                         (when-let [directory (:cfg-dir config)]
                           (str (.joinpath (pathlib/Path directory) ".cache"))))]
-      (.joinpath (pathlib/Path path) "blt-v2"))))
+      (.joinpath (pathlib/Path path) "blt-v3"))))
 
 (defn- fingerprint [owner]
   (when owner
@@ -378,30 +384,81 @@
       (when (and (map? entry) (string? (:owner entry))
                  (map? (get-in entry [:declarations :definitions]))
                  (string? (get-in entry [:declarations :namespace]))
-                 (string? (get-in entry [:declarations :parsed :source]))
+                 (string? (:digest entry))
                  (= (:fingerprint entry) (fingerprint (:owner entry))))
-        entry))
+        ;; EDN printing omits collection metadata. Reattach the namespace
+        ;; metadata used by analyzer resolution from its explicit cached field.
+        (update-in entry [:declarations :definitions]
+                   with-meta {:namespace-meta (get-in entry [:declarations :namespace-meta])})))
     (catch python/Exception _ nil)))
 
-(defn- cached-project [directory]
+(defn- config-cache-value [value]
+  ;; Compare data rather than compiled regex identities, retaining the metadata
+  ;; that changes how namespace-scoped settings are merged.
+  (cond
+    (regex/pattern? value) [:regex (regex/source value)]
+    (map? value) [:map (boolean (:replace (meta value)))
+                  (into {} (map (fn [[key item]] [(config-cache-value key) (config-cache-value item)]) value))]
+    (sequential? value) [:sequence (boolean (:replace (meta value))) (mapv config-cache-value value)]
+    (set? value) [:set (boolean (:replace (meta value))) (set (map config-cache-value value))]
+    :else [:value value]))
+
+(defn- declaration-config [config]
+  (config-cache-value (select-keys config [:lint-as :config-in-ns :ns-groups])))
+
+(declare cached-declarations)
+
+(defn- cached-source [entry]
+  (let [owner (pathlib/Path (:owner entry)) filename (:filename entry)
+        archive? (contains? #{".whl" ".zip" ".jar"} (.-suffix owner))
+        source (if archive?
+                 (with-open [archive (zipfile/ZipFile owner)]
+                   (let [prefix (str owner ":")
+                         member (if (.startswith filename prefix) (subs filename (count prefix)) filename)]
+                     (.decode (.read archive member) "utf-8")))
+                 (.read_text owner ** :encoding "utf-8"))]
+    {:filename filename :owner (str owner) :source source
+     :lang (or (:lang entry) (if (.endswith filename ".edn") :edn :lpy))}))
+
+(defn- cached-project [directory current-files config python-options debug?]
   (if (and directory (.is_dir directory))
-    (reduce (fn [project file]
-              (if-let [entry (cached-entry file)]
-                (let [declarations (:declarations entry)]
-                  (update project (:namespace declarations) merge (:definitions declarations)))
-                project))
-            {} (sort (iterator-seq (.glob directory "*.edn"))))
+    (let [python-version (py/environment-version python-options)
+          config-key (declaration-config config)]
+      (reduce (fn [project file]
+                (try
+                  (if-let [entry (cached-entry file)]
+                    (let [compatible? (and (= config-key (:declaration-config entry))
+                                           (= python-version (:python-version entry)))
+                          declarations (if compatible? (:declarations entry)
+                                           (cached-declarations (cached-source entry) directory
+                                                                config python-options debug?))]
+                      (update project (:namespace declarations) merge (:definitions declarations)))
+                    project)
+                  ;; Dependency caches are advisory; corrupt or unavailable
+                  ;; entries must not prevent checking the selected sources.
+                  (catch python/Exception _ project)))
+              {} (remove #(contains? current-files (.-name %))
+                         (sort (iterator-seq (.glob directory "*.edn"))))))
     {}))
 
-(defn- cached-declarations [source directory debug?]
+(defn- declaration-cache-name [{:keys [owner filename lang]}]
+  (str (cache-key (pr-str [owner filename lang])) ".edn"))
+
+(defn- cached-declarations [source directory config python-options debug?]
   (let [{:keys [filename owner]} source
         digest (.hexdigest (hashlib/sha256 (.encode (:source source) "utf-8")))
-        file (when (and directory owner) (.joinpath directory (str (cache-key (pr-str [owner filename (:lang source)])) ".edn")))
+        python-version (py/environment-version python-options)
+        config-key (declaration-config config)
+        file (when (and directory owner) (.joinpath directory (declaration-cache-name source)))
         entry (when (and file (.is_file file)) (cached-entry file))]
-    (if (and entry (= digest (:digest entry)) (= filename (:filename entry)))
+    (if (and entry (= digest (:digest entry)) (= filename (:filename entry))
+             (= config-key (:declaration-config entry))
+             (= python-version (:python-version entry)))
       (do (when debug? (.write sys/stderr (str "[blt] Cached declarations: " filename "\n")))
-          (:declarations entry))
-      (let [declarations (analyzer/declarations (:source source) {:filename filename})
+          ;; Parsing source is much cheaper than reading its expanded CST as
+          ;; EDN. Persist only the declaration index needed by dependencies.
+          (assoc (:declarations entry) :parsed (syntax/parse (:source source))))
+      (let [declarations (analyzer/declarations (:source source) {:filename filename :config config :python-options python-options})
             declarations (if (= :edn (:lang source)) (assoc declarations :namespace "user" :definitions {}) declarations)]
         (when file
           (try
@@ -410,7 +467,7 @@
               (try
                 (.write_text temporary
                              (pr-str {:filename filename :owner owner :fingerprint (fingerprint owner)
-                                      :digest digest :declarations declarations}) ** :encoding "utf-8")
+                                      :digest digest :lang (:lang source) :declaration-config config-key :python-version python-version :declarations (dissoc declarations :parsed)}) ** :encoding "utf-8")
                 (.replace temporary file)
                 (finally (when (.exists temporary) (.unlink temporary)))))
             (catch python/OSError e
@@ -461,16 +518,6 @@
                    (filterv #(not (regex/search pattern (.replace (:filename %) "\\" "/"))) (:sources collected))
                    (:sources collected))
          sources (if (and (:skip-lint options) (not (analysis-options config))) [] sources)
-         sources (mapv (fn [{:keys [filename] :as item}]
-                         (try
-                           (assoc item :declarations (cached-declarations (assoc item :lang (if (.endswith filename ".edn") :edn (:lang options :lpy))) cache-dir (:debug options)))
-                           (catch python/Exception e
-                             (assoc item :declaration-error (file-finding filename (str "Analysis failed: " e))))))
-                       sources)
-         project (reduce (fn [result {:keys [declarations]}]
-                           (if declarations
-                             (update result (:namespace declarations) merge (:definitions declarations)) result))
-                         (cached-project cache-dir) sources)
          root (if-let [dir (:cfg-dir config)] (.-parent (pathlib/Path dir))
                       (pathlib/Path (or (:cwd options) (.cwd pathlib/Path))))
          python-options {:python-executable (default-python options config)
@@ -478,6 +525,18 @@
                          :python-paths (or (:python-paths options) [(str root) (str (.joinpath root "src"))])
                          :python-timeout (:python-timeout options 5)
                          :python-cache (or (:python-cache options) (py/create-cache))}
+         sources (mapv (fn [{:keys [filename] :as item}]
+                         (let [item (assoc item :lang (if (.endswith filename ".edn") :edn (:lang options :lpy)))]
+                           (try
+                             (assoc item :declarations (cached-declarations item cache-dir config python-options (:debug options)))
+                             (catch python/Exception e
+                               (assoc item :declaration-error (file-finding filename (str "Analysis failed: " e)))))))
+                       sources)
+         project (reduce (fn [result {:keys [declarations]}]
+                           (if declarations
+                             (update result (:namespace declarations) merge (:definitions declarations)) result))
+                         (cached-project cache-dir (set (map declaration-cache-name sources))
+                                         config python-options (:debug options)) sources)
          dependency-cache (or (:dependency-cache options) (analyzer/create-cache))
          hook-cache (or (:hook-cache options) (hooks/create-cache))
          completed (atom 0)
@@ -720,32 +779,48 @@
 (defn- selected-metadata [value selector]
   (if (true? selector) value (when value (select-keys value selector))))
 
-(defn- definition-form [nodes definition]
-  (some #(when (and (= :list (:kind %)) (= (:start %) (:scope-start definition))) %) nodes))
-
 (defn- qualified-name [analysis text]
   (let [parts (str/split text #"/" 1)]
     (if (= 2 (count parts))
       (symbol (str (get (:aliases analysis) (first parts) (first parts)) "/" (second parts)))
       (symbol (str "basilisp.core/" text)))))
 
-(defn- enclosing-definition [analysis start end]
-  (first (sort-by #(- (:scope-end %) (:scope-start %))
-                  (filter #(and (<= (:scope-start %) start) (<= end (:scope-end %)))
-                          (:var-definitions analysis)))))
+(defn- with-definition-index [analysis]
+  (if (::definition-index analysis) analysis
+      (let [entries (vec (sort-by first
+                                  (map-indexed (fn [order definition]
+                                                 [(:scope-start definition) (:scope-end definition)
+                                                  order definition])
+                                               (:var-definitions analysis))))]
+        (assoc analysis ::definition-index
+               {:entries entries :starts (mapv first entries)
+                :max-ends (reduce (fn [ends entry]
+                                    (conj ends (max (or (peek ends) -1) (second entry)))) [] entries)}))))
 
-(defn- public-definition [analysis parsed filename nodes options config definition]
-  (let [node (definition-form nodes definition)
+(defn- enclosing-definition [analysis start end]
+  (let [{:keys [entries starts max-ends]} (::definition-index (with-definition-index analysis))]
+    ;; Earlier scopes can be skipped once their largest end precedes this node.
+    ;; Width and original order preserve the previous selection for nested,
+    ;; overlapping, and identical definition ranges.
+    (loop [i (dec (bisect/bisect_right starts start)) best nil]
+      (if (and (>= i 0) (>= (nth max-ends i) end))
+        (let [[left right order :as entry] (nth entries i)
+              narrower? (or (nil? best) (< (- right left) (- (nth best 1) (first best)))
+                            (and (= (- right left) (- (nth best 1) (first best)))
+                                 (< order (nth best 2))))]
+          (recur (dec i) (if (and (>= right end) narrower?) entry best)))
+        (nth best 3 nil)))))
+
+(defn- public-definition [analysis parsed filename context options config definition]
+  (let [node (get-in context [:lists-by-start (:scope-start definition)])
         xs (syntax/forms node) head (first xs) name-node (second xs)
         metadata (merge (literal-metadata name-node)
                         (when (#{"defn" "defn-" "defmacro" "defmacro-" "defasync"}
                                (last (str/split (syntax/text head) #"/")))
                           (when-let [value (first (filter #(= :map (:kind %)) (take 2 (drop 2 xs))))]
                             (try (config-value value "source metadata" {:allow-regex? true :source-metadata? true}) (catch python/Exception _ nil)))))
-        protocol (some #(when (and (= :list (:kind %))
-                                   (= "defprotocol" (some-> % syntax/forms first syntax/text))
-                                   (< (:start %) (:scope-start definition))
-                                   (<= (:scope-end definition) (:end %))) %) nodes)
+        protocol (some #(when (and (< (:start %) (:scope-start definition))
+                                   (<= (:scope-end definition) (:end %))) %) (:protocols context))
         defined-by (or (:defined-by definition)
                        (if protocol 'basilisp.core/defprotocol
                            (qualified-name analysis (syntax/text head))))
@@ -775,7 +850,7 @@
                             (filter #(and (= :list (:kind %))
                                           (<= (:start %) (:scope-start definition))
                                           (<= (:scope-end definition) (:end %))
-                                          (= :symbol (:kind (first (syntax/forms %))))) nodes)))))))
+                                          (= :symbol (:kind (first (syntax/forms %))))) (:lists context))))))))
 
 (defn- public-namespace [parsed filename nodes options entry]
   (let [node (some #(when (and (= :list (:kind %))
@@ -835,15 +910,11 @@
       (assoc :context (select-keys (:context usage) (:context options)))
       (and (true? (:context options)) (:context usage)) (assoc :context (:context usage)))))
 
-(defn- keyword-analysis [analysis parsed filename nodes node]
+(defn- keyword-analysis [analysis parsed filename context node]
   (let [raw (syntax/text node) auto? (.startswith raw "::")
         parts (str/split (subs raw (if auto? 2 1)) #"/" 1)
         prefix (when (= 2 (count parts)) (first parts))
-        map-prefix (some (fn [candidate]
-                           (when (= :namespaced-map (:kind candidate))
-                             (let [keys (map first (partition 2 (syntax/forms (first (syntax/forms candidate)))))]
-                               (when (some #(= (:start %) (:start node)) keys)
-                                 (:text (first (:children candidate))))))) nodes)
+        map-prefix (get-in context [:map-prefixes (:start node)])
         prefix-auto? (and map-prefix (.startswith map-prefix "#::"))
         map-ns (when map-prefix (subs map-prefix (if prefix-auto? 3 2)))
         map-ns (if prefix-auto? (get (:aliases analysis) map-ns (if (empty? map-ns) (:namespace analysis) map-ns)) map-ns)
@@ -851,9 +922,8 @@
                              (and map-prefix (= "_" prefix)) nil
                              prefix prefix
                              :else map-ns)
-        ns-form (some #(when (and (= :list (:kind %))
-                                  (= "ns" (some-> % syntax/forms first syntax/text))
-                                  (<= (:start %) (:start node)) (<= (:end node) (:end %))) %) nodes)
+        ns-form (some #(when (and (<= (:start %) (:start node))
+                                  (<= (:end node) (:end %))) %) (:ns-forms context))
         outer (enclosing-definition analysis (:start node) (:end node))
         outer (when (and outer (> (:start node) (:end outer))) outer)]
     (cond-> (merge (source-location parsed filename node)
@@ -884,11 +954,12 @@
 
 (defn- shallow-body-ranges [analysis parsed options]
   (when (get-in options [:var-definitions :shallow])
-    (let [nodes (vec (syntax/nodes (:root parsed)))]
+    (let [nodes (into {} (map (juxt :start identity)
+                              (filter #(= :list (:kind %)) (syntax/nodes (:root parsed)))))]
       (vec
        (mapcat
         (fn [definition]
-          (let [node (definition-form nodes definition)
+          (let [node (get nodes (:scope-start definition))
                 xs (syntax/forms node)
                 head (some-> xs first syntax/text)
                 tail (drop 2 xs)
@@ -949,20 +1020,39 @@
     @result))
 
 (defn- keyword-records [analysis parsed filename nodes options]
-  (let [skipped (shallow-body-ranges analysis parsed options)
-        live (remove #(in-ranges? skipped %)
-                     (tree-seq #(seq (:children %)) syntax/forms (:root parsed)))
+  (let [analysis (with-definition-index analysis)
+        skipped (shallow-body-ranges analysis parsed options)
+        ;; Index lexical keyword context once, rather than rescanning every node
+        ;; for every keyword in large source files.
+        context {:map-prefixes
+                 (into {} (for [candidate nodes :when (= :namespaced-map (:kind candidate))
+                                [key _] (partition 2 (syntax/forms (first (syntax/forms candidate))))]
+                            [(:start key) (:text (first (:children candidate)))]))
+                 :ns-forms (filterv #(and (= :list (:kind %))
+                                          (= "ns" (some-> % syntax/forms first syntax/text))) nodes)}
+        ;; Materialize the walk before the nested comprehensions below. Chained
+        ;; lazy tree traversal/filtering can exhaust Python's stack on wide files.
+        live (loop [pending [(:root parsed)] result []]
+               (if (seq pending)
+                 (let [node (peek pending)]
+                   (recur (into (pop pending) (reverse (syntax/forms node)))
+                          (if (in-ranges? skipped node) result (conj result node))))
+                 result))
         local-starts (set (map :start (:locals analysis)))
-        destructuring (for [node live :when (= :map (:kind node))
-                            [key values] (partition 2 (syntax/forms node))
-                            :when (and (= :keyword (:kind key)) (= :vector (:kind values))
-                                       (= "keys" (name (edn/read-string (syntax/text key)))))
-                            :when (some #(contains? local-starts (:start %)) (syntax/forms values))]
-                        [key values])
+        destructuring
+        (reduce (fn [result node]
+                  (if (= :map (:kind node))
+                    (reduce (fn [result [key values]]
+                              (if (and (= :keyword (:kind key)) (= :vector (:kind values))
+                                       (= "keys" (last (str/split (.lstrip (syntax/text key) ":") #"/")))
+                                       (some #(contains? local-starts (:start %)) (syntax/forms values)))
+                                (conj result [key values]) result))
+                            result (partition 2 (syntax/forms node)))
+                    result)) [] live)
         modifiers (set (map (comp :start first) destructuring))
         overrides (into {} (map (juxt :start identity) (:keywords analysis)))
         keywords (map (fn [node]
-                        (cond-> (merge (keyword-analysis analysis parsed filename nodes node)
+                        (cond-> (merge (keyword-analysis analysis parsed filename context node)
                                        (into {} (remove (comp nil? second)
                                                         (select-keys (get overrides (:start node))
                                                                      [:reg :context :derived-location]))))
@@ -970,7 +1060,7 @@
                       (filter #(= :keyword (:kind %)) live))
         derived (for [[key values] destructuring value (syntax/forms values)
                       :let [raw (syntax/text value) parts (str/split raw #"/" 1)
-                            key-record (keyword-analysis analysis parsed filename nodes key)
+                            key-record (keyword-analysis analysis parsed filename context key)
                             prefix (when (= 2 (count parts)) (first parts))]]
                   (cond-> (merge (source-location parsed filename value)
                                  (select-keys key-record [:from :from-var])
@@ -989,6 +1079,14 @@
         records (if edn? (map #(assoc % :from nil) records) records)]
     (mapv #(contextual % options) (distinct (sort-by (juxt :row :col) records)))))
 
+(defn keyword-output
+  "Export keyword usages without computing unrelated namespace or Var records."
+  ([analysis source] (keyword-output analysis source {}))
+  ([analysis source options]
+   (let [parsed (get-in source [:declarations :parsed])]
+     (keyword-records analysis parsed (:filename source)
+                      (vec (syntax/nodes (:root parsed))) options))))
+
 (defn- protocol-analysis [analysis parsed filename config]
   (mapv (fn [entry]
           (let [defined-by (symbol (:defined-by entry))
@@ -1001,9 +1099,14 @@
         (:implementations analysis)))
 
 (defn- file-analysis [analysis source options config ids]
-  (let [parsed (get-in source [:declarations :parsed])
+  (let [analysis (with-definition-index analysis)
+        parsed (get-in source [:declarations :parsed])
         filename (:filename source)
         nodes (vec (syntax/nodes (:root parsed)))
+        lists (filterv #(= :list (:kind %)) nodes)
+        context {:lists lists :lists-by-start (into {} (map (juxt :start identity) lists))
+                 :protocols (filterv #(= "defprotocol" (some-> % syntax/forms first syntax/text)) lists)}
+        quoted (filterv #(#{:quote :discard :syntax-quote} (:kind %)) nodes)
         calls (into {} (for [node nodes :when (= :list (:kind node))
                              :let [head (first (syntax/forms node))]]
                          [(:start head) node]))
@@ -1024,7 +1127,7 @@
         ;; Compiler special forms do not appear as resolved Vars in Basilisp.
         ;; The compatible export still records defining forms such as def.
         defining-usages (for [definition definitions
-                              :let [node (definition-form nodes definition)
+                              :let [node (get-in context [:lists-by-start (:scope-start definition)])
                                     head (first (syntax/forms node))]
                               :when (and head (not (contains? recorded (:start head)))
                                          (#{"def" "declare"} (syntax/text head)))]
@@ -1036,7 +1139,7 @@
                              :when (and (= "quote" (syntax/text head))
                                         (not (contains? recorded (:start head)))
                                         (not (some #(and (#{:quote :discard :syntax-quote} (:kind %))
-                                                         (<= (:start %) (:start node)) (<= (:end node) (:end %))) nodes)))]
+                                                         (<= (:start %) (:start node)) (<= (:end node) (:end %))) quoted)))]
                          (merge head (source-location parsed filename head)
                                 {:name "quote" :ns "basilisp.core" :from (:namespace analysis)
                                  :definition {:macro true :fixed-arities #{1}}}))
@@ -1058,7 +1161,7 @@
     (cond-> {:namespace-definitions (mapv #(public-namespace parsed filename nodes options %) (:namespace-definitions analysis))
              :namespace-usages (mapv #(public-namespace-usage analysis parsed filename nodes %)
                                      (remove :python (:namespace-usages analysis)))
-             :var-definitions (mapv #(public-definition analysis parsed filename nodes options config %) definitions)}
+             :var-definitions (mapv #(public-definition analysis parsed filename context options config %) definitions)}
       (get options :var-usages true) (assoc :var-usages (mapv #(public-var-usage analysis parsed filename calls options %) usages))
       (:locals options) (assoc :locals locals :local-usages local-usages)
       (:keywords options) (assoc :keywords (keyword-records analysis parsed filename nodes options))

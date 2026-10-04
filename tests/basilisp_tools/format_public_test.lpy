@@ -1,0 +1,49 @@
+(ns basilisp-tools.format-public-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.syntax :as syntax]))
+
+(deftest supported-runtime-keyword-forms-test
+  ;; Public nREPL and Blender integrations use (namespace ::). These forms
+  ;; are readable in our minimum supported Basilisp 0.5.1 runtime.
+  (doseq [source [":" "::" ":legacy/" "::1"]]
+    (testing source
+      (is (keyword? (read-string source)))
+      (let [parsed (syntax/parse source)]
+        (is (empty? (:diagnostics parsed)))
+        (is (= source (syntax/text (:root parsed)))))
+      (is (= source (fmt/format-string source))))))
+
+(deftest public-logger-keyword-preservation-test
+  (let [source "(def logger\n(logging/getLogger (namespace ::)))"
+        expected "(def logger\n  (logging/getLogger (namespace ::)))"]
+    (is (= expected (fmt/format-string source)))
+    (is (= expected (fmt/format-string expected)))))
+
+(deftest closing-delimiter-blank-line-compatibility-test
+  ;; Reduced from basilisp-kernel's notebook integration tests. Upstream
+  ;; collapses a newline run across indented closing delimiters before it
+  ;; removes surrounding whitespace from the collections.
+  (doseq [[source expected]
+          [["(do\n (do\n (f)\n )\n )\n(g)\n"
+            "(do\n  (do\n    (f)))\n\n(g)\n"]
+           ["(do\n (do\n (f)\n)\n)\n(g)\n"
+            "(do\n  (do\n    (f)))\n(g)\n"]
+           ["(do\n (f)\n \n \n )\n#_(g)\n"
+            "(do\n  (f))\n\n#_(g)\n"]
+           ["(do\n (f)\n \n \n )\n"
+            "(do\n  (f))\n"]]]
+    (is (= expected (fmt/format-string source)))
+    (is (= expected (fmt/format-string expected))))
+  (is (= "(do\n  (do\n    (f)))\n(g)\n"
+         (fmt/format-string "(do\n (do\n (f)\n )\n )\n(g)\n"
+                            {:remove-consecutive-blank-lines? false})))
+  (doseq [source ["\"(do (do x\n )\n )\ny)\""
+                  "#\"(do (do x\n )\n )\ny)\""
+                  "#f\"{(do (do 1\n )\n )}\nend\""]]
+    (is (= source (fmt/format-string source)))))
+
+(deftest closing-gap-keeps-comment-line-endings-test
+  (doseq [source ["(do\n  (f) ; keep\n  )\n\n(g)\n"
+                  "{:a 1\n ;; keep\n }\n\n(g)\n"]]
+    (is (= source (fmt/format-string source)))))

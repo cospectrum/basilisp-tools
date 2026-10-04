@@ -147,7 +147,7 @@
                                    :epilog "Run blt COMMAND --help for command options and examples.")
         commands (.add_subparsers p ** :dest "command" :required true)
         format (.add_parser commands "format" ** :help "Format Basilisp source."
-                            :description "Format files in place, or use - for stdin/stdout. Directories are searched recursively for .lpy files."
+                            :description "Format files in place, or use - for stdin/stdout. Directories are searched recursively for .lpy and .cljc files."
                             :formatter_class argparse/RawDescriptionHelpFormatter
                             :epilog (str "Examples:\n"
                                          "  blt format src tests\n"
@@ -227,7 +227,7 @@
     @result))
 
 (defn- collect-files [paths options]
-  (let [pattern (:file-pattern options (re/compile "\\.lpy$"))]
+  (let [pattern (:file-pattern options (re/compile "\\.(?:lpy|cljc)$"))]
     (->> paths
          (mapcat (fn [path]
                    (let [p (.absolute (pathlib/Path path))]
@@ -528,8 +528,8 @@
         (if (= command "diagnostics")
           (do
             (cond
-              (empty? diagnostics) (.write sys/stdout "No diagnostics found!\n")
               (:format output) (print-batch-data diagnostics (:format output))
+              (empty? diagnostics) (.write sys/stdout "No diagnostics found!\n")
               :else
               (doseq [[uri items] (sort-by key diagnostics) item items]
                 (let [filename (get filenames uri)

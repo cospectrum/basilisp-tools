@@ -36,9 +36,9 @@
     (.write stream body)
     (.flush stream)))
 
-(defn- response! [client id]
+(defn- response! [client id timeout]
   (loop []
-    (let [message (.get (:messages client) ** :timeout 20)]
+    (let [message (.get (:messages client) ** :timeout timeout)]
       (when (:reader-error message) (throw (python/RuntimeError (:reader-error message))))
       (if (= id (:id message)) message
           (do (swap! (:notifications client) conj message)
@@ -53,7 +53,8 @@
 (defn- request! [client method params]
   (let [id (swap! (:id client) inc)]
     (send! client {:id id :method method :params params})
-    (response! client id)))
+    ;; A fresh installation compiles Basilisp namespaces on its first launch.
+    (response! client id (if (= method "initialize") 90 20))))
 
 (defn- result! [client method params]
   (let [response (request! client method params)]

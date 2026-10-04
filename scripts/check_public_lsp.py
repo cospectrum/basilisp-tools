@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""Exercise a real blt LSP process against a checked-out Basilisp project."""
+
+import argparse
+import collections
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+BLT = str(Path(__file__).resolve().parent.parent / ".venv" / "bin" / "blt")
+
+
+class Client:
+    def __init__(self, root, output, blt=BLT):
+        self.output = output
+        self.stderr = open(str(output) + ".stderr", "w")  # noqa: SIM115 - Owned until stop().
+        self.process = subprocess.Popen(
+            [str(blt), "lsp"],
+            cwd=root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr,
+        )
+        self.messages = queue.Queue()
+        self.notifications = []
+        self.next_id = 0
+        self.timings = []
+        self.transcript = []
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        try:
+            while True:
+                headers = {}
+                while True:
+                    line = self.process.stdout.readline()
+                    if not line:
+                        raise EOFError("server closed stdout")
+                    if line == b"\r\n":
+                        break
+                    key, value = line.decode("ascii").strip().split(":", 1)
+                    headers[key.lower()] = value.strip()
+                message = json.loads(
+                    self.process.stdout.read(int(headers["content-length"]))
+                )
+                self.messages.put(message)
+        except (EOFError, OSError, ValueError, IndexError) as error:
+            self.messages.put({"reader_error": repr(error)})
+
+    def send(self, method=None, params=None, **fields):
+        message = {"jsonrpc": "2.0", **fields}
+        if method is not None:
+            message.update(method=method, params=params)
+        body = json.dumps(message, ensure_ascii=False).encode()
+        self.process.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        self.process.stdin.flush()
+
+    def receive(self, deadline):
+        message = self.messages.get(timeout=max(0.001, deadline - time.monotonic()))
+        self.transcript.append(message)
+        if "reader_error" in message:
+            raise RuntimeError(message)
+        if "method" in message and "id" in message:
+            result = None
+            if message["method"] == "workspace/configuration":
+                result = [None for _ in message["params"]["items"]]
+            elif message["method"] == "workspace/applyEdit":
+                result = {"applied": False, "failureReason": "audit is read-only"}
+            self.send(id=message["id"], result=result)
+        return message
+
+    def request(self, method, params, timeout=180):
+        self.next_id += 1
+        request_id = self.next_id
+        begin = time.monotonic()
+        self.send(method, params, id=request_id)
+        while True:
+            try:
+                message = self.receive(begin + timeout)
+            except queue.Empty as error:
+                raise TimeoutError(
+                    f"{method} did not respond within {timeout}s"
+                ) from error
+            if message.get("id") == request_id and "method" not in message:
+                self.timings.append(
+                    {"method": method, "seconds": round(time.monotonic() - begin, 4)}
+                )
+                print(
+                    json.dumps(
+                        {"method": method, "seconds": self.timings[-1]["seconds"]}
+                    ),
+                    flush=True,
+                )
+                if "error" in message:
+                    raise RuntimeError(f"{method}: {message['error'].get('message')}")
+                return message.get("result")
+            self.notifications.append(message)
+
+    def diagnostics(self, uri, version, timeout=300):
+        begin = time.monotonic()
+
+        def matched(message):
+            params = message.get("params", {}) or {}
+            return (
+                message.get("method") == "textDocument/publishDiagnostics"
+                and params.get("uri") == uri
+                and params.get("version") == version
+            )
+
+        for index, message in enumerate(self.notifications):
+            if matched(message):
+                return self.notifications.pop(index)["params"]["diagnostics"]
+        while True:
+            try:
+                message = self.receive(begin + timeout)
+            except queue.Empty as error:
+                raise TimeoutError(
+                    f"diagnostics version {version} did not arrive within {timeout}s"
+                ) from error
+            if matched(message):
+                self.timings.append(
+                    {
+                        "method": "diagnostics",
+                        "version": version,
+                        "seconds": round(time.monotonic() - begin, 4),
+                    }
+                )
+                print(json.dumps(self.timings[-1]), flush=True)
+                return message["params"]["diagnostics"]
+            self.notifications.append(message)
+
+    def stop(self):
+        try:
+            if self.process.poll() is None:
+                self.request("shutdown", None, timeout=30)
+                self.send("exit", None)
+                # Finish the stdio session once the exit notification is flushed.
+                self.process.stdin.close()
+                self.process.wait(timeout=30)
+        finally:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.wait()
+            for stream in (self.process.stdin, self.process.stdout):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            self.stderr.close()
+            Path(str(self.output) + ".protocol.json").write_text(
+                json.dumps(self.transcript, indent=2)
+            )
+
+
+def at(uri, source, offset):
+    prefix = source[:offset]
+    return {
+        "textDocument": {"uri": uri},
+        "position": {
+            "line": prefix.count("\n"),
+            "character": len(prefix.rsplit("\n", 1)[-1].encode("utf-16-le")) // 2,
+        },
+    }
+
+
+def audit(root, filename, output, source_paths=None, python_executable=None, blt=BLT):
+    print(
+        json.dumps({"project": root.name, "file": str(filename), "status": "starting"}),
+        flush=True,
+    )
+    source = filename.read_text()
+    uri = filename.as_uri()
+    client = Client(root, output, blt=blt)
+    report = {
+        "root": str(root),
+        "file": str(filename),
+        "bytes": len(source.encode()),
+        "assertions": [],
+        "observations": {},
+    }
+
+    def verify(label, condition):
+        report["assertions"].append({"name": label, "passed": bool(condition)})
+
+    try:
+        settings = {
+            "text-document-sync-kind": "incremental",
+            "cache-path": str(output) + ".cache",
+        }
+        if source_paths:
+            settings["source-paths"] = source_paths
+        if python_executable:
+            settings["python"] = {"executable": python_executable}
+        initialized = client.request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": root.as_uri(),
+                "capabilities": {
+                    "general": {"positionEncodings": ["utf-16"]},
+                    "workspace": {"workspaceEdit": {"documentChanges": True}},
+                },
+                "initializationOptions": settings,
+            },
+        )
+        verify(
+            "incremental sync advertised",
+            initialized["capabilities"]["textDocumentSync"]["change"] == 2,
+        )
+        client.send("initialized", {})
+        client.send(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "basilisp",
+                    "version": 1,
+                    "text": source,
+                }
+            },
+        )
+        original_diagnostics = client.diagnostics(uri, 1)
+        report["observations"]["diagnostics"] = original_diagnostics
+        report["observations"]["diagnostic_counts"] = dict(
+            collections.Counter(d.get("code") for d in original_diagnostics)
+        )
+        verify(
+            "no server/configuration failure",
+            all(d.get("code") != "configuration" for d in original_diagnostics),
+        )
+        symbols = client.request(
+            "textDocument/documentSymbol", {"textDocument": {"uri": uri}}
+        )
+        report["observations"]["symbols"] = symbols
+        verify("document symbols found", bool(symbols))
+        candidate = None
+        # Protocol method symbols may be generated/non-renamable; select an
+        # editable declaration through the same capability an editor uses.
+        for symbol in sorted(symbols, key=lambda item: item.get("kind") != 12):
+            probe = {
+                "textDocument": {"uri": uri},
+                "position": symbol["selectionRange"]["start"],
+            }
+            try:
+                prepared = client.request("textDocument/prepareRename", probe)
+            except RuntimeError:
+                continue
+            if prepared:
+                candidate = symbol
+                report["observations"]["rename_candidate"] = symbol["name"]
+                break
+        verify("editable declaration found", candidate is not None)
+        if candidate:
+            point = {
+                "textDocument": {"uri": uri},
+                "position": candidate["selectionRange"]["start"],
+            }
+            hover = client.request("textDocument/hover", point)
+            report["observations"]["hover"] = hover
+            verify(
+                "declared symbol hover", bool(hover) and candidate["name"] in str(hover)
+            )
+            references = client.request(
+                "textDocument/references",
+                {**point, "context": {"includeDeclaration": True}},
+                timeout=900,
+            )
+            report["observations"]["references"] = references
+            verify(
+                "references include declaration",
+                any(
+                    x["uri"] == uri and x["range"]["start"] == point["position"]
+                    for x in references
+                ),
+            )
+            definition = client.request("textDocument/definition", point)
+            report["observations"]["definition"] = definition
+            verify(
+                "definition points to same document",
+                isinstance(definition, dict) and definition.get("uri") == uri,
+            )
+            rename = client.request(
+                "textDocument/rename", {**point, "newName": "blt-audit-renamed"}
+            )
+            report["observations"]["rename"] = rename
+            verify(
+                "rename contains declaration edit",
+                bool(
+                    rename and (rename.get("documentChanges") or rename.get("changes"))
+                ),
+            )
+        formatted = client.request(
+            "textDocument/formatting",
+            {
+                "textDocument": {"uri": uri},
+                "options": {"tabSize": 2, "insertSpaces": True},
+            },
+        )
+        report["observations"]["format_edits"] = formatted
+        # Exercise a UTF-16 ranged edit, and then remove its own diagnostic.
+        suffix = '\n(def blt-audit-emoji "😀")\nblt-audit-missing\n'
+        client.send(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": 2},
+                "contentChanges": [
+                    {
+                        "range": {
+                            "start": at(uri, source, len(source))["position"],
+                            "end": at(uri, source, len(source))["position"],
+                        },
+                        "text": suffix,
+                    }
+                ],
+            },
+        )
+        changed = source + suffix
+        changed_diagnostics = client.diagnostics(uri, 2)
+        verify(
+            "edit introduces unresolved symbol",
+            any(
+                d.get("code") == "unresolved-symbol"
+                and "blt-audit-missing" in d.get("message", "")
+                for d in changed_diagnostics
+            ),
+        )
+        start = changed.index("blt-audit-missing")
+        client.send(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": 3},
+                "contentChanges": [
+                    {
+                        "range": {
+                            "start": at(uri, changed, start)["position"],
+                            "end": at(uri, changed, start + len("blt-audit-missing"))[
+                                "position"
+                            ],
+                        },
+                        "text": "blt-audit-emoji",
+                    }
+                ],
+            },
+        )
+        fixed = client.diagnostics(uri, 3)
+        verify(
+            "edit removes unresolved symbol",
+            not any("blt-audit-missing" in d.get("message", "") for d in fixed),
+        )
+        # Supplement real source with an in-memory stdlib interop buffer.
+        python_uri = (filename.parent / "__blt_audit_interop.lpy").as_uri()
+        python_source = '(ns blt-audit-interop (:import [pathlib]))\n(def p (pathlib/Path "."))\n(.read_text p)\n(.read_ p)\n'
+        client.send(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": python_uri,
+                    "languageId": "basilisp",
+                    "version": 1,
+                    "text": python_source,
+                }
+            },
+        )
+        report["observations"]["python_diagnostics"] = client.diagnostics(python_uri, 1)
+        completion = client.request(
+            "textDocument/completion",
+            at(
+                python_uri,
+                python_source,
+                python_source.rindex(".read_") + len(".read_"),
+            ),
+        )
+        labels = [x["label"] for x in completion["items"]]
+        report["observations"]["python_completions"] = labels
+        verify(
+            "Python instance completion",
+            ".read_text" in labels and ".read_bytes" in labels,
+        )
+        python_hover = client.request(
+            "textDocument/hover",
+            at(python_uri, python_source, python_source.index(".read_text") + 3),
+        )
+        report["observations"]["python_hover"] = python_hover
+        verify(
+            "Python method hover",
+            bool(python_hover) and "read_text" in str(python_hover),
+        )
+    except Exception as error:  # noqa: BLE001 - Preserve failures and audit the next project.
+        report["error"] = repr(error)
+    finally:
+        try:
+            client.stop()
+            verify("clean shutdown", client.process.returncode == 0)
+        except Exception as error:  # noqa: BLE001 - Persist shutdown failure evidence.
+            report["shutdown_error"] = repr(error)
+        report["timings"] = client.timings
+        published = [
+            message["params"]
+            for message in client.transcript
+            if message.get("method") == "textDocument/publishDiagnostics"
+        ]
+        report["observations"]["published_versions"] = [
+            {
+                "uri": item["uri"],
+                "version": item.get("version"),
+                "counts": dict(
+                    collections.Counter(d.get("code") for d in item["diagnostics"])
+                ),
+            }
+            for item in published
+        ]
+        verify(
+            "no background configuration failures",
+            not any(
+                d.get("code") == "configuration"
+                for item in published
+                for d in item["diagnostics"]
+            ),
+        )
+        output.write_text(json.dumps(report, indent=2))
+        print(
+            json.dumps(
+                {
+                    "output": str(output),
+                    "file": str(filename),
+                    "assertions": report["assertions"],
+                    "timings": client.timings,
+                    "diagnostic_counts": report["observations"].get(
+                        "diagnostic_counts"
+                    ),
+                    "error": report.get("error"),
+                    "shutdown_error": report.get("shutdown_error"),
+                }
+            ),
+            flush=True,
+        )
+    return report
+
+
+PUBLIC_FILES = {
+    "basilisp-lang/basilisp": "src/basilisp/contrib/bencode.lpy",
+    "ikappaki/basilisp-pprint": "src/basilisp_pprint/pprint.lpy",
+    "ikappaki/basilisp-nrepl-async": "src/basilisp_nrepl_async/utils.lpy",
+    "ikappaki/basilisp-kernel": "basilisp_kernel/nrepl_server.lpy",
+    "ikappaki/basilisp-blender": "src/basilisp_blender/utils.lpy",
+    "vefjun/basilisp-flask": "src/basilisp_flask/demo.lpy",
+    "dpom/aerob": "src/aero/core.lpy",
+    "EnigmaCurry/calc": "src/calc/dice.cljc",
+    "vandyand/balli": "src/balli/describe.lpy",
+    "dpom/steno": "src/steno/utils.lpy",
+}
+
+
+def successful(report):
+    return (
+        not report.get("error")
+        and not report.get("shutdown_error")
+        and all(item["passed"] for item in report["assertions"])
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", type=Path, nargs="?")
+    parser.add_argument("file", type=Path, nargs="?")
+    parser.add_argument("report", type=Path, nargs="?")
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="JSON repository manifest (defaults to public_projects.json with --corpus)",
+    )
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        help="Directory containing checkout folders named after each repository",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Directory for per-project JSON, wire transcript and stderr",
+    )
+    parser.add_argument(
+        "--project",
+        action="append",
+        help="Limit to repository names or their final path components",
+    )
+    parser.add_argument("--blt", default=BLT)
+    parser.add_argument("--source-path", action="append")
+    parser.add_argument("--python-executable")
+    args = parser.parse_args()
+    if args.corpus and not args.manifest:
+        args.manifest = Path(__file__).with_name("public_projects.json")
+    if not args.manifest:
+        if not (args.root and args.file and args.report):
+            parser.error("provide root/file/report or --manifest and --output")
+        report = audit(
+            args.root.resolve(),
+            args.file.resolve(),
+            args.report,
+            args.source_path,
+            args.python_executable,
+            args.blt,
+        )
+        return 0 if successful(report) else 1
+    if not args.output:
+        parser.error("--manifest requires --output")
+    if not args.corpus and any(
+        not entry.get("path") for entry in json.loads(args.manifest.read_text())
+    ):
+        parser.error("manifest entries without path require --corpus")
+    args.output.mkdir(parents=True, exist_ok=True)
+    reports = []
+    for entry in json.loads(args.manifest.read_text()):
+        name = entry["repo"]
+        if (
+            args.project
+            and name not in args.project
+            and name.split("/")[-1] not in args.project
+        ):
+            continue
+        root = (
+            Path(entry["path"])
+            if entry.get("path")
+            else args.corpus / name.split("/")[-1]
+        ).resolve()
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        if entry.get("sha") and revision != entry["sha"]:
+            parser.error(f"{name}: checkout differs from the pinned manifest")
+        filename = root / (PUBLIC_FILES.get(name) or entry["files"][0])
+        report = audit(
+            root,
+            filename,
+            args.output / (name.replace("/", "__") + ".json"),
+            args.source_path or ["."],
+            args.python_executable,
+            args.blt,
+        )
+        report["repo"] = name
+        report["sha"] = entry.get("sha")
+        reports.append(report)
+    if not reports:
+        parser.error("no projects matched")
+    (args.output / "summary.json").write_text(json.dumps(reports, indent=2))
+    return 0 if all(successful(report) for report in reports) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

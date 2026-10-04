@@ -1,0 +1,225 @@
+(ns basilisp-tools.analyzer-public-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as bridge])
+  (:import [pathlib] [tempfile] [sys]))
+
+(defn- findings [source]
+  (:findings (analyzer/analyze source)))
+
+(defn- errors [source]
+  (filterv #(= :error (:level %)) (findings source)))
+
+(deftest builtin-and-implicit-import-resolution-test
+  (doseq [source ["(Exception.)" "(ValueError \"bad\")" "(round 1.25)"
+                  "(sys/getrecursionlimit)" "(operator/add 1 2)"
+                  "(basilisp.lang.keyword/keyword \"x\")"
+                  "(basilisp.lang.compiler.CompilerContext. \"<test>\")"]]
+    (testing source (is (empty? (findings source)))))
+  (is (= [:unresolved-symbol] (mapv :type (findings "(DefinitelyMissingBuiltin 1)"))))
+  (is (empty? (findings "(let [round (fn [x] x)] (round :custom))"))))
+
+(deftest dotted-import-resolution-test
+  (doseq [source ["(ns demo (:import os)) (os.path/join \"a\" \"b\")"
+                  "(ns demo (:import [datetime :as dt])) (dt.datetime/now)"
+                  "(python.str/upper \"hello\")"
+                  "(python.str/.upper \"hello\")"]]
+    (testing source (is (empty? (findings source)))))
+  (is (= [:unresolved-symbol]
+         (mapv :type (findings "(ns demo (:import os)) (os.path/definitely-missing)")))))
+
+(deftest context-manager-binding-test
+  (is (empty? (findings "(ns demo (:import contextlib)) (with [value (contextlib/nullcontext 3)] (+ value 1))")))
+  (is (empty? (errors "(defn ^:async f [manager] (with-async [value manager] value))")))
+  (is (= [:unresolved-symbol]
+         (mapv :type (findings "(ns demo (:import contextlib)) (with [value (contextlib/nullcontext 3)] value) value")))))
+
+(deftest interface-and-proxy-bindings-test
+  (is (empty? (findings "(definterface Stream (flush []) (write [value])) (proxy [Stream] [] (flush [] nil) (write [value] [this value]))")))
+  (is (empty? (errors "(proxy [python/object] [] (f ([] this) ([x] [this x])) (g [] (proxy-super f)))")))
+  (is (= [:unresolved-symbol]
+         (mapv :type (errors "(proxy [python/object] [] (f [value] [value missing]))")))))
+
+(deftest clojure-namespace-fallback-test
+  (is (empty? (errors "(ns demo (:require [clojure.test :refer [deftest is are]] [clojure.string :as s])) (deftest t (are [x expected] (= expected (s/upper-case x)) \"a\" \"A\"))")))
+  (is (empty? (errors "(ns demo (:use [basilisp.test])) (deftest t (is (= 1 1)))")))
+  (is (empty? (errors "(use 'basilisp.test) (deftest t (is (= 1 1)))")))
+  (is (= [:invalid-arity]
+         (mapv :type (errors "(ns demo (:require [clojure.string :as s])) (s/join)")))))
+
+(deftest if-not-tail-position-test
+  (is (empty? (errors "(loop [n 3] (if-not (zero? n) (recur (dec n)) :done))")))
+  (is (= [:unexpected-recur]
+         (mapv :type (errors "(loop [n 3] (if-not (zero? n) (recur (dec n)) :done) :after)")))))
+
+(deftest basilisp-character-string-test
+  (is (empty? (errors "(ns demo (:require [basilisp.string :as s])) (s/starts-with? \"abc\" \\a)"))))
+
+(deftest lint-as-project-declarations-test
+  (let [config {:lint-as {'demo.macros/defhandler 'basilisp.core/defn}}
+        source "(ns main (:require [demo.macros :refer [defhandler]])) (defhandler run [x] x)"
+        declarations (analyzer/declarations source {:config config})
+        result (analyzer/analyze "(ns caller (:require [main :as m])) (m/run)"
+                                 {:config config :project {"main" (:definitions declarations)}})]
+    (is (= #{1} (get-in declarations [:definitions "run" :fixed-arities])))
+    (is (= [:invalid-arity] (mapv :type (:findings result))))))
+
+(deftest compiler-special-forms-test
+  (is (empty? (errors "(require* [basilisp.string :as s]) (s/join [1 2])")))
+  (is (empty? (errors "(letfn* [a (fn* a [x] (b x)) b (fn* b [x] x)] (a 1))")))
+  (is (= [:invalid-arity]
+         (mapv :type (errors "(letfn* [a (fn* a [x] (b)) b (fn* b [x] x)] (a 1))"))))
+  (is (empty? (errors "(deftype* Item [value] :implements [python/object] (read [self] value))")))
+  (is (empty? (errors "(reify* :implements [python/object] (read [self] self))"))))
+
+(deftest docstrings-preserve-escapes-test
+  (is (= "Plain text" (get-in (analyzer/declarations "(defn f \"Plain text\" [] nil)") [:definitions "f" :doc])))
+  (is (= "Line\nTwo" (get-in (analyzer/declarations "(defn f \"Line\\nTwo\" [] nil)") [:definitions "f" :doc]))))
+
+(deftest version-reader-conditional-test
+  (is (empty? (errors "(ns demo (:require [basilisp.string :as s])) (s/starts-with? \"abc\" #?(:lpy39- missing :lpy310+ \"a\"))")))
+  (is (= "present" (first (keys (:definitions (analyzer/declarations "#?(:lpy39- (def absent 1) :lpy310+ (def present 2))")))))))
+
+(deftest private-var-quote-test
+  (let [project {"library" (:definitions (analyzer/declarations "(ns library) (defn- hidden [x] x)"))}]
+    (is (empty? (:findings (analyzer/analyze "(ns demo (:require [library :as lib])) (#'lib/hidden 1)" {:project project}))))
+    (is (= [:invalid-arity]
+           (mapv :type (:findings (analyzer/analyze "(ns demo (:require [library :as lib])) (#'lib/hidden)" {:project project})))))
+    (is (= [:private-call]
+           (mapv :type (:findings (analyzer/analyze "(ns demo (:require [library :as lib])) (lib/hidden 1)" {:project project})))))))
+
+(deftest context-manager-control-flow-test
+  (is (some #(= :unexpected-recur (:type %))
+            (errors "(loop [n 1] (with [r (io/StringIO)] (recur (dec n))))")))
+  (is (some #(= :await-without-async-fn (:type %))
+            (errors "(defn f [manager] (with-async [value manager] value))"))))
+
+(deftest selected-python-reader-features-test
+  (let [source "#?(:lpy310 (def target 10) :lpy313 (def host 13)) #?(:lpy310+ :valid :default unknown)"]
+    (with [directory (tempfile/TemporaryDirectory)]
+          (let [executable (pathlib/Path directory "python")]
+            (doseq [[minor expected] [[10 "target"] [13 "host"]]]
+              (.write_text executable
+                           (str "#!" sys/executable "\nprint('{\"paths\": [], \"version\": [3, " minor "]}')\n"))
+              (.chmod executable 493)
+              (let [opts {:python-options {:python-executable (str executable)
+                                           :python-cache (bridge/create-cache)}}]
+                (is (= #{expected} (set (keys (:definitions (analyzer/declarations source opts))))))
+                (is (empty? (:findings (analyzer/analyze source opts))))))))))
+
+(deftest use-does-not-synthesize-refer-all-finding-test
+  (is (= [:use]
+         (mapv :type (findings "(ns demo (:use [clojure.string])) (upper-case \"hello\")"))))
+  (is (= [:refer-all]
+         (mapv :type (findings "(ns demo (:require [clojure.string :refer :all])) (upper-case \"hello\")")))))
+
+(deftest metadata-wrapped-call-head-test
+  (is (empty? (errors "(^:mutable reify python/object (f [self] self))")))
+  (is (empty? (errors "(^:tagged let [x 1] x)")))
+  (is (= [:unresolved-symbol]
+         (mapv :type (errors "(^:mutable reify python/object (f [self] [self missing]))")))))
+
+(deftest fixed-and-variadic-arity-test
+  (is (empty? (errors "(defn f ([x] x) ([x & rest] [x rest])) (f 1) (f 1 2)")))
+  (is (= [:conflicting-fn-arity]
+         (mapv :type (errors "(fn ([x] x) ([y] y))"))))
+  (is (= [:conflicting-fn-arity]
+         (mapv :type (errors "(fn ([x & xs] [x xs]) ([y z & ys] [y z ys]))")))))
+
+(deftest literal-in-ns-bootstrap-test
+  (let [source "(in-ns 'basilisp.core) (def ^:macro fn (fn* fn [&env &form & decl] (cons 'fn* decl))) (def identity (fn identity [v] v))"
+        declarations (analyzer/declarations source)]
+    (is (= "basilisp.core" (:namespace declarations)))
+    (is (= "basilisp.core" (get-in declarations [:definitions "identity" :ns])))
+    (is (empty? (errors source))))
+  (is (= "user" (:namespace (analyzer/declarations "(in-ns (symbol (str missing)))"))))
+  (is (= [:unresolved-symbol]
+         (mapv :type (errors "(in-ns (symbol (str missing)))")))))
+
+(deftest namespaced-destructuring-directives-test
+  (is (empty? (errors "(let [{:a/syms [b] :or {b 1}} {'a/b 2}] (+ b 1))")))
+  (is (= [:type-mismatch] (mapv :type (errors "(let [{:a/syms [b]} {'a/b \"text\"}] (inc b))")))))
+
+(deftest function-postcondition-binding-test
+  (is (empty? (errors "(fn [x] {:pre [(pos? x)] :post [(> % 16)]} (* x x))")))
+  (is (empty? (errors "(fn ^{:post [(pos? %)]} [x] x)")))
+  (is (= [:unresolved-symbol] (mapv :type (errors "(fn [x] {:pre [(pos? %)]} x)")))))
+
+(deftest async-comprehension-binding-test
+  (is (empty? (errors "(defn ^:async f [values] (for-async [v values] (str v)))")))
+  (is (some #(= :await-without-async-fn (:type %))
+            (errors "(defn f [values] (for-async [v values] v))"))))
+
+(deftest assertion-template-bindings-test
+  (is (empty? (errors "(ns demo (:require [basilisp.test :refer [are]])) (are [input expected] (= expected (count input)) [1 2] 2 [3] 1)")))
+  (is (= [:type-mismatch]
+         (mapv :type (errors "(ns demo (:require [basilisp.test :refer [are]])) (are [input] (inc input) \"bad\")")))))
+
+(deftest variadic-protocols-and-dotted-new-test
+  (is (empty? (errors "(defprotocol P (f [self] [self x & xs])) (deftype T []) (extend-protocol P T (f [self] self) (f [self x & xs] [self x xs])) (f (->T) 1 2)")))
+  (is (empty? (errors "(ns demo) (defrecord R [x]) (new demo.R 1)"))))
+
+(deftest basilisp-python-name-munging-test
+  (is (empty? (errors "(basilisp.lang.runtime/next (list 1 2))")))
+  (is (empty? (errors "(let [f (fn [x] x)] (.-arities f))")))
+  (is (= [:unresolved-symbol]
+         (mapv :type (errors "(let [f (fn [x] x)] (.-not-a-real-attribute f))")))))
+
+(defprotocol VariadicProtocol
+  (-values [self] [self value & more]))
+
+(deftype VariadicImplementation [])
+
+(extend-protocol VariadicProtocol
+  VariadicImplementation
+  (-values [_self] [])
+  (-values [_self value & more] (cons value more)))
+
+(deftest variadic-protocol-runtime-test
+  (is (= [] (-values (->VariadicImplementation))))
+  (is (= [1 2 3] (-values (->VariadicImplementation) 1 2 3))))
+
+(deftest drop-last-sequence-arity-test
+  (doseq [source ["(drop-last [1 2 3])" "(drop-last 2 [1 2 3])"]]
+    (is (empty? (errors source))))
+  (is (= [:type-mismatch] (mapv :type (errors "(drop-last 2)"))))
+  (is (= [:type-mismatch] (mapv :type (errors "(drop-last :invalid [1 2 3])")))))
+
+(deftest are-implicit-assertion-test
+  ;; The invalid keyword call is intentional; thrown? itself is assertion syntax.
+  (is (= [:type-mismatch]
+         (mapv :type (errors "(ns demo (:require [basilisp.test :refer [are]])) (are [x] (thrown? TypeError (keyword x)) #'basilisp.core/map)")))))
+
+(deftest var-member-and-call-signature-test
+  (is (empty? (errors "(defn f [x] x) (.alter-meta #'f assoc :doc \"new\") (.alter-meta (var f) assoc :doc \"new\") (#'f 1)")))
+  (is (= [:invalid-arity] (mapv :type (errors "(defn f [x] x) (#'f)"))))
+  (is (empty? (errors "(defn f [x] x) (apply #'f [1])"))))
+
+(deftest apply-method-literal-selector-test
+  (doseq [source ["(apply-method \"hello\" upper [])"
+                  "(defn f [o f args] (apply-method o alter-meta f args))"
+                  "(defn f [o args] (apply-method-kw o update args))"]]
+    (is (empty? (errors source))))
+  (is (= [:unresolved-symbol] (mapv :type (errors "(apply-method \"hello\" missing-method [])")))))
+
+(deftest implicit-package-child-test
+  (is (empty? (errors "(ns demo (:import importlib)) (.entry_points importlib/metadata)"))))
+
+(deftest native-core-signatures-test
+  (is (= "bc" (subs "abc" 1 nil)))
+  (is (= 'demo/value (symbol :demo/value)))
+  (is (= 'basilisp-tools.analyzer-public-test/errors (symbol #'errors)))
+  (doseq [source ["(subs \"abc\" 1 nil)" "(symbol :demo/value)" "(symbol #'basilisp.core/map)"]]
+    (is (empty? (errors source))))
+  (is (= [:type-mismatch] (mapv :type (errors "(subs \"abc\" 1 :invalid)"))))
+  (is (= [:type-mismatch] (mapv :type (errors "(symbol nil)")))))
+
+(deftest native-string-arithmetic-test
+  (is (= "------" (* "-" 2 3)))
+  (is (= "---" (* 3 "-")))
+  (is (= "abc" (+ "a" "b" "c")))
+  (doseq [source ["(* \"-\" 3)" "(* 3 \"-\")" "(* \"-\" 2 3)"
+                  "(+ \"a\" \"b\")" "(subs (* \"-\" 3) 1)"]]
+    (is (empty? (errors source))))
+  (doseq [source ["(* \"a\" \"b\")" "(* \"a\" 1.5)" "(* [1 2] 2)" "(+ \"a\" 1)"]]
+    (is (= [:type-mismatch] (mapv :type (errors source))))))

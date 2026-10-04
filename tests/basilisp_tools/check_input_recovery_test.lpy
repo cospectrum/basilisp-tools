@@ -1,0 +1,220 @@
+(ns basilisp-tools.check-input-recovery-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.check :as check])
+  (:import [importlib] [pathlib] [tempfile] [zipfile] [unittest.mock :as mock]))
+
+(defn- check-path [path canonical?]
+  (check/run {:paths [(str path)] :repro true :cache false
+              :cwd (str (.-parent path)) :python-inspection? false
+              :config {:output {:canonical-paths canonical?}}}))
+
+(deftest unreadable-source-preserves-directory-findings-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp)
+          bad (.joinpath root "a.lpy") good (.joinpath root "b.lpy")]
+      (.write_bytes bad (python/bytes [255]))
+      (.write_text good "(ns b)\nmissing" ** :encoding "utf-8")
+      (doseq [canonical? [false true]
+              :let [result (check-path root canonical?)
+                    files (filterv #(= :file (:type %)) (:findings result))
+                    unresolved (filterv #(= :unresolved-symbol (:type %)) (:findings result))]]
+        (is (= 1 (get-in result [:summary :files])))
+        (is (= 1 (count files)))
+        (is (= (str (if canonical? (.resolve bad) bad)) (:filename (first files))))
+        (is (= 1 (count unresolved)))
+        (is (= (str (if canonical? (.resolve good) good)) (:filename (first unresolved))))
+        (is (= 3 (check/exit-status result)))))))
+
+(deftest unreadable-archive-member-preserves-findings-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) file (.joinpath root "library.whl")]
+      (with-open [archive (zipfile/ZipFile file "w")]
+        (.writestr archive "library/a.lpy" (python/bytes [255]))
+        (.writestr archive "library/b.lpy" "(ns library.b)\nmissing"))
+      (doseq [canonical? [false true]
+              :let [result (check-path file canonical?)
+                    prefix (if canonical? (str (.resolve file) ":") "")
+                    files (filterv #(= :file (:type %)) (:findings result))
+                    unresolved (filterv #(= :unresolved-symbol (:type %)) (:findings result))]]
+        (is (= 1 (get-in result [:summary :files])))
+        (is (= 1 (count files)))
+        (is (= (str prefix "library/a.lpy") (:filename (first files))))
+        (is (= 1 (count unresolved)))
+        (is (= (str prefix "library/b.lpy") (:filename (first unresolved))))
+        (is (= 3 (check/exit-status result)))))))
+
+(deftest shared-clojure-source-discovery-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp)
+          shared (.joinpath root "shared.cljc")
+          native (.joinpath root "native.lpy")]
+      (.write_text shared "(ns shared)\n#?(:clj unknown-jvm-value :lpy (defn identity* [x] x))" ** :encoding "utf-8")
+      (.write_text native "(ns native (:require [shared :as shared]))\n(shared/identity* 1)" ** :encoding "utf-8")
+      (.write_text (.joinpath root "ignored.clj") "unknown-jvm-value" ** :encoding "utf-8")
+      (let [result (check-path root false)]
+        (is (= 2 (get-in result [:summary :files])))
+        (is (empty? (:findings result))))
+      (let [wheel (.joinpath root "library.whl")]
+        (with-open [archive (zipfile/ZipFile wheel "w")]
+          (.writestr archive "shared.cljc" (.read_text shared ** :encoding "utf-8"))
+          (.writestr archive "native.lpy" (.read_text native ** :encoding "utf-8")))
+        (let [result (check-path wheel false)]
+          (is (= 2 (get-in result [:summary :files])))
+          (is (empty? (:findings result))))))))
+
+(deftest wide-source-keyword-analysis-does-not-exhaust-stack-test
+  (let [source (str "(ns wide)\n" (apply str (repeat 300 "(do {0 [1 2 3]})\n"))
+                    "(let [{:keys [value]} {:value 1}] value)\n:visible\n#_[:discarded]\n")
+        result (check/run {:stdin source :filename "wide.lpy" :repro true :cache false
+                           :python-inspection? false :config {:analysis {:keywords true}}})
+        keywords (:keywords (check/analysis-output result))]
+    (is (= ["keys" "value" "value" "visible"] (mapv :name keywords)))
+    (is (:keys-destructuring (second keywords)))))
+
+(deftest cached-declarations-preserve-source-analysis-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) file (.joinpath root "cached.lpy")
+          source "(ns ^{:custom true} cached)\n(defn f [x] x)\n(f)\n:visible"
+          options {:paths [(str file)] :repro true :cwd (str root)
+                   :python-inspection? false :cache-dir (str (.joinpath root "cache"))
+                   :config {:analysis {:keywords true :namespace-definitions {:meta true}}}}]
+      (.write_text file source ** :encoding "utf-8")
+      (let [cold (check/run options) warm (check/run options)
+            uncached (check/run (assoc options :cache false))]
+        (is (= (:findings cold) (:findings warm) (:findings uncached)))
+        (is (= (check/analysis-output cold) (check/analysis-output warm)
+               (check/analysis-output uncached)))
+        (is (= (get-in cold [:sources 0 :declarations])
+               (get-in warm [:sources 0 :declarations])))
+        (is (= (meta (get-in cold [:sources 0 :declarations :definitions]))
+               (meta (get-in warm [:sources 0 :declarations :definitions])))))
+      ;; Replacing the current namespace must not import its older cached Vars.
+      (.write_text file "(ns cached)\n(f)" ** :encoding "utf-8")
+      (let [changed (check/run options)]
+        (is (= [:unresolved-symbol] (mapv :type (:findings changed))))))))
+
+(deftest lint-as-config-invalidates-cached-declarations-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) library (.joinpath root "library.lpy")
+          consumer (.joinpath root "consumer.lpy")
+          options {:paths [(str root)] :repro true :cwd (str root)
+                   :python-inspection? false :cache-dir (str (.joinpath root "cache"))}]
+      (.write_text library "(ns library)\n(custom/defhandler handler [x] x)" ** :encoding "utf-8")
+      (.write_text consumer "(ns consumer (:require [library :as library]))\n(library/handler)" ** :encoding "utf-8")
+      (check/run options)
+      (let [config {:lint-as {'custom/defhandler 'basilisp.core/defn}}
+            configured (assoc options :config config)
+            cold (check/run configured) warm (check/run configured)]
+        (is (= (:findings cold) (:findings warm)))
+        (is (some #(= :invalid-arity (:type %)) (:findings warm)))
+        (is (= #{1} (get-in warm [:sources 1 :declarations :definitions "handler" :fixed-arities]))))
+      (let [unconfigured (check/run options)]
+        (is (not-any? #(= :invalid-arity (:type %)) (:findings unconfigured)))))))
+
+(deftest selected-python-version-invalidates-declarations-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) file (.joinpath root "versioned.cljc")
+          options {:paths [(str file)] :repro true :cwd (str root)
+                   :python-inspection? false :cache-dir (str (.joinpath root "cache"))}]
+      (.write_text file "(ns versioned)\n#?(:lpy310 (defn f [] nil) :default (defn f [x] x))\n(f)" ** :encoding "utf-8")
+      (with-open [_version (mock/patch "basilisp_tools.python.environment_version" ** :return_value [3 10])]
+        (is (empty? (:findings (check/run options))))
+        (is (empty? (:findings (check/run options)))))
+      (with-open [_version (mock/patch "basilisp_tools.python.environment_version" ** :return_value [3 13])]
+        (let [cold (check/run options) warm (check/run options)]
+          (is (= [:invalid-arity] (mapv :type (:findings cold))))
+          (is (= (:findings cold) (:findings warm))))))))
+
+(deftest definition-scope-index-preserves-containment-test
+  (let [checker (importlib/import_module "basilisp_tools.check")
+        ranges [[0 30] [2 8] [4 12] [2 8] [10 20] [12 18] [14 14] [25 40]]
+        definitions (mapv (fn [order [start end]]
+                            {:scope-start start :scope-end end :name (str order)})
+                          (range) ranges)
+        analysis (.with_definition_index checker {:var-definitions definitions})]
+    (doseq [start (range 42) end (range start 43)]
+      (let [expected (first (sort-by #(- (:scope-end %) (:scope-start %))
+                                     (filter #(and (<= (:scope-start %) start)
+                                                   (<= end (:scope-end %))) definitions)))]
+        (is (= expected (.enclosing_definition checker analysis start end))
+            (str "Query " start ".." end))))))
+
+(deftest dependency-cache-refreshes-reader-branches-test
+  (doseq [[archive? canonical?] [[false false] [true false] [true true]]]
+    (with-open [temp (tempfile/TemporaryDirectory)]
+      (let [root (pathlib/Path temp) vendor (.joinpath root "vendor")
+            _ (.mkdir vendor)
+            dependency (.joinpath vendor (if archive? "library.whl" "library.cljc"))
+            consumer (.joinpath root "consumer.lpy")
+            source "(ns library)\n#?(:lpy310 (defn which [] 10) :default (defn which [x] x))"
+            options {:repro true :cwd (str root) :python-inspection? false
+                     :cache-dir (str (.joinpath root "cache"))
+                     :config {:output {:canonical-paths canonical?}}}
+            consume (assoc options :paths [(str consumer)])]
+        (if archive?
+          (with-open [archive (zipfile/ZipFile dependency "w")]
+            (.writestr archive "library.cljc" source))
+          (.write_text dependency source ** :encoding "utf-8"))
+        (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/which 1)" ** :encoding "utf-8")
+        (with-open [_version (mock/patch "basilisp_tools.python.environment_version" ** :return_value [3 10])]
+          (check/run (assoc options :paths [(str dependency)] :dependencies true))
+          (is (= [:invalid-arity] (mapv :type (:findings (check/run consume))))))
+        (with-open [_version (mock/patch "basilisp_tools.python.environment_version" ** :return_value [3 13])]
+          (is (empty? (:findings (check/run consume))))
+          (is (empty? (:findings (check/run consume))))
+          ;; A refreshed cache must retain the selected declaration, not drop it.
+          (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/which)" ** :encoding "utf-8")
+          (is (= [:invalid-arity] (mapv :type (:findings (check/run consume))))))))))
+
+(deftest dependency-cache-refreshes-lint-as-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) vendor (.joinpath root "vendor")
+          _ (.mkdir vendor)
+          dependency (.joinpath vendor "library.lpy") consumer (.joinpath root "consumer.lpy")
+          options {:repro true :cwd (str root) :python-inspection? false
+                   :cache-dir (str (.joinpath root "cache"))}
+          config {:lint-as {'custom/defhandler 'basilisp.core/defn}}
+          consume (assoc options :paths [(str consumer)])]
+      (.write_text dependency "(ns library)\n(custom/defhandler handler [x] x)" ** :encoding "utf-8")
+      (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/handler)" ** :encoding "utf-8")
+      (check/run (assoc options :paths [(str dependency)] :config config :dependencies true))
+      (is (= [:invalid-arity] (mapv :type (:findings (check/run (assoc consume :config config))))))
+      (let [changed (check/run consume)
+            explicit (check/run (assoc options :paths [(str dependency) (str consumer)] :cache false))
+            expected (filterv #(= (str consumer) (:filename %)) (:findings explicit))]
+        (is (= expected (:findings changed)))
+        (is (not-any? #(= :invalid-arity (:type %)) (:findings changed)))
+        (is (= expected (:findings (check/run consume))))))))
+
+(deftest namespace-scoped-config-invalidates-declarations-test
+  (let [mapping {'library/custom 'basilisp.core/defn}
+        direct {:config-in-ns {'library {:lint-as mapping}}}
+        grouped {:config-in-ns {'libraries {:lint-as mapping}}
+                 :ns-groups [{:name 'libraries :pattern "^library$"}]}
+        inherited {:lint-as mapping :config-in-ns {'library {:lint-as {}}}}]
+    (doseq [[before after] [[direct (assoc-in direct [:config-in-ns 'library :lint-as 'library/custom] 'basilisp.core/def)]
+                            [grouped (assoc-in grouped [:ns-groups 0 :pattern] "^other$")]
+                            [inherited (assoc-in inherited [:config-in-ns 'library :lint-as] ^:replace {})]]]
+      (with-open [temp (tempfile/TemporaryDirectory)]
+        (let [root (pathlib/Path temp) vendor (.joinpath root "vendor")
+              _ (.mkdir vendor)
+              dependency (.joinpath vendor "library.lpy") consumer (.joinpath root "consumer.lpy")
+              options {:repro true :cwd (str root) :python-inspection? false
+                       :cache-dir (str (.joinpath root "cache"))}
+              consume (assoc options :paths [(str consumer)])]
+          (.write_text dependency "(ns library)\n(custom which [] 10)" ** :encoding "utf-8")
+          (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/which 1)" ** :encoding "utf-8")
+          (check/run (assoc options :paths [(str dependency)] :config before :dependencies true))
+          (is (= [:invalid-arity] (mapv :type (:findings (check/run (assoc consume :config before))))))
+          (let [changed (check/run (assoc consume :config after))
+                explicit (check/run (assoc options :paths [(str dependency) (str consumer)] :config after :cache false))
+                expected (filterv #(= (str consumer) (:filename %)) (:findings explicit))]
+            (is (= expected (:findings changed)))
+            (is (not-any? #(= :invalid-arity (:type %)) (:findings changed)))
+            (is (= expected (:findings (check/run (assoc consume :config after))))))
+          ;; Selected files must use the same configuration identity as dependencies.
+          (check/run (assoc options :paths [(str dependency)] :config before :dependencies true))
+          (let [selected (check/run (assoc options :paths [(str dependency)] :config after))
+                uncached (check/run (assoc options :paths [(str dependency)] :config after :cache false))]
+            (is (= (get-in selected [:sources 0 :declarations])
+                   (get-in uncached [:sources 0 :declarations])))))))))

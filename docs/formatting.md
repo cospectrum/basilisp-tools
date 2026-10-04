@@ -1,7 +1,7 @@
 # Formatting
 
 `blt format` formats files in place. Directories are searched recursively for
-`.lpy` files; use `-` to read from stdin and write to stdout.
+`.lpy` and `.cljc` files; use `-` to read from stdin and write to stdout.
 
 ```sh
 blt format src tests

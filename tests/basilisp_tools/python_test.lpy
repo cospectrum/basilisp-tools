@@ -1,7 +1,7 @@
 (ns basilisp-tools.python-test
   (:require [basilisp.test :refer [deftest is testing]]
             [basilisp-tools.python :as bridge])
-  (:import [pathlib] [subprocess] [sys] [tempfile]
+  (:import [pathlib] [subprocess] [sys] [tempfile] [types]
            [unittest.mock :as mock]))
 
 (deftest installed-module-test
@@ -97,7 +97,7 @@
   (is (= :missing (:status (bridge/inspect-module "blt_module_that_does_not_exist_92831"))))
   (is (= :unknown (:status (bridge/inspect-module "math" {:python-executable "/does/not/exist"}))))
   (is (nil? (bridge/check-call {:status :unknown} 100 ["anything"])))
-  (let [patch (mock/patch "subprocess.run"
+  (let [patch (mock/patch "subprocess.Popen"
                           ** :side_effect (subprocess/TimeoutExpired "python" 0.01))]
     (.start patch)
     (try
@@ -107,8 +107,8 @@
 
 (deftest inspection-cache-test
   (bridge/clear-cache!)
-  (let [original subprocess/run
-        patch (mock/patch "subprocess.run" ** :wraps original)
+  (let [original subprocess/Popen
+        patch (mock/patch "subprocess.Popen" ** :wraps original)
         wrapped (.start patch)]
     (try
       (bridge/inspect-modules ["math" "json"])
@@ -222,8 +222,8 @@
 (deftest owned-and-bounded-cache-test
   (let [first-cache (bridge/create-cache)
         second-cache (bridge/create-cache)
-        original subprocess/run
-        patch (mock/patch "subprocess.run" ** :wraps original)
+        original subprocess/Popen
+        patch (mock/patch "subprocess.Popen" ** :wraps original)
         wrapped (.start patch)]
     (try
       (bridge/inspect-module "math" {:python-cache first-cache})
@@ -242,18 +242,21 @@
 (deftest transient-failure-retry-test
   (let [storage (bridge/create-cache)
         opts {:python-cache storage}
-        patch (mock/patch "subprocess.run"
-                          ** :side_effect (subprocess/TimeoutExpired "python" 0.01))]
-    (.start patch)
+        clock (mock/patch "time.monotonic" ** :return_value 0)
+        patch (mock/patch "subprocess.Popen"
+                          ** :side_effect (subprocess/TimeoutExpired "python" 0.01))
+        wrapped (.start patch)]
+    (.start clock)
     (try
       (is (= "inspection-timeout" (:reason (bridge/inspect-module "math" opts))))
-      (finally (.stop patch)))
+      (is (= "inspection-timeout" (:reason (bridge/inspect-module "math" opts))))
+      (is (= 1 (.-call_count wrapped)))
+      (finally (.stop patch) (.stop clock)))
     (is (= :known (:status (bridge/inspect-module "math" opts))))
     (is (seq (bridge/environment-paths {:python-cache storage :python-inspection? false})))))
 
 (deftest in-flight-cache-clear-test
-  (let [script "import importlib, json, threading, types\nfrom unittest.mock import patch\nimport basilisp_tools\nfrom basilisp.lang.keyword import keyword\nfrom basilisp.lang.map import map as persistent_map\nbridge = importlib.import_module(\"basilisp_tools.python\")\ncache = bridge.create_cache()\noptions = persistent_map({keyword(\"python-cache\"): cache})\nentered, release = threading.Event(), threading.Event()\ncalls = []\ndef inspect(*args, **kwargs):\n    first = not calls\n    calls.append(True)\n    if first:\n        entered.set()\n        assert release.wait(5)\n    name = json.loads(kwargs[\"input\"])[\"modules\"][0]\n    data = {name: {\"status\": \"known\", \"name\": name, \"kind\": \"module\", \"doc\": \"old\" if first else \"fresh\"}}\n    return types.SimpleNamespace(returncode=0, stdout=json.dumps(data))\nwith patch(\"subprocess.run\", side_effect=inspect):\n    thread = threading.Thread(target=lambda: bridge.inspect_module(\"cache_race\", options))\n    thread.start()\n    assert entered.wait(5)\n    bridge.clear_cache__BANG__(cache)\n    assert bridge.inspect_module(\"cache_race\", options).val_at(keyword(\"doc\")) == \"fresh\"\n    release.set()\n    thread.join(5)\n    assert not thread.is_alive()\n    assert bridge.inspect_module(\"cache_race\", options).val_at(keyword(\"doc\")) == \"fresh\"\nprint(\"safe\")\n"
-        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+  (let [script "import importlib, json, threading, types\nfrom unittest.mock import patch\nimport basilisp_tools\nfrom basilisp.lang.keyword import keyword\nfrom basilisp.lang.map import map as persistent_map\nbridge = importlib.import_module(\"basilisp_tools.python\")\ncache = bridge.create_cache()\noptions = persistent_map({keyword(\"python-cache\"): cache})\nentered, release = threading.Event(), threading.Event()\ncalls = []\ndef inspect(*args, **kwargs):\n    first = not calls\n    calls.append(True)\n    if first:\n        entered.set()\n        assert release.wait(5)\n    name = json.loads(kwargs[\"input\"])[\"modules\"][0]\n    data = {name: {\"status\": \"known\", \"name\": name, \"kind\": \"module\", \"doc\": \"old\" if first else \"fresh\"}}\n    return types.SimpleNamespace(returncode=0, stdout=json.dumps(data))\nwith patch.object(bridge.worker_runtime.InspectionProcesses, \"run\", side_effect=inspect):\n    thread = threading.Thread(target=lambda: bridge.inspect_module(\"cache_race\", options))\n    thread.start()\n    assert entered.wait(5)\n    bridge.clear_cache__BANG__(cache)\n    assert bridge.inspect_module(\"cache_race\", options).val_at(keyword(\"doc\")) == \"fresh\"\n    release.set()\n    thread.join(5)\n    assert not thread.is_alive()\n    assert bridge.inspect_module(\"cache_race\", options).val_at(keyword(\"doc\")) == \"fresh\"\nprint(\"safe\")\n"
         result (subprocess/run (lisp->py [sys/executable "-I" "-c" script])
                                ** :text true :capture_output true :timeout 15)]
     (is (= 0 (.-returncode result)) (.-stderr result))
@@ -266,3 +269,184 @@
                                ** :text true :capture_output true :timeout 15)]
     (is (= 0 (.-returncode result)) (.-stderr result))
     (is (= "safe\n" (.-stdout result)))))
+
+(deftest metadata-member-name-collision-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-cache (bridge/create-cache)}]
+    (try
+      (.write_text (.joinpath root "colliding.py")
+                   (str "from typing import TypedDict\n"
+                        "status = 'ready'\n"
+                        "kind = 1\n"
+                        "inspection = True\n"
+                        "typevar = 'member'\n"
+                        "class Response:\n"
+                        "    status: str\n"
+                        "    def kind(self) -> int: return 1\n"
+                        "class Payload(TypedDict):\n"
+                        "    status: str\n"
+                        "    typevar: int\n")
+                   ** :encoding "utf-8")
+      (let [module (bridge/inspect-module "colliding" opts)
+            response (bridge/resolve-member module "Response")
+            payload (bridge/resolve-member module "Payload")]
+        (is (= :known (:status module)))
+        (doseq [member ["status" "kind" "inspection" "typevar"]]
+          (is (= :variable (:kind (bridge/resolve-member module member))) member))
+        (is (= ["str"] (:type-path (bridge/resolve-member response "status"))))
+        (is (= :function (:kind (bridge/resolve-member response "kind"))))
+        (is (= ["str"] (get-in payload [:typed-dict-fields "status" :type-path])))
+        (is (= ["int"] (get-in payload [:typed-dict-fields "typevar" :type-path]))))
+      (finally (.cleanup temp)))))
+
+(deftest partial-inspection-timeout-test
+  (let [opts {:python-cache (bridge/create-cache)}
+        output (.encode (str "{\"math\":{\"status\":\"known\",\"name\":\"math\",\"kind\":\"module\",\"members\":{}}}\n"
+                             "{\"unfinished") "utf-8")
+        patch (mock/patch "subprocess.Popen"
+                          ** :side_effect (subprocess/TimeoutExpired "python" 0.01 ** :output output))
+        wrapped (.start patch)]
+    (try
+      (let [modules (bridge/inspect-modules ["math" "slow"] opts)]
+        (is (= :known (:status (get modules "math"))))
+        (is (= "inspection-timeout" (:reason (get modules "slow")))))
+      (is (= :known (:status (bridge/inspect-module "math" opts))))
+      (is (= 1 (.-call_count wrapped)))
+      (finally (.stop patch)))))
+
+(deftest context-manager-protocol-selection-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-cache (bridge/create-cache)}
+        type {:module "contexts" :path ["Both"]}]
+    (try
+      (.write_text (.joinpath root "contexts.py")
+                   (str "class Both:\n"
+                        "    def __enter__(self) -> str: return ''\n"
+                        "    async def __aenter__(self) -> int: return 1\n")
+                   ** :encoding "utf-8")
+      (is (= ["str"] (:path (bridge/context-type type opts))))
+      (is (= ["int"] (:path (bridge/context-type type (assoc opts :async? true)))))
+      (finally (.cleanup temp)))))
+
+(deftest independent-import-graph-budget-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        modules (mapv #(str "budget_module_" %) (range 70))
+        opts {:python-paths [(str root)] :python-inspection? false
+              :python-cache (bridge/create-cache)}]
+    (try
+      (doseq [module modules]
+        (.write_text (.joinpath root (str module ".py")) "value: int = 1\n" ** :encoding "utf-8"))
+      (let [results (bridge/inspect-modules modules opts)]
+        (is (= 70 (count results)))
+        (doseq [module modules]
+          (is (= :known (:status (get results module))) module)
+          (is (= ["int"] (:type-path (bridge/resolve-member (get results module) "value"))) module)))
+      (finally (.cleanup temp)))))
+
+(deftest selected-interpreter-environment-test
+  (is (= [(.-major sys/version-info) (.-minor sys/version-info)]
+         (bridge/environment-version)))
+  (let [opts {:python-executable "/selected/bin/python" :python-cache (bridge/create-cache)}
+        result (types/SimpleNamespace ** :returncode 0
+                                      :stdout "{\"paths\":[\"/selected/lib\"],\"version\":[3,10]}")
+        patch (.object mock/patch (python/type (:processes (meta @(:python-cache opts))))
+                       "run" ** :return_value result)
+        wrapped (.start patch)]
+    (try
+      (is (= [3 10] (bridge/environment-version opts)))
+      (is (= ["/selected/lib"] (bridge/environment-paths opts)))
+      (is (= 1 (.-call_count wrapped)))
+      (finally (.stop patch)))))
+
+(deftest sibling-inheritance-substitution-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-cache (bridge/create-cache)}]
+    (try
+      (.write_text (.joinpath root "siblings.py")
+                   (str "from typing import Generic, TypeVar, Self, TypedDict\n"
+                        "T = TypeVar('T')\n"
+                        "class Parent:\n"
+                        "    def label(self) -> str: return ''\n"
+                        "    def again(self) -> Self: return self\n"
+                        "class Left(Parent): pass\n"
+                        "class Right(Parent): pass\n"
+                        "class Box(Generic[T]):\n"
+                        "    def get(self) -> T: ...\n"
+                        "class Text(Box[str]): pass\n"
+                        "class Number(Box[int]): pass\n"
+                        "Payload = TypedDict('Payload', {'$id': str, '$ref': int, '$blt_metadata': str, 'records': int, 'root': str, 'status': str})\n")
+                   ** :encoding "utf-8")
+      (doseq [name ["Left" "Right" "Parent"]]
+        (is (= [name] (:type-path (bridge/inspect-path "siblings" [name "again"] opts))))
+        (is (= ["str"] (:type-path (bridge/inspect-path "siblings" [name "label"] opts)))))
+      (is (= ["str"] (:type-path (bridge/inspect-path "siblings" ["Text" "get"] opts))))
+      (is (= ["int"] (:type-path (bridge/inspect-path "siblings" ["Number" "get"] opts))))
+      (is (= "T" (:typevar (bridge/inspect-path "siblings" ["Box" "get"] opts))))
+      (let [payload (bridge/inspect-path "siblings" ["Payload"] opts)]
+        (is (= #{"$id" "$ref" "$blt_metadata" "records" "root" "status"}
+               (set (keys (:typed-dict-fields payload)))))
+        (is (= ["int"] (get-in payload [:typed-dict-fields "$ref" :type-path]))))
+      (finally (.cleanup temp)))))
+
+(deftest metadata-transport-roundtrip-test
+  (let [script "import importlib.util, json, sys\nspec = importlib.util.spec_from_file_location('worker', sys.argv[1])\nworker = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(worker)\nshared = {'status': 'known', 'name': 'status', 'kind': 'variable', 'type-module': 'builtins', 'type-path': ['str']}\nsource = {'sample': {'status': 'known', 'kind': 'module', 'members': {name: shared for name in ['left', 'right', '$id', '$ref', '$blt_metadata', 'records', 'root', 'status']}}}\ndecode = worker.metadata_decoder(lambda name: ':' + name, dict, tuple)\nlegacy = json.loads(json.dumps(source), object_hook=decode)\ngraph = json.loads(json.dumps(worker.encode_graph(source)), object_hook=decode)\nassert legacy == graph\nshared_list = ['status', {'$ref': 9, '$blt_graph': 1}]\nnative = {'left': shared_list, 'right': shared_list}\nrestored = worker.decode_graph(json.loads(json.dumps(worker.encode_graph(native))))\nassert restored == native\nassert restored['left'] is restored['right']\nmembers = graph['sample'][':members']\nassert members['left'] is members['right']\nassert set(members) == set(source['sample']['members'])\ntry:\n    json.loads('{\"$blt_graph\":1,\"records\":[],\"root\":{\"$ref\":0}}', object_hook=decode)\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('invalid reference accepted')\nprint('safe')\n"
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])
+                               ** :text true :capture_output true :timeout 15)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "safe\n" (.-stdout result)))))
+
+(deftest statically-discovered-package-child-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        package (.joinpath root "lazy_package")
+        sentinel (.joinpath root "executed")
+        opts {:python-paths [(str root)] :python-cache (bridge/create-cache)}]
+    (try
+      (.mkdir package)
+      (.write_text (.joinpath package "__init__.py") "shadowed = 1\n" ** :encoding "utf-8")
+      (.write_text (.joinpath package "child.py")
+                   (str "from pathlib import Path\n"
+                        "Path(" (python/repr (str sentinel)) ").touch()\n"
+                        "def convert(value: str) -> int: return len(value)\n")
+                   ** :encoding "utf-8")
+      (.write_text (.joinpath package "shadowed.py") "raise AssertionError('not a module attribute')\n"
+                   ** :encoding "utf-8")
+      (let [function (bridge/inspect-path "lazy_package" ["child" "convert"] opts)]
+        (is (= :known (:status function)))
+        (is (= ["int"] (:type-path function)))
+        (is (= [] (bridge/check-call function 1 []))))
+      (is (= :variable (:kind (bridge/inspect-path "lazy_package" ["shadowed"] opts))))
+      (is (nil? (bridge/inspect-path "lazy_package" ["not_a_module"] opts)))
+      (is (not (.exists sentinel)))
+      (is (= :function (:kind (bridge/inspect-path "urllib" ["parse" "quote"]))))
+      (is (= :class (:kind (bridge/inspect-path "importlib" ["metadata" "EntryPoint"]))))
+      (finally (.cleanup temp)))))
+
+(deftest shared-generic-specialization-test
+  ;; Eighteen shared levels represent over 250,000 paths but only 19 nodes.
+  ;; This shape occurs in large NumPy signatures and inherited class metadata.
+  (let [leaf {:status :known :kind :variable :name "value" :typevar "T"}
+        tree (nth (iterate #(hash-map :members {"left" % "right" %}) leaf) 18)
+        metadata (assoc tree :type-parameters [{:typevar "T"}])
+        specialize (fn [name]
+                     (bridge/specialize metadata {:arguments [{:module "builtins" :path [name]}]}))]
+    (doseq [name ["str" "int"]]
+      (loop [value (specialize name) remaining 18]
+        (if (zero? remaining)
+          (is (= [name] (:type-path value)))
+          (let [left (get-in value [:members "left"])
+                right (get-in value [:members "right"])]
+            (is (identical? left right))
+            (recur left (dec remaining))))))
+    (is (= "T" (:typevar leaf)))))
+
+(deftest dynamic-super-receiver-test
+  (let [opts {:python-cache (bridge/create-cache)}
+        receiver {:module "builtins" :path ["super"]}]
+    (is (= :unknown (:status (bridge/inspect-member receiver "write" opts))))
+    (is (nil? (bridge/inspect-member {:module "builtins" :path ["str"]} "definitely_missing" opts)))))

@@ -11,8 +11,8 @@ blt check --lang edn - < settings.edn
 blt check --fail-level error .
 ```
 
-Directories are searched for `.lpy` files. Explicit `.edn` files are checked as
-data. Inputs can also be archives, platform-separated path lists, or stdin.
+Directories are searched for `.lpy` and `.cljc` files. Explicit `.edn` files are
+checked as data. Inputs can also be archives, platform-separated path lists, or stdin.
 Generated directories and symlinks are skipped.
 
 Exit codes are **0** for success, **2** for warnings, and **3** for errors.
@@ -90,6 +90,7 @@ names and severities are used where the behavior applies to Basilisp.
 
 Basilisp semantics take precedence: for example, `format` uses Python's
 percent-formatting rules, and reader conditionals select Basilisp branches.
+Version branches such as `:lpy310+` follow the selected Python interpreter.
 Source diagnostic rows and columns are one-based; columns count UTF-16 code units.
 
 ## Python support
@@ -112,8 +113,9 @@ types also flow through bindings, returns, common builtins, threaded calls, and
 supported asynchronous or context-manager operations.
 
 Runtime inspection executes package import initialization code. The subprocess
-has a timeout and is not a security sandbox. `--no-python-inspection` disables
-runtime inspection while retaining static source and stub analysis.
+has a timeout and is not a security sandbox. The timeout covers an inspection
+batch; completed results are retained if a later module times out.
+`--no-python-inspection` disables runtime inspection while retaining static source and stub analysis.
 
 Dynamic attributes, unknown macros, and missing annotations can leave types
 unknown. The checker avoids reporting a mismatch without enough information.

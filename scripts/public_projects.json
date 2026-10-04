@@ -1,0 +1,42 @@
+[
+  {
+    "repo": "basilisp-lang/basilisp",
+    "sha": "2f993f9e53b4195316426140384c38728304341e"
+  },
+  {
+    "repo": "ikappaki/basilisp-pprint",
+    "sha": "8102a7a0055c732c189a42b98d63efb90de4d7bb"
+  },
+  {
+    "repo": "ikappaki/basilisp-nrepl-async",
+    "sha": "ed3b930a70814743335d6ffda78a3b9c34a6e894"
+  },
+  {
+    "repo": "ikappaki/basilisp-kernel",
+    "sha": "680ee54c26564d2b473bfffc01033c9b242d679d"
+  },
+  {
+    "repo": "ikappaki/basilisp-blender",
+    "sha": "96f0d3efa59dd1025d001655c1322aa7fb740864"
+  },
+  {
+    "repo": "vefjun/basilisp-flask",
+    "sha": "ccdb8e90477d166ba7247b1385d2bd3b9905465d"
+  },
+  {
+    "repo": "dpom/aerob",
+    "sha": "e8de39a945579267a7f134ed74a4903899575e7b"
+  },
+  {
+    "repo": "EnigmaCurry/calc",
+    "sha": "e9137f2c50ab9e55799e9a2c3e94a48829384dba"
+  },
+  {
+    "repo": "vandyand/balli",
+    "sha": "c530ac16afff7d7ca0d8a0606bc630914ade77ca"
+  },
+  {
+    "repo": "dpom/steno",
+    "sha": "aaef8204d0ea5b6e46c0e46ab64e53bc747d1ae5"
+  }
+]

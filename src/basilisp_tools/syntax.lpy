@@ -42,9 +42,20 @@
   (filterv #(not (contains? non-form-kinds (:kind %))) (:children node)))
 
 (defn nodes
-  "All nodes in source order, including the supplied root."
+  "A reusable lazy sequence of all nodes in source order, including the root."
   [node]
-  (tree-seq #(seq (:children %)) :children node))
+  ;; An explicit stack avoids nested tree-seq/mapcat chains on large trees.
+  (let [pending (python/list [node]) end (python/object)]
+    (iterator-seq
+     (python/iter
+      (fn []
+        (if (python/bool pending)
+          (let [current (.pop pending)]
+            (when-let [children (:children current)]
+              (.extend pending (python/reversed children)))
+            current)
+          end))
+      end))))
 
 (defn tokens
   "Leaf tokens in source order, including trivia and invalid text."
@@ -148,8 +159,13 @@
     (op/eq kind :number) (when-not (valid-number? s) "Invalid numeric literal")
     (op/eq kind :keyword)
     (let [body (subs s (if (.startswith s "::") 2 1))]
-      (when-not (or (and (not (.startswith s "::")) (.isnumeric body))
-                    (.fullmatch identifier-re body))
+      ;; Basilisp 0.5.1 accepts empty and numeric keyword names, including
+      ;; the bare :: commonly used to obtain the current namespace. Keep
+      ;; these readable even though newer readers tightened identifiers.
+      (when-not (or (empty? body) (.isnumeric body)
+                    (.fullmatch identifier-re body)
+                    (and (.endswith body "/") (op/eq 1 (.count body "/"))
+                         (.fullmatch identifier-re (subs body 0 (dec (count body))))))
         "Invalid keyword"))
     (op/eq kind :symbol)
     (when-not (.fullmatch identifier-re s) "Invalid symbol")

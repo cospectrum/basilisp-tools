@@ -214,3 +214,55 @@
       (cached doc {} options {} {} compute)
       (is (= 2 @calls))
       (finally (.cleanup temporary)))))
+
+(deftest unsaved-editor-snapshots-preserve-the-saved-analysis-cache-test
+  (let [{:keys [temporary root options]} (fixture)
+        cached (internal 'cached-analysis) file (.joinpath root "sample.lpy")
+        uri (.as_uri file) source "(ns sample)" calls (atom 0)
+        saved (workspace/TextDocument uri ** :source source :version 1)
+        dirty (workspace/TextDocument uri ** :source "(ns sample) missing" :version 2)
+        compute #(do (swap! calls inc) {:namespace "sample" :findings []})]
+    (try
+      (.write_text file source ** :encoding "utf-8")
+      (cached saved {} options {} {} compute)
+      (is (= 1 @calls))
+      (cached dirty {} options {} {} compute)
+      (cached dirty {} options {} {} compute)
+      (is (= 3 @calls))
+      ;; Returning to the on-disk text still hits the cache written before edits.
+      (cached saved {} options {} {} compute)
+      (is (= 3 @calls))
+      (.write_text file (.-source dirty) ** :encoding "utf-8")
+      (cached dirty {} options {} {} compute)
+      (cached dirty {} options {} {} compute)
+      (is (= 4 @calls))
+      (finally (.cleanup temporary)))))
+
+(deftest persistent-cache-preserves-shared-metadata-test
+  (let [{:keys [temporary root options]} (fixture)
+        cached (internal 'cached-analysis) doc (document root "(ns sample)")
+        shared {:name "read" :parameters [{:name "source" :type "str"}]
+                :literal {"$ref" 9 "$blt_graph" "user-value"}}
+        result {:namespace "sample" :findings [] :first shared :second shared}
+        calls (atom 0) compute #(do (swap! calls inc) result)]
+    (try
+      (cached doc {} options {} {} compute)
+      (let [restored (cached doc {} options {} {} compute)]
+        (is (= result restored))
+        (is (= 1 @calls))
+        (is (identical? (:first restored) (:second restored))))
+      (finally (.cleanup temporary)))))
+
+(deftest stale-persistence-does-not-replace-an-existing-cache-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary)) file (.joinpath root "snapshot.json")
+        write (internal 'analysis-cache-write!) calls (atom 0)]
+    (try
+      (write file "old" {:findings [] :source "saved"})
+      (let [original (.read_text file)]
+        ;; The snapshot becomes stale after encoding but before atomic replace.
+        (write file "stale" {:findings [] :source "obsolete"} #(= 1 (swap! calls inc)))
+        (is (= 2 @calls))
+        (is (= original (.read_text file)))
+        (is (empty? (vec (.glob root ".blt-*.tmp")))))
+      (finally (.cleanup temporary)))))

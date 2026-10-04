@@ -1,0 +1,50 @@
+(ns basilisp-tools.cli-shared-source-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.cli :as cli])
+  (:import [io] [json] [pathlib] [tempfile] [unittest.mock :as mock]))
+
+(defn- run-cli [args]
+  (let [out (io/StringIO) err (io/StringIO)]
+    (with-open [_out (mock/patch "sys.stdout" out)
+                _err (mock/patch "sys.stderr" err)]
+      (let [code (cli/main args)]
+        {:code code :out (.getvalue out) :err (.getvalue err)}))))
+
+(deftest formatter-discovers-shared-clojure-sources-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp)
+          config (.joinpath root "config.edn")
+          shared (.joinpath root "shared.cljc")
+          native (.joinpath root "native.lpy")
+          source "(let [x 1]\nx)\n"
+          expected "(let [x 1]\n  x)\n"
+          args ["format" "--config" (str config)]]
+      (.write_text config "{}" ** :encoding "utf-8")
+      (.write_text shared source ** :encoding "utf-8")
+      (.write_text native source ** :encoding "utf-8")
+      (.write_text (.joinpath root "ignored.clj") "(" ** :encoding "utf-8")
+      (let [result (run-cli (concat args ["--diff" (str root)]))]
+        (is (= 1 (:code result)))
+        (is (>= (.find (:out result) "shared.cljc") 0))
+        (is (>= (.find (:out result) "native.lpy") 0)))
+      (is (= source (.read_text shared ** :encoding "utf-8")))
+      (is (= 0 (:code (run-cli (conj args (str root))))))
+      (is (= expected (.read_text shared ** :encoding "utf-8")))
+      (is (= expected (.read_text native ** :encoding "utf-8")))
+      (is (= 0 (:code (run-cli (concat args ["--check" (str root)]))))))))
+
+(deftest empty-lsp-diagnostics-honor-output-format-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp)
+          source (.joinpath root "src" "clean.lpy")
+          args ["lsp" "diagnostics" "--project-root" (str root)
+                "--no-python-inspection" "--settings" "{:cache-path false}"]]
+      (.mkdir (.-parent source))
+      (.write_text source "(ns clean)" ** :encoding "utf-8")
+      (let [result (run-cli (concat args ["--output" "{:format :json}"]))]
+        (is (= 0 (:code result)))
+        (is (empty? (json/loads (:out result)))))
+      (let [result (run-cli (concat args ["--output" "{:format :edn}"]))]
+        (is (= 0 (:code result)))
+        (is (= "{}\n" (:out result))))
+      (is (= "No diagnostics found!\n" (:out (run-cli args)))))))

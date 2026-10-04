@@ -53,6 +53,8 @@ jobs:
         run: nix develop --no-update-lock-file --command actionlint
       - name: Check real Python packages
         run: nix develop --no-update-lock-file --command uv run --locked --with numpy==2.5.3 --with requests==2.34.2 --with types-requests==2.33.0.20260906 --with pydantic==2.13.5 python scripts/check_python_packages.py --timeout 10
+      - name: Exercise generated projects
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_generated_projects.py --output "$RUNNER_TEMP/blt-generated" --seeds 1 --workspace-files 12
       - name: Build distribution
         run: nix develop --no-update-lock-file --command uv build
       - name: Test installed wheel

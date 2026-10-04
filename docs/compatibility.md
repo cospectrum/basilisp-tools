@@ -20,6 +20,8 @@ supported refactorings preserve values and evaluation order.
 - **Language semantics:** Basilisp reader branches, Python objects, Python
   formatting, and Basilisp's core library govern checking. JVM/ClojureScript
   classes, Java classpaths, and their platform-specific tooling are not emulated.
+  Valid native differences, such as variadic protocols, are reported separately
+  from exact upstream matches.
 - **Static knowledge:** unknown macros, dynamic Python attributes, and missing
   annotations can remain unresolved. Annotations and overloads improve inference;
   they do not make Python fully statically typed.
@@ -45,8 +47,9 @@ See [Formatting](formatting.md), [Checking](checking.md), and
 ## Development
 
 CI runs on macOS and Linux, checks blt's own source, and tests the installed wheel.
-Formatter tests include Basilisp's source corpus. Python integration tests use
-NumPy, Requests with type stubs, and Pydantic. The
+Formatter tests include Basilisp's source corpus. The
+[public-project audit](public-project-audit.md) covers ten repositories and
+executable generated projects. Python integration tests use NumPy, Requests with type stubs, and Pydantic. The
 [workflow](../.github/workflows/ci.yml) and [Nix lockfile](../flake.lock) record
 the exact reference versions.
 

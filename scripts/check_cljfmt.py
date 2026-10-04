@@ -2,7 +2,7 @@
 
 Run with: uv run python scripts/check_cljfmt.py --cljfmt /path/to/cljfmt
 Requires Clojure and Java. No upstream source or generated fixtures are vendored.
-Add --corpus /path/to/basilisp to compare real .lpy files as well.
+Add --corpus /path/to/basilisp to compare real .lpy and .cljc files as well.
 """
 
 from __future__ import annotations

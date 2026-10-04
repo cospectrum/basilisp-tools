@@ -48,6 +48,11 @@
     {:name "spaced-reader-conditional" :source "#? (:clj (a\nb)\n:cljs (c\nd))" :options {}}
     {:name "spaced-reader-splice" :source "#?@ (:clj [a\nb])" :options {}}
     {:name "commented-reader-conditional" :source "#? ; platform\n(:clj (a\nb)\n:cljs (c\nd))" :options {}}
+    {:name "indented-closing-delimiters" :source "(do\n (do\n (f)\n )\n )\n(g)\n" :options {}}
+    {:name "indented-closing-delimiters-no-collapse" :source "(do\n (do\n (f)\n )\n )\n(g)\n"
+     :options {:remove-consecutive-blank-lines? false}}
+    {:name "indented-closing-delimiters-no-trim" :source "(do\n (do\n (f)\n )\n )\n(g)\n"
+     :options {:remove-surrounding-whitespace? false}}
     {:name "java-quoted-indent-pattern" :source "(my-fn value\n(body))"
      :options {:extra-indents {(re-pattern "^\\Qmy-fn\\E$") [[:block 1]]}}}
     {:name "java-unicode-indent-pattern" :source "(συνάρτηση value\n(body))"
@@ -91,7 +96,8 @@
                          :oracle-error (.getMessage ex)}))))
                 (range)
                 (sort-by str (filter #(and (.isFile %)
-                                           (string/ends-with? (.getName %) ".lpy"))
+                                           (or (string/ends-with? (.getName %) ".lpy")
+                                               (string/ends-with? (.getName %) ".cljc")))
                                      (file-seq (io/file corpus))))))
         data (walk/postwalk
               #(if (instance? java.util.regex.Pattern %)

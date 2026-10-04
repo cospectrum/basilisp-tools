@@ -15,7 +15,7 @@ uv tool install git+https://github.com/cospectrum/basilisp-tools.git
 ## Usage
 
 ```sh
-blt format .          # Format .lpy files in place
+blt format .          # Format .lpy and .cljc files in place
 blt format --check .  # Check without writing
 blt check .           # Check code and Python interop
 blt lsp               # Start the stdio language server

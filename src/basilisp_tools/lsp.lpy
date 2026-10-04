@@ -10,7 +10,9 @@
             [basilisp-tools.python :as py]
             [basilisp-tools.regex :as regex]
             [basilisp-tools.syntax :as syntax])
-  (:import [base64] [datetime] [decimal] [fractions] [hashlib] [json] [tempfile] [uuid]
+  (:import [importlib.util :as import-util]
+           [concurrent.futures :as futures] [contextvars] [queue] [threading]
+           [base64] [datetime] [decimal] [fractions] [hashlib] [json] [tempfile] [uuid]
            [urllib.parse :as url] [zipfile] [asyncio] [functools] [logging] [os] [os.path :as pathutil] [pathlib] [re] [sys]
            [importlib] [importlib.metadata :as metadata]
            [lsprotocol.types :as lsp]
@@ -21,9 +23,49 @@
            [pygls.uris :as uris]
            [pygls.workspace :as workspace]))
 
+(defn- worker-loop [jobs]
+  (loop []
+    (when-let [[future context function arguments] (.get jobs)]
+      (when (.set_running_or_notify_cancel future)
+        (try
+          (.set_result future (.run context #(apply function arguments)))
+          (catch python/BaseException error (.set_exception future error))))
+      (recur))))
+
+(defn- create-workers []
+  ;; A fixed number of daemon workers bounds live computations, including jobs
+  ;; whose awaiting coroutine was cancelled. Disposable analysis must not keep
+  ;; the stdio server alive after the client has requested shutdown and exit.
+  (let [jobs (queue/Queue)
+        threads (mapv (fn [number]
+                        (doto (threading/Thread ** :target #(worker-loop jobs)
+                                                :name (str "blt-analysis-" number) :daemon true)
+                          (.start))) (range 4))]
+    {:jobs jobs :threads threads :closed (threading/Event)}))
+
+(defn- stop-workers! [workers]
+  (when (and workers (not (.is_set (:closed workers))))
+    (.set (:closed workers))
+    (loop []
+      (when-let [job (try (.get_nowait (:jobs workers)) (catch queue/Empty _ nil))]
+        (.cancel (first job))
+        (recur)))
+    (doseq [_ (:threads workers)] (.put (:jobs workers) nil))))
+
+(defasync ^:private worker! [state function & arguments]
+  (let [workers (or (:workers @state)
+                    (let [workers (create-workers)] (swap! state assoc :workers workers) workers))
+        future (futures/Future)]
+    (when (.is_set (:closed workers)) (throw (asyncio/CancelledError)))
+    (.put (:jobs workers) [future (contextvars/copy_context) function arguments])
+    ;; wrap_future handles delivery to a cancelled future or closed event loop.
+    (await (asyncio/wrap_future future))))
+
 (def ^:private excluded-directories
   #{".git" ".hg" ".svn" ".lsp" ".clj-kondo" ".venv" "venv" ".direnv" ".tox" "node_modules"
     "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
+
+(def ^:private source-suffixes #{".lpy" ".cljc"})
 
 (defn- failure [message]
   (throw (errors/JsonRpcInvalidParams message)))
@@ -438,6 +480,7 @@
                      (not= by-root (:settings-by-root @state)))]
     (when changed?
       (swap! state assoc :settings settings :settings-by-root by-root :analyses {})
+      (swap! state update :analysis-epoch (fnil inc 0))
       (swap! state update :generation inc)
       (swap! state assoc :tokens {})
       (py/clear-cache! (:python-cache (:options @state)))
@@ -552,15 +595,17 @@
 (defn- cached-declaration-index [documents cache options settings epoch]
   (let [raw (reduce (fn [index [uri document]]
                       (let [source (.-source document) prior (get @cache uri)
-                            info (if (= source (:source prior)) (:info prior)
-                                     (let [info (analyzer/declarations source {:filename (source-file document)})]
-                                       (swap! cache assoc uri {:source source :info info}) info))]
+                            info (if (and (= source (:source prior)) (= epoch (:declaration-epoch prior))) (:info prior)
+                                     (let [filename (source-file document)
+                                           config (check/load-config (kondo-options filename options settings))
+                                           info (analyzer/declarations source {:filename filename :config config :python-options options})]
+                                       (swap! cache assoc uri {:source source :info info :config config :declaration-epoch epoch}) info))]
                         (if-let [ns (:namespace info)] (assoc index ns (:definitions info)) index)))
                     {} documents)]
     (reduce (fn [index [uri document]]
               (let [prior (get @cache uri)
                     expanded (if (= epoch (:epoch prior)) (:expanded prior)
-                                 (let [config (check/load-config (kondo-options (source-file document) options settings))
+                                 (let [config (:config prior)
                                        info (:info prior)
                                        definitions (if (or (seq (:hooks config)) (seq (:lint-as config)))
                                                      (:definitions (analyzer/analyze (.-source document)
@@ -602,7 +647,7 @@
       (let [keep (filterv #(not (contains? excluded-directories %)) dirs)]
         (.clear dirs)
         (.extend dirs keep))
-      (doseq [name files :when (.endswith name ".lpy")
+      (doseq [name files :when (contains? source-suffixes (.-suffix (pathlib/Path name)))
               :let [path (.joinpath (pathlib/Path directory) name)]
               :when (and (not (.is_symlink path)) (not (ignored-path? settings path)))]
         (try
@@ -612,33 +657,38 @@
                                            :position_codec codec)))
           (catch python/OSError _ nil)
           (catch python/UnicodeError _ nil))))
-    {:documents @documents :project (declaration-index @documents)}))
+    {:documents @documents}))
 
-(defn- navigation-analysis [document analysis]
-  (let [source (.-source document) filename (source-file document)
-        declarations (analyzer/declarations source {:filename filename})
-        parsed (:parsed declarations)
-        projection (check/analysis-output
-                    {:config {:analysis {:keywords true}} :analysis [analysis]
-                     :sources [{:filename filename :declarations declarations}]})
-        starts (:line-starts parsed)
+(defn- navigation-analysis [document analysis declarations]
+  (let [records (check/keyword-output analysis {:filename (source-file document) :declarations declarations})
+        ;; Checker coordinates are UTF-16 even when the editor negotiates UTF-8.
+        utf16-document (workspace/TextDocument (.-uri document) ** :source (.-source document))
+        offset (fn [row col] (.offset_at_position utf16-document (lsp/Position (dec row) (dec col))))
         keywords (mapv (fn [item]
                          (assoc item :keyword? true :ns (some-> (:ns item) str)
-                                :start (+ (nth starts (dec (:row item))) (dec (:col item)))
-                                :end (+ (nth starts (dec (:end-row item))) (dec (:end-col item)))))
-                       (:keywords projection))]
+                                :start (offset (:row item) (:col item))
+                                :end (offset (:end-row item) (:end-col item)))) records)]
     (assoc analysis :keyword-usages keywords)))
 
 (declare kondo-options)
 
-(def ^:private analysis-cache-schema 1)
+(def ^:private cache-codec
+  ;; Like the inspection decoder, load the stdlib-only helper without running
+  ;; the parent package bootstrap while this Basilisp namespace is importing.
+  (let [file (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.lsp"))) "_inspect.py")
+        spec (import-util/spec-from-file-location "_blt_analysis_codec" (str file))
+        module (import-util/module-from-spec spec)]
+    (.exec_module (.-loader spec) module)
+    module))
+
+(def ^:private analysis-cache-schema 2)
 
 (defn- cache-tag [tag value]
   (python/list [tag value]))
 
-(declare cache-encode)
+(declare cache-encode-value)
 
-(defn- cache-encode-base [value]
+(defn- cache-encode-base [value seen]
   (cond
     (or (nil? value) (string? value) (boolean? value)) value
     (keyword? value) (cache-tag "keyword" (subs (str value) 1))
@@ -656,53 +706,71 @@
     (python/isinstance value python/float) (cache-tag "float" (python/repr value))
     (or (map? value) (python/isinstance value python/dict))
     (cache-tag (if (map? value) "map" "dict")
-               (python/list (sort-by #(json/dumps (first %) ** :ensure_ascii false)
-                                     (map (fn [[key item]] (python/list [(cache-encode key) (cache-encode item)]))
-                                          (if (map? value) value (.items value))))))
+               (python/sorted (map (fn [[key item]] (python/list [(cache-encode-value key seen) (cache-encode-value item seen)]))
+                                   (if (map? value) value (.items value)))
+                              ** :key #(json/dumps (first %) ** :ensure_ascii false)))
     (or (set? value) (python/isinstance value (python/tuple [python/set python/frozenset])))
     (cache-tag (cond (set? value) "set" (python/isinstance value python/frozenset) "frozenset" :else "pyset")
-               (python/list (sort-by #(json/dumps % ** :ensure_ascii false) (map cache-encode value))))
-    (vector? value) (cache-tag "vector" (python/list (map cache-encode value)))
-    (seq? value) (cache-tag "list" (python/list (map cache-encode value)))
-    (python/isinstance value python/list) (cache-tag "pylist" (python/list (map cache-encode value)))
-    (python/isinstance value python/tuple) (cache-tag "tuple" (python/list (map cache-encode value)))
+               (python/sorted (map #(cache-encode-value % seen) value) ** :key #(json/dumps % ** :ensure_ascii false)))
+    (vector? value) (cache-tag "vector" (python/list (map #(cache-encode-value % seen) value)))
+    (seq? value) (cache-tag "list" (python/list (map #(cache-encode-value % seen) value)))
+    (python/isinstance value python/list) (cache-tag "pylist" (python/list (map #(cache-encode-value % seen) value)))
+    (python/isinstance value python/tuple) (cache-tag "tuple" (python/list (map #(cache-encode-value % seen) value)))
     :else (throw (python/TypeError (str "Unsupported analysis cache value: " (python/type value))))))
 
-(defn- cache-encode [value]
-  (let [data (cache-encode-base value)
-        metadata (meta value)]
-    (if (seq metadata) (cache-tag "meta" (python/list [data (cache-encode metadata)])) data)))
+(defn- cache-encode-value [value seen]
+  (if (or (nil? value) (string? value) (boolean? value) (python/isinstance value python/int))
+    value
+    (if-let [prior (.get seen (python/id value))]
+      (second prior)
+      (let [data (cache-encode-base value seen)
+            metadata (meta value)
+            encoded (if (seq metadata) (cache-tag "meta" (python/list [data (cache-encode-value metadata seen)])) data)]
+        ;; Analysis contains shared immutable definitions and Python metadata.
+        ;; Retaining the value also prevents id reuse for temporary sequences.
+        (.__setitem__ seen (python/id value) (python/tuple [value encoded]))
+        encoded))))
 
-(defn- cache-decode [value]
+(defn- cache-encode [value]
+  (cache-encode-value value (python/dict)))
+
+(defn- cache-decode-value [value seen]
   (if (python/isinstance value python/list)
-    (let [[tag item] value]
-      (when-not (= 2 (count value)) (throw (python/ValueError "Malformed analysis cache tag")))
-      (case tag
-        "keyword" (keyword item)
-        "symbol" (symbol item)
-        "pyregex" (re/compile (first item) (second item))
-        "regex" (regex/compile item)
-        "datetime" (.fromisoformat datetime/datetime item)
-        "date" (.fromisoformat datetime/date item)
-        "uuid" (uuid/UUID item)
-        "decimal" (decimal/Decimal item)
-        "ratio" (fractions/Fraction (first item) (second item))
-        "bytes" (base64/b64decode item ** :validate true)
-        "float" (python/float item)
-        "map" (into {} (map (fn [[key child]] [(cache-decode key) (cache-decode child)]) item))
-        "dict" (python/dict (python/list (map (fn [[key child]]
-                                                (python/tuple [(cache-decode key) (cache-decode child)])) item)))
-        "set" (set (map cache-decode item))
-        "pyset" (python/set (map cache-decode item))
-        "frozenset" (python/frozenset (map cache-decode item))
-        "vector" (mapv cache-decode item)
-        "list" (apply list (map cache-decode item))
-        "pylist" (python/list (map cache-decode item))
-        "tuple" (python/tuple (map cache-decode item))
-        "meta" (with-meta (cache-decode (first item)) (cache-decode (second item)))
-        (throw (python/ValueError "Unknown analysis cache tag"))))
+    (if-let [prior (.get seen (python/id value))]
+      (second prior)
+      (let [[tag item] value
+            _ (when-not (= 2 (count value)) (throw (python/ValueError "Malformed analysis cache tag")))
+            decoded (case tag
+                      "keyword" (keyword item)
+                      "symbol" (symbol item)
+                      "pyregex" (re/compile (first item) (second item))
+                      "regex" (regex/compile item)
+                      "datetime" (.fromisoformat datetime/datetime item)
+                      "date" (.fromisoformat datetime/date item)
+                      "uuid" (uuid/UUID item)
+                      "decimal" (decimal/Decimal item)
+                      "ratio" (fractions/Fraction (first item) (second item))
+                      "bytes" (base64/b64decode item ** :validate true)
+                      "float" (python/float item)
+                      "map" (into {} (map (fn [[key child]] [(cache-decode-value key seen) (cache-decode-value child seen)]) item))
+                      "dict" (python/dict (python/list (map (fn [[key child]]
+                                                              (python/tuple [(cache-decode-value key seen) (cache-decode-value child seen)])) item)))
+                      "set" (set (map #(cache-decode-value % seen) item))
+                      "pyset" (python/set (map #(cache-decode-value % seen) item))
+                      "frozenset" (python/frozenset (map #(cache-decode-value % seen) item))
+                      "vector" (mapv #(cache-decode-value % seen) item)
+                      "list" (apply list (map #(cache-decode-value % seen) item))
+                      "pylist" (python/list (map #(cache-decode-value % seen) item))
+                      "tuple" (python/tuple (map #(cache-decode-value % seen) item))
+                      "meta" (with-meta (cache-decode-value (first item) seen) (cache-decode-value (second item) seen))
+                      (throw (python/ValueError "Unknown analysis cache tag")))]
+        (.__setitem__ seen (python/id value) (python/tuple [value decoded]))
+        decoded))
     (if (or (nil? value) (string? value) (boolean? value) (python/isinstance value python/int))
       value (throw (python/ValueError "Malformed analysis cache scalar")))))
+
+(defn- cache-decode [value]
+  (cache-decode-value value (python/dict)))
 
 (defn- analysis-cache-stat [file]
   (try
@@ -737,7 +805,7 @@
                  :executable (analysis-cache-stat executable)
                  :environment (mapv analysis-cache-stat (py/environment-paths options))
                  :python-sources (analysis-cache-source-files (:python-paths options) #{".py" ".pyi"})
-                 :hook-sources (analysis-cache-source-files (:config-directories config) #{".lpy" ".clj" ".edn"})}]
+                 :hook-sources (analysis-cache-source-files (:config-directories config) #{".lpy" ".cljc" ".clj" ".edn"})}]
     (.hexdigest (hashlib/sha256 (.encode (json/dumps (cache-encode context) ** :ensure_ascii false) "utf-8")))))
 
 (defn- analysis-cache-key [document project options settings config]
@@ -763,22 +831,26 @@
           directory (.expanduser (pathlib/Path (or (:cache-path settings) ".lsp/.cache")))
           directory (if (.is_absolute directory) directory (.joinpath root directory))
           filename (.hexdigest (hashlib/sha256 (.encode (source-file document) "utf-8")))]
-      (.joinpath directory "blt-analysis-v1" (str filename ".json")))))
+      (.joinpath directory "blt-analysis-v2" (str filename ".json")))))
 
 (defn- analysis-cache-dependencies [analysis]
-  (let [dependencies (atom #{})]
+  (let [dependencies (atom #{}) files (atom #{}) seen (python/set)]
     (letfn [(walk [value]
-              (cond
-                (map? value)
-                (do
-                  (doseq [key [:filename :file] :let [file (get value key)]
-                          :when (and (string? file) (.is_absolute (pathlib/Path file)) (.is_file (pathlib/Path file)))]
-                    (swap! dependencies conj (analysis-cache-stat file)))
-                  (doseq [dependency (:dependencies value)
-                          :when (and (sequential? dependency) (= 3 (count dependency)) (string? (first dependency)))]
-                    (swap! dependencies conj (vec dependency)))
-                  (doseq [child (vals value)] (walk child)))
-                (or (sequential? value) (set? value)) (doseq [child value] (walk child))))]
+              (when (and (or (map? value) (sequential? value) (set? value))
+                         (not (contains? seen (python/id value))))
+                (.add seen (python/id value))
+                (if (map? value)
+                  (do
+                    (doseq [key [:filename :file] :let [file (get value key)]
+                            :when (and (string? file) (not (contains? @files file)))]
+                      (swap! files conj file)
+                      (when (and (.is_absolute (pathlib/Path file)) (.is_file (pathlib/Path file)))
+                        (swap! dependencies conj (analysis-cache-stat file))))
+                    (doseq [dependency (:dependencies value)
+                            :when (and (sequential? dependency) (= 3 (count dependency)) (string? (first dependency)))]
+                      (swap! dependencies conj (vec dependency)))
+                    (run! walk (vals value)))
+                  (run! walk value))))]
       (walk analysis))
     (vec (sort-by first @dependencies))))
 
@@ -789,43 +861,60 @@
         (when (and (= analysis-cache-schema (get payload "schema"))
                    (= fingerprint (get payload "fingerprint"))
                    (every? #(= (vec %) (analysis-cache-stat (first %))) (get payload "dependencies" [])))
-          (let [analysis (cache-decode (get payload "analysis"))]
+          (let [analysis (cache-decode (.decode_graph cache-codec (get payload "analysis")))]
             (when (and (map? analysis) (vector? (:findings analysis))) analysis)))))
     (catch python/Exception _ nil)))
 
-(defn- analysis-cache-write! [file fingerprint analysis]
-  (let [temporary (atom nil)]
+(defn- analysis-cache-write! [file fingerprint analysis & [current?]]
+  (let [temporary (atom nil) current? (or current? (constantly true))]
     (try
-      (let [payload #py {"schema" analysis-cache-schema "fingerprint" fingerprint
-                         "dependencies" (lisp->py (analysis-cache-dependencies analysis))
-                         "analysis" (cache-encode analysis)}]
-        (.mkdir (.-parent file) ** :parents true :exist_ok true)
-        (let [stream (tempfile/NamedTemporaryFile ** :mode "w" :encoding "utf-8"
-                                                  :dir (str (.-parent file)) :prefix ".blt-" :suffix ".tmp" :delete false)]
-          (reset! temporary (pathlib/Path (.-name stream)))
-          (try
-            (.write stream (json/dumps payload ** :ensure_ascii false :allow_nan false))
-            (.flush stream)
-            (os/fsync (.fileno stream))
-            (finally (.close stream))))
-        (os/replace (str @temporary) (str file)))
+      (when (current?)
+        (let [payload #py {"schema" analysis-cache-schema "fingerprint" fingerprint
+                           "dependencies" (lisp->py (analysis-cache-dependencies analysis))
+                           "analysis" (.encode_graph cache-codec (cache-encode analysis))}]
+          (.mkdir (.-parent file) ** :parents true :exist_ok true)
+          (let [stream (tempfile/NamedTemporaryFile ** :mode "w" :encoding "utf-8"
+                                                    :dir (str (.-parent file)) :prefix ".blt-" :suffix ".tmp" :delete false)]
+            (reset! temporary (pathlib/Path (.-name stream)))
+            (try
+              (.write stream (json/dumps payload ** :ensure_ascii false :allow_nan false))
+              (.flush stream)
+              (os/fsync (.fileno stream))
+              (finally (.close stream))))
+          ;; An edit or shutdown during serialization must not replace a newer
+          ;; session's reusable snapshot with obsolete work.
+          (when (current?) (os/replace (str @temporary) (str file)))))
       (catch python/Exception _ nil)
       (finally
         (when (and @temporary (.exists @temporary))
           (try (.unlink @temporary) (catch python/OSError _ nil)))))))
 
+(defn- saved-document? [document]
+  ;; Unsaved editor versions cannot be reused after restart. Keep their analysis
+  ;; in memory without serializing Python metadata or replacing the disk cache.
+  (or (nil? (.-version document))
+      (try
+        (when-let [path (file-path (.-uri document))]
+          (= (.-source document) (.read_text path ** :encoding "utf-8")))
+        (catch python/OSError _ false)
+        (catch python/UnicodeError _ false))))
+
 (defn- cached-analysis [document project options settings config compute]
   (let [entry (try
-                (when-let [file (analysis-cache-file document options settings)]
-                  [file (analysis-cache-key document project options settings config)])
+                (when (saved-document? document)
+                  (when-let [file (analysis-cache-file document options settings)]
+                    [file (analysis-cache-key document project options settings config)]))
                 (catch python/Exception _ nil))]
     (or (when entry (analysis-cache-read (first entry) (second entry)))
         (let [analysis (compute)]
           (when (and entry
+                     (not (some-> (:shutdown-event options) .is_set))
                      (not-any? #(contains? #{"inspection-timeout" "inspection-failed" "interpreter-unavailable"
                                              "invalid-inspection-output" "missing-result"} (:reason %))
                                (vals (:python-modules analysis))))
-            (analysis-cache-write! (first entry) (second entry) analysis))
+            (if-let [deferred (:deferred-cache-writes options)]
+              (swap! deferred conj {:file (first entry) :fingerprint (second entry) :analysis analysis})
+              (analysis-cache-write! (first entry) (second entry) analysis)))
           analysis))))
 
 (defn- analyze-document [document project options settings]
@@ -837,10 +926,13 @@
     (cached-analysis
      document project options settings config
      (fn []
-       (navigation-analysis document
-                            (analyzer/analyze (.-source document)
-                                              {:filename filename :project project :config config
-                                               :python-options options :dependency-cache (:dependency-cache options)}))))))
+       (let [declarations (analyzer/declarations (.-source document)
+                                                 {:filename filename :config config :python-options options})]
+         (navigation-analysis document
+                              (analyzer/analyze (.-source document)
+                                                {:filename filename :project project :config config :declarations declarations
+                                                 :python-options options :dependency-cache (:dependency-cache options)})
+                              declarations))))))
 
 (def ^:private unnecessary-diagnostics
   #{:redefined-var :redundant-do :redundant-expression :redundant-let :unused-binding
@@ -913,8 +1005,8 @@
             task (if (= generation (:generation pending))
                    (:task pending)
                    (let [task (asyncio/create_task
-                               (asyncio/to_thread cached-declaration-index (workspace-documents state uri) (:declaration-cache @state)
-                                                  (options-for state uri) (settings-for state uri) (:analysis-epoch @state 0)))]
+                               (worker! state cached-declaration-index (workspace-documents state uri) (:declaration-cache @state)
+                                        (options-for state uri) (settings-for state uri) (:analysis-epoch @state 0)))]
                      (swap! state assoc-in [:project-pending root] {:generation generation :task task})
                      task))
             project (await (asyncio/shield task))]
@@ -922,21 +1014,61 @@
           (swap! state assoc-in [:project-caches root] {:generation generation :project project}))
         project))))
 
+(defasync ^:private persist-analysis! [state uri document generation epoch entry]
+  ;; Yield once so document diagnostics can be published before disk persistence.
+  (await (asyncio/sleep 0))
+  (let [current? #(and (= generation (:generation @state)) (= epoch (:analysis-epoch @state 0))
+                       (identical? document (get-in @state [:documents uri]))
+                       (not (some-> (:workers @state) :closed .is_set)))
+        lock (or (:cache-write-lock @state)
+                 (let [lock (asyncio/Lock)] (swap! state assoc :cache-write-lock lock) lock))]
+    (try
+      ;; Persist at most one snapshot at a time, leaving workers for editor
+      ;; requests. Stale tasks check again after waiting for this lock.
+      (await (.acquire lock))
+      (swap! state assoc :cache-writing-task (asyncio/current_task))
+      (try
+        (when (current?)
+          (await (worker! state analysis-cache-write! (:file entry) (:fingerprint entry) (:analysis entry) current?)))
+        (finally
+          (swap! state dissoc :cache-writing-task)
+          (.release lock)))
+      (finally
+        (when (identical? (asyncio/current_task) (get-in @state [:cache-writes uri]))
+          (swap! state update :cache-writes dissoc uri))))))
+
 (defasync ^:private analyze-latest! [state uri]
   (await (wait-index! state))
   (let [document (get-in @state [:documents uri]) generation (:generation @state)
-        epoch (:analysis-epoch @state 0) cached (get-in @state [:analyses uri])]
+        epoch (:analysis-epoch @state 0) cached (get-in @state [:analyses uri])
+        writes (atom [])]
     (when document
       (let [project (await (project! state uri))
-            reusable? (and (= (.-source document) (:source cached)) (= epoch (:epoch cached))
-                           (= (:dependencies cached) (dependency-fingerprint (:analysis cached) project)))
-            result (if reusable? (refresh-project-definitions (:analysis cached) project)
-                       (await (asyncio/to_thread analyze-document document project (options-for state uri) (settings-for state uri))))]
+            same-source? (and (= (.-source document) (:source cached)) (= epoch (:epoch cached)))
+            current? (and same-source? (= generation (:generation cached)))
+            reusable? (and same-source?
+                           (or current? (= (:dependencies cached) (dependency-fingerprint (:analysis cached) project))))
+            result (cond
+                     current? (:analysis cached)
+                     reusable? (refresh-project-definitions (:analysis cached) project)
+                     :else (await (worker! state analyze-document document project
+                                           (assoc (options-for state uri) :deferred-cache-writes writes)
+                                           (settings-for state uri))))]
         (if (and (= generation (:generation @state)) (= epoch (:analysis-epoch @state 0))
                  (= (.-source document) (some-> (get-in @state [:documents uri]) .-source)))
-          (do (swap! state assoc-in [:analyses uri]
+          (do
+            (when-not current?
+              (swap! state assoc-in [:analyses uri]
                      {:source (.-source document) :generation generation :epoch epoch
-                      :dependencies (dependency-fingerprint result project) :analysis result}) result)
+                      :dependencies (if reusable? (:dependencies cached) (dependency-fingerprint result project)) :analysis result}))
+            (when-let [entry (first @writes)]
+              ;; Coalesce queued saves without cancelling the writer that holds
+              ;; the slot; its snapshot guard rejects obsolete work at replace.
+              (when-let [prior (get-in @state [:cache-writes uri])]
+                (when-not (identical? prior (:cache-writing-task @state)) (.cancel prior)))
+              (swap! state assoc-in [:cache-writes uri]
+                     (asyncio/create_task (persist-analysis! state uri document generation epoch entry))))
+            result)
           (await (analyze-latest! state uri)))))))
 
 (defasync ^:private analyzed! [state uri]
@@ -991,7 +1123,7 @@
         generation (:generation @state)
         root (root-for state uri)
         documents (into {} (map (fn [[candidate document]] [candidate (.-source document)]) (workspace-documents state uri)))
-        findings (await (asyncio/to_thread project-findings documents analyses (settings-for state uri) root))]
+        findings (await (worker! state project-findings documents analyses (settings-for state uri) root))]
     (if (= generation (:generation @state))
       (do (swap! state assoc-in [:project-diagnostics root] {:generation generation :findings findings}) findings)
       (await (latest-project-findings! state uri)))))
@@ -1008,33 +1140,37 @@
         (await (asyncio/shield task))))))
 
 (defasync ^:private refresh! [ls state uri]
-  ;; Edits arriving during this debounce share one analysis, and a stale result
-  ;; never overwrites diagnostics from a more recent document version.
+  ;; Publish document findings as soon as they are ready. Whole-project linters
+  ;; enrich them later, so a large unrelated file cannot hide local diagnostics.
   (await (asyncio/sleep 0.08))
   (let [document (get-in @state [:documents uri])
-        version (some-> document .-version)]
+        version (some-> document .-version)
+        publish-current! (fn [result]
+                           (when (and (contains? (:open @state) uri)
+                                      (= version (some-> (get-in @state [:documents uri]) .-version))
+                                      (identical? document (get-in @state [:documents uri])))
+                             (publish! ls state document result)
+                             true))]
     (when document
       (try
-        (let [result (await (analyzed! state uri))
-              project-findings (await (workspace-findings! state uri))
-              result (update result :findings into (map #(assoc % :lsp? true) (get project-findings uri)))
-              result (if (seq (get-in (settings-for state uri) [:linters :custom]))
-                       (let [analyses (await (all-analyses! state uri))
-                             custom (await (asyncio/to_thread custom-findings state uri analyses))]
-                         (update result :findings into (map #(assoc % :lsp? true) custom))) result)]
-          (when (and (contains? (:open @state) uri)
-                     (= version (some-> (get-in @state [:documents uri]) .-version))
-                     (identical? document (get-in @state [:documents uri])))
-            (publish! ls state document result)
-            (when (:test-tree? @state)
-              (when-let [tree (test-tree uri document result)]
-                (.notify (.-protocol ls) "clojure/textDocument/testTree" (lisp->py tree))))))
-        (catch python/Exception e
-          (when (and (contains? (:open @state) uri)
-                     (= version (some-> (get-in @state [:documents uri]) .-version))
-                     (identical? document (get-in @state [:documents uri])))
-            (publish! ls state document {:findings [{:type :configuration :level :error
-                                                     :start 0 :end 0 :message (str e)}]})))))))
+        (let [result (await (analyzed! state uri))]
+          (when (and (publish-current! result) (:test-tree? @state))
+            (when-let [tree (test-tree uri document result)]
+              (.notify (.-protocol ls) "clojure/textDocument/testTree" (lisp->py tree))))
+          (try
+            (let [project-findings (await (workspace-findings! state uri))
+                  enriched (update result :findings into (map #(assoc % :lsp? true) (get project-findings uri)))
+                  enriched (if (seq (get-in (settings-for state uri) [:linters :custom]))
+                             (let [analyses (await (all-analyses! state uri))
+                                   custom (await (worker! state custom-findings state uri analyses))]
+                               (update enriched :findings into (map #(assoc % :lsp? true) custom))) enriched)]
+              (when (not= (:findings result) (:findings enriched))
+                (publish-current! enriched)))
+            (catch python/Exception error
+              (logging/warning "Could not enrich diagnostics for %s: %s" uri (str error)))))
+        (catch python/Exception error
+          (publish-current! {:findings [{:type :configuration :level :error
+                                         :start 0 :end 0 :message (str error)}]}))))))
 
 (defn- changed! [ls state params]
   (refresh-settings! state)
@@ -1051,7 +1187,7 @@
 (defasync ^:private index! [state roots]
   (await (prepare-workspace-kondo-configs! state))
   (let [settings (:settings-by-root @state)
-        result (await (asyncio/to_thread discover roots (:codec @state) settings))]
+        result (await (worker! state discover roots (:codec @state) settings))]
     (when (and (= (set roots) (set (:roots @state)))
                (= settings (:settings-by-root @state)))
       (swap! state update :documents
@@ -1060,9 +1196,9 @@
 
 (defasync ^:private closed! [state uri]
   (when-let [path (file-path uri)]
-    (when (and (= ".lpy" (.-suffix path)) (selected-path? state path))
+    (when (and (contains? source-suffixes (.-suffix path)) (selected-path? state path))
       (try
-        (let [source (await (asyncio/to_thread #(.read_text path ** :encoding "utf-8")))]
+        (let [source (await (worker! state #(.read_text path ** :encoding "utf-8")))]
           (when-not (contains? (:open @state) uri)
             (swap! state assoc-in [:documents uri]
                    (workspace/TextDocument uri ** :source source :position_codec (:codec @state)))
@@ -1079,7 +1215,7 @@
                    (map #(assoc % :namespace? true) (remove :python (concat (:namespace-definitions analysis) (:namespace-usages analysis))))))))
 
 (defasync ^:private formatting-options! [state uri]
-  (let [options (await (asyncio/to_thread cljfmt-settings state uri))
+  (let [options (await (worker! state cljfmt-settings state uri))
         project (await (project! state uri))
         analysis (await (analyzed! state uri))
         definitions (concat (mapcat vals (vals project)) (:var-definitions analysis)
@@ -2893,7 +3029,7 @@
         root (root-for state uri)
         settings (settings-for state uri)
         path (pathlib/Path filename)]
-    (when (and root (= ".lpy" (.-suffix path)))
+    (when (and root (contains? source-suffixes (.-suffix path)))
       (when-let [source (first (sort-by #(- (count %))
                                         (filter #(.is_relative_to path (pathlib/Path %)) (source-paths root settings))))]
         (-> (str (.with_suffix (.relative_to path source) ""))
@@ -2928,7 +3064,8 @@
   (let [paths (distinct (concat (:python-paths options) (py/environment-paths options)))
         locate (fn [ns]
                  (let [relative (str/replace (str/replace ns "." "/") "-" "_")]
-                   (first (for [directory paths suffix [(str relative ".lpy") (str relative "/__init__.lpy")]
+                   (first (for [directory paths suffix [(str relative ".lpy") (str relative ".cljc")
+                                                        (str relative "/__init__.lpy") (str relative "/__init__.cljc")]
                                 :let [path (.joinpath (pathlib/Path directory) suffix)]
                                 :when (.is_file path)] path))))]
     (loop [remaining (vec (vals documents)) seen (set (keys documents)) documents documents]
@@ -3372,14 +3509,16 @@
           (failure "A namespace name must be a valid dotted symbol."))
         (when (some #(= to (:namespace %)) (vals analyses))
           (failure (str "Namespace already exists: " to)))
-        (let [old-suffix (str (-> from (str/replace "." "/") (str/replace "-" "_")) ".lpy")
-              new-suffix (str (-> to (str/replace "." "/") (str/replace "-" "_")) ".lpy")
+        (let [old-path (-> from (str/replace "." "/") (str/replace "-" "_"))
+              new-path (-> to (str/replace "." "/") (str/replace "-" "_"))
               renames (into {} (keep (fn [[filename _]]
-                                       (when (.endswith filename old-suffix)
-                                         (let [target (str (subs filename 0 (- (count filename) (count old-suffix))) new-suffix)]
-                                           (when (.exists (pathlib/Path target))
-                                             (failure (str "Destination already exists: " target)))
-                                           [filename target]))) definitions))]
+                                       (let [suffix (.-suffix (pathlib/Path filename))
+                                             old-suffix (str old-path suffix)]
+                                         (when (and (contains? source-suffixes suffix) (.endswith filename old-suffix))
+                                           (let [target (str (subs filename 0 (- (count filename) (count old-suffix))) new-path suffix)]
+                                             (when (.exists (pathlib/Path target))
+                                               (failure (str "Destination already exists: " target)))
+                                             [filename target])))) definitions))]
           {:result {:from from :to to} :edits (namespace-edits documents (select-keys analyses (keys documents)) from to)
            :renames renames :exit-code 0}))
       :else {:result [] :edits {} :exit-code 1})))
@@ -3906,7 +4045,7 @@
                   analysis (update analysis :findings into (map #(assoc % :lsp? true) (get project-findings uri)))
                   analysis (if (seq (get-in (settings-for state uri) [:linters :custom]))
                              (let [analyses (await (all-analyses! state uri))
-                                   custom (await (asyncio/to_thread custom-findings state uri analyses))]
+                                   custom (await (worker! state custom-findings state uri analyses))]
                                (update analysis :findings into (map #(assoc % :lsp? true) custom))) analysis)]
               (when (and (= generation (:generation @state))
                          (identical? document (get-in @state [:documents uri]))
@@ -3922,10 +4061,13 @@
   ([options]
    (let [ls (server/LanguageServer "blt" (metadata/version "basilisp-tools")
                                    ** :protocol_cls configured-protocol)
-         state (atom {:documents {} :analyses {} :tasks {} :reloads {} :open #{} :hook-cache (atom {}) :declaration-cache (atom {}) :persistent-cache-context (atom {}) :analysis-epoch 0
-                      :tokens {} :token-sequence (atom 0) :generation 0 :options (assoc (dissoc options :force-settings) :python-cache (py/create-cache) :dependency-cache (analyzer/create-cache))
+         workers (create-workers)
+         state (atom {:workers workers :documents {} :analyses {} :tasks {} :reloads {} :open #{} :hook-cache (atom {}) :declaration-cache (atom {}) :persistent-cache-context (atom {}) :analysis-epoch 0
+                      :tokens {} :token-sequence (atom 0) :generation 0 :options (assoc (dissoc options :force-settings) :python-cache (py/create-cache) :dependency-cache (analyzer/create-cache) :shutdown-event (:closed workers))
                       :force-settings (:force-settings options {})})
          feature (fn [method handler & [opts]] ((.feature ls method opts) handler))]
+     (python/setattr ls "blt_workers" workers)
+     (python/setattr ls "blt_python_cache" (get-in @state [:options :python-cache]))
      (python/setattr ls "blt_force_settings" (:force-settings options {}))
      (feature lsp/INITIALIZE
               (fn [params]
@@ -3954,9 +4096,11 @@
                   (swap! state assoc :index-task (asyncio/create_task (index! state roots))))))
      (feature lsp/SHUTDOWN
               (fn ^:async shutdown-handler [_params]
-                (doseq [task (distinct (remove nil? (concat [(:startup-diagnostics-task @state) (:index-task @state)]
+                (stop-workers! (:workers @state))
+                (py/stop-cache! (get-in @state [:options :python-cache]))
+                (doseq [task (distinct (remove nil? (concat [(:startup-diagnostics-task @state) (:index-task @state) (:cache-writing-task @state)]
                                                             (vals (:tasks @state)) (vals (:reloads @state))
-                                                            (vals (:analysis-pending @state))
+                                                            (vals (:analysis-pending @state)) (vals (:cache-writes @state))
                                                             (vals (:project-diagnostics-pending @state))
                                                             (map :task (vals (:project-pending @state))))))]
                   (.cancel task))
@@ -3974,6 +4118,7 @@
                              "blt-source-files" lsp/WORKSPACE_DID_CHANGE_WATCHED_FILES
                              (lsp/DidChangeWatchedFilesRegistrationOptions
                               #py [(lsp/FileSystemWatcher "**/*.lpy")
+                                   (lsp/FileSystemWatcher "**/*.cljc")
                                    (lsp/FileSystemWatcher "**/*.py")
                                    (lsp/FileSystemWatcher "**/*.pyi")
                                    (lsp/FileSystemWatcher "**/config.edn")
@@ -4049,17 +4194,17 @@
                     (doseq [change changes
                             :let [uri (.-uri change) path (file-path uri)]
                             :when path]
-                      (when (and (= ".lpy" (.-suffix path)) (not (contains? (:open @state) uri)))
+                      (when (and (contains? source-suffixes (.-suffix path)) (not (contains? (:open @state) uri)))
                         (when-let [task (get-in @state [:reloads uri])] (.cancel task))
                         (swap! state (fn [value]
                                        (-> value (update :documents dissoc uri)
                                            (update :analyses dissoc uri) (update :reloads dissoc uri))))
                         (when-not (= (.-type change) (.-Deleted lsp/FileChangeType))
                           (swap! state assoc-in [:reloads uri] (asyncio/create_task (closed! state uri)))))
-                      (when (or (not= ".lpy" (.-suffix path)) (not (selected-path? state path)))
+                      (when (or (not (contains? source-suffixes (.-suffix path))) (not (selected-path? state path)))
                         (swap! state update :analysis-epoch (fnil inc 0))
                         (reset! (:dependency-cache (:options @state)) {}))
-                      (when (#{".lpy" ".clj" ".edn"} (.-suffix path))
+                      (when (#{".lpy" ".cljc" ".clj" ".edn"} (.-suffix path))
                         (reset! (:hook-cache @state) {})
                         (when (or (str/includes? (str path) "/.clj-kondo/") (str/includes? (str path) "/.lsp/"))
                           (swap! state update :analysis-epoch (fnil inc 0))))
@@ -4100,7 +4245,7 @@
                 (doseq [file (.-files params) :let [uri (.-uri file)]]
                   (swap! state assoc-in [:reloads uri] (asyncio/create_task (closed! state uri)))))
               (lsp/FileOperationRegistrationOptions
-               #py [(lsp/FileOperationFilter (lsp/FileOperationPattern "**/*.lpy") ** :scheme "file")]))
+               #py [(lsp/FileOperationFilter (lsp/FileOperationPattern "**/*.{lpy,cljc}") ** :scheme "file")]))
      (feature lsp/WORKSPACE_DID_DELETE_FILES
               (fn [params]
                 (doseq [file (.-files params) :let [deleted (file-path (.-uri file))]
@@ -4172,8 +4317,8 @@
                       types (or (seq (:union type)) (when type [type]))]
                   (python/list
                    (keep #(location state %)
-                         (await (asyncio/to_thread
-                                 #(mapv (fn [type] (py/inspect-type type (options-for state uri))) types))))))))
+                         (await (worker! state
+                                         #(mapv (fn [type] (py/inspect-type type (options-for state uri))) types))))))))
      (feature lsp/TEXT_DOCUMENT_IMPLEMENTATION
               (fn ^:async handler [params]
                 (let [{:keys [uri item analysis]} (await (query! state params))
@@ -4412,10 +4557,10 @@
                       prefix (completion-prefix document offset)
                       project (or (when fast? (get-in @state [:project-caches (root-for state uri) :project]))
                                   (await (project! state uri)))
-                      candidates (await (asyncio/to_thread
-                                         #(vec (completion-candidates
-                                                (assoc analysis :project project :source (.-source document))
-                                                offset prefix (options-for state uri)))))
+                      candidates (await (worker! state
+                                                 #(vec (completion-candidates
+                                                        (assoc analysis :project project :source (.-source document))
+                                                        offset prefix (options-for state uri)))))
                       range (span document (- offset (count prefix)) offset)]
                   (lsp/CompletionList false
                                       (python/list
@@ -4485,7 +4630,7 @@
                 (let [{:keys [uri ns name]} (py->lisp (.-data lens))
                       references (occurrences (await (all-analyses! state uri)) [:var ns name] false)
                       settings (settings-for state uri)
-                      patterns (:test-locations-regex settings ["_test\\.lpy$"])
+                      patterns (:test-locations-regex settings ["_test\\.(?:lpy|cljc)$"])
                       tests (when (get-in settings [:code-lens :segregate-test-references] (get settings :lens-segregate-test-references true))
                               (filter (fn [[reference-uri _]]
                                         (and (not= uri reference-uri)
@@ -4578,7 +4723,7 @@
                   (if-not (get (settings-for state uri) :document-formatting? true) #py []
                           (let [source (.-source document)
                                 options (await (formatting-options! state uri))
-                                formatted (await (asyncio/to_thread fmt/format-string source options))]
+                                formatted (await (worker! state fmt/format-string source options))]
                             (when (identical? document (get-in @state [:documents uri]))
                               (if (= source formatted) #py []
                                   #py [(lsp/TextEdit (span document 0 (count source)) formatted)])))))))
@@ -4596,7 +4741,7 @@
                                 from (:start (first selected)) to (:end (last selected))]
                             (if-not from #py []
                                     (let [options (await (formatting-options! state uri))
-                                          formatted (await (asyncio/to_thread fmt/format-string (subs source from to) options))]
+                                          formatted (await (worker! state fmt/format-string (subs source from to) options))]
                                       (when (identical? document (get-in @state [:documents uri]))
                                         #py [(lsp/TextEdit (span document from to) formatted)]))))))))
      (python/setattr ls "blt_state" state)
@@ -4607,5 +4752,9 @@
   ([] (start {}))
   ([options]
    (logging/basicConfig ** :level logging/WARNING)
-   (.start_io (create-server options))
+   (let [ls (create-server options)]
+     (try (.start_io ls)
+          (finally
+            (stop-workers! (.-blt_workers ls))
+            (py/stop-cache! (.-blt_python_cache ls)))))
    0))

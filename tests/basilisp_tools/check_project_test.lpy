@@ -74,7 +74,7 @@
         dependency (write! root "external/library.lpy" "(ns external.library)\n(defn public [x] x)")
         opts (options root)
         consumer "(ns consumer (:require [external.library :as e]))\n(e/public)"
-        cache-dir (.joinpath root ".clj-kondo/.cache/blt-v2")]
+        cache-dir (.joinpath root ".clj-kondo/.cache/blt-v3")]
     (try
       (check/run (assoc opts :paths [(str dependency)] :dependencies true))
       (is (.is_dir cache-dir))
@@ -104,7 +104,7 @@
       (check/run (assoc opts :cache false))
       (is (not (.exists (.joinpath root ".clj-kondo/.cache"))))
       (check/run (assoc opts :cache-dir (str (.joinpath root "custom"))))
-      (is (.is_dir (.joinpath root "custom/blt-v2")))
+      (is (.is_dir (.joinpath root "custom/blt-v3")))
       (finally (.cleanup temp)))))
 
 (deftest input-lists-stdin-progress-and-skip-test

@@ -152,8 +152,8 @@
            ["\\" :invalid-character] ["\\blah" :invalid-character]
            ["\\uFFFFFFFF" :invalid-character] ["\\u12zz" :invalid-character]
            ["1/0" :invalid-token] ["2r2" :invalid-token] ["37rZ" :invalid-token]
-           ["08" :invalid-token] ["1.2.3" :invalid-token] [":" :invalid-token]
-           ["::" :invalid-token] ["//" :invalid-token]
+           ["08" :invalid-token] ["1.2.3" :invalid-token]
+           ["//" :invalid-token]
            ["##Other" :invalid-number] ["{:a}" :odd-form-count]
            [") next" :unexpected-delimiter]]]
     (testing source
@@ -276,3 +276,35 @@
       (is (= source (syntax/text (:root parsed))))))
   (doseq [source ["\\o400" "\"\\400\"" "#? (:clj)"]]
     (is (seq (:diagnostics (syntax/parse source {:dialect :clojure}))))))
+
+(deftest nodes-traversal-test
+  (is (= [nil] (vec (syntax/nodes nil))))
+  (testing "Source order and repeated traversal after partial consumption"
+    (let [root (:root (syntax/parse "(a [b]) ; comment\n"))
+          nodes (syntax/nodes root)
+          expected [:root :list :delimiter :symbol :whitespace :vector
+                    :delimiter :symbol :delimiter :delimiter
+                    :whitespace :comment :newline]]
+      (is (identical? root (first nodes)))
+      (is (= [:root :list] (mapv :kind (take 2 nodes))))
+      (is (= expected (mapv :kind nodes)))
+      (is (= expected (mapv :kind nodes)))))
+  (testing "Children of later nodes are visited lazily"
+    (let [children (python/list)
+          leaf {:kind :symbol :text "later"}
+          root {:kind :root :children [{:kind :vector :children children}]}
+          nodes (syntax/nodes root)]
+      (is (identical? root (first nodes)))
+      (.append children leaf)
+      (is (identical? leaf (nth nodes 2)))))
+  (testing "Deep trees do not require recursive traversal"
+    (let [depth 2000
+          leaf {:kind :symbol :text "end"}
+          root (loop [remaining depth node leaf]
+                 (if (zero? remaining) node
+                     (recur (dec remaining) {:kind :list :children [node]})))
+          nodes (syntax/nodes root)]
+      (is (= (inc depth) (count nodes)))
+      (is (identical? root (first nodes)))
+      (is (identical? leaf (last nodes)))
+      (is (= (inc depth) (count nodes))))))

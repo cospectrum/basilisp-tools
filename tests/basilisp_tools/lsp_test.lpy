@@ -4,7 +4,7 @@
             [basilisp-tools.lsp :as lsp]
             [basilisp-tools.analyzer :as analyzer]
             [basilisp-tools.syntax :as syntax])
-  (:import [json] [os] [pathlib] [queue] [subprocess] [sys] [tempfile] [threading]))
+  (:import [json] [os] [pathlib] [queue] [subprocess] [sys] [time] [tempfile] [threading]))
 
 (defn- read-messages [process messages]
   (try
@@ -19,9 +19,9 @@
             (recur)))))
     (catch python/Exception e (.put messages {:reader-error (str e)}))))
 
-(defn- client [root & [environment]]
+(defn- client [root & [environment command]]
   (let [process (subprocess/Popen
-                 [(str (.joinpath (.-parent (pathlib/Path sys/executable)) "blt")) "lsp"]
+                 (or command [(str (.joinpath (.-parent (pathlib/Path sys/executable)) "blt")) "lsp"])
                  ** :stdin subprocess/PIPE :stdout subprocess/PIPE :stderr subprocess/PIPE
                  :cwd (str root) :env environment)
         messages (queue/Queue)
@@ -37,9 +37,9 @@
     (.write stream body)
     (.flush stream)))
 
-(defn- response! [client id]
+(defn- response! [client id timeout]
   (loop []
-    (let [message (.get (:messages client) ** :timeout 20)]
+    (let [message (.get (:messages client) ** :timeout timeout)]
       (when (:reader-error message) (throw (python/RuntimeError (:reader-error message))))
       (if (= id (:id message)) message
           (do (swap! (:notifications client) conj message) (recur))))))
@@ -47,7 +47,8 @@
 (defn- request! [client method params]
   (let [id (swap! (:id client) inc)]
     (send! client {:id id :method method :params params})
-    (response! client id)))
+    ;; A fresh installation compiles Basilisp namespaces on its first launch.
+    (response! client id (if (= method "initialize") 90 20))))
 
 (defn- result! [client method params]
   (let [response (request! client method params)]
@@ -883,7 +884,9 @@
       (let [c (client root) uri (.as_uri (.joinpath root "app.lpy"))]
         (try
           (initialize! c root)
-          (let [diagnostics (:diagnostics (open! c uri "(ns app)"))
+          (open! c uri "(ns app)")
+          (let [diagnostics (:diagnostics (next-diagnostics! c uri
+                                                             #(some (fn [finding] (= "Custom rule" (:message finding))) %)))
                 custom (first (filter #(= "Custom rule" (:message %)) diagnostics))]
             (is custom)
             (is (= 3 (:severity custom))))
@@ -1226,3 +1229,117 @@
                            "command-demo/custom basilisp.core/let") (pr-str changes))
         (send! c {:id (:id request) :result {:applied true}}))
       (finally (stop! c) (.cleanup temp)))))
+
+(deftest cljc-workspace-discovery-navigation-and-watching-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        provider (.joinpath root "shared.cljc") consumer (.joinpath root "consumer.lpy")
+        source "(ns consumer (:require [shared :as s]))\n(s/greet 1)\n"
+        provider-source "(ns shared)\n#?(:clj (def ignored 0) :lpy (defn greet [x] x))\n"
+        _ (.write_text provider provider-source ** :encoding "utf-8")
+        _ (.write_text consumer source ** :encoding "utf-8")
+        c (client root) uri (.as_uri consumer)]
+    (try
+      (initialize! c root)
+      (is (empty? (:diagnostics (open! c uri source))))
+      (let [definition (result! c "textDocument/definition" (at uri 1 4))]
+        (is (= (.as_uri provider) (:uri definition))))
+      (is (= ["greet"] (mapv :name (result! c "workspace/symbol" {:query "greet"}))))
+      (is (empty? (result! c "workspace/symbol" {:query "ignored"})))
+      (let [edit (result! c "workspace/willRenameFiles"
+                          {:files [{:oldUri (.as_uri provider)
+                                    :newUri (.as_uri (.joinpath root "renamed.cljc"))}]})
+            texts (mapcat #(map :newText (:edits %)) (:documentChanges edit))]
+        (is (= ["renamed" "renamed"] (vec texts))))
+      (.write_text provider "(ns shared)\n(defn greet [x y] (+ x y))\n" ** :encoding "utf-8")
+      (notification! c "workspace/didChangeWatchedFiles"
+                     {:changes [{:uri (.as_uri provider) :type 2}]})
+      (let [diagnostics (:diagnostics (next-diagnostics! c uri
+                                                         #(some (fn [finding] (= "invalid-arity" (:code finding))) %)))]
+        (is (= 1 (count (filter #(= "invalid-arity" (:code %)) diagnostics)))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest keyword-references-preserve-negotiated-unicode-positions-test
+  (doseq [encoding ["utf-16" "utf-8"]]
+    (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+          c (client root) uri (.as_uri (.joinpath root "keywords.lpy"))
+          line "[\"😀\" :demo/value :demo/value]"
+          source (str "(ns keywords)\n" line)
+          units (fn [offset] (let [prefix (subs line 0 offset)]
+                               (if (= encoding "utf-8") (count (.encode prefix "utf-8"))
+                                   (quot (count (.encode prefix "utf-16-le")) 2))))
+          first-col (units (.find line ":demo/value"))
+          second-col (units (.rfind line ":demo/value"))]
+      (try
+        (result! c "initialize" {:rootUri (.as_uri root)
+                                 :initializationOptions {:source-paths ["."]}
+                                 :capabilities {:general {:positionEncodings [encoding]}}})
+        (notification! c "initialized" {})
+        (open! c uri source)
+        (let [references (result! c "textDocument/references"
+                                  (assoc (at uri 1 (+ first-col 3)) :context {:includeDeclaration true}))]
+          (is (= [first-col second-col] (mapv #(get-in % [:range :start :character]) references)))
+          (is (= [(+ first-col 11) (+ second-col 11)]
+                 (mapv #(get-in % [:range :end :character]) references))))
+        (finally (stop! c) (.cleanup temp))))))
+
+(deftest shutdown-exits-while-disposable-project-analysis-is-running-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        bootstrap (.joinpath root "slow_server.py") marker (.joinpath root "analysis-started")
+        _ (.write_text bootstrap
+                       (str "import sys, time\nfrom pathlib import Path\n"
+                            "from basilisp_tools.cli import main\nimport basilisp_tools.lsp as lsp\n"
+                            "def slow_worker(jobs):\n"
+                            "    future, context, function, arguments = jobs.get()\n"
+                            "    future.set_running_or_notify_cancel()\n"
+                            "    Path('analysis-started').write_text('running')\n"
+                            "    time.sleep(60)\n    return {}\n"
+                            "lsp.worker_loop = slow_worker\nsys.argv = ['blt', 'lsp']\nmain()\n"))
+        c (client root nil [sys/executable (str bootstrap)])]
+    (try
+      (initialize! c root)
+      (loop [attempt 0]
+        (when (and (not (.exists marker)) (< attempt 100))
+          (time/sleep 0.02) (recur (inc attempt))))
+      (is (.exists marker))
+      (let [start (time/monotonic)]
+        (stop! c)
+        (is (< (- (time/monotonic) start) 5)))
+      (finally
+        (when (nil? (.poll (:process c))) (.kill (:process c)))
+        (.cleanup temp)))))
+
+(deftest shutdown-stops-owned-python-inspection-subprocess-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        bootstrap (.joinpath root "sleeping_inspector.py") marker (.joinpath root "inspection.pid")
+        child-code (str "import os,time; from pathlib import Path; Path("
+                        (json/dumps (str marker)) ").write_text(str(os.getpid())); time.sleep(60)")
+        _ (.write_text bootstrap
+                       (str "import sys\nfrom basilisp_tools.cli import main\n"
+                            "import basilisp_tools.python as inspection\n"
+                            "original = inspection.worker_runtime.InspectionProcesses.run\n"
+                            "def sleeping(self, args, **kwargs):\n"
+                            "    if str(args[-1]).endswith('_inspect.py'):\n"
+                            "        args = [sys.executable, '-c', " (json/dumps child-code) "]\n"
+                            "    return original(self, args, **kwargs)\n"
+                            "inspection.worker_runtime.InspectionProcesses.run = sleeping\n"
+                            "sys.argv = ['blt', 'lsp', '--python-timeout', '60']\nmain()\n"))
+        c (client root nil [sys/executable (str bootstrap)]) child (atom nil)]
+    (try
+      (initialize! c root)
+      (notification! c "textDocument/didOpen"
+                     {:textDocument {:uri (.as_uri (.joinpath root "waiting.lpy")) :languageId "basilisp" :version 1
+                                     :text "(ns waiting (:import [math]))\n(math/sqrt 4)\n"}})
+      (loop [attempt 0]
+        (when (and (not (.exists marker)) (< attempt 500))
+          (time/sleep 0.02) (recur (inc attempt))))
+      (is (.exists marker))
+      (when (.exists marker) (reset! child (python/int (.read_text marker))))
+      (let [start (time/monotonic)]
+        (stop! c)
+        (is (< (- (time/monotonic) start) 5)))
+      (when @child
+        (is (try (os/kill @child 0) false (catch python/ProcessLookupError _ true))))
+      (finally
+        (when (nil? (.poll (:process c))) (.kill (:process c)))
+        (when @child (try (os/kill @child 9) (catch python/ProcessLookupError _ nil)))
+        (.cleanup temp)))))

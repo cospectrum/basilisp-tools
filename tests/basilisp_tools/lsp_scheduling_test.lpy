@@ -1,7 +1,7 @@
 (ns basilisp-tools.lsp-scheduling-test
   (:require [basilisp.test :refer [deftest is]]
             [basilisp-tools.lsp])
-  (:import [asyncio] [time] [importlib] [pygls.workspace :as workspace]))
+  (:import [asyncio] [time] [importlib] [threading] [contextvars] [functools] [pygls.workspace :as workspace]))
 
 (deftest analysis-workers-coalesce-and-survive-cancellation-test
   (let [analyze-var (ns-resolve 'basilisp-tools.lsp 'analyze-document)
@@ -86,3 +86,130 @@
       (finally
         (python/setattr module analyze-name original-analyze)
         (python/setattr module project-name original-project)))))
+
+(deftest document-diagnostics-do-not-wait-for-project-linters-test
+  (let [module (importlib/import_module "basilisp_tools.lsp")
+        names ['analyzed! 'workspace-findings! 'publish!]
+        originals (mapv #(deref (ns-resolve 'basilisp-tools.lsp %)) names)
+        attributes (mapv #(.-__name__ %) originals)
+        refresh (deref (ns-resolve 'basilisp-tools.lsp 'refresh!))
+        uri "file:///tmp/early.lpy"
+        document (workspace/TextDocument uri ** :source "missing" :version 1)
+        state (atom {:documents {uri document} :open #{uri} :settings {} :roots []})
+        local {:findings [{:type :unresolved-symbol :message "missing"}]}
+        published (atom [])
+        run (fn ^:async exercise []
+              (let [first-published (asyncio/Event) project-ready (asyncio/Event)
+                    analyzed (fn ^:async current-analysis [_state _uri] local)
+                    findings (fn ^:async slow-project [_state _uri]
+                               (await (.wait project-ready))
+                               {uri [{:type :clojure-lsp/unused-public-var}]})
+                    publish (fn [_ls _state _document analysis]
+                              (swap! published conj analysis)
+                              (.set first-published))]
+                (doseq [[name function] (map vector attributes [analyzed findings publish])]
+                  (python/setattr module name function))
+                (let [task (asyncio/create_task (refresh nil state uri))]
+                  (await (asyncio/wait_for (.wait first-published) 2))
+                  (is (= [local] @published))
+                  (is (not (.done task)))
+                  (.set project-ready)
+                  (await task)
+                  (is (= 2 (count @published)))
+                  (is (= :clojure-lsp/unused-public-var
+                         (:type (last (:findings (last @published)))))))
+                ;; A newer document snapshot must never receive old project findings.
+                (.clear first-published) (.clear project-ready) (reset! published [])
+                (let [task (asyncio/create_task (refresh nil state uri))]
+                  (await (asyncio/wait_for (.wait first-published) 2))
+                  (swap! state assoc-in [:documents uri]
+                         (workspace/TextDocument uri ** :source "fixed" :version 2))
+                  (.set project-ready)
+                  (await task)
+                  (is (= [local] @published)))))]
+    (try
+      (asyncio/run (run))
+      (finally
+        (doseq [[name original] (map vector attributes originals)]
+          (python/setattr module name original))))))
+
+(deftest analysis-worker-bound-includes-cancelled-running-jobs-test
+  (let [create (deref (ns-resolve 'basilisp-tools.lsp 'create-workers))
+        stop (deref (ns-resolve 'basilisp-tools.lsp 'stop-workers!))
+        submit (deref (ns-resolve 'basilisp-tools.lsp 'worker!))
+        workers (create) state (atom {:workers workers})
+        gate (threading/Event) active (atom 0) peak (atom 0)
+        context (contextvars/ContextVar "blt-test-context")
+        token (.set context "caller")
+        blocked (fn []
+                  (swap! active inc) (swap! peak max @active)
+                  (try (.wait gate 3) (.get context)
+                       (finally (swap! active dec))))
+        run (fn ^:async exercise []
+              (let [tasks (mapv (fn [_] (asyncio/create_task (submit state blocked))) (range 8))]
+                (await (asyncio/sleep 0.05))
+                (is (= 4 @active))
+                (doseq [task tasks] (.cancel task))
+                (let [more (mapv (fn [_] (asyncio/create_task (submit state blocked))) (range 4))]
+                  (await (asyncio/sleep 0.05))
+                  (is (= 4 @peak))
+                  (.set gate)
+                  (is (= ["caller" "caller" "caller" "caller"] (vec (await (apply asyncio/gather more)))))
+                  (await (apply (functools/partial asyncio/gather ** :return_exceptions true) tasks)))))]
+    (try
+      (asyncio/run (run))
+      (finally
+        (.set gate) (stop workers) (.reset context token)
+        (doseq [thread (:threads workers)] (.join thread 1))))))
+
+(deftest document-analysis-does-not-wait-for-cache-persistence-test
+  (let [module (importlib/import_module "basilisp_tools.lsp")
+        names ['analyze-document 'project! 'analysis-cache-write!]
+        originals (mapv #(deref (ns-resolve 'basilisp-tools.lsp %)) names)
+        attributes (mapv #(.-__name__ %) originals)
+        analyzed (deref (ns-resolve 'basilisp-tools.lsp 'analyzed!))
+        stop (deref (ns-resolve 'basilisp-tools.lsp 'stop-workers!))
+        uri "file:///tmp/deferred.lpy"
+        document #(workspace/TextDocument uri ** :source %)
+        state (atom {:documents {uri (document "old")} :generation 0 :options {} :settings {} :roots []})
+        started (threading/Event) release (threading/Event)
+        active (atom 0) peak (atom 0) calls (atom 0) persisted (atom [])
+        analyze (fn [document _project options _settings]
+                  (let [result {:source (.-source document) :findings []}]
+                    (swap! (:deferred-cache-writes options) conj {:file nil :fingerprint "test" :analysis result})
+                    result))
+        project (fn ^:async no-project [_state _uri] {})
+        write (fn [_file _fingerprint analysis current?]
+                (swap! calls inc) (swap! active inc) (swap! peak max @active) (.set started)
+                (try
+                  (.wait release 5)
+                  (when (current?) (swap! persisted conj (:source analysis)))
+                  (finally (swap! active dec))))
+        run (fn ^:async exercise []
+              ;; The first result returns even while its writer is held below.
+              (is (= "old" (:source (await (asyncio/wait_for (analyzed state uri) 1)))))
+              (loop [attempt 0]
+                (when (and (not (.is_set started)) (< attempt 100))
+                  (await (asyncio/sleep 0.005)) (recur (inc attempt))))
+              (is (.is_set started))
+              (swap! state assoc :generation 1 :documents {uri (document "superseded")})
+              (await (asyncio/wait_for (analyzed state uri) 1))
+              (let [queued (get-in @state [:cache-writes uri])]
+                (swap! state assoc :generation 2 :documents {uri (document "new")})
+                (await (asyncio/wait_for (analyzed state uri) 1))
+                (await (asyncio/sleep 0.01))
+                (is (.cancelled queued)))
+              (is (= 1 @calls))
+              (.set release)
+              (when-let [pending (get-in @state [:cache-writes uri])]
+                (await (asyncio/wait_for pending 2)))
+              (is (= 1 @peak))
+              (is (= ["new"] @persisted)))]
+    (try
+      (doseq [[attribute function] (map vector attributes [analyze project write])]
+        (python/setattr module attribute function))
+      (asyncio/run (run))
+      (finally
+        (.set release) (stop (:workers @state))
+        (doseq [[attribute original] (map vector attributes originals)]
+          (python/setattr module attribute original))))))

@@ -520,15 +520,29 @@ def main() -> int:
                     "name": name, "source": source, "expected": expected,
                     "exception": repr(error), "match": False,
                 }
+            if name == "protocol-varargs":
+                # Basilisp permits these methods; the runtime regression in
+                # analyzer_public_test.lpy exercises an actual implementation.
+                comparison["native_difference"] = "Basilisp supports variadic protocol methods."
+                comparison["native_difference_valid"] = (
+                    [(item["type"], item["level"]) for item in expected]
+                    == [("protocol-method-varargs", "error")]
+                    and comparison.get("actual") == []
+                    and comparison.get("expected_exit") == 3
+                    and comparison.get("actual_exit") == 0
+                )
             comparisons.append(comparison)
-    failed = [case for case in comparisons if not case["match"]]
+    differences = [case for case in comparisons if case.get("native_difference_valid")]
+    failed = [case for case in comparisons if not case["match"] and not case.get("native_difference_valid")]
     if args.report:
         args.report.write_text(json.dumps({
             "clj_kondo_version": KONDO_VERSION, "cases": comparisons,
         }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     for case in failed:
         print(json.dumps(case, ensure_ascii=False, sort_keys=True))
-    print(f"clj-kondo diagnostics: {len(comparisons) - len(failed)}/{len(comparisons)} matched.")
+    matched = sum(case["match"] for case in comparisons)
+    print(f"clj-kondo diagnostics: {matched}/{len(comparisons)} exact matches; "
+          f"{len(differences)} verified native differences; {len(failed)} failures.")
     return int(bool(failed))
 
 

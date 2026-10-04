@@ -1,0 +1,42 @@
+(ns basilisp-tools.python-processes-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.python :as bridge])
+  (:import [os] [pathlib] [sys] [tempfile] [threading] [time]))
+
+(deftest inspection-cache-shutdown-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        marker (.joinpath root "pid")
+        executable (.joinpath root "slow-python")
+        storage (bridge/create-cache)
+        processes (:processes (meta @storage))
+        options {:python-cache storage :python-executable (str executable) :python-timeout 30}
+        result (atom nil)
+        thread (threading/Thread ** :target #(reset! result (bridge/inspect-module "math" options)))]
+    (try
+      (.write_text executable
+                   (str "#!" sys/executable "\n"
+                        "import os, pathlib, signal, time\n"
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                        "pathlib.Path(" (pr-str (str marker)) ").write_text(str(os.getpid()))\n"
+                        "time.sleep(30)\n"))
+      (.chmod executable 493)
+      (.start thread)
+      (let [deadline (+ (time/monotonic) 5)]
+        (while (and (not (.exists marker)) (< (time/monotonic) deadline))
+          (time/sleep 0.01)))
+      (is (.exists marker))
+      (bridge/stop-cache! storage)
+      (.join thread 2)
+      (is (not (.is_alive thread)))
+      (is (= :unknown (:status @result)))
+      (is (= "inspection-failed" (:reason @result)))
+      (when (.exists marker)
+        (is (thrown? python/ProcessLookupError (os/kill (python/int (.read_text marker)) 0))))
+      (bridge/clear-cache! storage)
+      (is (identical? processes (:processes (meta @storage))))
+      (is (= "interpreter-unavailable" (:reason (bridge/inspect-module "math" options))))
+      (finally
+        (bridge/stop-cache! storage)
+        (when (.-ident thread) (.join thread 2))
+        (.cleanup temp)))))

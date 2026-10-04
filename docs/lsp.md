@@ -1,7 +1,7 @@
 # Language server
 
-Configure your editor to launch `blt lsp` for `.lpy` files, with the project
-directory as its workspace root.
+Configure your editor to launch `blt lsp` for `.lpy` and `.cljc` files, with the
+project directory as its workspace root.
 
 ```sh
 blt lsp
