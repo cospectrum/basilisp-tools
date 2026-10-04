@@ -104,12 +104,13 @@
                                          "  blt format --check .\n"
                                          "  blt format --diff .\n"
                                          "  blt format - < file.lpy\n\n"
-                                         "Configuration: discovers project.clj with Leiningen precedence,\n"
-                                         "otherwise the nearest .cljfmt.edn or cljfmt.edn. Add\n"
-                                         "--read-clj-config-files to discover .clj configurations too.\n"
-                                         "Project settings load files only with :load-config-file? true;\n"
-                                         "project values win.\n"
-                                         "--config selects a file directly. Project code is never evaluated.\n\n"
+                                         "Configuration: put settings in .cljfmt.edn at the project root.\n"
+                                         "--config selects a file directly. Automatic discovery searches\n"
+                                         "upward for .cljfmt.edn or cljfmt.edn; --read-clj-config-files\n"
+                                         "also enables .clj configurations.\n\n"
+                                         "Existing project.clj files are supported for compatibility and\n"
+                                         "take precedence during discovery. :load-config-file? true loads\n"
+                                         "EDN settings before project overrides. Project code is never evaluated.\n\n"
                                          "Exit codes: 0 success, 1 changes needed (--check/--diff), 2 error."))
         modes (.add_mutually_exclusive_group format)]
     (add-format-options! format)

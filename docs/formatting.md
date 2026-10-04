@@ -5,48 +5,39 @@ of options. It returns formatted source or raises `ExceptionInfo` for malformed
 syntax or invalid options. It never evaluates source, expands macros, resolves
 runtime variables, or imports dependencies from the formatted project.
 
-Configuration loading lives in the same namespace. `load-config` takes a file
-or a directory; without an argument it starts at the current working directory.
-An explicit CLI `--config` selects an existing file and bypasses discovery.
-Otherwise the nearest ancestor `project.clj` selects Leiningen configuration;
-without a project, configuration is discovered in the nearest ancestor directory.
-The order is `.cljfmt.edn`, `.cljfmt.clj`, `cljfmt.edn`, `cljfmt.clj`.
+## Configuration
+
+Put formatter settings in `.cljfmt.edn` at the project root:
+
+```clojure
+{:extra-indents {with-session [[:block 1]]}
+ :normalize-newlines-at-file-end? true}
+```
+
+Use `blt format --config .cljfmt.edn` to select the file explicitly.
+Otherwise, formatter files are discovered upward from the working directory.
+The nearest directory wins; files are not merged across directories. Within a
+directory, the order is `.cljfmt.edn`, `.cljfmt.clj`, `cljfmt.edn`, `cljfmt.clj`.
 Discovery of `.clj` files requires `--read-clj-config-files`; without it, they
 produce a warning and EDN discovery continues. An explicit `--config FILE.clj`
 works without this flag. EDN uses `#re "pattern"`; `.clj` uses `#"pattern"`.
 Both readers consume the first form, as upstream does. Literal `.clj` metadata
 and unqualified automatic namespaces are supported; reader evaluation is not.
 
-## Leiningen configuration
+The `load-config` function lives in `basilisp-tools.format` and takes a file
+or a directory; without an argument it starts at the current working directory.
+An explicit file bypasses automatic discovery.
 
-A literal `:cljfmt` map in the top-level `defproject` form is supported:
-
-```clojure
-(defproject example "0.1.0"
-  :cljfmt {:load-config-file? true
-           :extra-indents {with-session [[:block 1]]
-                           #"^with-" [[:inner 0]]}})
-```
-
-Precedence follows the cljfmt Leiningen plugin:
-
-- Project options alone are used by default, even when an EDN file exists.
-- `:load-config-file? true` enables EDN discovery from the project root upward.
-  The nearest directory wins; `.cljfmt.edn` precedes `cljfmt.edn`. Parent files
-  are not merged.
-- Project options override file options with a shallow merge: a nested map is
-  replaced as a whole. File validation and legacy-key conversion happen first.
-- Project `:cljfmt :paths` wins over `:source-paths` and `:test-paths` (defaults
-  `src` and `test`, restricted to existing directories). File-config paths do
-  not override this selection. Configured project paths are relative to its
-  root; explicit CLI paths remain relative to the working directory.
-
-`project.clj` is parsed as data without running Leiningen or project code.
-Symbols, regex literals, collections, and explicit namespaced maps are supported.
-Unquoted computations and metadata in selected settings are rejected. Inline
-profiles affecting formatter settings are rejected; external Leiningen profiles
-are not loaded. Use top-level literal settings or an explicit EDN file.
-The static configuration scope does not reproduce Leiningen project evaluation.
+For compatibility with existing projects, automatic discovery also recognizes
+literal `:cljfmt` settings in the nearest ancestor `project.clj`. If present,
+that file takes precedence over formatter files. Its `:load-config-file? true`
+option enables EDN discovery from the project root, with project settings winning
+through a shallow merge. Project `:cljfmt :paths` takes precedence over
+`:source-paths` and `:test-paths` (defaulting to existing `src` and `test`
+directories); configured project paths are relative to its root.
+Project code and external Leiningen profiles are never evaluated; computations,
+metadata in selected settings, and inline profiles affecting formatting are
+rejected. An explicit `--config .cljfmt.edn` bypasses this compatibility behavior.
 
 ## Indentation
 
