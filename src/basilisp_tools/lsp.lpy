@@ -7,11 +7,12 @@
             [basilisp-tools.format :as fmt]
             [basilisp-tools.python :as py]
             [basilisp-tools.syntax :as syntax])
-  (:import [asyncio] [functools] [logging] [os] [pathlib] [re] [sys]
+  (:import [asyncio] [functools] [logging] [os] [os.path :as pathutil] [pathlib] [re] [sys]
            [importlib.metadata :as metadata]
            [lsprotocol.types :as lsp]
            [pygls.exceptions :as errors]
            [pygls.lsp.server :as server]
+           [pygls.protocol :as protocol]
            [pygls.uris :as uris]
            [pygls.workspace :as workspace]))
 
@@ -25,6 +26,202 @@
 (defn- file-path [uri]
   (when (.startswith uri "file://")
     (some-> (uris/to_fs_path uri) pathlib/Path)))
+
+(defn deep-merge-settings
+  "Merge LSP settings recursively, concatenating collections as clojure-lsp does."
+  [a b]
+  (reduce (fn [result [key value]]
+            (assoc result key
+                   (if (contains? result key)
+                     (let [previous (get result key)]
+                       (cond
+                         (and (map? previous) (map? value)) (deep-merge-settings previous value)
+                         (and (set? previous) (set? value)) (into previous value)
+                         (and (coll? previous) (coll? value)) (vec (concat previous value))
+                         :else value))
+                     value)))
+          (or a {}) b))
+
+(defn merge-settings
+  "Apply clojure-lsp's special merge rules to cumulative settings."
+  [a b]
+  (let [merged (deep-merge-settings a b)]
+    (cond
+      (get-in merged [:cljfmt :indents])
+      (assoc-in merged [:cljfmt :indents] (merge (get-in a [:cljfmt :indents])
+                                                 (get-in b [:cljfmt :indents])))
+      (seq (:paths-ignore-regex merged))
+      (update merged :paths-ignore-regex #(vec (distinct %)))
+      (coll? (:project-specs merged))
+      (update merged :project-specs
+              (fn [specs]
+                (:items (reduce (fn [{:keys [seen items] :as result} spec]
+                                  (if (contains? seen (:project-path spec)) result
+                                      {:seen (conj seen (:project-path spec)) :items (conj items spec)}))
+                                {:seen #{} :items []} specs))))
+      :else merged)))
+
+(defn- overlay-settings [a b]
+  (if (and (map? a) (map? b)) (merge-with overlay-settings a b) b))
+
+(defn- setting-keyword [value]
+  (cond (keyword? value) value
+        (string? value) (keyword (if (.startswith value ":") (subs value 1) value))))
+
+(defn clean-client-settings
+  "Convert JSON initialization options using clojure-lsp's client conventions."
+  [settings]
+  (let [settings (or settings {})
+        paths (when (seq (:source-paths settings))
+                (not-empty (set (keep #(when (string? %)
+                                         (if (.startswith % ":") (subs % 1) %))
+                                      (:source-paths settings)))))
+        clean-value (fn clean-value [value]
+                      (cond (string? value) (keyword value)
+                            (map? value) (into {} (map (fn [[k v]] [k (clean-value v)]) value))
+                            (vector? value) (mapv clean-value value)
+                            (set? value) (set (map clean-value value))
+                            :else value))
+        settings (-> settings
+                     (update :dependency-scheme #(or % "zipfile"))
+                     (update :text-document-sync-kind setting-keyword)
+                     (assoc :source-paths paths)
+                     (update :source-aliases #(when (seq %) (not-empty (set (keep setting-keyword %)))))
+                     (update :cljfmt-config-path #(or % ".cljfmt.edn"))
+                     (update :document-formatting? #(if (nil? %) true %))
+                     (update :document-range-formatting? #(if (nil? %) true %)))]
+    (cond-> settings
+      (contains? (:cljfmt settings) :indents)
+      (update-in [:cljfmt :indents]
+                 #(into {} (map (fn [[k v]]
+                                  [(let [text (if (keyword? k) (subs (str k) 1) (str k))]
+                                     (if (.startswith text "#") (re/compile (subs text 1))
+                                         (symbol text))) (clean-value v)]) %)))
+      (contains? settings :linters)
+      (update :linters #(into {} (map (fn [[k v]] [k (clean-value v)]) %))))))
+
+(defn read-settings
+  "Read literal LSP EDN, with #re tags and top-level JSON-style string keys."
+  ([source] (read-settings source "LSP settings"))
+  ([source label]
+   (let [parsed (syntax/parse source)
+         node (first (syntax/forms (:root parsed)))
+         prefix (syntax/parse (if node (subs source 0 (:end node)) source))]
+     (when (seq (:diagnostics prefix))
+       (throw (python/ValueError (str label ": " (:message (first (:diagnostics prefix)))))))
+     (if (or (nil? node) (= :nil (:kind node))) {}
+         (into {} (map (fn [[k v]] [(if (string? k) (keyword k) k) v])
+                       (check/read-config (syntax/text node) label {:readers #{'re}})))))))
+
+(defn- read-settings-file [path]
+  (when (.is_file path)
+    (try
+      (read-settings (.read_text path ** :encoding "utf-8") (str path))
+      (catch python/Exception e
+        (logging/warning "Could not read LSP configuration %s: %s" (str path) (str e))
+        {}))))
+
+(defn load-settings
+  "Resolve initialization options < global/ancestor/project .lsp files < forced settings.
+  Optional :home and :xdg-config-home make global discovery reproducible for callers."
+  [{:keys [root client-settings force-settings home xdg-config-home]}]
+  (let [home (pathlib/Path (or home (.home pathlib/Path)))
+        xdg (pathlib/Path (or xdg-config-home (.get os/environ "XDG_CONFIG_HOME")
+                              (.joinpath home ".config")))
+        xdg-directory (.joinpath xdg "clojure-lsp")
+        global-file (.joinpath (if (.exists xdg-directory) xdg-directory
+                                   (.joinpath home ".lsp")) "config.edn")
+        root (when root (.absolute (pathlib/Path root)))
+        directories (when root (reverse (cons root (vec (.-parents root)))))
+        files (keep (fn [directory]
+                      (let [file (.joinpath directory ".lsp" "config.edn")]
+                        (when (not= (.absolute file) (.absolute global-file)) file)))
+                    directories)
+        file-settings (reduce deep-merge-settings (or (read-settings-file global-file) {})
+                              (keep read-settings-file files))]
+    (overlay-settings (overlay-settings (clean-client-settings client-settings) file-settings)
+                      (or force-settings {}))))
+
+(defn- root-for [state uri]
+  (when-let [path (file-path uri)]
+    (first (sort-by #(- (count %))
+                    (filter #(.is_relative_to path (pathlib/Path %)) (:roots @state))))))
+
+(defn- settings-for [state uri]
+  (get-in @state [:settings-by-root (root-for state uri)] (:settings @state)))
+
+(defn- ignored-path? [settings path]
+  (some #(re/fullmatch % (str path)) (:paths-ignore-regex settings)))
+
+(defn- source-paths [root settings]
+  (let [root (pathlib/Path root)
+        paths (or (:source-paths settings) #{"src" "test"})
+        ignored (:source-paths-ignore-regex settings ["target.*"])]
+    (vec (keep (fn [path]
+                 (let [path (pathlib/Path (pathutil/abspath (str (.joinpath root path))))
+                       relative (pathutil/relpath (str path) (str root))]
+                   (when-not (some #(re/fullmatch % relative) ignored) (str path))))
+               paths))))
+
+(defn- load-workspace-settings! [state]
+  (let [base {:client-settings (:client-settings @state)
+              :force-settings (:force-settings @state)}
+        settings (load-settings (assoc base :root (first (:roots @state))))
+        by-root (into {} (map (fn [root] [root (load-settings (assoc base :root root))])
+                              (:roots @state)))
+        changed? (or (not= settings (:settings @state))
+                     (not= by-root (:settings-by-root @state)))]
+    (when changed?
+      (swap! state assoc :settings settings :settings-by-root by-root :analyses {})
+      (swap! state update :generation inc)
+      (swap! state assoc-in [:options :python-paths]
+             (vec (distinct (mapcat (fn [[root settings]] (cons root (source-paths root settings)))
+                                    by-root)))))
+    changed?))
+
+(declare index!)
+
+(defn- refresh-settings! [state]
+  (when (load-workspace-settings! state)
+    (swap! state assoc :index-task (asyncio/create_task (index! state (:roots @state))))))
+
+(defn- selected-path? [state path]
+  (some (fn [[root settings]]
+          (and (not (ignored-path? settings path))
+               (some #(.is_relative_to path (pathlib/Path %)) (source-paths root settings))))
+        (:settings-by-root @state)))
+
+(defn- cljfmt-settings [state uri]
+  (let [settings (settings-for state uri)
+        root (pathlib/Path (or (root-for state uri) (.cwd pathlib/Path)))
+        path (.joinpath root (:cljfmt-config-path settings ".cljfmt.edn"))
+        file-options (when (.is_file path)
+                       (fmt/load-config path))]
+    (overlay-settings (:cljfmt settings {}) (or file-options {}))))
+
+(defn- initialization-roots [params]
+  (vec (or (seq (keep #(some-> (.-uri %) file-path str)
+                      (or (.-workspace_folders params) [])))
+           (when-let [root (some-> (.-root_uri params) file-path str)] [root])
+           (when-let [root (.-root_path params)] [root]) [])))
+
+;; pygls captures sync kind before the initialize hook; configure it before
+;; delegating request dispatch so its workspace and advertised capability agree.
+(def ^:private configured-protocol
+  (python/type
+   "ConfiguredProtocol" (python/tuple [protocol/LanguageServerProtocol])
+   #py {"_handle_request"
+        (fn [self id method params]
+          (when (= method lsp/INITIALIZE)
+            (let [ls (.-_server self)
+                  settings (load-settings {:root (first (initialization-roots params))
+                                           :client-settings (py->lisp (.-initialization_options params))
+                                           :force-settings (.-blt_force_settings ls)})]
+              (python/setattr ls "_text_document_sync_kind"
+                              (if (= :incremental (:text-document-sync-kind settings))
+                                (.-Incremental lsp/TextDocumentSyncKind)
+                                (.-Full lsp/TextDocumentSyncKind)))))
+          (._handle_request protocol/LanguageServerProtocol self id method params))}))
 
 (defn- snapshot [ls uri]
   (let [document (.get_text_document (.-workspace ls) uri)]
@@ -62,16 +259,18 @@
                 (assoc index ns (:definitions info)) index)))
           {} (vals documents)))
 
-(defn- discover [roots codec]
+(defn- discover [roots codec settings-by-root]
   (let [documents (atom {})]
     (doseq [root roots
-            [directory dirs files] (iterator-seq (os/walk root ** :followlinks false))]
+            :let [settings (get settings-by-root root)]
+            source (source-paths root settings)
+            [directory dirs files] (iterator-seq (os/walk source ** :followlinks false))]
       (let [keep (filterv #(not (contains? excluded-directories %)) dirs)]
         (.clear dirs)
         (.extend dirs keep))
       (doseq [name files :when (.endswith name ".lpy")
               :let [path (.joinpath (pathlib/Path directory) name)]
-              :when (not (.is_symlink path))]
+              :when (and (not (.is_symlink path)) (not (ignored-path? settings path)))]
         (try
           (let [uri (.as_uri (.absolute path))]
             (swap! documents assoc uri
@@ -81,28 +280,48 @@
           (catch python/UnicodeError _ nil))))
     {:documents @documents :project (declaration-index @documents)}))
 
-(defn- analyze-document [document project options]
+(defn- analyze-document [document project options settings]
   (let [filename (source-file document)
-        config (check/load-config {:filename filename})]
+        config (check/load-config {:filename filename})
+        config (if (get-in settings [:linters :clj-kondo :report-duplicates] true)
+                 (reduce #(assoc-in %1 [:linters %2 :report-duplicates] true) config
+                         [:unresolved-symbol :unresolved-namespace :unresolved-var]) config)]
     (analyzer/analyze (.-source document)
                       {:filename filename :project project :config config
                        :python-options options})))
 
-(defn- diagnostic [document finding]
+(def ^:private unnecessary-diagnostics
+  #{:redefined-var :redundant-do :redundant-expression :redundant-let :unused-binding
+    :unreachable-code :unused-import :unused-namespace :unused-private-var :unused-referred-var})
+
+(defn- diagnostic [document finding settings]
   (lsp/Diagnostic
-   (span document (:start finding 0) (:end finding (:start finding 0)))
+   (let [start (:start finding 0) end (:end finding start)
+         source (.-source document)
+         simple? (and (not= :full (setting-keyword (get-in settings [:diagnostics :range-type] :full)))
+                      (< start (count source)) (contains? #{"(" "[" "{"} (subs source start (inc start))))
+         multiline? (not= (:row finding) (:end-row finding (:row finding)))]
+     (span document start (if (or simple? multiline?) start end)))
    (:message finding)
    ** :severity (case (:level finding)
                   :warning (.-Warning lsp/DiagnosticSeverity)
                   :info (.-Information lsp/DiagnosticSeverity)
                   (.-Error lsp/DiagnosticSeverity))
-   :source "blt" :code (name (:type finding :syntax))))
+   :source "blt" :code (str (symbol (:type finding :syntax)))
+   :tags (python/list (cond-> []
+                        (contains? unnecessary-diagnostics (:type finding)) (conj (.-Unnecessary lsp/DiagnosticTag))
+                        (= :deprecated-var (:type finding)) (conj (.-Deprecated lsp/DiagnosticTag))))))
 
-(defn- publish! [ls document analysis]
-  (.text_document_publish_diagnostics
-   ls (lsp/PublishDiagnosticsParams
-       (.-uri document) (python/list (map #(diagnostic document %) (:findings analysis)))
-       ** :version (.-version document))))
+(defn- publish! [ls state document analysis]
+  (let [settings (settings-for state (.-uri document))
+        excluded (get-in settings [:linters :clj-kondo :ns-exclude-regex])
+        findings (when-not (or (= :off (get-in settings [:linters :clj-kondo :level]))
+                               (and excluded (re/fullmatch excluded (:namespace analysis ""))))
+                   (:findings analysis))]
+    (.text_document_publish_diagnostics
+     ls (lsp/PublishDiagnosticsParams
+         (.-uri document) (python/list (map #(diagnostic document % settings) findings))
+         ** :version (.-version document)))))
 
 (defasync ^:private wait-index! [state]
   (when-let [task (:index-task @state)]
@@ -142,7 +361,8 @@
                (= generation (:generation cached)))
         (:analysis cached)
         (let [project (await (project! state))
-              result (await (asyncio/to_thread analyze-document document project (:options @state)))]
+              result (await (asyncio/to_thread analyze-document document project (:options @state)
+                                               (settings-for state uri)))]
           (if (and (= generation (:generation @state))
                    (= (.-source document) (some-> (get-in @state [:documents uri]) .-source)))
             (do (swap! state assoc-in [:analyses uri]
@@ -162,33 +382,38 @@
           (when (and (contains? (:open @state) uri)
                      (= version (some-> (get-in @state [:documents uri]) .-version))
                      (identical? document (get-in @state [:documents uri])))
-            (publish! ls document result)))
+            (publish! ls state document result)))
         (catch python/Exception e
           (when (and (contains? (:open @state) uri)
                      (= version (some-> (get-in @state [:documents uri]) .-version))
                      (identical? document (get-in @state [:documents uri])))
-            (publish! ls document {:findings [{:type :configuration :level :error
-                                               :start 0 :end 0 :message (str e)}]})))))))
+            (publish! ls state document {:findings [{:type :configuration :level :error
+                                                     :start 0 :end 0 :message (str e)}]})))))))
 
 (defn- changed! [ls state params]
+  (refresh-settings! state)
   (let [uri (.-uri (.-text_document params))]
     (when-let [task (get-in @state [:tasks uri])] (.cancel task))
     (swap! state (fn [value]
                    (-> value (assoc-in [:documents uri] (snapshot ls uri))
                        (update :generation inc) (update :open conj uri))))
-    (doseq [uri (:open @state)]
+    (doseq [uri (if (get (settings-for state uri) :notify-references-on-file-change true)
+                  (:open @state) [uri])]
       (when-let [task (get-in @state [:tasks uri])] (.cancel task))
       (swap! state assoc-in [:tasks uri] (asyncio/create_task (refresh! ls state uri))))))
 
 (defasync ^:private index! [state roots]
-  (let [result (await (asyncio/to_thread discover roots (:codec @state)))]
-    (when (= (set roots) (set (:roots @state)))
-      (swap! state update :documents #(merge (:documents result) %))
+  (let [settings (:settings-by-root @state)
+        result (await (asyncio/to_thread discover roots (:codec @state) settings))]
+    (when (and (= (set roots) (set (:roots @state)))
+               (= settings (:settings-by-root @state)))
+      (swap! state update :documents
+             #(merge (:documents result) (select-keys % (:open @state))))
       (swap! state update :generation inc))))
 
 (defasync ^:private closed! [state uri]
   (when-let [path (file-path uri)]
-    (when (= ".lpy" (.-suffix path))
+    (when (and (= ".lpy" (.-suffix path)) (selected-path? state path))
       (try
         (let [source (await (asyncio/to_thread #(.read_text path ** :encoding "utf-8")))]
           (when-not (contains? (:open @state) uri)
@@ -218,6 +443,7 @@
       (when (some #(= % item) (:var-definitions analysis)) item)))
 
 (defasync ^:private query! [state params]
+  (refresh-settings! state)
   (let [uri (.-uri (.-text_document params))
         analysis (await (analyzed! state uri))
         document (get-in @state [:documents uri])
@@ -227,6 +453,7 @@
                (when (pos? offset) (occurrence analysis (dec offset))))}))
 
 (defasync ^:private all-analyses! [state]
+  (refresh-settings! state)
   (await (wait-index! state))
   (await (wait-reloads! state))
   (loop [uris (keys (:documents @state)) result {}]
@@ -247,13 +474,19 @@
         :when (= identity (identity-of item))]
     [uri item]))
 
-(defn- markdown [definition]
-  (let [signature (or (:signature definition)
-                      (when (seq (:arglists definition))
-                        (str/join " " (:arglists definition))))
-        doc (:doc definition)]
-    (lsp/MarkupContent (.-PlainText lsp/MarkupKind)
-                       (str (:name definition "") (when signature (str " " signature)) (when (seq doc) (str "\n\n" doc))))))
+(defn- markdown
+  ([definition] (markdown definition {}))
+  ([definition settings]
+   (let [signature (or (:signature definition)
+                       (when (seq (:arglists definition))
+                         (str/join " " (:arglists definition))))
+         doc (:doc definition)]
+     (lsp/MarkupContent (.-PlainText lsp/MarkupKind)
+                        (str (:name definition "")
+                             (when signature (str (if (get-in settings [:hover :arity-on-same-line?]) " " "\n") signature))
+                             (when (seq doc) (str "\n\n" doc))
+                             (when (and (:filename definition) (not (get-in settings [:hover :hide-file-location?])))
+                               (str "\n\n" (:filename definition))))))))
 
 (defn- definition-kind [definition]
   (if (or (:macro definition) (seq (:arglists definition)))
@@ -390,24 +623,29 @@
   "Create a fresh server. The options map is forwarded to Python inspection."
   ([] (create-server {}))
   ([options]
-   (let [ls (server/LanguageServer "blt" (metadata/version "basilisp-tools"))
+   (let [ls (server/LanguageServer "blt" (metadata/version "basilisp-tools")
+                                   ** :protocol_cls configured-protocol)
          state (atom {:documents {} :analyses {} :tasks {} :reloads {} :open #{}
-                      :generation 0 :options options})
+                      :generation 0 :options (dissoc options :force-settings)
+                      :force-settings (:force-settings options {})})
          feature (fn [method handler & [opts]] ((.feature ls method opts) handler))]
+     (python/setattr ls "blt_force_settings" (:force-settings options {}))
      (feature lsp/INITIALIZE
               (fn [params]
                 (let [codec (.-position_codec (.-workspace ls))
-                      roots (or (seq (keep #(some-> (.-uri %) file-path str)
-                                           (or (.-workspace_folders params) [])))
-                                (when-let [root (some-> (.-root_uri params) file-path str)] [root])
-                                [])
-                      paths (vec (mapcat #(vector % (str (.joinpath (pathlib/Path %) "src"))) roots))
+                      roots (initialization-roots params)
                       workspace-capabilities (.-workspace (.-capabilities params))
                       edit-capabilities (when workspace-capabilities (.-workspace_edit workspace-capabilities))]
                   (swap! state assoc :roots (vec roots) :watch-registration?
                          (some-> workspace-capabilities .-did_change_watched_files .-dynamic_registration))
                   (swap! state assoc :document-changes?
                          (and edit-capabilities (.-document_changes edit-capabilities)))
+                  (swap! state assoc :client-settings (py->lisp (.-initialization_options params)))
+                  (load-workspace-settings! state)
+                  (doseq [[method key] [[lsp/TEXT_DOCUMENT_FORMATTING :document-formatting?]
+                                        [lsp/TEXT_DOCUMENT_RANGE_FORMATTING :document-range-formatting?]]]
+                    (.__setitem__ (.-feature_options (.-fm (.-protocol ls))) method
+                                  (get (:settings @state) key true)))
                   (let [executable (or (:python-executable options)
                                        (some (fn [root]
                                                (some (fn [name]
@@ -417,7 +655,7 @@
                                              roots)
                                        sys/executable)]
                     (swap! state assoc :codec codec
-                           :options (assoc options :python-paths paths :python-executable executable)))
+                           :options (assoc (:options @state) :python-executable executable)))
                   (swap! state assoc :index-task (asyncio/create_task (index! state roots))))))
      (feature lsp/INITIALIZED
               (fn [_params]
@@ -454,10 +692,18 @@
                                (assoc :analyses {}) (update :generation inc)
                                (assoc-in [:options :python-paths]
                                          (vec (mapcat #(vector % (str (.joinpath (pathlib/Path %) "src"))) roots))))))
+                  (load-workspace-settings! state)
                   (swap! state assoc :index-task (asyncio/create_task (index! state roots)))
                   (doseq [uri (:open @state)]
                     (when-let [task (get-in @state [:tasks uri])] (.cancel task))
                     (swap! state assoc-in [:tasks uri] (asyncio/create_task (refresh! ls state uri)))))))
+     (feature lsp/WORKSPACE_DID_CHANGE_CONFIGURATION
+              (fn [params]
+                (swap! state update :client-settings deep-merge-settings (py->lisp (.-settings params)))
+                (refresh-settings! state)
+                (doseq [uri (:open @state)]
+                  (when-let [task (get-in @state [:tasks uri])] (.cancel task))
+                  (swap! state assoc-in [:tasks uri] (asyncio/create_task (refresh! ls state uri))))))
      (feature lsp/TEXT_DOCUMENT_DID_OPEN #(changed! ls state %))
      (feature lsp/TEXT_DOCUMENT_DID_CHANGE #(changed! ls state %))
      (feature lsp/TEXT_DOCUMENT_DID_SAVE #(changed! ls state %))
@@ -475,6 +721,7 @@
                   (swap! state assoc-in [:reloads uri] (asyncio/create_task (closed! state uri))))))
      (feature lsp/WORKSPACE_DID_CHANGE_WATCHED_FILES
               (fn [params]
+                (refresh-settings! state)
                 (doseq [change (.-changes params)
                         :let [uri (.-uri change) path (file-path uri)]
                         :when path]
@@ -494,7 +741,7 @@
               (fn ^:async handler [params]
                 (let [{:keys [analysis document item]} (await (query! state params))]
                   (when-let [definition (definition-of analysis item)]
-                    (lsp/Hover (markdown definition)
+                    (lsp/Hover (markdown definition (settings-for state (.-uri document)))
                                ** :range (span document (:start item) (:end item)))))))
      (feature lsp/TEXT_DOCUMENT_DEFINITION
               (fn ^:async handler [params]
@@ -592,16 +839,33 @@
                                             ** :container_name (:ns definition)))))))
      (feature lsp/TEXT_DOCUMENT_FORMATTING
               (fn ^:async handler [params]
+                (refresh-settings! state)
+                (let [uri (.-uri (.-text_document params))
+                      document (get-in @state [:documents uri])]
+                  (if-not (get (settings-for state uri) :document-formatting? true) #py []
+                          (let [source (.-source document)
+                                options (await (asyncio/to_thread cljfmt-settings state uri))
+                                formatted (await (asyncio/to_thread fmt/format-string source options))]
+                            (when (identical? document (get-in @state [:documents uri]))
+                              (if (= source formatted) #py []
+                                  #py [(lsp/TextEdit (span document 0 (count source)) formatted)])))))))
+     (feature lsp/TEXT_DOCUMENT_RANGE_FORMATTING
+              (fn ^:async handler [params]
+                (refresh-settings! state)
                 (let [uri (.-uri (.-text_document params))
                       document (get-in @state [:documents uri])
-                      source (.-source document)
-                      path (file-path uri)
-                      options (await (asyncio/to_thread fmt/load-config
-                                                        (if path (.-parent path) (.cwd pathlib/Path))))
-                      formatted (await (asyncio/to_thread fmt/format-string source options))]
-                  (when (identical? document (get-in @state [:documents uri]))
-                    (if (= source formatted) #py []
-                        #py [(lsp/TextEdit (span document 0 (count source)) formatted)])))))
+                      source (.-source document)]
+                  (if-not (get (settings-for state uri) :document-range-formatting? true) #py []
+                          (let [start (.offset_at_position document (.-start (.-range params)))
+                                end (.offset_at_position document (.-end (.-range params)))
+                                forms (syntax/forms (:root (syntax/parse source)))
+                                selected (filter #(and (<= (:start %) end) (<= start (:end %))) forms)
+                                from (:start (first selected)) to (:end (last selected))]
+                            (if-not from #py []
+                                    (let [options (await (asyncio/to_thread cljfmt-settings state uri))
+                                          formatted (await (asyncio/to_thread fmt/format-string (subs source from to) options))]
+                                      (when (identical? document (get-in @state [:documents uri]))
+                                        #py [(lsp/TextEdit (span document from to) formatted)]))))))))
      (python/setattr ls "blt_state" state)
      ls)))
 

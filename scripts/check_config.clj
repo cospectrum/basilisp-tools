@@ -34,7 +34,7 @@
         (update :source-paths #(mapv (partial absolute-path root) (or % ["src"])))
         (update :test-paths #(mapv (partial absolute-path root) (or % ["test"]))))))
 
-(defn capture [{:keys [name mode root path source keys]}]
+(defn capture [{:keys [name mode root path source keys read-clj-config-files?]}]
   (try
     (let [options
           (case mode
@@ -46,7 +46,7 @@
                           tool/check-no-config identity]
               (plugin (project-map root source) "check"))
             :file (load-config path)
-            :discover (load-config path))
+            :discover (load-config path {:read-clj-config-files? read-clj-config-files?}))
           options (cond-> (select-keys options keys)
                     (and (= mode :lein) (contains? options :paths))
                     (assoc :paths (mapv (partial absolute-path root) (:paths options))))

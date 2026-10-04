@@ -82,7 +82,7 @@ def main():
                                "capabilities": {"general": {"positionEncodings": ["utf-16"]}}}, 1)
             capabilities = response(1)["capabilities"]
             assert capabilities["positionEncoding"] == "utf-16", capabilities
-            assert capabilities["textDocumentSync"]["change"] == 2, capabilities
+            assert capabilities["textDocumentSync"]["change"] == 1, capabilities
             for name in ("hoverProvider", "definitionProvider", "referencesProvider",
                          "renameProvider", "completionProvider", "documentSymbolProvider",
                          "workspaceSymbolProvider", "documentFormattingProvider"):

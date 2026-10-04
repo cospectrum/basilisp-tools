@@ -63,7 +63,10 @@
       (is (= {:indentation? false} (fmt/load-config nested)))
       (.write_text (.joinpath nested ".cljfmt.edn") "{:indentation? true}" ** :encoding "utf-8")
       (is (= {:indentation? true} (fmt/load-config nested)))
-      (doseq [bad ["{}{}" "{} x" "[]" "{:extra-indents #evil {}}"
+      (doseq [source ["{}{}" "{} x"]]
+        (.write_text (.joinpath nested ".cljfmt.edn") source ** :encoding "utf-8")
+        (is (= {} (fmt/load-config nested))))
+      (doseq [bad ["[]" "{:extra-indents #evil {}}"
                    "{:indentation? \"yes\"}" "#=(python/print \"bad\")"]]
         (.write_text (.joinpath nested ".cljfmt.edn") bad ** :encoding "utf-8")
         (is (thrown? python/Exception (fmt/load-config nested))))

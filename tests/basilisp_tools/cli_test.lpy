@@ -104,3 +104,103 @@
         (is (.startswith (:out result) "{"))
         (is (= (.encode source "utf-8") (.read_bytes file))))
       (finally (.cleanup temp)))))
+
+(deftest formatter-command-overrides-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        config (.joinpath root "config.edn")
+        source "(let [x 1]\nx)"]
+    (try
+      (.write_text config "{:indentation? false :normalize-newlines-at-file-end? true}" ** :encoding "utf-8")
+      (let [result (run-cli ["format" "--config" (str config) "--indentation"
+                             "--no-normalize-newlines-at-file-end" "-"] source)]
+        (is (= 0 (:code result)))
+        (is (= "(let [x 1]\n  x)" (:out result))))
+      (is (= (str source "\n")
+             (:out (run-cli ["format" "--config" (str config) "-"] source))))
+      (finally (.cleanup temp)))))
+
+(deftest formatter-relative-pattern-and-display-root-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        source-dir (.joinpath root "src")
+        config (.joinpath root "config.edn")]
+    (try
+      (.mkdir source-dir)
+      (.write_text config "{}" ** :encoding "utf-8")
+      (.write_text (.joinpath source-dir "sample.lpy") "(let [x 1]\nx)" ** :encoding "utf-8")
+      (.write_text (.joinpath root "excluded.lpy") "(" ** :encoding "utf-8")
+      (let [result (run-cli ["format" "--config" (str config) "--check"
+                             "--file-pattern" "^src/.*\\.lpy$" "--project-root" (str root)
+                             "--verbose" (str root)] "")]
+        (is (= 1 (:code result)))
+        (is (.startswith (:err result) "Processing file: src/sample.lpy\n"))
+        (is (.endswith (:err result) "Would format src/sample.lpy\n")))
+      (finally (.cleanup temp)))))
+
+(deftest formatter-parallel-preserves-batch-validation-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        config (.joinpath root "config.edn")
+        first-file (.joinpath root "a.lpy")
+        second-file (.joinpath root "b.lpy")
+        source "(let [x 1]\nx)"
+        args ["format" "--config" (str config) "--no-ansi"]]
+    (try
+      (.write_text config "{:parallel? true :quiet? true :verbose? true}" ** :encoding "utf-8")
+      (.write_text first-file source ** :encoding "utf-8")
+      (.write_text second-file "(" ** :encoding "utf-8")
+      (is (= 2 (:code (run-cli (conj args (str root)) ""))))
+      (is (= source (.read_text first-file ** :encoding "utf-8")))
+      (.write_text second-file source ** :encoding "utf-8")
+      (let [parallel (run-cli (concat args ["--parallel" "--diff" (str root)]) "")
+            sequential (run-cli (concat args ["--no-parallel" "--diff" (str root)]) "")]
+        (is (= 1 (:code parallel)))
+        (is (= (:out sequential) (:out parallel)))
+        (is (= "" (:err parallel))))
+      (is (= 0 (:code (run-cli (conj args (str root)) ""))))
+      (is (= "(let [x 1]\n  x)" (.read_text first-file ** :encoding "utf-8")))
+      (is (= "(let [x 1]\n  x)" (.read_text second-file ** :encoding "utf-8")))
+      (finally (.cleanup temp)))))
+
+(deftest kondo-lint-cli-alias-test
+  (let [result (run-cli ["check" "--repro" "--no-python-inspection" "--format" "json"
+                         "--filename" "sample.lpy" "--lint" "-"] "(ns sample)\nmissing")]
+    (is (= 3 (:code result)))
+    (is (= "unresolved-symbol" (.get (first (.get (json/loads (:out result)) "findings")) "type")))))
+
+(deftest formatter-clj-discovery-cli-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        original (.cwd pathlib/Path)
+        source "(let [x 1]\nx)"]
+    (try
+      (.write_text (.joinpath root ".cljfmt.clj") "{:indentation? false}" ** :encoding "utf-8")
+      (os/chdir root)
+      (let [enabled (run-cli ["format" "--read-clj-config-files" "-"] source)
+            disabled (run-cli ["format" "--no-read-clj-config-files" "-"] source)]
+        (is (= 0 (:code enabled)))
+        (is (= source (:out enabled)))
+        (is (= 0 (:code disabled)))
+        (is (= "(let [x 1]\n  x)" (:out disabled)))
+        (is (not= "" (:err disabled))))
+      (finally (os/chdir original) (.cleanup temp)))))
+
+(deftest formatter-configured-project-root-only-affects-display-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        original (.cwd pathlib/Path)
+        source-dir (.joinpath root "src")
+        display-root (.joinpath root "display")
+        source "(let [x 1]\nx)"]
+    (try
+      (.mkdir source-dir)
+      (.mkdir display-root)
+      (.write_text (.joinpath source-dir "sample.lpy") source ** :encoding "utf-8")
+      (.write_text (.joinpath root ".cljfmt.edn")
+                   "{:paths [\"src\"] :project-root \"display\"}" ** :encoding "utf-8")
+      (os/chdir root)
+      (let [result (run-cli ["format" "--check"] "")]
+        (is (= 1 (:code result)))
+        (is (= "Would format ../src/sample.lpy\n" (:err result))))
+      (finally (os/chdir original) (.cleanup temp)))))

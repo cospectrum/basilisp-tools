@@ -4,7 +4,8 @@
             [basilisp-tools.format :as fmt]
             [basilisp-tools.syntax :as syntax])
   (:import [argparse] [importlib] [difflib] [os] [os.path :as pathutil] [pathlib] [re] [stat] [sys] [tempfile]
-           [importlib.metadata :as metadata]))
+           [importlib.metadata :as metadata]
+           [concurrent.futures :as futures]))
 
 (def ^:private skipped-directories
   #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" "node_modules"
@@ -23,6 +24,8 @@
                                     "Exit codes: 0 clean, 2 warnings, 3 errors."))]
     (.add_argument p "paths" ** :nargs "*" :metavar "PATH"
                    :help "Files/directories, or - for stdin. Defaults to the current directory.")
+    (.add_argument p "--lint" ** :action "extend" :nargs "+" :metavar "PATH"
+                   :help "clj-kondo-style alias for positional source paths; may be repeated.")
     (.add_argument p "--config" ** :action "append" :metavar "EDN_OR_FILE"
                    :help "Additional checker configuration; repeat to merge multiple sources.")
     (.add_argument p "--config-dir" ** :metavar "DIR"
@@ -48,12 +51,45 @@
   (let [p (.add_parser commands "lsp" ** :help "Start the stdio language server."
                        :description "Serve editor features over LSP on stdin/stdout."
                        :epilog "Configure your editor to launch: blt lsp")]
+    (.add_argument p "-s" "--settings" ** :metavar "EDN"
+                   :help "Force LSP settings over client and .lsp/config.edn settings.")
     (.add_argument p "--python" ** :dest "python_executable" :metavar "EXECUTABLE"
                    :help "Python environment to inspect; defaults to the workspace .venv, then this interpreter.")
     (.add_argument p "--no-python-inspection" ** :dest "python_inspection" :action "store_false"
                    :help "Disable runtime inspection of installed Python dependencies.")
     (.add_argument p "--python-timeout" ** :type python/float :default 5.0 :metavar "SECONDS"
                    :help "Timeout for Python inspection (default: 5).")))
+
+(def ^:private format-switches
+  [:align-form-columns? :align-map-columns? :align-single-column-lines?
+   :blank-lines-separate-alignment? :indentation? :indent-line-comments?
+   :insert-missing-whitespace? :remove-consecutive-blank-lines?
+   :remove-multiple-non-indenting-spaces? :remove-surrounding-whitespace?
+   :remove-trailing-whitespace? :remove-blank-lines-in-forms?
+   :normalize-newlines-at-file-end? :sort-ns-references?
+   :split-keypairs-over-multiple-lines? :read-clj-config-files? :parallel? :ansi?])
+
+(defn- format-argument [option]
+  (str "format_" (str/replace (str/replace (name option) "?" "") "-" "_")))
+
+(defn- add-format-options! [p]
+  (doseq [option format-switches]
+    (.add_argument p (str "--" (str/replace (name option) "?" ""))
+                   ** :dest (format-argument option) :action argparse/BooleanOptionalAction
+                   :default nil :help (str "Override :" (name option) " from formatter configuration.")))
+  (.add_argument p "--function-arguments-indentation"
+                 ** :dest "format_function_arguments_indentation"
+                 :choices #py ["community" "cursive" "zprint"]
+                 :help "Override the function argument indentation style.")
+  (.add_argument p "--file-pattern" ** :dest "format_file_pattern" :metavar "REGEX"
+                 :help "Match paths relative to each searched directory.")
+  (doseq [option [:max-column-alignment-gap :max-column-alignment-width]]
+    (.add_argument p (str "--" (name option)) ** :dest (format-argument option)
+                   :type python/int :metavar "N" :help (str "Override :" (name option) ".")))
+  (.add_argument p "--project-root" ** :dest "format_project_root" :metavar "DIR"
+                 :help "Base directory for displayed paths; input paths remain relative to the working directory.")
+  (.add_argument p "--verbose" "-v" ** :action "store_true" :default nil
+                 :help "Report every processed file."))
 
 (defn- parser []
   (let [p (argparse/ArgumentParser ** :prog "blt"
@@ -69,11 +105,14 @@
                                          "  blt format --diff .\n"
                                          "  blt format - < file.lpy\n\n"
                                          "Configuration: discovers project.clj with Leiningen precedence,\n"
-                                         "otherwise the nearest .cljfmt.edn or cljfmt.edn. Project settings\n"
-                                         "load EDN only with :load-config-file? true; project values win.\n"
+                                         "otherwise the nearest .cljfmt.edn or cljfmt.edn. Add\n"
+                                         "--read-clj-config-files to discover .clj configurations too.\n"
+                                         "Project settings load files only with :load-config-file? true;\n"
+                                         "project values win.\n"
                                          "--config selects a file directly. Project code is never evaluated.\n\n"
                                          "Exit codes: 0 success, 1 changes needed (--check/--diff), 2 error."))
         modes (.add_mutually_exclusive_group format)]
+    (add-format-options! format)
     (add-check-options! commands)
     (add-lsp-options! commands)
     (.add_argument p "--version" ** :action "version"
@@ -85,8 +124,8 @@
     (.add_argument modes "--diff" ** :action "store_true"
                    :help "Print unified diffs without changing files.")
     (.add_argument format "--config" ** :metavar "FILE"
-                   :help "Use an EDN configuration file instead of discovery.")
-    (.add_argument format "--quiet" "-q" ** :action "store_true"
+                   :help "Use an EDN or literal .clj configuration file instead of discovery.")
+    (.add_argument format "--quiet" "-q" ** :action "store_true" :default nil
                    :help "Suppress file status messages.")
     p))
 
@@ -94,11 +133,26 @@
 (defn- report [message] (.write sys/stderr (str message "\n")))
 
 (defn- configuration [args]
-  (if-let [path (.-config args)]
-    (let [p (pathlib/Path path)]
-      (when-not (.is_file p) (error (str "Configuration file does not exist: " path)))
-      (fmt/load-config p))
-    (fmt/load-config)))
+  (let [discovery {:read-clj-config-files? (.-format_read_clj_config_files args)}
+        base (if-let [path (.-config args)]
+               (let [p (pathlib/Path path)]
+                 (when-not (.is_file p) (error (str "Configuration file does not exist: " path)))
+                 (fmt/load-config p discovery))
+               (fmt/load-config (.cwd pathlib/Path) discovery))
+        options (reduce (fn [options option]
+                          (let [value (python/getattr args (format-argument option))]
+                            (if (nil? value) options (assoc options option value))))
+                        base (concat format-switches [:max-column-alignment-gap :max-column-alignment-width
+                                                      :project-root]))
+        options (cond-> options
+                  (.-format_function_arguments_indentation args)
+                  (assoc :function-arguments-indentation (keyword (.-format_function_arguments_indentation args)))
+                  (.-format_file_pattern args) (assoc :file-pattern (re/compile (.-format_file_pattern args)))
+                  (some? (.-quiet args)) (assoc :quiet? (.-quiet args))
+                  (some? (.-verbose args)) (assoc :verbose? (.-verbose args)))]
+    ;; --project-root changes displayed paths. Leiningen's configured paths
+    ;; retain their original project root even when that display base changes.
+    (vary-meta options assoc :paths-root (:paths-root (meta base)))))
 
 (defn- walk-files [path pattern]
   (let [result (atom [])]
@@ -114,7 +168,8 @@
       (.sort dirs)
       (doseq [name (sort files)
               :let [p (.joinpath (pathlib/Path root) name)]
-              :when (and (re/search pattern name) (.is_file p) (not (.is_symlink p)))]
+              :when (and (re/search pattern (.as_posix (.relative_to p (pathlib/Path path))))
+                         (.is_file p) (not (.is_symlink p)))]
         (swap! result conj p)))
     @result))
 
@@ -151,6 +206,36 @@
                   (difflib/unified_diff (.splitlines source true) (.splitlines formatted true)
                                         ** :fromfile (str "a/" label) :tofile (str "b/" label))))))
 
+(defn- display-diff [source formatted label options]
+  (let [text (diff source formatted label)
+        color? (and (:ansi? options true) (.isatty sys/stdout)
+                    (os/getenv "TERM") (nil? (os/getenv "NO_COLOR")))
+        escape (python/chr 27)]
+    (if color?
+      (reduce (fn [text [pattern code]]
+                (re/sub pattern #(str escape "[" code "m" (.group % 0) escape "[0m") text))
+              text [[#"(?m)^(@@.*@@)$" "036"]
+                    [#"(?m)^(\+(?!\+\+).*)$" "032"]
+                    [#"(?m)^(-(?!--).*)$" "031"]])
+      text)))
+
+(defn- displayed-path [path options]
+  (pathutil/relpath path (:project-root options ".")))
+
+(defn- prepare-files [files options]
+  (when (and (:verbose? options) (not (:quiet? options)))
+    (doseq [path files] (report (str "Processing file: " (displayed-path path options)))))
+  (let [prepare (fn [path]
+                  (let [original (.read_bytes path)
+                        source (.decode original "utf-8")
+                        label (displayed-path path options)]
+                    {:path path :original original :source source
+                     :formatted (format-source source options label) :label label}))]
+    (if (and (:parallel? options) (> (count files) 1))
+      (with-open [pool (futures/ThreadPoolExecutor ** :max_workers (min 32 (count files)))]
+        (vec (iterator-seq (.map pool prepare files))))
+      (mapv prepare files))))
+
 (defn- replace-file! [path original formatted]
   (when-not (= original (.read_bytes path))
     (error (str "File changed while formatting: " path)))
@@ -170,8 +255,9 @@
   (let [options (configuration args)
         explicit-paths (seq (.-paths args))
         paths (or explicit-paths (:paths options) ["."])
-        paths (if (and (not explicit-paths) (:project-root options))
-                (mapv #(if (= "-" %) % (str (.joinpath (pathlib/Path (:project-root options)) %))) paths)
+        paths-root (:paths-root (meta options))
+        paths (if (and (not explicit-paths) paths-root)
+                (mapv #(if (= "-" %) % (str (.joinpath (pathlib/Path paths-root) %))) paths)
                 paths)
         check? (or (.-check args) (.-diff args))]
     (if (some #(= "-" %) paths)
@@ -181,32 +267,24 @@
               formatted (format-source source options "<stdin>")
               changed? (not= source formatted)]
           (cond
-            (.-diff args) (.write sys/stdout (diff source formatted "stdin"))
+            (.-diff args) (.write sys/stdout (display-diff source formatted "stdin" options))
             (not check?) (.write sys/stdout formatted))
           (if (and check? changed?) 1 0)))
       (let [files (collect-files paths options)
             _ (when (empty? files) (error "No matching source files found."))
             ;; Validate and format the entire selection before writing anything.
-            changes (->> files
-                         (mapv (fn [path]
-                                 (let [original (.read_bytes path)
-                                       source (.decode original "utf-8")
-                                       label (pathutil/relpath path)
-                                       formatted (format-source source options label)]
-                                   {:path path :original original :source source
-                                    :formatted formatted :label label})))
-                         (filterv #(not= (:source %) (:formatted %))))]
+            changes (filterv #(not= (:source %) (:formatted %)) (prepare-files files options))]
         (doseq [{:keys [path original source formatted label]} changes]
           (cond
-            (.-diff args) (.write sys/stdout (diff source formatted label))
+            (.-diff args) (.write sys/stdout (display-diff source formatted label options))
             (not check?) (replace-file! path original formatted))
-          (when-not (.-quiet args)
+          (when-not (:quiet? options)
             (report (str (if check? "Would format " "Formatted ") label))))
         (if (and check? (seq changes)) 1 0)))))
 
 (defn- check-command [args]
   (let [checker (importlib/import_module "basilisp_tools.check")
-        paths (vec (or (seq (.-paths args)) ["."]))
+        paths (vec (or (seq (concat (.-paths args) (or (.-lint args) []))) ["."]))
         options {:paths paths
                  :config (vec (or (.-config args) []))
                  :config-dir (.-config_dir args)
@@ -226,7 +304,8 @@
   (let [server (importlib/import_module "basilisp_tools.lsp")
         options (cond-> {:python-inspection? (.-python_inspection args)
                          :python-timeout (.-python_timeout args)}
-                  (.-python_executable args) (assoc :python-executable (.-python_executable args)))]
+                  (.-python_executable args) (assoc :python-executable (.-python_executable args))
+                  (.-settings args) (assoc :force-settings (.read_settings server (.-settings args) "--settings")))]
     (.start server options)))
 
 (defn main

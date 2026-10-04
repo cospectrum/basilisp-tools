@@ -95,6 +95,84 @@ def cases():
            "files": {".cljfmt.edn": FILE_OPTIONS}}
 
 
+    yield {"name": "clj-file-ignored-by-default", "files": {".cljfmt.clj": FILE_OPTIONS}}
+    yield {"name": "clj-file-enabled", "read_clj": True,
+           "files": {".cljfmt.clj": FILE_OPTIONS}}
+    yield {"name": "plain-clj-file-enabled", "read_clj": True,
+           "files": {"cljfmt.clj": FILE_OPTIONS}}
+    yield {"name": "explicit-clj-file-without-discovery-flag", "explicit": "chosen.clj",
+           "files": {"chosen.clj": FILE_OPTIONS}}
+    yield {"name": "dot-edn-precedes-dot-clj", "read_clj": True,
+           "files": {".cljfmt.edn": FILE_OPTIONS, ".cljfmt.clj": "{:indentation? true}"}}
+    yield {"name": "dot-clj-precedes-plain-edn-when-enabled", "read_clj": True,
+           "files": {".cljfmt.clj": FILE_OPTIONS, "cljfmt.edn": "{:indentation? true}"}}
+    yield {"name": "dot-clj-falls-back-to-plain-edn-when-disabled",
+           "files": {".cljfmt.clj": "{:indentation? true}", "cljfmt.edn": FILE_OPTIONS}}
+    yield {"name": "plain-edn-precedes-plain-clj", "read_clj": True,
+           "files": {"cljfmt.edn": FILE_OPTIONS, "cljfmt.clj": "{:indentation? true}"}}
+    yield {"name": "child-clj-beats-parent-edn-when-enabled", "read_clj": True, "start": "child",
+           "files": {"child/.cljfmt.clj": FILE_OPTIONS, ".cljfmt.edn": "{:indentation? true}"}}
+    yield {"name": "child-clj-ignored-parent-edn-used", "start": "child",
+           "files": {"child/.cljfmt.clj": "{:indentation? true}", ".cljfmt.edn": FILE_OPTIONS}}
+    yield {"name": "lein-does-not-enable-clj-discovery",
+           "project": ":cljfmt {:load-config-file? true :read-clj-config-files? true}",
+           "read_clj": True, "files": {".cljfmt.clj": FILE_OPTIONS}}
+    yield {"name": "explicit-clj-regex", "explicit": "chosen.clj",
+           "files": {"chosen.clj": '{:extra-indents {#"^with-" [[:inner 0]]}}'}}
+    yield {"name": "edn-tagged-regex", "files": {
+        ".cljfmt.edn": '{:extra-indents {#re "^with-" [[:inner 0]]}}'}}
+    yield {"name": "edn-does-not-read-clj-regex", "error": True,
+           "files": {".cljfmt.edn": '{:extra-indents {#"^with-" [[:inner 0]]}}'}}
+    yield {"name": "clj-does-not-read-edn-re-tag", "error": True,
+           "explicit": "chosen.clj",
+           "files": {"chosen.clj": '{:extra-indents {#re "^with-" [[:inner 0]]}}'}}
+    yield {"name": "clj-map-metadata", "explicit": "chosen.clj",
+           "files": {"chosen.clj": '^:replace {:indentation? false}'}}
+    yield {"name": "clj-symbol-metadata", "explicit": "chosen.clj",
+           "files": {"chosen.clj": '{:extra-indents {^String action [[:inner 0]]}}'}}
+    yield {"name": "clj-auto-keyword-namespace", "explicit": "chosen.clj", "keys": ["alias-map"],
+           "files": {"chosen.clj": '{:alias-map {::local remote}}'}}
+    yield {"name": "clj-auto-map-namespace", "explicit": "chosen.clj",
+           "files": {"chosen.clj": '{:extra-indents #::{action [[:inner 0]]}}'}}
+    yield {"name": "clj-unresolved-keyword-alias", "explicit": "chosen.clj", "error": True,
+           "files": {"chosen.clj": '{:alias-map {::absent/local remote}}'}}
+    yield {"name": "edn-rejects-auto-keywords", "error": True,
+           "files": {".cljfmt.edn": '{:alias-map {::local remote}}'}}
+    for extension in ("edn", "clj"):
+        for literal in ("nil", "{} {:indentation? false}", "{} (", "{}]", "#_{} " + FILE_OPTIONS):
+            yield {"name": f"{extension}-reader-{literal}", "explicit": f"chosen.{extension}",
+                   "files": {f"chosen.{extension}": literal}}
+    yield {"name": "empty-edn-is-error", "error": True, "files": {".cljfmt.edn": ""}}
+    yield {"name": "empty-clj-is-error", "error": True, "explicit": "chosen.clj",
+           "files": {"chosen.clj": ""}}
+
+
+    for filename in ("chosen.txt", "chosen"):
+        yield {"name": f"unsupported-config-extension-{filename}", "explicit": filename, "error": True,
+               "files": {filename: "{}"}}
+
+    booleans = ["indent-line-comments?", "indentation?", "normalize-newlines-at-file-end?",
+                "insert-missing-whitespace?", "remove-blank-lines-in-forms?",
+                "remove-consecutive-blank-lines?", "remove-multiple-non-indenting-spaces?",
+                "remove-surrounding-whitespace?", "remove-trailing-whitespace?",
+                "sort-ns-references?", "split-keypairs-over-multiple-lines?",
+                "align-map-columns?", "align-form-columns?", "align-binding-columns?",
+                "align-single-column-lines?", "blank-lines-separate-alignment?",
+                "ansi?", "parallel?", "quiet?", "verbose?", "read-clj-config-files?"]
+    for value in ("true", "false"):
+        yield {"name": f"all-boolean-options-{value}", "keys": booleans,
+               "files": {".cljfmt.edn": "{" + " ".join(f":{key} {value}" for key in booleans) + "}"}}
+    for style in ("community", "cursive", "zprint"):
+        yield {"name": f"function-argument-style-{style}", "keys": ["function-arguments-indentation"],
+               "files": {".cljfmt.edn": "{:function-arguments-indentation :" + style + "}"}}
+    yield {"name": "file-selection-and-width-options", "keys": [
+        "paths", "project-root", "file-pattern", "max-column-alignment-gap", "max-column-alignment-width"],
+           "files": {".cljfmt.edn": '{:paths ["lib" "spec"] :project-root "project" :file-pattern #re ".*lpy" :max-column-alignment-gap 3 :max-column-alignment-width 80}'}}
+    yield {"name": "custom-form-rules-and-aliases", "keys": [
+        "aligned-forms", "extra-aligned-forms", "blank-line-forms", "extra-blank-line-forms", "alias-map", "refer-map"],
+           "files": {".cljfmt.edn": '{:aligned-forms {bind #{0}} :extra-aligned-forms {pair #{1}} :blank-line-forms {cond :all} :extra-blank-line-forms {other :all} :alias-map {local external} :refer-map {item external/item}}'}}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cljfmt", type=Path, required=True)
@@ -145,11 +223,12 @@ def main() -> int:
             if mode == "lein":
                 keys += ["paths", "project-root"]
             specifications.append(
-                "{:name %s :root %s :path %s :mode :%s :source %s :keys [%s]}"
+                "{:name %s :root %s :path %s :mode :%s :source %s :keys [%s] :read-clj-config-files? %s}"
                 % (json.dumps(case["name"]), json.dumps(str(directory)), json.dumps(str(path)),
-                   mode, json.dumps(source), " ".join(":" + key for key in keys))
+                   mode, json.dumps(source), " ".join(":" + key for key in keys),
+                   "true" if case.get("read_clj") else "false")
             )
-            prepared.append((case["name"], mode, directory, path, keys, case.get("error", False)))
+            prepared.append((case["name"], mode, directory, path, keys, case.get("error", False), case.get("read_clj", False)))
 
         # Prevent a developer's own ancestor config from affecting empty fixtures.
         (root / ".cljfmt.edn").write_text("{}", encoding="utf-8")
@@ -165,13 +244,13 @@ def main() -> int:
         )
         if len(expected) != len(prepared):
             raise RuntimeError("The configuration oracle returned an incomplete result.")
-        for (name, mode, directory, path, keys, expect_error), oracle in zip(prepared, expected):
+        for (name, mode, directory, path, keys, expect_error, read_clj), oracle in zip(prepared, expected):
             oracle_error = oracle.val_at(kw("error"))
             if bool(oracle_error) != expect_error:
                 failures.append((name, f"oracle error={expect_error}", str(oracle_error)))
                 continue
             try:
-                raw = formatter.load_config(str(path))
+                raw = formatter.load_config(str(path), lmap({kw("read-clj-config-files?"): read_clj}))
                 merged = dict(formatter.default_options)
                 merged.update(dict(raw))
                 actual = {kw(key): merged[kw(key)] for key in keys if kw(key) in merged}

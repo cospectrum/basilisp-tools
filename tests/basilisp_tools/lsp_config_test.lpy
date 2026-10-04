@@ -1,0 +1,75 @@
+(ns basilisp-tools.lsp-config-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.lsp :as lsp])
+  (:import [pathlib] [re] [tempfile]))
+
+(defn- write! [root name content]
+  (let [path (.joinpath root name)]
+    (.mkdir (.-parent path) ** :parents true :exist_ok true)
+    (.write_text path content ** :encoding "utf-8")
+    path))
+
+(deftest client-settings-conversion-test
+  (let [settings (lsp/clean-client-settings
+                  {:text-document-sync-kind ":incremental"
+                   :source-paths [":src" "test" 42]
+                   :source-aliases [":dev" "test"]
+                   :cljfmt {:indents {"let" [["block" 1]] "#with-.*" [["inner" 0]]}}
+                   :linters {:clj-kondo {:level "off"}}})]
+    (is (= :incremental (:text-document-sync-kind settings)))
+    (is (= #{"src" "test"} (:source-paths settings)))
+    (is (= #{:dev :test} (:source-aliases settings)))
+    (is (= [[:block 1]] (get-in settings [:cljfmt :indents 'let])))
+    (is (= :off (get-in settings [:linters :clj-kondo :level])))
+    (is (:document-formatting? settings))
+    (is (:document-range-formatting? settings))
+    (is (= ".cljfmt.edn" (:cljfmt-config-path settings)))
+    (is (= "zipfile" (:dependency-scheme settings)))))
+
+(deftest settings-merging-test
+  (is (= {:x {:a false :b 2} :paths ["a" "b"] :set #{1 2} :nil nil}
+         (lsp/deep-merge-settings {:x {:a true} :paths ["a"] :set #{1} :nil 3}
+                                  {:x {:a false :b 2} :paths ["b"] :set #{2} :nil nil})))
+  (is (= {:cljfmt {:indents {'f [[:inner 0]]}}}
+         (lsp/merge-settings {:cljfmt {:indents {'f [[:block 1]]}}}
+                             {:cljfmt {:indents {'f [[:inner 0]]}}})))
+  (is (= ["a" "b"] (:paths-ignore-regex
+                    (lsp/merge-settings {:paths-ignore-regex ["a"]}
+                                        {:paths-ignore-regex ["a" "b"]})))))
+
+(deftest configuration-discovery-and-precedence-test
+  (let [temp (tempfile/TemporaryDirectory)
+        home (.joinpath (pathlib/Path (.-name temp)) "home")
+        xdg (.joinpath home "xdg")
+        parent (.joinpath (pathlib/Path (.-name temp)) "projects")
+        root (.joinpath parent "app")
+        options {:root (str root) :home (str home) :xdg-config-home (str xdg)
+                 :client-settings {:hover {:arity-on-same-line? true}
+                                   :document-formatting? true}
+                 :force-settings {:hover {:hide-file-location? false}}}]
+    (try
+      (write! home ".lsp/config.edn" "{:document-formatting? false :hover {:hide-file-location? true}}")
+      (write! parent ".lsp/config.edn" "{:hover {:arity-on-same-line? false} :source-paths [\"src\"]}")
+      (write! root ".lsp/config.edn" "{:source-paths [\"test\"] :hover {:hide-file-location? true}}")
+      (let [settings (lsp/load-settings options)]
+        (is (false? (:document-formatting? settings)))
+        (is (false? (get-in settings [:hover :arity-on-same-line?])))
+        (is (false? (get-in settings [:hover :hide-file-location?])))
+        (is (= ["src" "test"] (:source-paths settings))))
+      (testing "An existing XDG directory takes precedence even without its config file"
+        (.mkdir (.joinpath xdg "clojure-lsp") ** :parents true)
+        (is (:document-formatting? (lsp/load-settings options))))
+      (write! xdg "clojure-lsp/config.edn" "{:document-formatting? false}")
+      (is (false? (:document-formatting? (lsp/load-settings options))))
+      (finally (.cleanup temp)))))
+
+(deftest literal-lsp-reader-test
+  (is (= {} (lsp/read-settings "nil")))
+  (is (= {} (lsp/read-settings "; only a comment")))
+  (is (= {:document-formatting? false}
+         (lsp/read-settings "{:document-formatting? false} [unterminated")))
+  (let [settings (lsp/read-settings "{\"document-formatting?\" false :cljfmt {:indents {#re \"with-.*\" [[:inner 0]]}}}")
+        pattern (first (keys (get-in settings [:cljfmt :indents])))]
+    (is (false? (:document-formatting? settings)))
+    (is (re/fullmatch pattern "with-lock")))
+  (is (thrown? python/ValueError (lsp/read-settings "{:x #=(print :unsafe)}"))))

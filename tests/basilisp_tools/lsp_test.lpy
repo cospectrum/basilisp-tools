@@ -66,6 +66,7 @@
 (defn- initialize! [client root]
   (let [result (result! client "initialize"
                         {:processId nil :rootUri (.as_uri root)
+                         :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"}
                          :capabilities {:general {:positionEncodings ["utf-16"]}
                                         :workspace {:workspaceEdit {:documentChanges true}}}})]
     (notification! client "initialized" {})
@@ -172,7 +173,7 @@
         (is (some #(= "math/sin" (:label %)) items)))
       (let [hover (result! c "textDocument/hover" (at uri 1 5))]
         (is (some? hover))
-        (is (.startswith (get-in hover [:contents :value]) "sin ")))
+        (is (.startswith (get-in hover [:contents :value]) "sin\n")))
       (is (nil? (result! c "textDocument/prepareRename" (at uri 1 5))))
       (finally (stop! c) (.cleanup temp)))))
 
@@ -371,6 +372,7 @@
     (try
       (result! c "initialize"
                {:processId nil :rootUri (.as_uri root)
+                :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"}
                 :capabilities {:workspace {:didChangeWatchedFiles {:dynamicRegistration true}}}})
       (notification! c "initialized" {})
       (let [registration (.get (:messages c) ** :timeout 20)]
@@ -385,4 +387,120 @@
       (notification! c "workspace/didChangeWorkspaceFolders"
                      {:event {:added [] :removed [{:uri (.as_uri added) :name "second"}]}})
       (is (empty? (result! c "workspace/symbol" {:query "external"})))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest file-settings-control-protocol-and-discovery-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        config (.joinpath root ".lsp" "config.edn")
+        _ (.mkdir (.-parent config) ** :parents true)
+        _ (.write_text config
+                       "{:source-paths [\"src\" \"generated\"] :source-paths-ignore-regex [\"generated\"] :paths-ignore-regex [\".*/skip.lpy\"] :text-document-sync-kind :full :document-formatting? false :document-range-formatting? false :cljfmt {:remove-multiple-non-indenting-spaces? true}}"
+                       ** :encoding "utf-8")
+        _ (.mkdir (.joinpath root "src"))
+        _ (.mkdir (.joinpath root "generated"))
+        _ (.write_text (.joinpath root "src" "kept.lpy") "(ns kept) (def kept-value 1)")
+        _ (.write_text (.joinpath root "src" "skip.lpy") "(ns skip) (def skipped-value 1)")
+        _ (.write_text (.joinpath root "generated" "generated.lpy") "(ns generated) (def generated-value 1)")
+        _ (.write_text (.joinpath root "outside.lpy") "(ns outside) (def outside-value 1)")
+        c (client root) uri (.as_uri (.joinpath root "src" "kept.lpy"))]
+    (try
+      (let [init (initialize! c root)]
+        (is (= 1 (get-in init [:capabilities :textDocumentSync :change])))
+        (is (false? (get-in init [:capabilities :documentFormattingProvider])))
+        (is (false? (get-in init [:capabilities :documentRangeFormattingProvider]))))
+      (is (= ["kept-value"] (mapv :name (result! c "workspace/symbol" {:query "value"}))))
+      (open! c uri "(ns kept)\n(def   kept-value 1)")
+      (is (empty? (result! c "textDocument/formatting" {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})))
+      (testing "Project file settings override a dynamic client update"
+        (notification! c "workspace/didChangeConfiguration" {:settings {:document-formatting? true}})
+        (is (empty? (result! c "textDocument/formatting" {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}}))))
+      (testing "Removing a file override exposes the client's current setting"
+        (.write_text config "{:source-paths [\"src\"] :paths-ignore-regex [\".*/skip.lpy\"] :cljfmt {:remove-multiple-non-indenting-spaces? true}}" ** :encoding "utf-8")
+        (notification! c "workspace/didChangeWatchedFiles"
+                       {:changes [{:uri (.as_uri config) :type 2}]})
+        (is (= 1 (count (result! c "textDocument/formatting"
+                                 {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})))))
+      (testing "Formatting discovers settings changes without watched-file support and reindexes"
+        (.write_text config "{:source-paths [\"generated\"]}" ** :encoding "utf-8")
+        (result! c "textDocument/formatting" {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})
+        (is (= #{"kept-value" "generated-value"}
+               (set (map :name (result! c "workspace/symbol" {:query "value"}))))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest lsp-formatter-settings-precedence-and-range-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        config (.joinpath root ".lsp" "config.edn")
+        _ (.mkdir (.-parent config) ** :parents true)
+        _ (.write_text config
+                       "{:cljfmt-config-path \"format.clj\" :cljfmt {:remove-consecutive-blank-lines? false :remove-multiple-non-indenting-spaces? true} :hover {:hide-file-location? true :arity-on-same-line? true}}"
+                       ** :encoding "utf-8")
+        c (client root) uri (.as_uri (.joinpath root "sample.lpy"))
+        source "(ns sample)\n\n\n(defn identity [x] x)\n"]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (is (empty? (result! c "textDocument/formatting" {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})))
+      (.write_text (.joinpath root "format.clj") "^{:configuration true} {:remove-consecutive-blank-lines? true} :ignored-trailing-form" ** :encoding "utf-8")
+      (let [edits (result! c "textDocument/formatting" {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})]
+        (is (= 1 (count edits)))
+        (is (< (.find (:newText (first edits)) "\n\n\n") 0)))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns sample)\n(def   x 1)\n(def   y 2)\n"}]})
+      (diagnostics! c 2)
+      (let [edits (result! c "textDocument/rangeFormatting"
+                           {:textDocument {:uri uri} :range {:start {:line 1 :character 2} :end {:line 1 :character 8}}
+                            :options {:tabSize 2 :insertSpaces true}})]
+        (is (= 1 (count edits)))
+        (is (= "(def x 1)" (:newText (first edits))))
+        (is (= {:line 1 :character 0} (get-in (first edits) [:range :start])))
+        (is (= {:line 1 :character 11} (get-in (first edits) [:range :end]))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest lsp-diagnostic-settings-and-runtime-update-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        config (.joinpath root ".lsp" "config.edn")
+        _ (.mkdir (.-parent config) ** :parents true)
+        _ (.write_text config "{:linters {:clj-kondo {:ns-exclude-regex \"quiet.*\"}}}" ** :encoding "utf-8")
+        c (client root) uri (.as_uri (.joinpath root "quiet.lpy"))]
+    (try
+      (initialize! c root)
+      (is (empty? (:diagnostics (open! c uri "(ns quiet.example) missing"))))
+      (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 2}
+                                                 :contentChanges [{:text "(ns loud) missing"}]})
+      (is (= "unresolved-symbol" (:code (first (:diagnostics (diagnostics! c 2))))))
+      (notification! c "workspace/didChangeConfiguration" {:settings {:linters {:clj-kondo {:level "off"}}}})
+      (next-diagnostics! c uri empty?)
+      (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 3}
+                                                 :contentChanges [{:text "(ns loud) still-missing"}]})
+      (is (empty? (:diagnostics (diagnostics! c 3))))
+      (notification! c "workspace/didChangeConfiguration"
+                     {:settings {:linters {:clj-kondo {:level "on" :report-duplicates false}}
+                                 :diagnostics {:range-type "simple"}}})
+      (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 4}
+                                                 :contentChanges [{:text "(ns loud) (inc 1 2)"}]})
+      (let [diagnostic (first (:diagnostics (diagnostics! c 4)))]
+        (is (= "invalid-arity" (:code diagnostic)))
+        (is (= (get-in diagnostic [:range :start]) (get-in diagnostic [:range :end]))))
+      (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 5}
+                                                 :contentChanges [{:text "(ns loud) missing missing"}]})
+      (is (= 1 (count (:diagnostics (diagnostics! c 5)))))
+      (notification! c "workspace/didChangeConfiguration"
+                     {:settings {:linters {:clj-kondo {:report-duplicates true}}}})
+      (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 6}
+                                                 :contentChanges [{:text "(ns loud) missing missing"}]})
+      (is (= 2 (count (:diagnostics (diagnostics! c 6)))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest json-client-indentation-settings-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "sample.lpy"))]
+    (try
+      (result! c "initialize" {:rootUri (.as_uri root) :capabilities {}
+                               :initializationOptions {:cljfmt {:indents {"widget" [["block" 1]]}}}})
+      (notification! c "initialized" {})
+      (open! c uri "(ns sample)\n(widget x\ny)\n")
+      (let [edits (result! c "textDocument/formatting"
+                           {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})]
+        (is (= "(ns sample)\n(widget x\n  y)\n" (:newText (first edits)))))
       (finally (stop! c) (.cleanup temp)))))

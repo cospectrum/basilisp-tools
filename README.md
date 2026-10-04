@@ -23,6 +23,6 @@ blt --help
 blt format --help
 ```
 
-[Formatting](docs/formatting.md) · [Checking](docs/checking.md) · [Language server](docs/lsp.md) · [Syntax API](docs/syntax.md)
+[Formatting](docs/formatting.md) · [Checking](docs/checking.md) · [Language server](docs/lsp.md) · [Compatibility](docs/compatibility.md) · [Syntax API](docs/syntax.md)
 
 Licensed under [Apache 2.0](LICENSE).

@@ -3,7 +3,7 @@
   (:require [basilisp.edn :as edn]
             [basilisp.string :as str]
             [basilisp-tools.syntax :as syntax])
-  (:import [pathlib] [re] [operator :as op]))
+  (:import [pathlib] [re] [sys] [operator :as op]))
 
 (def ^:private containers
   #{:root :list :vector :map :set :anonymous-function
@@ -81,7 +81,8 @@
    :blank-lines-separate-alignment? false
    :max-column-alignment-gap nil :max-column-alignment-width nil})
 
-(def ^:private runtime-options #{:paths :file-pattern :project-root})
+(def ^:private runtime-options
+  #{:paths :file-pattern :project-root :read-clj-config-files? :quiet? :verbose? :ansi? :parallel?})
 (defn- invalid [message data] (throw (ex-info message data)))
 
 (defn- regex? [x] (instance? re/Pattern x))
@@ -105,7 +106,7 @@
     (doseq [[k v] options]
       (when-not (or (contains? default-options k) (contains? runtime-options k))
         (invalid (str "Unknown formatter option: " k) {:option k}))
-      (when (and (contains? default-options k) (.endswith (name k) "?")
+      (when (and (.endswith (name k) "?")
                  (not (boolean? v)))
         (invalid (str k " must be a boolean") {:option k})))
     (when-not (#{:community :cursive :zprint} (:function-arguments-indentation opts))
@@ -135,6 +136,8 @@
                      (or (op/eq :all v)
                          (and (set? v) (every? #(and (integer? %) (>= % 0)) v))))
         (invalid (str "Invalid " k " rule for " key) {:key key})))
+    (when (and (contains? options :project-root) (not (string? (:project-root options))))
+      (invalid ":project-root must be a path string" {}))
     (when (and (:file-pattern opts) (not (regex? (:file-pattern opts))))
       (invalid ":file-pattern must be a #re regular expression" {}))
     (when (and (:paths opts) (not (and (sequential? (:paths opts)) (every? string? (:paths opts)))))
@@ -158,8 +161,22 @@
   (let [kind (:kind node)
         forms (node-forms node)]
     (cond
+      (and (op/eq :keyword kind) (.startswith (:text node) "::"))
+      (if (and (true? clj?) (< (.find (subs (:text node) 2) "/") 0))
+        (keyword (str "user/" (subs (:text node) 2)))
+        (config-error file "Auto-resolved keyword aliases require a Clojure namespace"))
+
       (#{:nil :boolean :number :symbolic-number :character :keyword :symbol :string} kind)
       (edn/read-string (syntax/text node))
+
+      (and (true? clj?) (op/eq :metadata kind))
+      (let [metadata (config-value (first forms) file clj?)
+            target (second forms)]
+        (when-not (and (or (map? metadata) (keyword? metadata)
+                           (symbol? metadata) (string? metadata))
+                       (#{:symbol :map :vector :set :list :namespaced-map :metadata} (:kind target)))
+          (config-error file "Invalid configuration metadata"))
+        (config-value target file clj?))
 
       (#{:map :vector :set :list} kind)
       (let [values (mapv #(config-value % file clj?) forms)]
@@ -173,10 +190,11 @@
 
       (op/eq :namespaced-map kind)
       (let [prefix (:text (first (:children node)))
-            ns-name (subs prefix 2)
+            auto? (.startswith prefix "#::")
+            ns-name (if auto? "user" (subs prefix 2))
             values (config-value (first forms) file clj?)]
-        (when (.startswith prefix "#::")
-          (config-error file "Auto-resolved namespaces are not supported in configuration"))
+        (when (and auto? (not (and (true? clj?) (op/eq prefix "#::"))))
+          (config-error file "Auto-resolved namespace aliases require a Clojure namespace"))
         (config-map
          (for [[k v] values]
            [(if (or (keyword? k) (symbol? k))
@@ -209,20 +227,48 @@
                {:path (str file) :diagnostics (:diagnostics parsed)}))
     (:root parsed)))
 
-(defn- read-edn-config [file]
-  (let [forms (node-forms (config-tree file))]
-    (when-not (and (op/eq 1 (count forms))
-                   (#{:map :namespaced-map} (:kind (first forms))))
-      (config-error file "Expected exactly one EDN map"))
-    (let [value (config-value (first forms) file false)]
-      ;; cljfmt validates a file before merging project overrides and converts
-      ;; legacy keys at this point, rather than after the cross-file merge.
+(defn- read-file-config [file]
+  (when-not (#{".edn" ".clj"} (.-suffix file))
+    (config-error file "Configuration filename must end in .edn or .clj"))
+  (let [clj? (op/eq ".clj" (.-suffix file))
+        parsed (syntax/parse (.read_text file ** :encoding "utf-8"))
+        node (first (node-forms (:root parsed)))
+        ;; Both upstream readers consume just the first form. A malformed
+        ;; later form must not invalidate the selected configuration map.
+        prefix (if node (syntax/parse (subs (:source parsed) 0 (:end node))) parsed)
+        diagnostics (:diagnostics prefix)]
+    (when (seq diagnostics)
+      (invalid (str file ": Invalid configuration syntax")
+               {:path (str file) :diagnostics (vec diagnostics)}))
+    (when (nil? node) (config-error file "EOF while reading configuration"))
+    (let [value (if node (config-value node file clj?) nil)
+          value (if (nil? value) {} value)]
+      (when-not (map? value) (config-error file "Expected a configuration map"))
+      ;; Validate before merging project overrides and convert legacy keys at
+      ;; this point, exactly like cljfmt.config/load-config.
       (resolve-options (dissoc value :legacy/merge-indents?))
       (if (:legacy/merge-indents? value)
         (-> value
             (assoc :extra-indents (:indents value default-indents))
             (dissoc :indents :legacy/merge-indents?))
         value))))
+
+(defn- find-formatter-config [directory options]
+  (let [names [".cljfmt.edn" ".cljfmt.clj" "cljfmt.edn" "cljfmt.clj"]]
+    (loop [dir directory]
+      (let [files (filter #(.is_file %) (map #(.joinpath dir %) names))
+            preferred (first files)
+            ignored? (and preferred (not (:read-clj-config-files? options))
+                          (op/eq ".clj" (.-suffix preferred)))
+            chosen (if ignored?
+                     (first (filter #(op/eq ".edn" (.-suffix %)) files))
+                     preferred)]
+        (when ignored?
+          (.write sys/stderr
+                  (str "Warning: .clj config file '" (.-name preferred)
+                       "' detected but --read-clj-config-files is not set. Ignoring config file.\n")))
+        (or chosen
+            (when (not (op/eq dir (.-parent dir))) (recur (.-parent dir))))))))
 
 (defn- find-config [directory names]
   (loop [dir directory]
@@ -247,7 +293,7 @@
     (:paths options)
     (let [paths (mapcat (fn [[key fallback]]
                           (let [value (if-let [node (get fields key)]
-                                        (config-value node file true) fallback)
+                                        (config-value node file :project) fallback)
                                 value (if (nil? value) fallback value)]
                             (when-not (or (nil? value)
                                           (and (sequential? value) (every? string? value)))
@@ -267,35 +313,38 @@
                                  (#{":cljfmt" ":source-paths" ":test-paths"} (:text %)))
                            (syntax/nodes profiles)))
             (config-error file "Leiningen profiles affecting formatter settings are unsupported; use top-level configuration or --config"))
-        project (if-let [node (get fields ":cljfmt")] (config-value node file true) {})
+        project (if-let [node (get fields ":cljfmt")] (config-value node file :project) {})
         project (if (nil? project) {} project)
         _ (when-not (map? project) (config-error file ":cljfmt must be a literal map"))
         ;; Lein selects paths before loading the optional config file.
         project (assoc project :paths (project-paths fields project root file)
                        :project-root (str root))
         config-file (when (:load-config-file? project)
-                      (find-config root [".cljfmt.edn" "cljfmt.edn"]))
-        from-file (if config-file (read-edn-config config-file) {})]
+                      (find-formatter-config root {}))
+        from-file (if config-file (read-file-config config-file) {})]
     ;; This is deliberately shallow: a project map replaces the corresponding
     ;; file map, exactly as lein-cljfmt's merge-file-options does.
-    (dissoc (merge from-file project) :load-config-file? :legacy/merge-indents?)))
+    (with-meta (dissoc (merge from-file project) :load-config-file? :legacy/merge-indents?)
+      {:paths-root (str root)})))
 
 (defn load-config
   "Load literal project.clj settings with Leiningen precedence, or discover
-  .cljfmt.edn / cljfmt.edn upward when there is no project. An explicit EDN
-  file bypasses project discovery. Project code is never evaluated."
-  ([] (load-config (.cwd pathlib/Path)))
-  ([path]
+  cljfmt configuration upward when there is no project. Clojure files require
+  :read-clj-config-files? for discovery; explicit files always load. No project
+  code, reader evaluation or custom tagged-literal reader is executed."
+  ([] (load-config (.cwd pathlib/Path) {}))
+  ([path] (load-config path {}))
+  ([path options]
    (let [p (.absolute (pathlib/Path path))
          file (cond
                 (.is_file p) p
                 (.is_dir p) (or (find-config p ["project.clj"])
-                                (find-config p [".cljfmt.edn" "cljfmt.edn"]))
+                                (find-formatter-config p options))
                 :else (config-error p "Configuration path does not exist"))
          value (cond
                  (nil? file) {}
                  (op/eq "project.clj" (.-name file)) (read-project-config file)
-                 :else (read-edn-config file))]
+                 :else (read-file-config file))]
      (resolve-options value)
      value)))
 

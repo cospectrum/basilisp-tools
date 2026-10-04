@@ -1,0 +1,97 @@
+(ns basilisp-tools.check-config-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.check :as check])
+  (:import [io] [os] [pathlib] [re] [tempfile] [unittest.mock :as mock]))
+
+(defn- write! [root name content]
+  (let [path (.joinpath root name)]
+    (.mkdir (.-parent path) ** :parents true :exist_ok true)
+    (.write_text path content ** :encoding "utf-8")
+    path))
+
+(deftest included-data-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        options {:config-dir (str root) :repro true}
+        env (.dict mock/patch os/environ #py {"CLJ_KONDO_EXTRA_CONFIG_DIR" (str (.joinpath root "empty"))})]
+    (.start env)
+    (try
+      (write! root "config.edn" "{:linters #include \"nested/linters.edn\" :config-paths ^:replace []}")
+      (write! root "nested/linters.edn" "{:unused-binding {:exclude #include \"names.edn\"} :unresolved-symbol {:level :off}}")
+      (write! root "nested/names.edn" "[temporary]")
+      (let [config (check/load-config options)]
+        (is (= ['temporary] (get-in config [:linters :unused-binding :exclude])))
+        (is (= :off (get-in config [:linters :unresolved-symbol :level])))
+        (is (:replace (meta (:config-paths config)))))
+      (write! root "config.edn" "#include \"nested/linters.edn\"")
+      (is (= :off (get-in (check/load-config options) [:unresolved-symbol :level])))
+      (write! root "config.edn" "{:x #include \"cycle.edn\"}")
+      (write! root "cycle.edn" "#include \"config.edn\"")
+      (is (thrown? python/ValueError (check/load-config options)))
+      (is (thrown? python/ValueError (check/read-config "{:x #include \"config.edn\"}")))
+      (finally (.stop env) (.cleanup temp)))))
+
+(deftest tagged-regex-is-opt-in-test
+  (is (thrown? python/ValueError (check/read-config "{:x #re \"pattern\"}")))
+  (is (some? (re/fullmatch (:x (check/read-config "{:x #re \"p.*\"}" "settings" {:readers #{'re}}))
+                           "pattern")))
+  (is (thrown? python/ValueError
+               (check/read-config "{:x #unknown \"pattern\"}" "settings" {:readers #{'re}}))))
+
+(deftest merge-metadata-and-alias-test
+  (is (= {:replacement true}
+         (check/merge-config {:previous true} (check/read-config "^:replace {:replacement true}"))))
+  (is (= {:previous true} (check/merge-config {:previous true} (check/read-config "^:replace {}"))))
+  (is (= '(4 3 1 2) (:items (check/merge-config {:items '(1 2)} {:items [3 4]}))))
+  (is (= :off (get-in (check/merge-config {:linters {:missing-else-branch {:level :warning}}}
+                                          {:linters {:if {:level :off}}})
+                      [:linters :missing-else-branch :level]))))
+
+(deftest stdin-output-filter-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        options {:config-dir (str root) :repro true :stdin "missing" :filename "generated.lpy"
+                 :python-inspection? false}]
+    (try
+      (let [result (check/run (assoc options :config "{:exclude-files \"generated\"}"))]
+        (is (empty? (:findings result)))
+        (is (zero? (get-in result [:summary :files]))))
+      (let [result (check/run (assoc options :config "{:output {:exclude-files [\"generated\"]}}"))]
+        (is (empty? (:findings result)))
+        (is (= 1 (get-in result [:summary :files]))))
+      (let [result (check/run (assoc options :config "{:output {:include-files [\"other\"]}}"))]
+        (is (empty? (:findings result)))
+        (is (= 1 (get-in result [:summary :files]))))
+      (finally (.cleanup temp)))))
+
+(deftest text-output-configuration-test
+  (let [finding {:filename "sample.lpy" :row 2 :col 3 :end-row 2 :end-col 4
+                 :type :unused-binding :level :warning :message "unused binding x"}
+        result {:findings [finding] :config {:output {:summary false :show-rule-name-in-message true}}}]
+    (is (= "sample.lpy:2:3: warning: unused binding x [:unused-binding]\n"
+           (check/output result :text)))
+    (is (= ":unused-binding WARNING warning 2 4\n"
+           (check/output (assoc-in result [:config :output :pattern]
+                                   "{{type}} {{LEVEL}} {{level}} {{end-row}} {{end-col}}") :text)))))
+
+(deftest config-file-reader-compatibility-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        options {:config-dir (str root) :repro true}
+        env (.dict mock/patch os/environ #py {"CLJ_KONDO_EXTRA_CONFIG_DIR" (str (.joinpath root "empty"))})]
+    (.start env)
+    (try
+      (doseq [[source warning?] [["nil" false] ["; empty" true]
+                                 ["{} {:linters {:unresolved-symbol {:level :off}}}" false]
+                                 ["{} (" false] ["{:broken" true]
+                                 ["#include \"missing.edn\"" true]]]
+        (write! root "config.edn" source)
+        (let [output (io/StringIO) stderr (mock/patch "sys.stderr" output)]
+          (.start stderr)
+          (try
+            (let [config (check/load-config options)]
+              (is (nil? (:linters config)))
+              (is (= :text (get-in config [:output :format])))
+              (is (= warning? (.startswith (.getvalue output) "WARNING:"))))
+            (finally (.stop stderr)))))
+      ;; The shared literal parser stays strict for LSP settings and inline maps.
+      (doseq [source ["nil" "; empty" "{} {}"]]
+        (is (thrown? python/ValueError (check/read-config source))))
+      (finally (.stop env) (.cleanup temp)))))

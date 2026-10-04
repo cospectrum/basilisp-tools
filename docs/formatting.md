@@ -9,7 +9,13 @@ Configuration loading lives in the same namespace. `load-config` takes a file
 or a directory; without an argument it starts at the current working directory.
 An explicit CLI `--config` selects an existing file and bypasses discovery.
 Otherwise the nearest ancestor `project.clj` selects Leiningen configuration;
-without a project, the nearest `.cljfmt.edn` or `cljfmt.edn` is used.
+without a project, configuration is discovered in the nearest ancestor directory.
+The order is `.cljfmt.edn`, `.cljfmt.clj`, `cljfmt.edn`, `cljfmt.clj`.
+Discovery of `.clj` files requires `--read-clj-config-files`; without it, they
+produce a warning and EDN discovery continues. An explicit `--config FILE.clj`
+works without this flag. EDN uses `#re "pattern"`; `.clj` uses `#"pattern"`.
+Both readers consume the first form, as upstream does. Literal `.clj` metadata
+and unqualified automatic namespaces are supported; reader evaluation is not.
 
 ## Leiningen configuration
 
@@ -108,6 +114,19 @@ CLI configuration also accepts `:paths ["src" "tests"]` and a `:file-pattern #re
 "\\.lpy$"`. Explicit CLI paths take precedence over `:paths`.
 Unknown options and malformed rules produce errors.
 
+Formatter switches can be overridden with `--OPTION` / `--no-OPTION`, such as
+`--indentation` or `--no-remove-consecutive-blank-lines`. Explicit flags override
+file settings, including explicit `false` values. `--function-arguments-indentation`,
+`--max-column-alignment-gap`, `--max-column-alignment-width`, and `--file-pattern`
+also override configuration. File patterns match paths relative to each searched
+directory. `--project-root` changes displayed paths; it does not relocate CLI
+input paths or Leiningen's configured source directories.
+
+`:parallel?` / `--parallel` prepares files concurrently while retaining deterministic
+output and validating the complete batch before writes. `:quiet?`, `:verbose?`,
+and `:ansi?` have corresponding CLI flags. ANSI colors require a terminal and
+`TERM`, and respect `NO_COLOR`. Use `blt format --help` for all switches.
+
 ## Compatibility and source preservation
 
 CI compares output with cljfmt at commit
@@ -119,9 +138,11 @@ fault injection. A JVM or Clojure installation is not required to run `blt`.
 Compatibility covers the supported Basilisp syntax and options above, rather
 than every Clojure reader feature. The comparison explicitly excludes legacy
 `#^` metadata, read-eval `#=`, aliased namespaced maps, and Clojure array-class
-symbols such as `String/1`. `.cljfmt.clj` / `cljfmt.clj` discovery, auto-resolved
-namespaces in configuration, and cljfmt's CLI entry points are not supported.
-Use EDN or literal `project.clj` settings and `blt format`.
+symbols such as `String/1`. Configuration aliases requiring a running Clojure
+namespace, custom readers, reader evaluation, and dynamic Leiningen project/profile
+execution are not supported. Invalid or unknown formatter options are rejected
+more strictly than upstream. The command remains `blt format`; see the
+[compatibility matrix](compatibility.md) for tested coverage and differences.
 
 The formatter preserves token spelling and literal text, including multiline
 strings and f-string interpolation text. Reader conditionals retain all

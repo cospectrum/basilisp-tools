@@ -83,6 +83,26 @@ Maps merge recursively; `^:replace` replaces a value. Later explicit configs win
 `--repro` ignores home configuration. An explicit `--format` overrides the
 configured output format. Clojure hooks are rejected rather than executed.
 
+`#include "relative.edn"` loads literal data relative to the containing configuration
+file. Nested includes are supported and cycles are rejected. The legacy `:if`
+linter key is normalized to `:missing-else-branch`, as upstream does.
+
+Scoped settings include `:ns-groups`, recursively merged `:config-in-ns`,
+`:config-in-call`, `:config-in-tag`, namespace/macro `:clj-kondo/config` metadata,
+and `:clj-kondo/ignore` directives. Supported linters honor their exclusions,
+regular-expression exclusions, call-scoped exclusions, duplicate reporting, and
+scoped `:skip-args` where implemented. Unused-binding settings include exclusions
+for destructured function arguments, `:as` bindings, and `defmulti` arguments.
+`:skip-comments` and `:lint-as` for recognized forms are also supported.
+Inline macro configuration works within its declaring namespace; automatic
+export and propagation across namespaces are incomplete. These options do not
+add missing linters or macro expansion support.
+
+Output filtering includes `:include-files`, `:exclude-files`, custom `:pattern`,
+`:linter-name`, and the legacy `:show-rule-name-in-message` alias. Top-level
+`:exclude-files` applies to stdin's `--filename` too. `blt check --lint PATH...`
+is an alias for positional paths.
+
 ## Compatibility and limits
 
 CI compares original shared-language examples with clj-kondo **2026.08.04**,
@@ -94,6 +114,10 @@ This is a Basilisp analyzer with a tested subset of clj-kondo behavior, not
 complete clj-kondo feature parity. Clojure hooks, arbitrary macro expansion,
 full type checking, and every clj-kondo linter are not implemented. Python
 inspection has separate tests because JVM Clojure has different interop.
+`:analysis` output schema/categories, SARIF, progress output, and JVM-specific
+regular-expression constructs are not covered. See the
+[compatibility matrix](compatibility.md). CI separately compares configuration
+precedence, includes, merge behavior, output filtering, text rendering, and statuses.
 
 ```sh
 nix develop .#compatibility --command uv run --locked python scripts/check_kondo.py

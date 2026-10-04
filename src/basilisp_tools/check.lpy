@@ -12,15 +12,23 @@
 
 (defn- error [message] (throw (python/ValueError message)))
 
-(defn merge-config
+(defn- deep-merge
   "Merge clj-kondo data: maps recursively, collections cumulatively, ^:replace literally."
   [a b]
   (cond
     (nil? b) a
     (:replace (meta b)) b
-    (and (map? a) (map? b)) (merge-with merge-config a b)
+    (and (map? a) (map? b)) (merge-with deep-merge a b)
     (and (or (sequential? a) (set? a)) (or (sequential? b) (set? b))) (into a b)
     :else b))
+
+(defn merge-config
+  "Merge clj-kondo configuration, including the legacy :if linter alias."
+  [a b]
+  (if (empty? b) a
+      (deep-merge a (cond-> b
+                      (contains? (:linters b) :if)
+                      (assoc-in [:linters :missing-else-branch] (get-in b [:linters :if]))))))
 
 (defn- literal-map [values label]
   (let [pairs (mapv vec (partition 2 values)) result (into {} pairs)]
@@ -28,14 +36,16 @@
       (error (str label ": duplicate configuration key")))
     result))
 
-(defn- config-value [node label]
+(declare read-config-data-file)
+
+(defn- config-value [node label context]
   (let [kind (:kind node) forms (syntax/forms node)]
     (cond
       (#{:nil :boolean :number :symbolic-number :character :keyword :symbol :string} kind)
       (edn/read-string (syntax/text node))
 
       (#{:map :vector :set :list} kind)
-      (let [values (mapv #(config-value % label) forms)]
+      (let [values (mapv #(config-value % label context) forms)]
         (case kind
           :map (literal-map values label)
           :vector values
@@ -46,10 +56,10 @@
 
       (= :metadata kind)
       (let [[metadata value] forms
-            metadata (config-value metadata label)
+            metadata (config-value metadata label context)
             metadata (if (keyword? metadata) {metadata true} metadata)]
         (when-not (map? metadata) (error (str label ": configuration metadata must be a map or keyword")))
-        (with-meta (config-value value label) metadata))
+        (with-meta (config-value value label context) metadata))
 
       (= :namespaced-map kind)
       (let [prefix (:text (first (:children node))) namespace-name (subs prefix 2)]
@@ -63,28 +73,69 @@
                           nil (constructor (str namespace-name "/" (name k)))
                           "_" (constructor (name k))
                           k)) k) v])
-                 (config-value (first forms) label)) label))
+                 (config-value (first forms) label context)) label))
 
       (= :regex kind)
       (let [text (syntax/text node)] (re/compile (subs text 2 (dec (count text)))))
 
+      (= :tagged kind)
+      (let [tag (:text (first (:children node)))
+            value (config-value (first forms) label context)]
+        (case tag
+          "#re" (if (and (contains? (:readers context) 're) (string? value))
+                  (re/compile value)
+                  (error (str label ": unsupported configuration tag #re")))
+          "#include" (do
+                       (when-not (and (:file context) (string? value))
+                         (error (str label ": #include requires a config file and a relative filename")))
+                       (let [path (.joinpath (.-parent (:file context)) value)]
+                         (if (.is_file path)
+                           (read-config-data-file path (:seen context))
+                           (do (.write sys/stderr (str "WARNING: included file " (.resolve path) " does not exist.\n"))
+                               nil))))
+          (error (str label ": unsupported configuration tag " tag))))
+
       :else (error (str label ": unsupported configuration form " (name kind)
                         "; configuration is data and is never evaluated")))))
 
+(defn- read-config-data [source label context]
+  (let [parsed (syntax/parse source) forms (syntax/forms (:root parsed))
+        first-form (first forms)
+        diagnostics (if (and (:file context) first-form)
+                      (filter #(<= (:end %) (:end first-form)) (:diagnostics parsed))
+                      (:diagnostics parsed))]
+    (when (seq diagnostics)
+      (error (str label ": " (:message (first diagnostics)))))
+    (when-not first-form (error (str label ": EOF while reading")))
+    (when (and (not (:file context)) (not= 1 (count forms)))
+      (error (str label ": expected one configuration value")))
+    (config-value first-form label context)))
+
+(defn- require-map [value label]
+  (when-not (map? value) (error (str label ": expected a configuration map")))
+  value)
+
 (defn read-config
-  "Read one literal clj-kondo configuration map, without evaluating reader or project code."
+  "Read one literal configuration map. Reader and project code are never evaluated."
   ([source] (read-config source "configuration"))
-  ([source label]
-   (let [parsed (syntax/parse source) forms (syntax/forms (:root parsed))]
-     (when (seq (:diagnostics parsed))
-       (error (str label ": " (:message (first (:diagnostics parsed))))))
-     (when-not (= 1 (count forms)) (error (str label ": expected one configuration map")))
-     (let [value (config-value (first forms) label)]
-       (when-not (map? value) (error (str label ": expected a configuration map")))
-       value))))
+  ([source label] (read-config source label {}))
+  ([source label options] (require-map (read-config-data source label options) label)))
+
+(defn- read-config-data-file [path seen]
+  (let [path (.resolve (pathlib/Path path)) canonical (str path)]
+    (when (contains? seen canonical) (error (str "Cyclic #include at " path)))
+    (try
+      (read-config-data (.read_text path ** :encoding "utf-8") canonical
+                        {:file path :seen (conj seen canonical)})
+      (catch python/Exception e
+        (if (.startswith (str e) "Cyclic #include")
+          (throw e)
+          (do (.write sys/stderr (str "WARNING: error while reading " canonical " (" e ")\n"))
+              nil))))))
 
 (defn- read-config-file [path]
-  (read-config (.read_text (pathlib/Path path) ** :encoding "utf-8") (str path)))
+  (let [value (read-config-data-file path #{})]
+    (if (nil? value) {} (require-map value (str path)))))
 
 (defn- find-config-dir [start]
   (let [start (.absolute (pathlib/Path start))
@@ -246,6 +297,9 @@
                                       {:filename filename :source (.read_text path ** :encoding "utf-8")}
                                       (catch python/Exception e
                                         (swap! problems conj (file-finding filename (str e))) nil)))))) vec))
+         sources (if-let [pattern (:exclude-files config)]
+                   (filterv #(not (re/search pattern (.replace (:filename %) "\\" "/"))) sources)
+                   sources)
          sources (mapv (fn [{:keys [source filename] :as item}]
                          (try
                            (assoc item :declarations (analyzer/declarations source {:filename filename}))
@@ -301,14 +355,20 @@
   (select-keys finding [:filename :row :col :end-row :end-col :type :level :message]))
 
 (defn- text-finding [finding config]
-  (let [pattern (get-in config [:output :pattern])
-        text (if pattern
-               (reduce (fn [text [key value]]
-                         (.replace text (str "{{" (name key) "}}") (if (keyword? value) (name value) (str value))))
-                       (.replace pattern "{{LEVEL}}" (.upper (name (:level finding)))) finding)
-               (str (:filename finding) ":" (:row finding) ":" (:col finding) ": "
-                    (name (:level finding)) ": " (:message finding)))]
-    (str text (when (get-in config [:output :linter-name]) (str " [" (name (:type finding)) "]")))))
+  (if-let [pattern (get-in config [:output :pattern])]
+    (reduce (fn [text key]
+              (let [value (get finding key)]
+                (.replace text (str "{{" (name key) "}}")
+                          (cond (nil? value) ""
+                                (= :level key) (name value)
+                                :else (str value)))))
+            (.replace pattern "{{LEVEL}}" (.upper (name (:level finding))))
+            [:filename :row :end-row :col :end-col :level :message :type])
+    (str (:filename finding) ":" (:row finding) ":" (:col finding) ": "
+         (name (:level finding)) ": " (:message finding)
+         (when (or (get-in config [:output :linter-name])
+                   (get-in config [:output :show-rule-name-in-message]))
+           (str " [" (:type finding) "]")))))
 
 (defn output
   "Render deterministic text, JSON, or EDN. Report level filters text, matching clj-kondo."

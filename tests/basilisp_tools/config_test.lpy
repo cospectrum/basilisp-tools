@@ -103,6 +103,9 @@
        (put! root ".cljfmt.edn" "{:indentation? false}")
        (is (true? (:indentation? (fmt/load-config project-file))))
        (is (= {:indentation? false} (fmt/load-config edn-file)))
+       (is (= (str root) (:paths-root (meta (fmt/load-config project-file)))))
+       (let [file (put! root "paths.edn" "{:paths [\"code\"] :project-root \"display-only\"}")]
+         (is (nil? (:paths-root (meta (fmt/load-config file))))))
        (testing "Explicit EDN bypasses project discovery and project parse errors"
          (put! root "project.clj" "(defproject")
          (is (= {:indentation? false} (fmt/load-config edn-file))))))))
@@ -197,3 +200,77 @@
            (is (= {'example/action [[:inner 0]]} (:extra-indents options)))
            (is (= "(example/action x\n  (body))"
                   (fmt/format-string "(example/action x\n(body))" options)))))))))
+
+(deftest clojure-file-discovery-order-test
+  (in-project
+   (fn [root]
+     (let [names [".cljfmt.edn" ".cljfmt.clj" "cljfmt.edn" "cljfmt.clj"]]
+       (doseq [[i filename] (map-indexed vector names)]
+         (put! root filename (str "{:max-column-alignment-gap " i "}")))
+       (doseq [[i filename] (map-indexed vector names)]
+         (is (= i (:max-column-alignment-gap
+                   (fmt/load-config root {:read-clj-config-files? true}))))
+         (.unlink (.joinpath root filename)))))))
+
+(deftest ignored-clojure-config-warns-and-keeps-searching-test
+  (in-project
+   (fn [root]
+     (let [nested (.joinpath root "child")
+           stderr (io/StringIO)]
+       (put! root ".cljfmt.edn" "{:indentation? false}")
+       (put! nested ".cljfmt.clj" "{:indentation? true}")
+       (with-open [patch (mock/patch "sys.stderr" stderr)]
+         (let [options (fmt/load-config nested)]
+           (is (false? (:indentation? options)))))
+       (is (= (str "Warning: .clj config file '.cljfmt.clj' detected but "
+                   "--read-clj-config-files is not set. Ignoring config file.\n")
+              (.getvalue stderr)))
+       (put! nested "cljfmt.edn" "{:indentation? false}")
+       (with-open [patch (mock/patch "sys.stderr" (io/StringIO))]
+         (is (false? (:indentation? (fmt/load-config nested)))))
+       (is (true? (:indentation? (fmt/load-config nested {:read-clj-config-files? true}))))))))
+
+(deftest explicit-clojure-config-reader-test
+  (in-project
+   (fn [root]
+     (let [file (put! root "chosen.clj"
+                      "^:replace {:extra-indents {^String action [[:inner 0]] #\"^wrap-\" [[:block 1]]}}")
+           opts (fmt/load-config file)]
+       (is (= [[:inner 0]] (get (:extra-indents opts) 'action)))
+       (is (= "(wrap-action x\n  (body))"
+              (fmt/format-string "(wrap-action x\n(body))" opts))))
+     (let [file (put! root "chosen.clj" "{:alias-map {::local remote} :extra-indents #::{action [[:inner 0]]}}")
+           opts (fmt/load-config file)]
+       (is (= {:user/local 'remote} (:alias-map opts)))
+       (is (= {'user/action [[:inner 0]]} (:extra-indents opts))))
+     (doseq [[filename source]
+             [["chosen.edn" "{:extra-indents {#\"^wrap-\" [[:block 1]]}}"]
+              ["chosen.edn" "{:alias-map {::local remote}}"]
+              ["chosen.clj" "{:alias-map {::absent/local remote}}"]
+              ["chosen.clj" "{:extra-indents {#re \"^wrap-\" [[:block 1]]}}"]]]
+       (is (thrown? python/Exception (fmt/load-config (put! root filename source))))))))
+
+(deftest file-configuration-consumes-one-form-test
+  (in-project
+   (fn [root]
+     (doseq [filename ["chosen.edn" "chosen.clj"]]
+       (doseq [source ["nil" "{} {:indentation? false}" "{} (" "{}]" "#_{} {}"]]
+         (is (= {} (fmt/load-config (put! root filename source)))))
+       (doseq [source ["" "; only a comment" "{:indentation?"]]
+         (is (thrown? python/Exception (fmt/load-config (put! root filename source)))))))))
+
+(deftest clojure-reader-evaluation-is-rejected-test
+  (in-project
+   (fn [root]
+     (let [marker (.joinpath root "must-not-exist")
+           source (str "#=(spit " (pr-str (str marker)) " \"unsafe\")")]
+       (is (thrown? python/Exception (fmt/load-config (put! root "chosen.clj" source))))
+       (is (not (.exists marker)))))))
+
+(deftest runtime-format-options-are-validated-test
+  (doseq [key [:ansi? :parallel? :quiet? :verbose? :read-clj-config-files?]]
+    (is (true? (get (fmt/resolve-options {key true}) key)))
+    (is (false? (get (fmt/resolve-options {key false}) key)))
+    (is (thrown? python/Exception (fmt/resolve-options {key "true"}))))
+  (is (= "src" (:project-root (fmt/resolve-options {:project-root "src"}))))
+  (is (thrown? python/Exception (fmt/resolve-options {:project-root 4}))))

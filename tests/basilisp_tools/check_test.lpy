@@ -97,6 +97,6 @@
     (let [data (json/loads (check/output result :json :error))]
       (is (= 1 (python/len (.get data "findings")))))
     (is (= [(dissoc finding :start :end)] (:findings (edn/read-string (check/output result :edn)))))
-    (is (= "EXAMPLE example.lpy warning unused-binding\n"
+    (is (= "EXAMPLE example.lpy warning :unused-binding\n"
            (check/output (assoc-in result [:config :output]
                                    {:summary false :pattern "EXAMPLE {{filename}} {{level}} {{type}}"}) :text)))))

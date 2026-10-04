@@ -1,0 +1,201 @@
+(ns basilisp-tools.analyzer-config-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.check :as check]))
+
+;; Original fixtures also compared to pinned clj-kondo by scripts/check_kondo.py.
+(deftest scoped-linter-configuration-test
+  (doseq [[label source config expected]
+          [["exclude-symbol"
+            "(ns sample)\nmissing kept"
+            "{:linters {:unresolved-symbol {:exclude [missing]}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: kept"}]]
+           ["exclude-symbol-regex"
+            "(ns sample)\n?query kept"
+            "{:linters {:unresolved-symbol {:exclude-patterns [\"^\\\\?\"]}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: kept"}]]
+           ["duplicate-default"
+            "(ns sample)\nmissing missing"
+            "{}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["duplicate-report"
+            "(ns sample)\nmissing missing"
+            "{:linters {:unresolved-symbol {:report-duplicates true}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"} {:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["duplicate-namespace"
+            "(ns sample)\n(absent/a) (absent/b)"
+            "{}"
+            [{:type :unresolved-namespace :level :warning :message "Unresolved namespace absent. Are you missing a require?"}]]
+           ["unused-binding-regex"
+            "(ns sample)\n(let [this-that 1 kept 2] :ok)"
+            "{:linters {:unused-binding {:exclude-patterns [\"^this\"]}}}"
+            [{:type :unused-binding :level :warning :message "unused binding kept"}]]
+           ["unused-private-exclude"
+            "(ns sample)\n(defn- hidden [] :ok) (defn- kept [] :ok)"
+            "{:linters {:unused-private-var {:exclude [sample/hidden]}}}"
+            [{:type :unused-private-var :level :warning :message "Unused private var sample/kept"}]]
+           ["unused-ns-exclude"
+            "(ns sample (:require [unused.lib :as u]))"
+            "{:linters {:unused-namespace {:exclude [unused.lib]}}}"
+            []]
+           ["unused-ns-regex"
+            "(ns sample (:require [unused.lib :as u]))"
+            "{:linters {:unused-namespace {:exclude [\".*lib$\"]}}}"
+            []]
+           ["unused-refer"
+            "(ns sample (:require [unused.lib :refer [a b]]))"
+            "{:linters {:unused-referred-var {:exclude {unused.lib [a]}} :unused-namespace {:level :off}}}"
+            [{:type :unused-referred-var :level :warning :message "#'unused.lib/b is referred but never used"}]]
+           ["ns-groups"
+            "(ns sample)\nmissing"
+            "{:ns-groups [{:pattern \"^sam\" :name samples}] :config-in-ns {samples {:ignore [:unresolved-symbol]}}}"
+            []]
+           ["ns-groups-filename"
+            "(ns sample)\nmissing"
+            "{:ns-groups [{:filename-pattern \"sample\\\\.clj$\" :name samples}] :config-in-ns {samples {:ignore [:unresolved-symbol]}}}"
+            []]
+           ["ns-groups-specific"
+            "(ns sample)\nmissing"
+            "{:ns-groups [{:pattern \"^sam\" :name samples}] :config-in-ns {samples {:ignore [:unresolved-symbol]} sample {:linters {:unresolved-symbol {:level :warning}}}}}"
+            []]
+           ["ns-deep-merge"
+            "(ns sample)\nmissing kept"
+            "{:linters {:unresolved-symbol {:exclude [missing]}} :config-in-ns {sample {:linters {:unresolved-symbol {:exclude [kept]}}}}}"
+            []]
+           ["ns-replace"
+            "(ns sample)\nmissing kept"
+            "{:linters {:unresolved-symbol {:exclude [missing]}} :config-in-ns {sample {:linters {:unresolved-symbol {:exclude ^:replace [kept]}}}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["ns-metadata"
+            "(ns sample {:clj-kondo/config '{:linters {:unresolved-symbol {:level :off}}}}) missing"
+            "{}"
+            []]
+           ["ns-metadata-ignore"
+            "(ns sample {:clj-kondo/ignore [:unresolved-symbol]}) missing"
+            "{}"
+            []]
+           ["ns-name-metadata-ignore"
+            "(ns ^{:clj-kondo/ignore true} sample) missing"
+            "{}"
+            []]
+           ["call-config"
+            "(ns sample)\n(defn wrap [x] x) (wrap missing) kept"
+            "{:config-in-call {sample/wrap {:ignore [:unresolved-symbol]}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: kept"}]]
+           ["call-config-scope-unused"
+            "(ns sample)\n(identity (let [x 1] :ok)) (let [y 1] :ok)"
+            "{:config-in-call {clojure.core/identity {:ignore [:unused-binding]}}}"
+            [{:type :unused-binding :level :warning :message "unused binding y"}]]
+           ["call-config-alias"
+            "(ns sample (:require [basilisp.core :as c]))\n(c/identity missing) kept"
+            "{:config-in-call {clojure.core/identity {:ignore [:unresolved-symbol]}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: kept"}]]
+           ["call-exclude"
+            "(ns sample)\n(identity missing) missing"
+            "{:linters {:unresolved-symbol {:exclude [(clojure.core/identity [missing])]}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["call-exclude-all"
+            "(ns sample)\n(identity [missing other]) kept"
+            "{:linters {:unresolved-symbol {:exclude [(clojure.core/identity)]}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: kept"}]]
+           ["skip-args-linter"
+            "(ns sample)\n(identity (inc)) (inc)"
+            "{:linters {:invalid-arity {:skip-args [clojure.core/identity]}}}"
+            [{:type :invalid-arity :level :error :message "basilisp.core/inc is called with 0 args but expects 1"}]]
+           ["skip-args"
+            "(ns sample)\n(identity (inc missing other)) (inc)"
+            "{:skip-args [clojure.core/identity]}"
+            [{:type :invalid-arity :level :error :message "basilisp.core/inc is called with 2 args but expects 1"} {:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"} {:type :unresolved-symbol :level :error :message "Unresolved symbol: other"} {:type :invalid-arity :level :error :message "basilisp.core/inc is called with 0 args but expects 1"}]]
+           ["skip-comments"
+            "(ns sample)\n(comment missing (inc)) kept"
+            "{:skip-comments true}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: kept"}]]
+           ["tag-default"
+            "(ns sample)\n#data [missing (inc)]"
+            "{}"
+            []]
+           ["tag-config"
+            "(ns sample)\n#data [missing (inc)]"
+            "{:config-in-tag {data {:linters {:unresolved-symbol {:level :error}}}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["discard-ignore"
+            "(ns sample)\n#_:clj-kondo/ignore (inc) (inc)"
+            "{}"
+            [{:type :invalid-arity :level :error :message "basilisp.core/inc is called with 0 args but expects 1"}]]
+           ["discard-ignore-specific"
+            "(ns sample)\n#_{:clj-kondo/ignore [:invalid-arity]} (inc missing 2)"
+            "{}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["fn-destructure-keys"
+            "(ns sample)\n(fn [{:keys [x]}] :ok) (let [{:keys [y]} {}] :ok)"
+            "{:linters {:unused-binding {:exclude-destructured-keys-in-fn-args true}}}"
+            [{:type :unused-binding :level :warning :message "unused binding y"}]]
+           ["destructure-as"
+            "(ns sample)\n(let [{:keys [x] :as m} {} [y :as all] []] [x y])"
+            "{:linters {:unused-binding {:exclude-destructured-as true}}}"
+            []]
+           ["lint-as"
+            "(ns sample)\n(defmacro my-let [& args] args) (my-let [x 1] x)"
+            "{:lint-as {sample/my-let clojure.core/let}}"
+            []]
+           ["lint-as-local-shadow"
+            "(ns sample)\n(defmacro my-let [& args] args) (let [my-let (fn [x] x)] (my-let 1))"
+            "{:lint-as {sample/my-let clojure.core/let}}"
+            []]
+           ["inline-macro"
+            "(ns sample)\n(defmacro with-x {:clj-kondo/config '{:ignore [:unresolved-symbol]}} [& args] args) (with-x missing)"
+            "{}"
+            []]
+           ["nested-destructure"
+            "(ns sample)\n(fn [{:keys [x]}] (let [{:keys [nested]} {}] :ok))"
+            "{:linters {:unused-binding {:exclude-destructured-keys-in-fn-args true}}}"
+            [{:type :unused-binding :level :warning :message "unused binding nested"}]]
+           ["discard-binding"
+            "(ns sample)\n(let [#_:clj-kondo/ignore unused 1] :ok)"
+            "{}"
+            []]
+           ["call-macro-report"
+            "(ns sample)\n(defmacro wrap [& args] args) (wrap missing)"
+            "{:config-in-call {sample/wrap {:linters {:unresolved-symbol {:level :warning}}}}}"
+            [{:type :unresolved-symbol :level :error :message "Unresolved symbol: missing"}]]
+           ["unresolved-ns-group"
+            "(ns sample)\n(absent/value)"
+            "{:ns-groups [{:pattern \"^abs\" :name optional}] :linters {:unresolved-namespace {:exclude [optional]}}}"
+            []]
+           ["unresolved-var-exclusion"
+            "(ns sample)\n(sample/missing)"
+            "{:linters {:unresolved-var {:exclude [sample]}}}"
+            []]
+           ["macro-inline-lint-as"
+            "(ns sample)\n(defmacro my-let {:clj-kondo/lint-as 'basilisp.core/let} [& args] args) (my-let [x 1] x)"
+            "{}"
+            []]
+           ["fn-explicit-map-destructure"
+            "(ns sample)\n(fn [{x :x}] :ok)"
+            "{:linters {:unused-binding {:exclude-destructured-keys-in-fn-args true}}}"
+            [{:type :unused-binding :level :warning :message "unused binding x"}]]
+           ["defmulti-args"
+            "(ns sample)\n(defmulti f (fn [x y] x))"
+            "{:linters {:unused-binding {:exclude-defmulti-args true}}}"
+            []]
+           ["defmulti-nested-fn"
+            "(ns sample)\n(defmulti f (fn [x y] (fn [z] :ok)))"
+            "{:linters {:unused-binding {:exclude-defmulti-args true}}}"
+            []]
+           ["thread-call-config"
+            "(ns sample)\n(-> 1 (+ missing))"
+            "{:config-in-call {clojure.core/+ {:ignore [:unresolved-symbol]}}}"
+            []]
+           ["cond-thread-call-config"
+            "(ns sample)\n(cond-> 1 true (inc 2))"
+            "{:config-in-call {clojure.core/inc {:ignore [:invalid-arity]}}}"
+            []]
+           ["thread-call-arity"
+            "(ns sample)\n(-> 1 (identity missing))"
+            "{:config-in-call {clojure.core/identity {:ignore true}}}"
+            []]]]
+    (testing label
+      (let [result (analyzer/analyze source
+                                     {:filename "sample.clj" :config (check/read-config config)
+                                      :python-options {:python-inspection? false}})]
+        (is (= expected (mapv #(select-keys % [:type :level :message]) (:findings result))))))))
