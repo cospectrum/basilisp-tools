@@ -1,8 +1,8 @@
-# Checking reference
+# Checking
 
-`blt check` analyzes Basilisp source without evaluating its forms or expanding
-project macros. Files are read without modification. Directories are searched
-recursively for `.lpy` files, excluding generated directories and symlinks.
+`blt check` finds problems in Basilisp code without evaluating it or modifying
+files. Directories are searched recursively for `.lpy` files, skipping generated
+directories and symlinks.
 
 ```sh
 blt check src tests
@@ -11,27 +11,60 @@ blt check --filename example.lpy - < example.lpy
 blt check --fail-level error .
 ```
 
-Exit codes follow clj-kondo: **0** for no findings at the failure threshold,
-**2** for warnings, **3** for analysis errors. Invalid command arguments or
-configuration return **2**. `--fail-level error` permits warnings without a
-nonzero exit. `--report-level` filters text output; JSON and EDN retain findings.
+Exit codes are **0** for no findings at the failure threshold, **2** for warnings,
+and **3** for analysis errors. Invalid arguments or configuration also return
+**2**. Use `--fail-level error` to allow warnings. `--report-level` filters text
+output; JSON and EDN retain all findings. `--lint PATH...` is an alias for
+positional paths.
 
-## Analysis
+## Configuration
 
-The analyzer tracks namespaces, definitions, function arities, lexical bindings,
-destructuring, and references across the selected files. It understands common
-binding and control forms, quoted/discarded data, and Basilisp reader branches.
+Put clj-kondo settings in `.clj-kondo/config.edn`:
+
+```clojure
+{:linters {:unused-binding {:level :warning}
+           :unresolved-symbol {:level :error}}
+ :output {:format :json}}
+```
+
+The nearest configuration directory is used, or you can select one with
+`--config-dir DIR`. Add overrides with `--config`, accepting an EDN map or a
+filename; repeat it to load multiple configurations.
+
+```sh
+blt check --config '{:linters {:unused-binding {:level :off}}}' src
+blt check --repro --format json src
+```
+
+Settings merge in this order, with later values taking precedence: home settings,
+imported config paths, project settings, `CLJ_KONDO_EXTRA_CONFIG_DIR`, then explicit
+configurations. Maps merge recursively; `^:replace` replaces a value. `--repro`
+skips home settings, and `--format` overrides the configured output format.
+`#include "relative.edn"` loads another file relative to its containing config;
+nested includes work, but cycles are rejected. Clojure hooks are unsupported.
+
+You can scope settings by namespace (`:ns-groups`, `:config-in-ns`), call
+(`:config-in-call`), or reader tag (`:config-in-tag`). Namespace and macro
+`:clj-kondo/config` metadata and `:clj-kondo/ignore` directives are also supported.
+Supported linters honor exclusions, including regular expressions and call-scoped
+exclusions. Unused-binding options cover destructured function arguments, `:as`
+bindings, and `defmulti` arguments. `:skip-comments`, scoped `:skip-args`, and
+`:lint-as` work for recognized forms.
+
+Output settings include `:include-files`, `:exclude-files`, custom `:pattern`,
+and `:linter-name` (also called `:show-rule-name-in-message`). Top-level
+`:exclude-files` also applies to stdin's `--filename`. The legacy `:if` linter
+name is accepted as an alias for `:missing-else-branch`.
+
+## What it checks
+
 Checks include unresolved symbols and namespaces, invalid arities, unused
-bindings/imports/requires/refers, redefinitions, and syntax errors. Diagnostic
-rows and columns are one-based; columns count UTF-16 code units, as in clj-kondo.
-
-All selected files are indexed before analysis, so a definition can be resolved
-in another selected namespace without importing or executing that namespace.
-Installed Basilisp source is read statically when available.
-
-The analyzer returns immutable analysis maps. `check.lpy` handles project file
-selection, configuration, reporting, and exit status; `analyzer.lpy` owns language
-analysis; `python.lpy` supplies Python metadata.
+bindings/imports/requires/refers, redefinitions, and syntax errors. The analyzer
+understands common binding and control forms, destructuring, quoted or discarded
+data, and Basilisp reader branches. All selected files are indexed first, so
+references can resolve across namespaces. Installed Basilisp source is also read
+statically when available. Diagnostic rows and columns are one-based; columns
+count UTF-16 code units, as in clj-kondo.
 
 ## Python inspection
 
@@ -41,84 +74,25 @@ blt check --no-python-inspection src
 blt check --python-timeout 10 src
 ```
 
-By default the checker uses the project's `.venv` interpreter when present,
-otherwise its own interpreter. Use `--python` when dependencies live elsewhere.
+The checker uses the project's `.venv` when present, otherwise its own interpreter.
+Use `--python` when dependencies live elsewhere. That interpreter does not need
+Basilisp or blt installed.
 
-Local `.py` and `.pyi` files are parsed as Python ASTs without importing them.
-Installed modules can be imported in a separate process to inspect members,
-signatures, and annotations. The worker uses only Python's standard library;
-the selected interpreter does not need Basilisp or blt installed.
+Local `.py` and `.pyi` files are parsed without importing them. Installed modules
+can be imported in a separate process to inspect members, signatures, and
+annotations. Checks distinguish positional-only, keyword-only, optional, and
+variadic parameters, and can follow known constructors and members through local
+bindings. Dynamic attributes and unavailable signatures remain unknown.
 
-Python checks distinguish positional-only, keyword-only, optional, and variadic
-parameters. Known constructors and object members can be followed through local
-bindings. Dynamic attributes and unavailable signatures remain unknown, so the
-checker avoids claiming errors it cannot establish.
+**Installed-package inspection runs import initialization code**, including
+transitive imports. The subprocess has a timeout but is not a security sandbox.
+Use `--no-python-inspection` to disable runtime inspection; local Python files
+will still be inspected statically.
 
-Installed-package inspection can execute that package's import initialization
-and its transitive imports. The subprocess limits duration and separates failures;
-it is not a security sandbox. `--no-python-inspection` disables runtime inspection.
-Analyzed Basilisp forms are never evaluated; local Python files are inspected
-statically.
+## Limitations
 
-## Configuration
-
-The checker reads clj-kondo data configuration. Use the nearest
-`.clj-kondo/config.edn`, `--config-dir DIR`, or repeat `--config` with an EDN
-map or filename:
-
-```clojure
-{:linters {:unused-binding {:level :warning}
-           :unresolved-symbol {:level :error}}
- :output {:format :json}}
-```
-
-```sh
-blt check --config '{:linters {:unused-binding {:level :off}}}' src
-blt check --repro --format json src
-```
-
-Configuration merges home settings, imported config paths, project settings,
-`CLJ_KONDO_EXTRA_CONFIG_DIR`, and explicit configurations in that order.
-Maps merge recursively; `^:replace` replaces a value. Later explicit configs win.
-`--repro` ignores home configuration. An explicit `--format` overrides the
-configured output format. Clojure hooks are rejected rather than executed.
-
-`#include "relative.edn"` loads literal data relative to the containing configuration
-file. Nested includes are supported and cycles are rejected. The legacy `:if`
-linter key is normalized to `:missing-else-branch`, as upstream does.
-
-Scoped settings include `:ns-groups`, recursively merged `:config-in-ns`,
-`:config-in-call`, `:config-in-tag`, namespace/macro `:clj-kondo/config` metadata,
-and `:clj-kondo/ignore` directives. Supported linters honor their exclusions,
-regular-expression exclusions, call-scoped exclusions, duplicate reporting, and
-scoped `:skip-args` where implemented. Unused-binding settings include exclusions
-for destructured function arguments, `:as` bindings, and `defmulti` arguments.
-`:skip-comments` and `:lint-as` for recognized forms are also supported.
-Inline macro configuration works within its declaring namespace; automatic
-export and propagation across namespaces are incomplete. These options do not
-add missing linters or macro expansion support.
-
-Output filtering includes `:include-files`, `:exclude-files`, custom `:pattern`,
-`:linter-name`, and the legacy `:show-rule-name-in-message` alias. Top-level
-`:exclude-files` applies to stdin's `--filename` too. `blt check --lint PATH...`
-is an alias for positional paths.
-
-## Compatibility and limits
-
-CI compares original shared-language examples with clj-kondo **2026.08.04**,
-pinned through the Nix lockfile. It checks diagnostic types, levels, messages,
-source ranges, and exit codes. The core namespace differs intentionally:
-`basilisp.core` replaces `clojure.core`.
-
-This is a Basilisp analyzer with a tested subset of clj-kondo behavior, not
-complete clj-kondo feature parity. Clojure hooks, arbitrary macro expansion,
-full type checking, and every clj-kondo linter are not implemented. Python
-inspection has separate tests because JVM Clojure has different interop.
-`:analysis` output schema/categories, SARIF, progress output, and JVM-specific
-regular-expression constructs are not covered. See the
-[compatibility matrix](compatibility.md). CI separately compares configuration
-precedence, includes, merge behavior, output filtering, text rendering, and statuses.
-
-```sh
-nix develop .#compatibility --command uv run --locked python scripts/check_kondo.py
-```
+The checker supports a subset of clj-kondo behavior. It does not expand arbitrary
+macros, perform full type checking, or implement every linter. Inline macro
+configuration applies within its declaring namespace; automatic export to other
+namespaces is incomplete. See [Compatibility](compatibility.md) for supported
+behavior and remaining differences.

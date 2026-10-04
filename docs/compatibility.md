@@ -1,34 +1,52 @@
 # Compatibility
 
-blt follows cljfmt, clj-kondo, and clojure-lsp where their behavior applies to
-Basilisp. Compatibility means matching the supported behavior against upstream
-implementations; it does not mean full replacement of every upstream feature.
+blt follows familiar Clojure tooling conventions for Basilisp and Python interop.
+It supports part of each tool's behavior:
 
-## Tested scope
-
-| Command | Upstream comparison | Additional coverage |
+| Command | Based on | Compared in CI |
 | --- | --- | --- |
-| `blt format` | Formatting output, idempotence, option readers, discovery, and literal Leiningen configuration precedence | Basilisp syntax preservation, CLI overrides, file selection, parallel execution, and batch write validation |
-| `blt check` | Diagnostic type, message, severity, location, scoped configuration, exclusions, configuration merges, output filters, and exit status | Basilisp forms, project resolution, Python imports, members, and callable inspection |
-| `blt lsp` | Actual upstream settings helpers and startup merge behavior | Real stdio protocol tests for settings, indexing, diagnostics, Python interop, navigation, rename, and formatting |
+| `blt format` | [cljfmt](https://github.com/weavejester/cljfmt) | Formatting output and configuration |
+| `blt check` | [clj-kondo](https://github.com/clj-kondo/clj-kondo) | Diagnostics, configuration, output, and exit codes |
+| `blt lsp` | [clojure-lsp](https://clojure-lsp.io/) | Configuration loading and merging |
 
-The comparison scripts run real pinned upstream code or binaries. They are not
-copies of blt's implementation. LSP settings comparisons do not establish
-identical server responses or feature coverage.
+Separate tests exercise the language server through LSP, including Python interop,
+navigation, rename, and formatting. Matching these tests does not imply complete
+feature parity.
 
-CI runs the comparisons, the complete test suite on macOS and Linux with Python
-3.10 and 3.13, blt's own formatter and checker, workflow validation, and smoke
-tests against the installed wheel.
+## Current limits
 
-## Upstream versions
+- **Formatting:** unsupported reader features include read-eval, legacy metadata,
+  aliased namespaced maps, and Clojure array-class symbols. Invalid options are
+  rejected more strictly than cljfmt.
+- **Checking:** some clj-kondo linters, full type checking, Clojure hooks, the full
+  analysis-output format, SARIF, and progress reporting are missing. Dynamic
+  macros and Python attributes cannot always be resolved.
+- **LSP:** semantic tokens, code actions, code lenses, inlay hints, structural
+  refactorings, call hierarchy, custom linters, and clojure-lsp extensions are
+  not implemented. Ancestor configuration files are read from their actual
+  directories, which differs from the clojure-lsp version used in our comparisons.
+- **Configuration:** settings are read as data. Reader evaluation, executable
+  Leiningen profiles, and arbitrary tagged readers are unsupported. Regexes use
+  Python syntax, so Java-specific patterns may differ.
+- **Language:** JVM and ClojureScript behavior, classpath discovery, and
+  dependency-exported LSP settings are outside the current scope.
 
-- cljfmt 0.16.6:
-  [`baab500`](https://github.com/weavejester/cljfmt/tree/baab5008032945434cbca23ef5eda516e3ea97b0).
-- clj-kondo 2026.08.04, supplied by the locked Nix compatibility environment.
-- clojure-lsp:
-  [`8ad65c1`](https://github.com/clojure-lsp/clojure-lsp/tree/8ad65c1d681d2fc9022b3854f6dcaf1677d29631).
+See [Formatting](formatting.md), [Checking](checking.md), and [Language server](lsp.md)
+for supported options.
 
-Run the comparisons inside `nix develop .#compatibility`:
+## Development
+
+CI runs on macOS and Linux, checks blt's own source, and tests the installed wheel.
+The [CI workflow](../.github/workflows/ci.yml) and [Nix lockfile](../flake.lock)
+record the exact tool versions used for comparisons.
+
+```sh
+nix develop --command uv run --locked basilisp test -p tests --include-unsafe-path=false
+nix develop --command uv run --locked blt format --check src tests
+```
+
+To run comparisons, use the reference versions from the workflow and enter
+`nix develop .#compatibility`:
 
 ```sh
 uv run --locked python scripts/check_cljfmt.py --cljfmt /path/to/cljfmt
@@ -37,30 +55,3 @@ uv run --locked python scripts/check_kondo.py
 uv run --locked python scripts/check_kondo_config.py
 uv run --locked python scripts/check_lsp_config.py --clojure-lsp /path/to/clojure-lsp
 ```
-
-Use checkouts at the revisions above. The formatter oracle also checks original
-Basilisp fixtures and dynamically reads applicable upstream tests.
-
-## Differences and unsupported behavior
-
-- **CLI:** blt keeps the `format`, `check`, and `lsp` subcommands. Supported
-  upstream options are adapted to these commands; not every upstream flag or
-  output mode exists. `blt COMMAND --help` lists the available interface.
-- **Configuration:** data is never evaluated. Clojure reader evaluation,
-  executable Leiningen profiles, arbitrary tagged readers, and Clojure hooks
-  are unsupported. Regexes use Python semantics, so Java-specific constructs
-  may differ. Formatter option validation is stricter for unknown or invalid keys.
-- **Checking:** the supported linter set is smaller than clj-kondo's. Full
-  clj-kondo analysis output, SARIF, and progress reporting are unsupported.
-  Dynamic macro expansion and Python behavior cannot always be resolved.
-- **LSP:** JVM classpath and project discovery, dependency-exported settings,
-  custom linters, semantic tokens, code actions, code lenses, inlay hints,
-  structural refactorings, call hierarchy, and custom extensions are unsupported.
-  Ancestor settings discovery deliberately visits real ancestor directories,
-  instead of repeating the root file as the pinned upstream implementation does.
-- **Language:** blt analyzes Basilisp and Python interop. JVM/ClojureScript-only
-  semantics are outside its scope.
-
-See [Formatting](formatting.md), [Checking](checking.md), and [Language server](lsp.md)
-for supported options and operational details. A passing comparison suite covers
-its fixtures, not every possible program or configuration.

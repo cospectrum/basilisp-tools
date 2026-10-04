@@ -1,8 +1,8 @@
 # Syntax API
 
-The Basilisp namespace `basilisp-tools.syntax` parses source without evaluating
-forms, loading project namespaces, expanding macros, resolving aliases, or
-invoking tagged-literal readers.
+`basilisp-tools.syntax` parses source into an immutable tree. It preserves the
+original text and never runs project code, expands macros, or invokes tagged
+literal readers.
 
 ## Parse and inspect
 
@@ -15,35 +15,30 @@ invoking tagged-literal readers.
 (syntax/text (:root parsed)) ; original source, exactly
 ```
 
-The result is an immutable map with `:source`, `:root`, `:diagnostics`, and
-`:line-starts`. Every node has `:kind`, `:start`, and `:end`. Leaves have
-`:text`; branches have `:children`. Unfinished forms have `:incomplete? true`
-when their own delimiter or operand is missing.
+The result has `:source`, `:root`, `:diagnostics`, and `:line-starts`. Every node
+has `:kind`, `:start`, and `:end`, plus `:text` for leaves or `:children` for
+branches. A missing delimiter or operand marks its form `:incomplete? true`.
 
 Ranges are zero-based, half-open Unicode code-point offsets. Each character
-belongs to exactly one leaf; branch children partition their parent's range.
-Delimiters, prefixes, commas, whitespace, CRLF endings, comments, and invalid
-input are retained. No synthetic characters are inserted.
+belongs to exactly one leaf; children partition their parent's range. The tree
+retains punctuation, whitespace, line endings, comments, and invalid input
+without inserting synthetic characters.
 
-## Forms
-
-Supported syntax includes:
+## Supported forms
 
 - Lists, vectors, maps, sets, and anonymous functions.
-- Symbols, keywords and auto-resolved keywords, nil, and booleans.
+- Symbols, keywords, auto-resolved keywords, nil, and booleans.
 - Integers, bigints, decimals, floats, octal/hex/arbitrary-base numbers, ratios,
   scientific notation, imaginary numbers, and symbolic numeric constants.
 - Character literals and named/Unicode characters.
 - Strings, regex literals, byte strings, and f-strings. Interpolations contain
-  ordinary syntax nodes, accessible to later analysis.
+  ordinary syntax nodes for analysis.
 - Quote, syntax quote, unquote, unquote-splicing, dereference, var quote,
   metadata, nested reader discards, namespaced maps, and tagged literals.
-- Reader conditionals and splicing conditionals, preserving all branches.
+- Reader conditionals and splicing conditionals, with all branches preserved.
 - Line comments, shebang comments, whitespace, and commas.
 
-Grammar is informed by Basilisp's upstream reader and reader tests. We do not
-reproduce permissive historical reader behavior such as accepting a lone colon
-or backslash as an empty value; these receive editor diagnostics.
+A lone colon or backslash is reported as an error.
 
 ## Traversal
 
@@ -56,45 +51,31 @@ or backslash as an empty value; these receive editor diagnostics.
 | `trivia?` | Whether a node is whitespace, a newline, or a comment |
 | `node-at` | Deepest node containing an offset; nil at EOF |
 
-Reader conditionals in `forms` remain syntax, not expanded runtime values.
+`forms` preserves reader conditionals as syntax rather than selecting a branch.
 
 ## Positions
 
-`offset->position` returns a zero-based `{:line ... :character ...}` map.
-`position->offset` converts valid line positions back to offsets. Characters
-count code points, not UTF-16 units. CRLF is one line break; positions inside
-line endings are not valid inputs to `position->offset`. An LSP adapter must
-convert to its negotiated encoding.
+`offset->position` returns a zero-based `{:line ... :character ...}` map;
+`position->offset` converts it back. Characters count code points, not UTF-16
+units. CRLF is one line break, and `position->offset` rejects positions inside
+line endings. LSP adapters must convert to the negotiated encoding.
 
-## Recovery
+## Errors and recovery
 
-Diagnostics contain `:code`, `:message`, `:severity`, `:start`, and `:end`.
-Missing tokens can use zero-width diagnostic ranges.
+Diagnostics have `:code`, `:message`, `:severity`, `:start`, and `:end`. Missing
+tokens can have zero-width ranges.
 
-Mismatched delimiters recover at an enclosing delimiter when possible.
-Unexpected closers remain error leaves. Unterminated strings retain the
-remaining input; ambiguous malformed strings cannot always expose later forms
-as distinct expressions.
+Mismatched delimiters recover at an enclosing delimiter where possible;
+unexpected closers remain error leaves. Unterminated strings retain the
+remaining input, so later forms may become part of the string.
 
-The maximum recursive depth is 64, configurable downwards with
-`(parse source {:max-depth n})`. Excess nesting becomes error tokens.
-Parsing is a full-document pass; incremental parsing is not implemented.
+Recursive depth is limited to 64. Lower it with `(parse source {:max-depth n})`;
+excess nesting becomes error tokens. Each parse processes the full document.
 
-## Syntax versus analysis
-
-The parser checks token spelling, escapes, delimiters, required reader operands,
-map form counts, reader-conditional structure, and f-string expression counts.
-Map arity is deferred when reader conditionals can affect the count.
+The parser checks token spelling, escapes, delimiters, reader operands, map form
+counts, reader-conditional structure, and f-string expression counts. Map arity
+is deferred when reader conditionals can affect it.
 
 Namespace resolution, gensym context, nested anonymous-function restrictions,
 metadata target types, duplicate evaluated collection values, regex compilation,
-and tagged-literal value validation belong to analysis.
-
-## Tests
-
-```sh
-uv run basilisp test -p tests --include-unsafe-path=false
-```
-
-Tests cover forms, recovery, exact leaf/branch ranges, Unicode positions,
-deep nesting, large literals, and deterministic randomized editor input.
+and tagged-literal value validation require analysis.

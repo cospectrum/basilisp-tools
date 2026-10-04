@@ -1,73 +1,66 @@
-# Formatting reference
+# Formatting
 
-`basilisp-tools.format/format-string` accepts a source string and an optional map
-of options. It returns formatted source or raises `ExceptionInfo` for malformed
-syntax or invalid options. It never evaluates source, expands macros, resolves
-runtime variables, or imports dependencies from the formatted project.
+`blt format` formats files in place. Directories are searched recursively for
+`.lpy` files; use `-` to read from stdin and write to stdout.
+
+```sh
+blt format src tests
+blt format --check .  # Report files that need formatting
+blt format --diff .   # Show changes without writing
+blt format - < example.lpy
+```
+
+Exit codes are **0** for success, **1** when `--check` or `--diff` finds changes,
+and **2** for errors.
 
 ## Configuration
 
-Put formatter settings in `.cljfmt.edn` at the project root:
+Put settings in `.cljfmt.edn` at the project root:
 
 ```clojure
-{:extra-indents {with-session [[:block 1]]}
- :normalize-newlines-at-file-end? true}
+{:normalize-newlines-at-file-end? true
+ :remove-multiple-non-indenting-spaces? true}
 ```
 
-Use `blt format --config .cljfmt.edn` to select the file explicitly.
-Otherwise, formatter files are discovered upward from the working directory.
-The nearest directory wins; files are not merged across directories. Within a
-directory, the order is `.cljfmt.edn`, `.cljfmt.clj`, `cljfmt.edn`, `cljfmt.clj`.
-Discovery of `.clj` files requires `--read-clj-config-files`; without it, they
-produce a warning and EDN discovery continues. An explicit `--config FILE.clj`
-works without this flag. EDN uses `#re "pattern"`; `.clj` uses `#"pattern"`.
-Both readers consume the first form, as upstream does. Literal `.clj` metadata
-and unqualified automatic namespaces are supported; reader evaluation is not.
+The CLI searches the working directory and its parents, using the nearest
+configuration. Files in different directories are not merged. Within a directory,
+the order is `.cljfmt.edn`, `.cljfmt.clj`, `cljfmt.edn`, `cljfmt.clj`.
 
-The `load-config` function lives in `basilisp-tools.format` and takes a file
-or a directory; without an argument it starts at the current working directory.
-An explicit file bypasses automatic discovery.
+Discovering `.clj` files requires `--read-clj-config-files`; otherwise they are
+skipped with a warning. `--config FILE` selects a file directly, including
+`.clj` files. EDN regexes use `#re "pattern"`; Clojure files use `#"pattern"`.
+Only the first form is read. Configuration is never evaluated.
 
-For compatibility with existing projects, automatic discovery also recognizes
-literal `:cljfmt` settings in the nearest ancestor `project.clj`. If present,
-that file takes precedence over formatter files. Its `:load-config-file? true`
-option enables EDN discovery from the project root, with project settings winning
-through a shallow merge. Project `:cljfmt :paths` takes precedence over
-`:source-paths` and `:test-paths` (defaulting to existing `src` and `test`
-directories); configured project paths are relative to its root.
-Project code and external Leiningen profiles are never evaluated; computations,
-metadata in selected settings, and inline profiles affecting formatting are
-rejected. An explicit `--config .cljfmt.edn` bypasses this compatibility behavior.
+For existing projects, literal `:cljfmt` settings in `project.clj` are also
+supported. During discovery, the nearest `project.clj` takes precedence over
+formatter files; `:load-config-file? true` loads EDN settings before applying
+project overrides with a shallow merge. Configured project paths are relative
+to the project root. Use `--config .cljfmt.edn` to bypass this compatibility behavior.
 
 ## Indentation
 
-These rules use cljfmt's argument indexes and nesting depths:
+`:extra-indents` adds rules to the defaults; `:indents` replaces them.
+Argument indexes start at zero after the function or macro name.
 
 | Rule | Behavior |
 | --- | --- |
 | `[:default]` | Ordinary list indentation |
-| `[:inner depth]` | Body indentation at the specified nesting depth |
+| `[:inner depth]` | Body indentation at the given nesting depth |
 | `[:inner depth argument-index]` | Body indentation within one argument |
-| `[:block argument-count]` | Indent the body after the leading arguments |
-
-Argument indexes start at zero after the head symbol. `:extra-indents` extends
-the defaults; `:indents` replaces them. Keys can be unqualified symbols, qualified
-symbols, regexes, or `[namespace-pattern name-pattern]` vectors.
+| `[:block argument-count]` | Body indentation after the leading arguments |
 
 ```clojure
 {:extra-indents
  {with-session [[:block 1]]
   my.app/widget [[:inner 0]]
   #re "^defcomponent" [[:inner 0]]
-  [my.app #re "^with-"] [[:block 1]]}
-
- :alias-map {app my.app}
- :refer-map {widget my.app}}
+  [my.app #re "^with-"] [[:block 1]]}}
 ```
 
-Namespace names, aliases, and explicit refers are inferred from the `ns` form.
-Explicit `:alias-map` and `:refer-map` entries override inferred entries.
-Regexes use Python's regular-expression syntax and match a symbol's name.
+Rule keys can be symbols, regexes, or `[namespace-pattern name-pattern]` pairs.
+Regexes use Python syntax and match the symbol's name. The formatter reads
+namespace names, aliases, and refers from the `ns` form; `:alias-map` and
+`:refer-map` override those values.
 
 ## Options
 
@@ -75,7 +68,7 @@ Regexes use Python's regular-expression syntax and match a symbol's name.
 | --- | --- |
 | `:indentation?` | `true` |
 | `:function-arguments-indentation` | `:community`; also `:cursive`, `:zprint` |
-| `:indent-line-comments?` | `false`; when enabled, indents `;;` comments |
+| `:indent-line-comments?` | `false`; indents `;;` comments when enabled |
 | `:insert-missing-whitespace?` | `true` |
 | `:remove-surrounding-whitespace?` | `true` |
 | `:remove-trailing-whitespace?` | `true` |
@@ -92,97 +85,48 @@ Regexes use Python's regular-expression syntax and match a symbol's name.
 | `:max-column-alignment-gap` | `nil` |
 | `:max-column-alignment-width` | `nil` |
 
-`:aligned-forms` and `:blank-line-forms` map form names to sets of argument indexes
-or `:all`. The corresponding `:extra-aligned-forms` and
-`:extra-blank-line-forms` maps extend the defaults. By default, binding vectors
-such as those in `let`, `binding`, and `with-open` are alignment targets and may
-retain blank lines. `cond` and `comment` may also retain blank lines.
+`:aligned-forms` and `:blank-line-forms` map form names to argument-index sets
+or `:all`. Their `:extra-aligned-forms` and `:extra-blank-line-forms` counterparts
+extend the defaults. Binding vectors, such as those in `let`, are alignment
+targets by default and can retain blank lines.
 
-`:align-binding-columns?` is accepted as an alias for enabling form alignment.
-Legacy `:legacy/merge-indents? true` treats `:indents` as additions to defaults.
+For older configurations, `:align-binding-columns?` aliases form alignment,
+and `:legacy/merge-indents? true` treats `:indents` as additions to the defaults.
+Unknown options and invalid rules produce errors.
 
-CLI configuration also accepts `:paths ["src" "tests"]` and a `:file-pattern #re
-"\\.lpy$"`. Explicit CLI paths take precedence over `:paths`.
-Unknown options and malformed rules produce errors.
+### Command-line overrides
 
-Formatter switches can be overridden with `--OPTION` / `--no-OPTION`, such as
-`--indentation` or `--no-remove-consecutive-blank-lines`. Explicit flags override
-file settings, including explicit `false` values. `--function-arguments-indentation`,
-`--max-column-alignment-gap`, `--max-column-alignment-width`, and `--file-pattern`
-also override configuration. File patterns match paths relative to each searched
-directory. `--project-root` changes displayed paths; it does not relocate CLI
-input paths or Leiningen's configured source directories.
+Flags override file settings. For example, `--indentation` enables indentation
+and `--no-indentation` disables it. Styles, alignment limits, and file patterns
+also have CLI options; see `blt format --help`.
 
-`:parallel?` / `--parallel` prepares files concurrently while retaining deterministic
-output and validating the complete batch before writes. `:quiet?`, `:verbose?`,
-and `:ansi?` have corresponding CLI flags. ANSI colors require a terminal and
-`TERM`, and respect `NO_COLOR`. Use `blt format --help` for all switches.
+Use `:paths ["src" "tests"]` to set default input paths; explicit CLI paths win.
+A `:file-pattern #re "\\.lpy$"` matches paths relative to each searched directory.
+`--project-root` changes displayed paths without relocating inputs.
 
-## Compatibility and source preservation
+`--parallel` prepares files concurrently and keeps output ordered. `--quiet`
+hides file status messages, and `--verbose` lists processed files. These also
+accept `:parallel?`, `:quiet?`, and `:verbose?` in configuration.
+`:ansi?` controls colored diffs, which require a terminal and respect `NO_COLOR`.
 
-CI compares output with cljfmt at commit
-`baab5008032945434cbca23ef5eda516e3ea97b0`, running its tests from an external
-checkout and checking that a second formatting pass changes nothing. Local
-tests also cover independent examples, generated preservation cases, and
-fault injection. A JVM or Clojure installation is not required to run `blt`.
+## Behavior and limits
 
-Compatibility covers the supported Basilisp syntax and options above, rather
-than every Clojure reader feature. The comparison explicitly excludes legacy
-`#^` metadata, read-eval `#=`, aliased namespaced maps, and Clojure array-class
-symbols such as `String/1`. Configuration aliases requiring a running Clojure
-namespace, custom readers, reader evaluation, and dynamic Leiningen project/profile
-execution are not supported. Invalid or unknown formatter options are rejected
-more strictly than upstream. The command remains `blt format`; see the
-[compatibility matrix](compatibility.md) for tested coverage and differences.
+The formatter preserves token spelling, comments, literal contents, and all
+reader-conditional branches. Whitespace line endings become LF; line endings
+inside literals stay unchanged. It checks every result for syntax preservation
+and prepares the whole selection before writing any files.
 
-The formatter preserves token spelling and literal text, including multiline
-strings and f-string interpolation text. Reader conditionals retain all
-branches. Whitespace line endings become LF; line endings inside literals
-remain unchanged. Formatting columns follow cljfmt's UTF-16 convention; syntax
-offsets and positions count Unicode code points.
+Namespace sorting and column alignment are optional. Sorting keeps attached and
+dangling comments. Formatting does not wrap lines to a maximum length. Inputs
+nested more than 64 levels deep are rejected.
 
-Every result is parsed again before it is returned. The guard checks syntax,
-nesting, reader attachments, and token text against the original and prepared
-trees, allowing layout changes and comment trailing-space cleanup. With
-namespace sorting enabled, only reference-clause child ordering may change.
-The CLI prepares the entire batch before writing any file.
+The supported options follow cljfmt, with some differences in reader support
+and validation. See [Compatibility](compatibility.md) for details and development
+checks.
 
-Namespace sorting is opt-in. Attached comments move with their references;
-section and dangling comments are retained. This intentionally differs from
-upstream cases that drop dangling comments. Column alignment converges to a
-stable result in one invocation, including cases requiring multiple upstream
-runs. A cycle or failure to converge raises an error instead of returning
-unstable output.
+## Library API
 
-There is no automatic line-length wrapping. The parser has a nesting limit of
-64; input exceeding it is rejected. These checks do not replace compiler or
-semantic validation.
-
-## Development checks
-
-The normal suite and formatting check need only the default development shell:
-
-```sh
-nix develop --command uv run --locked basilisp test -p tests --include-unsafe-path=false
-nix develop --command uv run --locked blt format --check src tests
-```
-
-For the upstream comparison, use an unmodified cljfmt checkout at the pinned
-commit above. The separate shell supplies Clojure and Java:
-
-```sh
-nix develop .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt /path/to/cljfmt
-nix develop .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt /path/to/cljfmt
-```
-
-Add `--corpus /path/to/basilisp` to compare real `.lpy` files, or
-`--report /tmp/cljfmt-report.json` to save mismatches and explicit skips.
-Upstream source and generated fixtures are not vendored in this project.
-
-Measure a fixed input corpus with warmup and repeated samples:
-
-```sh
-uv run --locked python scripts/benchmark.py src tests --repeat 3
-```
-
-Add `--profile /tmp/blt.prof` for a Python cProfile of a formatting pass.
+`basilisp-tools.format/format-string` takes source and an optional options map.
+It returns formatted source or raises `ExceptionInfo` for malformed syntax or
+invalid options. `load-config`, in the same namespace, accepts a file or directory
+and defaults to the working directory. Neither function evaluates project code.
