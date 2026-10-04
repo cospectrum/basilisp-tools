@@ -29,7 +29,8 @@
     (doseq [p patches] (.start p))
     (try
       (os/chdir cwd)
-      {:code (cli/main args) :out (.getvalue out) :err (.getvalue err)}
+      (let [code (cli/main args)]
+        {:code code :out (.getvalue out) :err (.getvalue err)})
       (finally
         (os/chdir previous)
         (doseq [p (reverse patches)] (.stop p))))))

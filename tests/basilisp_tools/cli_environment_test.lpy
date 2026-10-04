@@ -9,7 +9,8 @@
         patches [(mock/patch "sys.stdout" out) (mock/patch "sys.stderr" err)]]
     (doseq [patch patches] (.start patch))
     (try
-      {:code (cli/main args) :out (.getvalue out) :err (.getvalue err)}
+      (let [code (cli/main args)]
+        {:code code :out (.getvalue out) :err (.getvalue err)})
       (finally (doseq [patch (reverse patches)] (.stop patch))))))
 
 (deftest selected-interpreter-exported-settings-test
@@ -43,9 +44,15 @@
           (.unlink config))
         (let [result (invoke (if from-file? args
                                  (into args ["--settings" "{:classpath-config-paths [\"vendor/library\"]}"])))
-              data (when (= 0 (:code result)) (py->lisp (json/loads (:out result))))]
-          (is (= 0 (:code result)) (:err result))
-          (is (= ["lib"] (get-in data [:settings :source-paths])))
-          (is (= false (get-in data [:settings :clean :sort :refer])))
-          (is (= ["sample"] (mapv :name (get-in data [:analysis :namespace-definitions]))))))
+              data (when (= 0 (:code result))
+                     (try (py->lisp (json/loads (:out result)))
+                          (catch json/JSONDecodeError error
+                            (is false (str "Expected JSON from lsp dump: " (pr-str result)
+                                           "; decode error: " error)) nil)))]
+          (is (= 0 (:code result)) (pr-str result))
+          (is (map? data) (str "Expected JSON object from lsp dump: " (pr-str result)))
+          (when (map? data)
+            (is (= ["lib"] (get-in data [:settings :source-paths])))
+            (is (= false (get-in data [:settings :clean :sort :refer])))
+            (is (= ["sample"] (mapv :name (get-in data [:analysis :namespace-definitions])))))))
       (finally (.stop home-patch) (.cleanup temporary)))))
