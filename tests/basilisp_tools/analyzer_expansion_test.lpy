@@ -1,0 +1,145 @@
+(ns basilisp-tools.analyzer-expansion-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [subprocess] [sys]))
+
+(deftest call-metadata-test
+  (let [source "(ns sample) (defn target [a b] (+ a b)) (defn caller [] (target 1 2))"
+        result (analyzer/analyze source)
+        call (first (filter #(= "target" (:name %)) (:calls result)))]
+    (is (empty? (:findings result)))
+    (is (= "caller" (get-in call [:caller :name])))
+    (is (= "sample" (get-in call [:definition :ns])))
+    (is (= ["[a b]"] (get-in call [:definition :arglists])))
+    (is (= "(target 1 2)" (subs source (:start call) (:end call))))
+    (is (= ["1" "2"] (mapv #(subs source (:start %) (:end %)) (:arguments call))))
+    (is (= "target" (subs source (get-in call [:name-range :start]) (get-in call [:name-range :end])))))
+  (is (map? (analyzer/analyze "(inc")))
+  (is (map? (analyzer/analyze "("))))
+
+(deftest cross-namespace-macro-settings-test
+  (let [defs (:definitions (analyzer/declarations
+                            "(ns macros) (defmacro bind {:clj-kondo/lint-as 'clojure.core/let} [& args] args) (defmacro quiet {:clj-kondo/config '{:ignore [:unresolved-symbol]}} [& args] args)"))
+        opts {:project {"macros" defs}}]
+    (doseq [source ["(ns client (:require [macros :as m])) (m/bind [x 1] x) (m/quiet absent)"
+                    "(ns client (:require [macros :refer [bind quiet]])) (bind [x 1] x) (quiet absent)"]]
+      (testing source (is (empty? (:findings (analyzer/analyze source opts))))))))
+
+(deftest dependency-cache-lifecycle-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        file (.joinpath root "library.lpy")
+        cache (analyzer/create-cache)
+        opts {:source-paths [(str root)] :dependency-cache cache}]
+    (try
+      (.write_text file "(ns library) (defn first-value [] 1)" ** :encoding "utf-8")
+      (is (contains? (analyzer/namespace-symbols "library" opts) "first-value"))
+      (is (= 1 (count @cache)))
+      (.write_text file "(ns library) (defn replacement-value [] 2)" ** :encoding "utf-8")
+      (is (contains? (analyzer/namespace-symbols "library" opts) "replacement-value"))
+      (is (not (contains? (analyzer/namespace-symbols "library" opts) "first-value")))
+      (is (= 1 (count @cache)))
+      (is (empty? @(analyzer/create-cache)))
+      (finally (.cleanup temporary)))))
+
+(deftest function-arity-scope-test
+  (let [source "(defn f ([a] a) ([a b] (+ a b)))"
+        locals (:locals (analyzer/analyze source))
+        first-arity (first locals) second-arity (second locals)]
+    (is (= "([a] a)" (subs source (:scope-start first-arity) (:scope-end first-arity))))
+    (is (= "([a b] (+ a b))" (subs source (:scope-start second-arity) (:scope-end second-arity))))))
+
+(deftest python-expression-inference-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        file (.joinpath root "inferred.py")
+        options {:python-options {:python-paths [(str root)] :python-cache (py/create-cache)}}]
+    (try
+      (.write_text file
+                   (str "class Widget:\n"
+                        "    def __init__(self, name: str): pass\n"
+                        "    def child(self) -> 'Widget': return self\n"
+                        "    def transform(self, value: int) -> 'Widget': return self\n"
+                        "    @property\n"
+                        "    def label(self) -> str: return 'name'\n"
+                        "def make() -> Widget: return Widget('name')\n"
+                        "def many() -> list[Widget]: return []\n")
+                   ** :encoding "utf-8")
+      (doseq [body ["(let [w (inferred/make)] (.child w))"
+                    "(. (inferred/make) child)"
+                    "(. (inferred/make) (child))"
+                    "(.upper (.- (inferred/make) label))"
+                    "(.upper (. (inferred/make) -label))"
+                    "(.. (inferred/make) child (transform 1) child)"
+                    "(def w (inferred/make)) (.child w)"
+                    "(defn factory [] (inferred/make)) (.child (factory))"
+                    "(let [factory (fn [] (inferred/make))] (.child (factory)))"
+                    "(-> (inferred/make) (.child) (.transform 1) (.child))"
+                    "(-> (inferred/make) .child .child)"
+                    "(doto (inferred/make) (.transform 1) (.child))"
+                    "(some-> (inferred/make) (.child))"
+                    "(->> 1 (.transform (inferred/make)))"
+                    "(.upper (.-label (inferred/make)))"
+                    "(defn typed [^inferred/Widget w] (.child w))"
+                    "(defn maybe [flag] (if flag (inferred/make) 1)) (.child (maybe true))"
+                    "(defn choose [flag] (if flag (inferred/make) (inferred/make))) (.child (choose true))"
+                    "(for [w (inferred/many)] (.child w))"
+                    "(let [[w] (inferred/many)] (.child w))"]]
+        (testing body
+          (let [result (analyzer/analyze (str "(ns sample (:import inferred)) " body) options)]
+            (is (empty? (:findings result)) (:findings result))
+            (is (seq (:python-expressions result)))
+            (is (some #(= ["Widget"] (get-in % [:python-type :path])) (:python-expressions result))))))
+      (doseq [body ["(.child (inferred/make) 1)"
+                    "(-> (inferred/make) (.child 1))"
+                    "(->> 1 (.child (inferred/make)))"
+                    "(defn factory [] (inferred/make)) (.child (factory) 1)"
+                    "(defn typed [^inferred/Widget w] (.child w 1))"
+                    "(for [w (inferred/many)] (.child w 1))"]]
+        (testing body
+          (is (= [:invalid-arity]
+                 (mapv :type (:findings (analyzer/analyze (str "(ns sample (:import inferred)) " body) options)))))))
+      (finally (.cleanup temporary)))))
+
+(deftest python-literal-and-refer-inference-test
+  (doseq [source ["(.upper \"hello\")"
+                  "(.append #py [] 1)"
+                  "(.get #py {} \"key\")"
+                  "(ns sample (:import [pathlib :refer [Path]])) (.-name (Path \".\"))"]]
+    (testing source (is (empty? (:findings (analyzer/analyze source))))))
+  (let [result (analyzer/analyze "(ns sample (:import [math :refer [sqrt]])) (sqrt 4)")]
+    (is (contains? (:python-refers result) "sqrt"))))
+
+(deftest selected-python-dependency-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        environment (.joinpath root "env")
+        executable (.joinpath environment "bin" "python")]
+    (try
+      (subprocess/run (lisp->py [sys/executable "-m" "venv" "--without-pip" (str environment)])
+                      ** :check true :capture_output true :timeout 30)
+      (let [options {:python-executable (str executable) :python-cache (py/create-cache)}
+            package-root (first (filter #(.endswith % "site-packages") (py/environment-paths options)))]
+        (is (some? package-root))
+        (.write_text (.joinpath (pathlib/Path package-root) "selected_library.lpy")
+                     "(ns selected-library) (defn selected [value] value)" ** :encoding "utf-8")
+        (let [result (analyzer/analyze "(ns sample (:require [selected-library :as selected])) (selected/selected)"
+                                       {:python-options options :dependency-cache (analyzer/create-cache)})]
+          (is (= [:invalid-arity] (mapv :type (:findings result))))
+          (is (.startswith (get-in (first (filter #(= "selected" (:name %)) (:var-usages result)))
+                                   [:definition :filename]) (str environment)))))
+      (finally (.cleanup temporary)))))
+
+(deftest python-keyword-call-test
+  (doseq [body ["(json/dumps {} ** :sort-keys true)"
+                "(json/dumps {} ** :some.namespace/indent 2)"
+                "(json/dumps {} ** \"indent\" 2)"]]
+    (testing body
+      (is (empty? (:findings (analyzer/analyze (str "(ns sample (:import json)) " body)))))))
+  (doseq [body ["(json/dumps {} ** :indent)"
+                "(json/dumps {} ** :indent 2 ** :sort-keys true)"
+                "(json/dumps {} ** :sort-keys true :sort_keys false)"
+                "(json/dumps {} ** 42 true)"]]
+    (testing body
+      (is (= [:syntax] (mapv :type (:findings (analyzer/analyze (str "(ns sample (:import json)) " body)))))))))

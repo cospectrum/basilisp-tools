@@ -90,9 +90,10 @@ or `:all`. Their `:extra-aligned-forms` and `:extra-blank-line-forms` counterpar
 extend the defaults. Binding vectors, such as those in `let`, are alignment
 targets by default and can retain blank lines.
 
-For older configurations, `:align-binding-columns?` aliases form alignment,
-and `:legacy/merge-indents? true` treats `:indents` as additions to the defaults.
-Unknown options and invalid rules produce errors.
+The old `:align-binding-columns?` option is accepted but has no effect; use
+`:align-form-columns?` instead. `:legacy/merge-indents? true` treats `:indents`
+as additions to the defaults. Unknown keys are ignored for compatibility with
+shared configurations. Invalid formatting rules still produce errors.
 
 ### Command-line overrides
 

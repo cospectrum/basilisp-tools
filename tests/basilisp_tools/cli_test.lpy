@@ -204,3 +204,24 @@
         (is (= 1 (:code result)))
         (is (= "Would format ../src/sample.lpy\n" (:err result))))
       (finally (os/chdir original) (.cleanup temp)))))
+
+(deftest checker-sarif-cli-test
+  (let [result (run-cli ["check" "--repro" "--no-python-inspection" "--format" "sarif"
+                         "--filename" "example.lpy" "-"] "(ns example)\nmissing")
+        data (json/loads (:out result))
+        run (first (.get data "runs"))
+        finding (first (.get run "results"))]
+    (is (= 3 (:code result)))
+    (is (= "2.1.0" (.get data "version")))
+    (is (= "unresolved-symbol" (.get finding "ruleId")))
+    (is (= "error" (.get finding "level")))
+    (is (= 2 (.get (.get (.get (first (.get finding "locations")) "physicalLocation") "region") "startLine")))))
+
+(deftest checker-dependencies-cli-test
+  (let [result (run-cli ["check" "--repro" "--no-python-inspection" "--format" "json"
+                         "--parallel" "--dependencies"
+                         "--config" "{:output {:analysis true}}"
+                         "--filename" "example.lpy" "-"] "(ns example)\nmissing")]
+    (is (= 0 (:code result)))
+    (is (= "" (:out result)))
+    (is (= "" (:err result)))))

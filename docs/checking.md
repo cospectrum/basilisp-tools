@@ -14,8 +14,15 @@ blt check --fail-level error .
 Exit codes are **0** for no findings at the failure threshold, **2** for warnings,
 and **3** for analysis errors. Invalid arguments or configuration also return
 **2**. Use `--fail-level error` to allow warnings. `--report-level` filters text
-output; JSON and EDN retain all findings. `--lint PATH...` is an alias for
-positional paths.
+output; JSON, EDN, and SARIF retain all findings. `--lint PATH...` is an alias
+for positional paths. `--parallel` analyzes files concurrently with ordered output.
+`--dependencies` analyzes silently and exits successfully.
+
+Use `--format sarif` for code-scanning integrations. JSON and EDN can also include
+analysis data with `:output {:analysis true}` in configuration: namespaces,
+definitions, and references. To include local bindings, keywords, and function
+argument lists, use `:analysis {:locals true :keywords true :arglists true}`
+inside `:output`.
 
 ## Configuration
 
@@ -80,9 +87,14 @@ Basilisp or blt installed.
 
 Local `.py` and `.pyi` files are parsed without importing them. Installed modules
 can be imported in a separate process to inspect members, signatures, and
-annotations. Checks distinguish positional-only, keyword-only, optional, and
-variadic parameters, and can follow known constructors and members through local
-bindings. Dynamic attributes and unavailable signatures remain unknown.
+annotations. Stubs, including installed stub packages, supply overloaded
+signatures and return types. The checker follows imports, inherited members,
+properties, and dataclass fields, and checks positional-only, keyword-only,
+optional, and variadic parameters.
+
+Known Python types carry through bindings, function returns, and threaded calls.
+Dynamic attributes and ambiguous types remain unknown. The selected interpreter's
+search paths are also used to find installed Basilisp dependencies.
 
 **Installed-package inspection runs import initialization code**, including
 transitive imports. The subprocess has a timeout but is not a security sandbox.
@@ -92,7 +104,6 @@ will still be inspected statically.
 ## Limitations
 
 The checker supports a subset of clj-kondo behavior. It does not expand arbitrary
-macros, perform full type checking, or implement every linter. Inline macro
-configuration applies within its declaring namespace; automatic export to other
-namespaces is incomplete. See [Compatibility](compatibility.md) for supported
-behavior and remaining differences.
+macros, perform full type checking, or implement every linter. Macro configuration
+can follow declarations across namespaces, but automatic configuration export
+is not implemented. See [Compatibility](compatibility.md) for remaining differences.

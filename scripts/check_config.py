@@ -159,7 +159,7 @@ def cases():
                 "align-map-columns?", "align-form-columns?", "align-binding-columns?",
                 "align-single-column-lines?", "blank-lines-separate-alignment?",
                 "ansi?", "parallel?", "quiet?", "verbose?", "read-clj-config-files?"]
-    for value in ("true", "false"):
+    for value in ("true", "false", "nil", "0", "[]", '"enabled"'):
         yield {"name": f"all-boolean-options-{value}", "keys": booleans,
                "files": {".cljfmt.edn": "{" + " ".join(f":{key} {value}" for key in booleans) + "}"}}
     for style in ("community", "cursive", "zprint"):
@@ -171,6 +171,14 @@ def cases():
     yield {"name": "custom-form-rules-and-aliases", "keys": [
         "aligned-forms", "extra-aligned-forms", "blank-line-forms", "extra-blank-line-forms", "alias-map", "refer-map"],
            "files": {".cljfmt.edn": '{:aligned-forms {bind #{0}} :extra-aligned-forms {pair #{1}} :blank-line-forms {cond :all} :extra-blank-line-forms {other :all} :alias-map {local external} :refer-map {item external/item}}'}}
+
+    yield {"name": "unknown-options-survive", "keys": ["future-option", "integration/settings"],
+           "files": {".cljfmt.edn": '{:future-option true :integration/settings {:enabled? nil}}'}}
+
+    for extension in ("edn", "clj"):
+        yield {"name": f"{extension}-standard-data-readers", "explicit": f"chosen.{extension}",
+               "keys": ["created", "identifier"],
+               "files": {f"chosen.{extension}": '{:created #inst "2020-01-01T00:00:00Z" :identifier #uuid "2c612548-e8c0-4399-9b48-4e8d0acf8d41"}'}}
 
 
 def main() -> int:
@@ -253,7 +261,9 @@ def main() -> int:
                 raw = formatter.load_config(str(path), lmap({kw("read-clj-config-files?"): read_clj}))
                 merged = dict(formatter.default_options)
                 merged.update(dict(raw))
-                actual = {kw(key): merged[kw(key)] for key in keys if kw(key) in merged}
+                selected = [kw(key.split("/", 1)[-1], key.split("/", 1)[0])
+                            if "/" in key else kw(key) for key in keys]
+                actual = {key: merged[key] for key in selected if key in merged}
                 if mode == "lein" and kw("paths") in actual:
                     actual[kw("paths")] = vector(
                         str((directory / str(item)).resolve()) for item in actual[kw("paths")]

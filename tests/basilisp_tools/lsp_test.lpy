@@ -1,7 +1,7 @@
 (ns basilisp-tools.lsp-test
   (:require [basilisp.test :refer [deftest is testing]]
             [basilisp-tools.lsp :as lsp])
-  (:import [json] [pathlib] [queue] [subprocess] [sys] [tempfile] [threading]))
+  (:import [json] [os] [pathlib] [queue] [subprocess] [sys] [tempfile] [threading]))
 
 (defn- read-messages [process messages]
   (try
@@ -16,11 +16,11 @@
             (recur)))))
     (catch python/Exception e (.put messages {:reader-error (str e)}))))
 
-(defn- client [root]
+(defn- client [root & [environment]]
   (let [process (subprocess/Popen
                  [(str (.joinpath (.-parent (pathlib/Path sys/executable)) "blt")) "lsp"]
                  ** :stdin subprocess/PIPE :stdout subprocess/PIPE :stderr subprocess/PIPE
-                 :cwd (str root))
+                 :cwd (str root) :env environment)
         messages (queue/Queue)
         reader (threading/Thread ** :target #(read-messages process messages) :daemon true)]
     (.start reader)
@@ -503,4 +503,248 @@
       (let [edits (result! c "textDocument/formatting"
                            {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})]
         (is (= "(ns sample)\n(widget x\n  y)\n" (:newText (first edits)))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(defn- absolute-tokens [data]
+  (:tokens (reduce (fn [{:keys [line column tokens]} [delta-line delta-column length kind modifiers]]
+                     (let [row (+ line delta-line) col (if (zero? delta-line) (+ column delta-column) delta-column)]
+                       {:line row :column col :tokens (conj tokens [row col length kind modifiers])}))
+                   {:line 0 :column 0 :tokens []} (partition 5 data))))
+
+(deftest signature-help-python-and-basilisp-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "signatures.lpy"))
+        source "(ns signatures (:import [json] [pathlib]))\n(defn choose ([x] x) ([x y] y))\n(choose 1 2)\n(json/dumps {} ** :indent 2)\n(let [p (pathlib/Path \".\")] (.read_text p ** :encoding \"utf-8\"))"]
+    (try
+      (let [init (initialize! c root)]
+        (is (get-in init [:capabilities :signatureHelpProvider])))
+      (open! c uri source)
+      (let [help (result! c "textDocument/signatureHelp" (at uri 2 10))]
+        (is (= ["(choose [x])" "(choose [x y])"] (mapv :label (:signatures help))))
+        (is (= 1 (:activeSignature help)))
+        (is (= 1 (:activeParameter help))))
+      (let [help (result! c "textDocument/signatureHelp" (at uri 3 25))
+            params (mapv :label (:parameters (first (:signatures help))))]
+        (is (= "indent" (nth params (:activeParameter help))))
+        (is (.startswith (:label (first (:signatures help))) "dumps(")))
+      (let [line (last (.split source "\n"))
+            help (result! c "textDocument/signatureHelp" (at uri 4 (+ (.find line ":encoding") 5)))]
+        (is (not (some #{"self"} (map :label (:parameters (first (:signatures help)))))))
+        (is (= "encoding" (:label (nth (:parameters (first (:signatures help))) (:activeParameter help))))))
+      (doseq [key [":sort-keys" ":json/sort-keys" "\"sort_keys\""]]
+        (let [line (str "(json/dumps {} ** " key " true)")]
+          (notification! c "textDocument/didChange"
+                         {:textDocument {:uri uri :version 2}
+                          :contentChanges [{:text (str "(ns signatures (:import [json]))\n" line)}]})
+          (let [help (result! c "textDocument/signatureHelp" (at uri 1 (- (count line) 2)))
+                params (:parameters (first (:signatures help)))]
+            (is (= "sort_keys" (:label (nth params (:activeParameter help))))))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns signatures)\n(defn choose [x y] y)\n(choose 1 "}]})
+      (diagnostics! c 2)
+      (let [help (result! c "textDocument/signatureHelp" (at uri 2 10))]
+        (is (= "(choose [x y])" (:label (first (:signatures help)))))
+        (is (= 1 (:activeParameter help))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest semantic-tokens-encoding-delta-range-and-settings-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "tokens.lpy"))
+        source "(ns tokens)\n(defn f [x] [\"😀\" x :a/key])\n#_(foo\n #_(bar)\n baz)"]
+    (try
+      (let [init (initialize! c root)]
+        (is (= ["namespace" "type" "function" "macro" "keyword" "class" "variable" "method" "event" "interface" "comment"]
+               (get-in init [:capabilities :semanticTokensProvider :legend :tokenTypes])))
+        (is (get-in init [:capabilities :semanticTokensProvider :full :delta])))
+      (open! c uri source)
+      (let [full (result! c "textDocument/semanticTokens/full" {:textDocument {:uri uri}})
+            tokens (absolute-tokens (:data full))
+            unchanged (result! c "textDocument/semanticTokens/full/delta"
+                               {:textDocument {:uri uri} :previousResultId (:resultId full)})
+            range (result! c "textDocument/semanticTokens/range"
+                           {:textDocument {:uri uri} :range {:start {:line 1 :character 0} :end {:line 2 :character 0}}})]
+        (is (some #(= [1 18 1 6 0] %) tokens))
+        (is (= [2 3 4] (mapv first (filter #(= 10 (nth % 3)) tokens))))
+        (is (every? #(not (neg? %)) (:data full)))
+        (is (empty? (:edits unchanged)))
+        (is (every? #(= 1 (first %)) (absolute-tokens (:data range))))
+        (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 2}
+                                                   :contentChanges [{:text (str source "\n(f 1)")}]})
+        (diagnostics! c 2)
+        (let [delta (result! c "textDocument/semanticTokens/full/delta"
+                             {:textDocument {:uri uri} :previousResultId (:resultId unchanged)})
+              edit (first (:edits delta))
+              rebuilt (vec (concat (take (:start edit) (:data full)) (:data edit)
+                                   (drop (+ (:start edit) (:deleteCount edit)) (:data full))))
+              updated (result! c "textDocument/semanticTokens/full" {:textDocument {:uri uri}})]
+          (is (= rebuilt (:data updated)))
+          (is (= (:data updated) (:data (result! c "textDocument/semanticTokens/full/delta"
+                                                 {:textDocument {:uri uri} :previousResultId "unknown"}))))))
+      (notification! c "workspace/didChangeConfiguration" {:settings {:semantic-tokens? false}})
+      (is (empty? (:data (result! c "textDocument/semanticTokens/full" {:textDocument {:uri uri}}))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest code-actions-lenses-and-call-hierarchy-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "calls.lpy"))
+        source "(ns calls)\n(defn leaf [x] x)\n(defn parent [x] (leaf x))\n(let [unused (parent 1)] 2)"]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (let [params {:textDocument {:uri uri}
+                    :range {:start {:line 3 :character 6} :end {:line 3 :character 12}}
+                    :context {:diagnostics []}}
+            actions (result! c "textDocument/codeAction" params)
+            edit (first (:edits (first (get-in (first actions) [:edit :documentChanges]))))]
+        (is (= "_unused" (:newText edit)))
+        (is (empty? (result! c "textDocument/codeAction" (assoc-in params [:context :only] ["source.organizeImports"])))))
+      (let [lenses (result! c "textDocument/codeLens" {:textDocument {:uri uri}})
+            lens (result! c "codeLens/resolve" (first lenses))]
+        (is (= 2 (count lenses)))
+        (is (= "1 reference" (get-in lens [:command :title])))
+        (is (= "code-lens-references" (get-in lens [:command :command])))
+        (is (= 1 (count (result! c "workspace/executeCommand" (:command lens))))))
+      (let [leaf (first (result! c "textDocument/prepareCallHierarchy" (at uri 1 7)))
+            parent (first (result! c "textDocument/prepareCallHierarchy" (at uri 2 7)))
+            incoming (result! c "callHierarchy/incomingCalls" {:item leaf})
+            outgoing (result! c "callHierarchy/outgoingCalls" {:item parent})]
+        (is (= ["parent"] (mapv #(get-in % [:from :name]) incoming)))
+        (is (= ["leaf"] (mapv #(get-in % [:to :name]) outgoing)))
+        (is (= {:line 2 :character 18} (get-in (first incoming) [:fromRanges 0 :start]))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text "(ns calls) (def _x 1) (let [x 2] _x)"}]})
+      (diagnostics! c 2)
+      (is (empty? (result! c "textDocument/codeAction"
+                           {:textDocument {:uri uri}
+                            :range {:start {:line 0 :character 26} :end {:line 0 :character 27}}
+                            :context {:diagnostics []}})))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest multiworkspace-resolution-python-and-rename-isolation-test
+  (let [temp (tempfile/TemporaryDirectory) base (pathlib/Path (.-name temp))
+        first-root (.joinpath base "one") second-root (.joinpath base "two")
+        _ (.mkdir first-root) _ (.mkdir second-root)
+        source "(ns shared (:require [provider :as p]) (:import [api]))\n(defn target [x] x)\n(target 1)\n(api/value)\n(p/target 1)"
+        first-uri (.as_uri (.joinpath first-root "shared.lpy"))
+        second-uri (.as_uri (.joinpath second-root "shared.lpy"))
+        c (client first-root)]
+    (try
+      (doseq [root [first-root second-root]]
+        (.write_text (.joinpath root "shared.lpy") source ** :encoding "utf-8")
+        (.write_text (.joinpath root "provider.lpy") "(ns provider) (defn target [x] x)" ** :encoding "utf-8")
+        (let [executable (.joinpath root ".venv" "bin" "python")]
+          (.mkdir (.-parent executable) ** :parents true)
+          (.write_text executable (str "#!/bin/sh\nprintf selected > '" (.joinpath root "selected-python")
+                                       "'\nexec '" sys/executable "' \"$@\"\n") ** :encoding "utf-8")
+          (.chmod executable 0755)))
+      (.write_text (.joinpath first-root "api.py") "def value():\n    \"\"\"First workspace.\"\"\"\n    return 1\n" ** :encoding "utf-8")
+      (.write_text (.joinpath second-root "api.py") "def value():\n    \"\"\"Second workspace.\"\"\"\n    return 2\n" ** :encoding "utf-8")
+      (result! c "initialize" {:workspaceFolders [{:uri (.as_uri first-root) :name "one"}
+                                                  {:uri (.as_uri second-root) :name "two"}]
+                               :initializationOptions {:source-paths ["."] :text-document-sync-kind "full"}
+                               :capabilities {:workspace {:workspaceEdit {:documentChanges true}}}})
+      (notification! c "initialized" {})
+      (open! c first-uri source)
+      (open! c second-uri source)
+      (doseq [[uri doc root] [[first-uri "First workspace." first-root] [second-uri "Second workspace." second-root]]]
+        (is (= (.as_uri (.joinpath root "provider.lpy"))
+               (:uri (result! c "textDocument/definition" (at uri 4 5)))))
+        (is (= 2 (count (:documentChanges (result! c "textDocument/rename"
+                                                   (assoc (at uri 4 5) :newName "remote-renamed"))))))
+        (is (= uri (:uri (result! c "textDocument/definition" (at uri 2 3)))))
+        (is (<= 0 (.find (get-in (result! c "textDocument/hover" (at uri 3 4)) [:contents :value]) doc)))
+        (is (.is_file (.joinpath root "selected-python")))
+        (is (= 1 (count (:documentChanges (result! c "textDocument/rename"
+                                                   (assoc (at uri 2 3) :newName "renamed")))))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest python-builtins-qualified-and-expression-completion-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "completion.lpy"))
+        source "(ns completion (:import [pathlib] [math :refer [sqrt]]))\npython/le\npathlib/Path.ho\nsqr\n(.read_ (pathlib/Path \".\"))"]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (doseq [[line col label] [[1 9 "python/len"] [2 15 "pathlib/Path.home"]
+                                [3 3 "sqrt"] [4 7 ".read_text"]]]
+        (is (some #(= label (:label %)) (:items (result! c "textDocument/completion" (at uri line col))))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest python-overloads-chain-and-property-editor-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "rich.lpy"))
+        source "(ns rich (:import [api]))\n(api/select 1 2)\n(let [v (api/Value)] (.method v 1))\n(.upp (.-name (api/Value)))"]
+    (try
+      (.write_text (.joinpath root "api.pyi")
+                   "from typing import overload\n@overload\ndef select(value: int) -> str: ...\n@overload\ndef select(value: int, fallback: str) -> str: ...\nclass Value:\n    @property\n    def name(self) -> str: ...\n    @overload\n    def method(self, value: int) -> str: ...\n    @overload\n    def method(self, value: str, *, upper: bool = ...) -> str: ...\n"
+                   ** :encoding "utf-8")
+      (initialize! c root)
+      (open! c uri source)
+      (let [help (result! c "textDocument/signatureHelp" (at uri 1 14))]
+        (is (= 2 (count (:signatures help))))
+        (is (= 1 (:activeSignature help))))
+      (let [help (result! c "textDocument/signatureHelp" (at uri 2 31))]
+        (is (= 2 (count (:signatures help))))
+        (is (every? #(not (some #{"self"} (map :label (:parameters %)))) (:signatures help))))
+      (is (some #(= ".upper" (:label %))
+                (:items (result! c "textDocument/completion" (at uri 3 5)))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest semantic-tokens-disabled-and-utf8-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        c (client root) uri (.as_uri (.joinpath root "encoding.lpy"))]
+    (try
+      (let [init (result! c "initialize"
+                          {:rootUri (.as_uri root) :initializationOptions {:semantic-tokens? false}
+                           :capabilities {:general {:positionEncodings ["utf-8"]}}})]
+        (is (nil? (get-in init [:capabilities :semanticTokensProvider])))
+        (is (= "utf-8" (get-in init [:capabilities :positionEncoding]))))
+      (notification! c "initialized" {})
+      (open! c uri "(ns encoding) (let [x 1] [\"😀\" x])")
+      (is (empty? (:data (result! c "textDocument/semanticTokens/range"
+                                  {:textDocument {:uri uri}
+                                   :range {:start {:line 0 :character 0} :end {:line 1 :character 0}}}))))
+      (is (empty? (result! c "textDocument/prepareCallHierarchy" (at uri 0 1))))
+      (notification! c "workspace/didChangeConfiguration" {:settings {:semantic-tokens? true}})
+      (let [data (:data (result! c "textDocument/semanticTokens/full" {:textDocument {:uri uri}}))
+            tokens (absolute-tokens data)]
+        (is (some #(= [0 33 1 6 0] %) tokens)))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest project-python-paths-and-interpreter-settings-test
+  (let [temp (tempfile/TemporaryDirectory) base (pathlib/Path (.-name temp))
+        launch-root (.joinpath base "launch") project-root (.joinpath base "project")
+        _ (.mkdir launch-root) _ (.mkdir project-root)
+        config (.joinpath project-root ".lsp" "config.edn")
+        executable (.joinpath project-root "bin" "project-python")
+        marker (.joinpath project-root "selected-python")
+        _ (.mkdir (.-parent config)) _ (.mkdir (.-parent executable))
+        environment (.copy os/environ)
+        _ (.__setitem__ environment "PATH" (str (.-parent executable) os/pathsep (.get os/environ "PATH" "")))
+        c (client launch-root environment)
+        uri (.as_uri (.joinpath project-root "configured.lpy"))]
+    (try
+      (doseq [[root doc] [[launch-root "Wrong launch directory."] [project-root "Correct project directory."]]]
+        (.mkdir (.joinpath root "lib"))
+        (.write_text (.joinpath root "lib" "onlylocal.py")
+                     (str "def value():\n    \"\"\"" doc "\"\"\"\n    return 1\n") ** :encoding "utf-8"))
+      (.write_text executable (str "#!/bin/sh\nprintf selected > '" marker
+                                   "'\nexec '" sys/executable "' \"$@\"\n") ** :encoding "utf-8")
+      (.chmod executable 0755)
+      (.write_text config "{:python {:paths [\"lib\"] :executable \"bin/project-python\"}}"
+                   ** :encoding "utf-8")
+      (initialize! c project-root)
+      (open! c uri "(ns configured (:import [onlylocal]))\n(onlylocal/value)")
+      (is (<= 0 (.find (get-in (result! c "textDocument/hover" (at uri 1 5)) [:contents :value])
+                       "Correct project directory.")))
+      (is (.is_file marker))
+      (.unlink marker)
+      (.write_text config "{:python {:paths [\"lib\"] :executable \"project-python\"}}"
+                   ** :encoding "utf-8")
+      (notification! c "workspace/didChangeConfiguration" {:settings {}})
+      (is (<= 0 (.find (get-in (result! c "textDocument/hover" (at uri 1 5)) [:contents :value])
+                       "Correct project directory.")))
+      (is (.is_file marker))
       (finally (stop! c) (.cleanup temp)))))

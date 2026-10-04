@@ -16,8 +16,10 @@ The server communicates over stdio. Logs go to stderr.
 - Diagnostics from the same analyzer as `blt check`.
 - Formatting using the same formatter as `blt format`.
 - Completion for local bindings, project definitions, Basilisp core, and Python members.
-- Hover documentation, signatures, definitions, and references.
+- Hover documentation, definitions, references, and signature help, including Python overloads.
 - Rename for resolved Basilisp bindings, with conflict checks.
+- Semantic highlighting, reference lenses, and incoming/outgoing Basilisp calls.
+- Quick fixes for unused bindings when a safe rename is possible.
 - Document and workspace symbols.
 
 Analysis includes unsaved changes and never evaluates Basilisp code. Range
@@ -72,12 +74,31 @@ respective editor features.
 
 Document synchronization defaults to `:full`; `:incremental` sends changed ranges.
 Restart the server after changing synchronization or formatting capabilities.
-Hover settings also include `:arity-on-same-line?`.
+Hover settings also include `:arity-on-same-line?`. Semantic highlighting defaults
+to enabled; set `:semantic-tokens? false` and restart to disable it. Reference
+lenses use the `code-lens-references` command, which returns LSP locations; the
+editor needs a handler to display them. `:code-lens {:segregate-test-references true}`
+separates test references using `:test-locations-regex`.
 
-Python inspection uses the workspace's `.venv` when present, otherwise the
-interpreter running blt. `--python`, `--python-timeout`, and
-`--no-python-inspection` work as described in [Checking](checking.md#python-inspection),
-including the fact that runtime inspection executes package import code.
+### Python
+
+Each workspace uses its own `.venv` when present, otherwise the interpreter
+running blt. Select a different environment in `.lsp/config.edn`:
+
+```clojure
+{:python {:executable ".venv/bin/python"
+          :paths ["src"]}}
+```
+
+An explicit `--python` takes precedence. `--python-timeout` and
+`--no-python-inspection` work as described in [Checking](checking.md#python-inspection).
+Use `:python {:inspection? false}` to disable inspection for a workspace. Runtime
+inspection executes package import code; source and stub inspection do not.
+
+Completion, hover, and signature help follow inspected Python members and inferred
+return types. Workspace caches are cleared on settings or environment-file changes
+reported by the client. Restart the server after changing an environment if your
+client does not send file-watch notifications.
 
 ## Limitations
 

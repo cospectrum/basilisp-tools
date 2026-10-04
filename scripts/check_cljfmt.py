@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 CLJFMT_REVISION = "baab5008032945434cbca23ef5eda516e3ea97b0"
@@ -42,6 +43,7 @@ def main() -> int:
     import basilisp_tools  # noqa: F401
     from basilisp.lang.keyword import keyword as kw
     from basilisp.lang.map import map as lmap
+    from basilisp.lang.vector import vector
 
     edn = importlib.import_module("basilisp.edn")
     formatter = importlib.import_module("basilisp_tools.format")
@@ -67,9 +69,21 @@ def main() -> int:
             output.read_text(encoding="utf-8"),
             lmap({kw("default"): tagged_reader}),
         )
+        # Corpus sources can be hundreds of KB each. Transport them as UTF-8
+        # files rather than making the EDN reader decode huge escaped strings.
+        corpus_cases = []
+        for case in captured.val_at(kw("corpus")):
+            item = dict(case)
+            for field_name in ("source", "expected"):
+                path = item.pop(kw(f"{field_name}-file"), None)
+                if path is not None:
+                    item[kw(field_name)] = Path(path).read_bytes().decode("utf-8")
+            corpus_cases.append(lmap(item))
+        captured = captured.assoc(kw("corpus"), vector(corpus_cases))
 
     counts = collections.Counter()
     findings = []
+    timings = []
 
     def field(value, name, default=None):
         return value.val_at(kw(name), default)
@@ -100,7 +114,6 @@ def main() -> int:
         if oracle_error:
             counts["oracle-unsupported"] += 1
             findings.append({**details, "kind": "oracle-unsupported", "reason": oracle_error})
-            return
         diagnostics = field(syntax.parse(source), "diagnostics")
         if len(diagnostics):
             reason = unsupported_reason(source, diagnostics)
@@ -115,6 +128,7 @@ def main() -> int:
                 **details, "kind": kind, "reason": reason or str(diagnostics)
             })
             return
+        started = time.perf_counter()
         try:
             actual = formatter.format_string(source, options)
             repeated = formatter.format_string(actual, options)
@@ -122,7 +136,11 @@ def main() -> int:
             counts["exception"] += 1
             findings.append({**details, "kind": "exception", "reason": str(exception)})
             return
-        if actual != expected:
+        timings.append({"name": name, "characters": len(source),
+                        "seconds": round(time.perf_counter() - started, 4)})
+        if oracle_error:
+            counts["basilisp-preserved"] += 1
+        elif actual != expected:
             counts["mismatch"] += 1
             findings.append({
                 **details, "kind": "mismatch", "expected": expected, "actual": actual
@@ -141,13 +159,20 @@ def main() -> int:
     for index, case in enumerate(cases, 1):
         compare(case)
         if index % 100 == 0:
-            print(f"Compared {index} upstream cases.", flush=True)
-    for case in field(captured, "corpus"):
+            print(f"Compared {index} formatting cases.", flush=True)
+    for index, case in enumerate(field(captured, "corpus"), 1):
         compare(case)
+        if index % 10 == 0:
+            print(f"Compared {index} corpus files.", flush=True)
 
     report = {
-        "cljfmt_revision": revision, "upstream_cases": len(cases),
+        "cljfmt_revision": revision,
+        "upstream_cases": field(captured, "upstream-count", len(cases)),
+        "regression_cases": field(captured, "regression-count", 0),
+        "corpus_files": len(field(captured, "corpus")),
         "counts": dict(counts), "findings": findings,
+        "format_seconds": round(sum(item["seconds"] for item in timings), 4),
+        "slowest": sorted(timings, key=lambda item: item["seconds"], reverse=True)[:10],
     }
     if args.report:
         args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

@@ -1,0 +1,96 @@
+(ns basilisp-tools.check-output-test
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.check :as check])
+  (:import [json] [pathlib] [tempfile]))
+
+(defn- analyze [source config]
+  (check/run {:stdin source :filename "sample.lpy" :repro true :python-inspection? false
+              :config-dir "/tmp/blt-output-tests-no-config" :config config}))
+
+(defn- analysis [source config]
+  (:analysis (edn/read-string (check/output (analyze source config) :edn))))
+
+(deftest analysis-output-schema-test
+  (let [result (analysis "(ns sample)\n(def ^:private answer 42)\nanswer"
+                         "{:output {:analysis true}}")
+        definition (first (:var-definitions result))
+        usage (last (:var-usages result))]
+    (is (= #{:namespace-definitions :namespace-usages :var-definitions :var-usages} (set (keys result))))
+    (is (= 'sample (:name (first (:namespace-definitions result)))))
+    (is (= 'answer (:name definition)))
+    (is (= 'basilisp.core/def (:defined-by definition)))
+    (is (= {:row 2 :col 1 :name-row 2 :name-col 16}
+           (select-keys definition [:row :col :name-row :name-col])))
+    (is (:private definition))
+    (is (= 'sample (:to usage)))
+    (is (nil? (:definition usage)))
+    (is (nil? (:scope-start definition))))
+  (is (nil? (analysis "(def x 1)" "{}")))
+  (is (nil? (analysis "(def x 1)" "{:analysis false :output {:analysis true}}")))
+  (is (not (contains? (analysis "(def x 1)" "{:analysis {:var-usages false}}") :var-usages))))
+
+(deftest analysis-metadata-and-locals-test
+  (let [result (analysis "(ns ^{:custom 1} sample)\n(defn ^{:added \"1\" :custom 2} f [a] (let [b a] b))"
+                         "{:analysis {:var-usages false :locals true :arglists true
+                                     :var-definitions {:meta [:custom]}
+                                     :namespace-definitions {:meta true}}}")
+        locals (:locals result) usages (:local-usages result)]
+    (is (= {:custom 1} (:meta (first (:namespace-definitions result)))))
+    (is (= {:custom 2} (:meta (first (:var-definitions result)))))
+    (is (= ["[a]"] (:arglist-strs (first (:var-definitions result)))))
+    (is (= [1 2] (mapv :id locals)))
+    (is (= [1 2] (mapv :id usages)))
+    (is (= ['a 'b] (mapv :name locals)))
+    (is (every? #(contains? % :scope-end-col) locals))
+    (is (every? #(contains? % :name-end-col) usages)))
+  (let [result (analysis "(ns sample)\n(let [x \"😀\"] x)" "{:analysis {:locals true}}")]
+    (is (= 15 (:col (first (:local-usages result)))))))
+
+(deftest keyword-analysis-test
+  (let [result (analysis "(ns sample (:require [example.util :as u]))\n#_[:discard] [:plain :abc/key ::local ::u/key]"
+                         "{:analysis {:keywords true}}")
+        keywords (:keywords result)]
+    (is (= ["require" "as" "plain" "key" "local" "key"] (mapv :name keywords)))
+    (is (= ['user 'user 'sample 'sample 'sample 'sample] (mapv :from keywords)))
+    (is (= 'sample (:ns (nth keywords 4))))
+    (is (= 'example.util (:ns (nth keywords 5))))
+    (is (= 'u (:alias (nth keywords 5))))
+    (is (:auto-resolved (nth keywords 5)))))
+
+(deftest sarif-output-test
+  (let [result (analyze "(ns sample)\nmissing" "{}")
+        data (json/loads (check/output result :sarif))
+        run (python/next (python/iter (.get data "runs")))
+        finding (python/next (python/iter (.get run "results")))
+        location (python/next (python/iter (.get finding "locations")))
+        physical (.get location "physicalLocation")]
+    (is (= "2.1.0" (.get data "version")))
+    (is (= "basilisp-tools" (.get (.get (.get run "tool") "driver") "name")))
+    (is (= "unresolved-symbol" (.get finding "ruleId")))
+    (is (= "error" (.get finding "level")))
+    (is (= "sample.lpy" (.get (.get physical "artifactLocation") "uri")))
+    (is (= 2 (.get (.get physical "region") "startLine"))))
+  (let [result (assoc-in (analyze "missing" "{}") [:findings 0 :filename] "src/a file.lpy")]
+    (is (>= (.find (check/output result :sarif) "src/a%20file.lpy") 0)))
+  (let [result (analyze "(let [unused 1] nil)" "{:linters {:unused-binding {:level :info}}}")]
+    (is (>= (.find (check/output result :sarif :error) "\"note\"") 0))))
+
+(deftest parallel-and-dependency-run-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        first-file (.joinpath root "first.lpy") second-file (.joinpath root "second.lpy")
+        options {:paths [(str root)] :config-dir (str (.joinpath root ".clj-kondo"))
+                 :repro true :python-inspection? false :config "{:analysis true}"}]
+    (try
+      (.write_text first-file "(ns first)\n(def x 1)" ** :encoding "utf-8")
+      (.write_text second-file "(ns second)\nmissing\n(" ** :encoding "utf-8")
+      (let [sequential (check/run options) parallel (check/run (assoc options :parallel true))]
+        (is (= (:findings sequential) (:findings parallel)))
+        (is (= (check/analysis-output sequential) (check/analysis-output parallel)))
+        (is (= 2 (get-in parallel [:summary :files])))
+        (is (= 3 (check/exit-status parallel))))
+      (let [result (check/run (assoc options :dependencies true :parallel true))]
+        (is (empty? (:findings result)))
+        (is (= 0 (check/exit-status result)))
+        (is (= 2 (count (:namespace-definitions (check/analysis-output result))))))
+      (finally (.cleanup temp)))))

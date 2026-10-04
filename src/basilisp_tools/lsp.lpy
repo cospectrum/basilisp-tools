@@ -150,6 +150,32 @@
 (defn- settings-for [state uri]
   (get-in @state [:settings-by-root (root-for state uri)] (:settings @state)))
 
+(declare source-paths)
+
+(defn- options-for [state uri]
+  (let [root (root-for state uri)
+        options (:options @state)
+        settings (settings-for state uri)
+        configured (:python settings)
+        executable (or (:python-executable options)
+                       (when-let [executable (:executable configured)]
+                         (if (or (str/includes? executable "/") (str/includes? executable "\\"))
+                           (str (.joinpath (pathlib/Path (or root (.cwd pathlib/Path))) executable))
+                           executable))
+                       (when root
+                         (some (fn [name]
+                                 (let [path (.joinpath (pathlib/Path root) name)]
+                                   (when (.is_file path) (str path))))
+                               [".venv/bin/python" ".venv/Scripts/python.exe"]))
+                       sys/executable)]
+    (cond-> (assoc options :python-executable executable
+                   :python-paths (vec (distinct (concat
+                                                 (when root (cons root (source-paths root settings)))
+                                                 (map #(str (.joinpath (pathlib/Path (or root (.cwd pathlib/Path))) %))
+                                                      (:paths configured))
+                                                 (:python-paths options)))))
+      (contains? configured :inspection?) (assoc :python-inspection? (:inspection? configured)))))
+
 (defn- ignored-path? [settings path]
   (some #(re/fullmatch % (str path)) (:paths-ignore-regex settings)))
 
@@ -174,9 +200,9 @@
     (when changed?
       (swap! state assoc :settings settings :settings-by-root by-root :analyses {})
       (swap! state update :generation inc)
-      (swap! state assoc-in [:options :python-paths]
-             (vec (distinct (mapcat (fn [[root settings]] (cons root (source-paths root settings)))
-                                    by-root)))))
+      (swap! state assoc :tokens {})
+      (py/clear-cache! (:python-cache (:options @state)))
+      (reset! (:dependency-cache (:options @state)) {}))
     changed?))
 
 (declare index!)
@@ -232,9 +258,16 @@
 (defn- source-file [document]
   (if-let [path (file-path (.-uri document))] (str path) (.-uri document)))
 
+(defn- client-position [document offset]
+  (let [source (.-source document) offset (max 0 (min offset (count source)))]
+    (if (and (pos? offset) (= offset (count source)) (not (.endswith source "\n")))
+      (let [position (.server_position_at_offset document (dec offset))]
+        (.position_to_client_units document (lsp/Position (.-line position) (inc (.-character position)))))
+      (.client_position_at_offset document offset))))
+
 (defn- span [document start end]
-  (lsp/Range (.client_position_at_offset document (max 0 start))
-             (.client_position_at_offset document (max start end))))
+  (lsp/Range (client-position document (max 0 start))
+             (client-position document (max start end))))
 
 (defn- location [state item]
   (when-let [filename (:filename item)]
@@ -288,7 +321,7 @@
                          [:unresolved-symbol :unresolved-namespace :unresolved-var]) config)]
     (analyzer/analyze (.-source document)
                       {:filename filename :project project :config config
-                       :python-options options})))
+                       :python-options options :dependency-cache (:dependency-cache options)})))
 
 (def ^:private unnecessary-diagnostics
   #{:redefined-var :redundant-do :redundant-expression :redundant-let :unused-binding
@@ -334,21 +367,28 @@
             (apply (functools/partial asyncio/gather ** :return_exceptions true)
                    (vals (:reloads @state)))))))
 
-(defasync ^:private project! [state]
+(defn- workspace-documents [state uri]
+  (let [root (when uri (root-for state uri))]
+    (if uri
+      (into {} (filter (fn [[candidate _]] (= root (root-for state candidate))) (:documents @state)))
+      (:documents @state))))
+
+(defasync ^:private project! [state uri]
   (await (wait-reloads! state))
-  (let [generation (:generation @state) cached (:project-cache @state)]
+  (let [generation (:generation @state) root (root-for state uri)
+        cached (get-in @state [:project-caches root])]
     (if (= generation (:generation cached))
       (:project cached)
-      (let [pending (:project-pending @state)
+      (let [pending (get-in @state [:project-pending root])
             task (if (= generation (:generation pending))
                    (:task pending)
                    (let [task (asyncio/create_task
-                               (asyncio/to_thread declaration-index (:documents @state)))]
-                     (swap! state assoc :project-pending {:generation generation :task task})
+                               (asyncio/to_thread declaration-index (workspace-documents state uri)))]
+                     (swap! state assoc-in [:project-pending root] {:generation generation :task task})
                      task))
             project (await (asyncio/shield task))]
         (when (= generation (:generation @state))
-          (swap! state assoc :project-cache {:generation generation :project project}))
+          (swap! state assoc-in [:project-caches root] {:generation generation :project project}))
         project))))
 
 (defasync ^:private analyzed! [state uri]
@@ -360,8 +400,8 @@
       (if (and (= (.-source document) (:source cached))
                (= generation (:generation cached)))
         (:analysis cached)
-        (let [project (await (project! state))
-              result (await (asyncio/to_thread analyze-document document project (:options @state)
+        (let [project (await (project! state uri))
+              result (await (asyncio/to_thread analyze-document document project (options-for state uri)
                                                (settings-for state uri)))]
           (if (and (= generation (:generation @state))
                    (= (.-source document) (some-> (get-in @state [:documents uri]) .-source)))
@@ -452,14 +492,16 @@
      :item (or (occurrence analysis offset)
                (when (pos? offset) (occurrence analysis (dec offset))))}))
 
-(defasync ^:private all-analyses! [state]
-  (refresh-settings! state)
-  (await (wait-index! state))
-  (await (wait-reloads! state))
-  (loop [uris (keys (:documents @state)) result {}]
-    (if-let [uri (first uris)]
-      (recur (rest uris) (assoc result uri (await (analyzed! state uri))))
-      result)))
+(defasync ^:private all-analyses!
+  ([state] (await (all-analyses! state nil)))
+  ([state uri]
+   (refresh-settings! state)
+   (await (wait-index! state))
+   (await (wait-reloads! state))
+   (loop [uris (keys (workspace-documents state uri)) result {}]
+     (if-let [uri (first uris)]
+       (recur (rest uris) (assoc result uri (await (analyzed! state uri))))
+       result))))
 
 (defn- occurrences [analyses identity declarations?]
   (for [[uri analysis] analyses
@@ -477,7 +519,9 @@
 (defn- markdown
   ([definition] (markdown definition {}))
   ([definition settings]
-   (let [signature (or (:signature definition)
+   (let [signature (or (when (seq (:overloads definition))
+                         (str/join "\n" (map :signature (:overloads definition))))
+                       (:signature definition)
                        (when (seq (:arglists definition))
                          (str/join " " (:arglists definition))))
          doc (:doc definition)]
@@ -521,7 +565,7 @@
            (not (some #(and (= (:start definition) (:start %))
                             (= (:filename definition) (:filename %))
                             (not= (:name definition) (:name %)))
-                      (vals (get-in @state [:project-cache :project (:ns definition)]))))
+                      (vals (get-in @state [:project-caches (root-for state (.-uri document)) :project (:ns definition)]))))
            (not (type-or-protocol-binding? document definition))
            (not (and (:id definition) (map-binding? document definition)))))))
 
@@ -575,7 +619,10 @@
                              (filter #(and (= receiver (:name %))
                                            (<= (:scope-start % 0) offset) (<= offset (:scope-end % offset)))
                                      (:locals analysis))))
-        type (:python-type local)]
+        receiver-node (second (syntax/forms form))
+        expression (last (filter #(and (= (:start %) (:start receiver-node))
+                                       (= (:end %) (:end receiver-node))) (:python-expressions analysis)))
+        type (or (:python-type expression) (:python-type local))]
     (when type
       (let [info (py/inspect-path (:module type) (:path type) options)
             attribute? (.startswith prefix ".-")
@@ -588,13 +635,16 @@
     (.startswith prefix ".") (method-candidates analysis offset prefix options)
     (str/includes? prefix "/")
     (let [[alias member-prefix] (str/split prefix #"/" 2)
-          module (:name (get (:imports analysis) alias))]
+          module (if (= alias "python") "builtins" (:name (get (:imports analysis) alias)))]
       (if module
-        (let [info (py/inspect-module module options)]
-          (for [[name definition] (:members info) :when (.startswith name member-prefix)]
-            [(str alias "/" name) definition]))
+        (let [parts (vec (.split member-prefix "."))
+              path (vec (butlast parts)) suffix (last parts)
+              info (if (seq path) (py/inspect-path module path options) (py/inspect-module module options))
+              qualifier (if (seq path) (str (str/join "." path) ".") "")]
+          (for [[name definition] (:members info) :when (.startswith name suffix)]
+            [(str alias "/" qualifier name) definition]))
         (let [ns (get (:aliases analysis) alias alias)]
-          (for [[name definition] (analyzer/namespace-symbols ns {:project (:project analysis)})
+          (for [[name definition] (analyzer/namespace-symbols ns {:project (:project analysis) :python-options options :dependency-cache (:dependency-cache options)})
                 :when (and (not (:private definition)) (.startswith name member-prefix))]
             [(str alias "/" name) definition]))))
     :else
@@ -606,9 +656,13 @@
      (for [[name definition] (:definitions analysis) :when (.startswith name prefix)]
        [name definition])
      (for [[alias referred] (:refers analysis) :when (.startswith alias prefix)
-           :let [definition (get (analyzer/namespace-symbols (:ns referred) {:project (:project analysis)})
+           :let [definition (get (analyzer/namespace-symbols (:ns referred) {:project (:project analysis) :python-options options :dependency-cache (:dependency-cache options)})
                                  (:name referred))]
            :when definition]
+       [alias definition])
+     (for [[alias referred] (:python-refers analysis) :when (.startswith alias prefix)
+           :let [definition (py/inspect-path (:name referred) [(:member referred)] options)]
+           :when (= :known (:status definition))]
        [alias definition])
      (for [[alias original] (:core-renamed analysis) :when (.startswith alias prefix)]
        [alias (get (analyzer/core-symbols) original)])
@@ -619,6 +673,202 @@
                       (or (nil? (:core-only analysis)) (contains? (:core-only analysis) name)))]
        [name definition]))))
 
+;; These queries share the analyzer's resolved identities and source offsets.
+;; All protocol positions pass through TextDocument's negotiated position codec.
+(defn- call-at [analysis offset]
+  (last (sort-by :start (filter #(and (<= (:start %) offset) (<= offset (:end %)))
+                                (:calls analysis)))))
+
+(defn- arglist-parameters [arglist]
+  (let [nodes (syntax/forms (first (syntax/forms (:root (syntax/parse arglist)))))]
+    (loop [nodes nodes result []]
+      (if-let [node (first nodes)]
+        (if (= "&" (:text node))
+          (conj result {:name (str "& " (syntax/text (second nodes))) :kind :var-positional})
+          (recur (rest nodes) (conj result {:name (syntax/text node) :kind :positional-or-keyword})))
+        result))))
+
+(defn- signature-variants [definition]
+  (if (seq (:arglists definition))
+    (mapv (fn [arglist] {:signature (str "(" (:name definition) " " arglist ")")
+                         :parameters (arglist-parameters arglist) :doc (:doc definition)})
+          (:arglists definition))
+    (when (:signature definition)
+      (mapv #(assoc % :signature (str (:name definition) (:signature %)) :doc (:doc definition))
+            (or (seq (:overloads definition)) [definition])))))
+
+(defn- signature-help [analysis document offset]
+  (when-let [call (call-at analysis offset)]
+    (let [variants (signature-variants (:definition call))
+          arguments (:arguments call)
+          before (vec (filter #(<= (:start %) offset) arguments))
+          marker (first (keep-indexed #(when (= "**" (subs (.-source document) (:start %2) (:end %2))) %1) arguments))
+          keyword-node (when (and marker (> (count before) (inc marker)))
+                         (nth arguments (+ marker 1 (* 2 (quot (- (count before) marker 2) 2))) nil))
+          keyword-name (when keyword-node
+                         (let [value (subs (.-source document) (:start keyword-node) (:end keyword-node))
+                               node (first (syntax/forms (:root (syntax/parse value))))]
+                           (analyzer/python-keyword-name node)))
+          positional (if marker marker (count arguments))
+          index (or (first (keep-indexed
+                            (fn [index variant]
+                              (let [params (:parameters variant)
+                                    fixed (count (filter #(contains? #{:positional-only :positional-or-keyword}
+                                                                     (:kind %)) params))]
+                                (when (or (= fixed positional)
+                                          (and (<= (count (filter #(and (contains? #{:positional-only :positional-or-keyword} (:kind %))
+                                                                        (:required? % true)) params)) positional)
+                                               (or (<= positional fixed)
+                                                   (some #(= :var-positional (:kind %)) params)))) index)))
+                            variants))
+                    (when (seq variants) (dec (count variants))))
+          active (when index
+                   (let [params (:parameters (nth variants index))]
+                     (when (seq params)
+                       (or (when keyword-name
+                             (first (keep-indexed #(when (= keyword-name (:name %2)) %1) params)))
+                           (max 0 (min (dec (count params))
+                                       (if (and (seq before) (> offset (:end (last before))))
+                                         (count before) (dec (count before)))))))))]
+      (when (seq variants)
+        (lsp/SignatureHelp
+         (python/list
+          (map (fn [variant]
+                 (lsp/SignatureInformation
+                  (:signature variant) ** :documentation (:doc variant)
+                  :parameters (python/list (map #(lsp/ParameterInformation (:name %)) (:parameters variant)))))
+               variants))
+         ** :active_signature index :active_parameter active)))))
+
+(def ^:private token-types
+  ["namespace" "type" "function" "macro" "keyword" "class" "variable" "method" "event" "interface" "comment"])
+(def ^:private token-modifiers ["definition" "defaultLibrary" "implementation"])
+
+(defn- split-token [start text kind modifier prefix]
+  (let [slash (.find text "/")]
+    (if (and (pos? slash) (< slash (dec (count text))))
+      [[(+ start prefix) (+ start slash) 1 0]
+       [(+ start slash) (+ start slash 1) 8 0]
+       [(+ start slash 1) (+ start (count text)) kind modifier]]
+      [[(+ start prefix) (+ start (count text)) kind modifier]])))
+
+(defn- semantic-spans [analysis document]
+  (let [source (.-source document) tree (syntax/parse source) nodes (syntax/nodes (:root tree))
+        discarded (filter #(= :discard (:kind %)) nodes)
+        discarded (remove (fn [node]
+                            (some #(and (< (:start %) (:start node)) (<= (:end node) (:end %)))
+                                  discarded)) discarded)
+        ignored? (fn [start] (some #(and (<= (:start %) start) (< start (:end %))) discarded))
+        items (concat
+               (for [item (:namespace-definitions analysis)] [item 0 0])
+               (for [item (:locals analysis)] [item 6 0])
+               (for [item (:local-usages analysis)] [item 6 0])
+               (for [item (:var-definitions analysis)] [item (if (:protocol item) 9 2) 1])
+               (for [item (:var-usages analysis)] [item (if (get-in item [:definition :macro]) 3 2) 0])
+               (for [item (:python-usages analysis)]
+                 [item (case (get-in item [:definition :kind]) :module 0 :class 5 :property 6
+                             (if (.startswith (:name item "") ".") 7 2)) 0]))
+        ranges (concat
+                (mapcat (fn [[item kind modifier]]
+                          (let [start (:start item) end (:end item)]
+                            (when (and start end (<= 0 start end (count source)) (not (ignored? start)))
+                              (split-token start (subs source start end) kind modifier 0)))) items)
+                (mapcat (fn [node]
+                          (when (and (= :keyword (:kind node)) (not (ignored? (:start node))))
+                            (split-token (:start node) (:text node) 4 0
+                                         (if (.startswith (:text node) "::") 2 1)))) nodes)
+                (for [node discarded] [(:start node) (:end node) 10 0]))]
+    (sort-by first (distinct ranges))))
+
+(defn- semantic-data [analysis document requested-range]
+  (let [lower (if requested-range (.offset_at_position document (.-start requested-range)) 0)
+        upper (if requested-range (.offset_at_position document (.-end requested-range)) (count (.-source document)))
+        tokens (mapcat
+                (fn [[start end kind modifiers]]
+                  (when (and (< start end) (< start upper) (< lower end))
+                     ;; Split reader-discard comments into individual lines. This
+                     ;; works even when the client does not support multiline tokens.
+                    (loop [start start result []]
+                      (if (>= start end) result
+                          (let [newline (.find (.-source document) "\n" start end)
+                                stop (if (neg? newline) end newline)
+                                token-end (if (and (> stop start) (= "\r" (subs (.-source document) (dec stop) stop)))
+                                            (dec stop) stop)
+                                from (client-position document start)
+                                to (client-position document token-end)
+                                length (- (.-character to) (.-character from))
+                                result (if (pos? length)
+                                         (conj result [(.-line from) (.-character from) length kind modifiers]) result)]
+                            (recur (inc stop) result))))))
+                (semantic-spans analysis document))]
+    (:data (reduce (fn [{:keys [line column end-line end-column data] :as previous}
+                        [row col length kind modifiers]]
+                     (if (and (= row end-line) (< col end-column)) previous
+                         {:line row :column col :end-line row :end-column (+ col length)
+                          :data (into data [(- row line) (if (= row line) (- col column) col)
+                                            length kind modifiers])}))
+                   {:line 0 :column 0 :end-line -1 :end-column 0 :data []} tokens))))
+
+(defn- token-response! [state uri data previous-id]
+  (let [previous (get-in @state [:tokens uri])
+        id (str (swap! (:token-sequence @state) inc))]
+    (swap! state assoc-in [:tokens uri] {:id id :data data})
+    (if (and previous-id (= previous-id (:id previous)))
+      (let [before (:data previous)
+            prefix (count (take-while true? (map = before data)))
+            suffix (count (take-while true? (map = (reverse (drop prefix before))
+                                                 (reverse (drop prefix data)))))
+            removed (- (count before) prefix suffix)
+            replacement (subvec data prefix (- (count data) suffix))]
+        (lsp/SemanticTokensDelta
+         (if (and (zero? removed) (empty? replacement)) #py []
+             #py [(lsp/SemanticTokensEdit prefix removed ** :data (python/list replacement))])
+         ** :result_id id))
+      (lsp/SemanticTokens (python/list data) ** :result_id id))))
+
+(defn- reference-title [references noun]
+  (str (count references) " " noun (when (not= 1 (count references)) "s")))
+
+(defn- hierarchy-item [state definition]
+  (when-let [loc (location state definition)]
+    (let [document (get-in @state [:documents (.-uri loc)])]
+      (lsp/CallHierarchyItem
+       (:name definition) (definition-kind definition) (.-uri loc)
+       (if (and document (:scope-start definition))
+         (span document (:scope-start definition) (:scope-end definition)) (.-range loc))
+       (.-range loc) ** :detail (:ns definition)
+       :data (lisp->py {:ns (:ns definition) :name (:name definition)
+                        :filename (:filename definition)})))))
+
+(defn- item-identity [item]
+  (let [data (py->lisp (.-data item))]
+    [:var (:ns data) (:name data)]))
+
+(defn- unused-binding-actions [state uri document analysis requested-range context]
+  (let [start (.offset_at_position document (.-start requested-range))
+        end (.offset_at_position document (.-end requested-range))
+        only (.-only context)]
+    (python/list
+     (if (or (not (seq only)) (some #(or (= % "quickfix") (.startswith "quickfix" (str % "."))) only))
+       (for [finding (:findings analysis)
+             :when (and (= :unused-binding (:type finding))
+                        (<= (:start finding) end) (<= start (:end finding)))
+             :let [definition (first (filter #(= (:start finding) (:start %)) (:locals analysis)))
+                   name (:name definition)
+                   replacement (str "_" name)]
+             :when (and definition (valid-name? name) (not (map-binding? document definition))
+                        (not (type-or-protocol-binding? document definition))
+                        (not (some #(= replacement (:text %))
+                                   (syntax/nodes (:root (syntax/parse (.-source document)))))))]
+         (lsp/CodeAction
+          (str "Mark '" name "' as intentionally unused") ** :kind (.-QuickFix lsp/CodeActionKind)
+          :is_preferred true
+          :diagnostics #py [(diagnostic document finding (settings-for state uri))]
+          :edit (workspace-edit
+                 state #py [(lsp/TextDocumentEdit
+                             (lsp/OptionalVersionedTextDocumentIdentifier uri (.-version document))
+                             #py [(lsp/TextEdit (span document (:start definition) (:end definition)) replacement)])]))) []))))
+
 (defn create-server
   "Create a fresh server. The options map is forwarded to Python inspection."
   ([] (create-server {}))
@@ -626,7 +876,7 @@
    (let [ls (server/LanguageServer "blt" (metadata/version "basilisp-tools")
                                    ** :protocol_cls configured-protocol)
          state (atom {:documents {} :analyses {} :tasks {} :reloads {} :open #{}
-                      :generation 0 :options (dissoc options :force-settings)
+                      :tokens {} :token-sequence (atom 0) :generation 0 :options (assoc (dissoc options :force-settings) :python-cache (py/create-cache) :dependency-cache (analyzer/create-cache))
                       :force-settings (:force-settings options {})})
          feature (fn [method handler & [opts]] ((.feature ls method opts) handler))]
      (python/setattr ls "blt_force_settings" (:force-settings options {}))
@@ -645,17 +895,13 @@
                   (doseq [[method key] [[lsp/TEXT_DOCUMENT_FORMATTING :document-formatting?]
                                         [lsp/TEXT_DOCUMENT_RANGE_FORMATTING :document-range-formatting?]]]
                     (.__setitem__ (.-feature_options (.-fm (.-protocol ls))) method
-                                  (get (:settings @state) key true)))
-                  (let [executable (or (:python-executable options)
-                                       (some (fn [root]
-                                               (some (fn [name]
-                                                       (let [path (.joinpath (pathlib/Path root) name)]
-                                                         (when (.is_file path) (str path))))
-                                                     [".venv/bin/python" ".venv/Scripts/python.exe"]))
-                                             roots)
-                                       sys/executable)]
-                    (swap! state assoc :codec codec
-                           :options (assoc (:options @state) :python-executable executable)))
+                                  (boolean (some #(get % key true)
+                                                 (or (seq (vals (:settings-by-root @state))) [(:settings @state)])))))
+                  (when-not (some #(get % :semantic-tokens? true)
+                                  (or (seq (vals (:settings-by-root @state))) [(:settings @state)]))
+                    (.__setitem__ (.-feature_options (.-fm (.-protocol ls)))
+                                  lsp/TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL nil))
+                  (swap! state assoc :codec codec)
                   (swap! state assoc :index-task (asyncio/create_task (index! state roots))))))
      (feature lsp/INITIALIZED
               (fn [_params]
@@ -670,7 +916,11 @@
                                    (lsp/FileSystemWatcher "**/*.pyi")
                                    (lsp/FileSystemWatcher "**/config.edn")
                                    (lsp/FileSystemWatcher "**/project.clj")
-                                   (lsp/FileSystemWatcher "**/*cljfmt.edn")]))])))))
+                                   (lsp/FileSystemWatcher "**/*cljfmt.edn")
+                                   (lsp/FileSystemWatcher "**/*cljfmt.clj")
+                                   (lsp/FileSystemWatcher "**/pyproject.toml")
+                                   (lsp/FileSystemWatcher "**/uv.lock")
+                                   (lsp/FileSystemWatcher "**/pyvenv.cfg")]))])))))
      (feature lsp/WORKSPACE_DID_CHANGE_WORKSPACE_FOLDERS
               (fn [params]
                 (let [event (.-event params)
@@ -689,9 +939,8 @@
                                                                  (when-let [path (file-path uri)]
                                                                    (.is_relative_to path (pathlib/Path root))))
                                                                removed))) %)))
-                               (assoc :analyses {}) (update :generation inc)
-                               (assoc-in [:options :python-paths]
-                                         (vec (mapcat #(vector % (str (.joinpath (pathlib/Path %) "src"))) roots))))))
+                               (assoc :analyses {} :tokens {} :project-caches {} :project-pending {})
+                               (update :generation inc))))
                   (load-workspace-settings! state)
                   (swap! state assoc :index-task (asyncio/create_task (index! state roots)))
                   (doseq [uri (:open @state)]
@@ -715,6 +964,7 @@
                                  (-> value (update :open disj uri)
                                      (update :documents dissoc uri)
                                      (update :analyses dissoc uri)
+                                     (update :tokens dissoc uri)
                                      (update :tasks dissoc uri)
                                      (update :generation inc))))
                   (.text_document_publish_diagnostics ls (lsp/PublishDiagnosticsParams uri #py []))
@@ -732,7 +982,10 @@
                                        (update :analyses dissoc uri) (update :reloads dissoc uri))))
                     (when-not (= (.-type change) (.-Deleted lsp/FileChangeType))
                       (swap! state assoc-in [:reloads uri] (asyncio/create_task (closed! state uri)))))
-                  (when (#{".py" ".pyi"} (.-suffix path)) (py/clear-cache!))
+                  (when (or (#{".py" ".pyi"} (.-suffix path))
+                            (#{"pyproject.toml" "uv.lock" "pyvenv.cfg"} (.-name path)))
+                    (py/clear-cache! (:python-cache (:options @state)))
+                    (reset! (:dependency-cache (:options @state)) {}))
                   (swap! state update :generation inc))
                 (doseq [uri (:open @state)]
                   (when-let [task (get-in @state [:tasks uri])] (.cancel task))
@@ -749,11 +1002,11 @@
                   (location state (definition-of analysis item)))))
      (feature lsp/TEXT_DOCUMENT_REFERENCES
               (fn ^:async handler [params]
-                (let [{:keys [item]} (await (query! state params))]
+                (let [{:keys [item uri]} (await (query! state params))]
                   (python/list
                    (keep (fn [[_uri entry]] (location state entry))
                          (when-let [identity (identity-of item)]
-                           (occurrences (await (all-analyses! state)) identity
+                           (occurrences (await (all-analyses! state uri)) identity
                                         (.-include_declaration (.-context params)))))))))
      (feature lsp/TEXT_DOCUMENT_PREPARE_RENAME
               (fn ^:async handler [params]
@@ -762,13 +1015,13 @@
                     (name-span document item)))))
      (feature lsp/TEXT_DOCUMENT_RENAME
               (fn ^:async handler [params]
-                (let [{:keys [item analysis]} (await (query! state params))
+                (let [{:keys [item analysis uri]} (await (query! state params))
                       identity (identity-of item)
                       name (.-new_name params)]
                   (when-not (and identity (editable-definition? state analysis item) (valid-name? name))
                     (failure "Only resolved Basilisp bindings can be renamed to an unqualified symbol."))
                   (let [generation (:generation @state)
-                        analyses (await (all-analyses! state))
+                        analyses (await (all-analyses! state uri))
                         matches (occurrences analyses identity true)
                         uris (set (map first matches))]
                     (doseq [[_uri analysis] analyses
@@ -802,12 +1055,13 @@
               (lsp/RenameOptions ** :prepare_provider true))
      (feature lsp/TEXT_DOCUMENT_COMPLETION
               (fn ^:async handler [params]
-                (let [{:keys [document analysis offset]} (await (query! state params))
+                (let [{:keys [document analysis offset uri]} (await (query! state params))
                       prefix (completion-prefix document offset)
-                      project (await (project! state))
-                      candidates (await (asyncio/to_thread completion-candidates
-                                                           (assoc analysis :project project :source (.-source document))
-                                                           offset prefix (:options @state)))
+                      project (await (project! state uri))
+                      candidates (await (asyncio/to_thread
+                                         #(vec (completion-candidates
+                                                (assoc analysis :project project :source (.-source document))
+                                                offset prefix (options-for state uri)))))
                       range (span document (- offset (count prefix)) offset)]
                   (lsp/CompletionList false
                                       (python/list
@@ -815,6 +1069,127 @@
                                               (completion-item label definition range))
                                             (sort-by first (into {} (reverse candidates))))))))
               (lsp/CompletionOptions ** :trigger_characters #py ["/" "."]))
+     (feature lsp/TEXT_DOCUMENT_SIGNATURE_HELP
+              (fn ^:async handler [params]
+                (let [{:keys [analysis document offset]} (await (query! state params))]
+                  (signature-help analysis document offset)))
+              (lsp/SignatureHelpOptions ** :trigger_characters #py [" " "("]
+                                        :retrigger_characters #py [" "]))
+     (feature lsp/TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL
+              (fn ^:async handler [params]
+                (refresh-settings! state)
+                (let [uri (.-uri (.-text_document params))
+                      analysis (await (analyzed! state uri))
+                      document (get-in @state [:documents uri])
+                      data (if (get (settings-for state uri) :semantic-tokens? true)
+                             (semantic-data analysis document nil) [])]
+                  (token-response! state uri data nil)))
+              (lsp/SemanticTokensLegend (python/list token-types) (python/list token-modifiers)))
+     (feature lsp/TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL_DELTA
+              (fn ^:async handler [params]
+                (refresh-settings! state)
+                (let [uri (.-uri (.-text_document params))
+                      analysis (await (analyzed! state uri))
+                      document (get-in @state [:documents uri])
+                      data (if (get (settings-for state uri) :semantic-tokens? true)
+                             (semantic-data analysis document nil) [])]
+                  (token-response! state uri data (.-previous_result_id params)))))
+     (feature lsp/TEXT_DOCUMENT_SEMANTIC_TOKENS_RANGE
+              (fn ^:async handler [params]
+                (refresh-settings! state)
+                (let [uri (.-uri (.-text_document params))
+                      analysis (await (analyzed! state uri))
+                      document (get-in @state [:documents uri])]
+                  (lsp/SemanticTokens
+                   (python/list (if (get (settings-for state uri) :semantic-tokens? true)
+                                  (semantic-data analysis document (.-range params)) []))))))
+     (feature lsp/TEXT_DOCUMENT_CODE_ACTION
+              (fn ^:async handler [params]
+                (refresh-settings! state)
+                (let [uri (.-uri (.-text_document params))
+                      analysis (await (analyzed! state uri))
+                      document (get-in @state [:documents uri])]
+                  (unused-binding-actions state uri document analysis (.-range params) (.-context params))))
+              (lsp/CodeActionOptions ** :code_action_kinds #py [(.-QuickFix lsp/CodeActionKind)]))
+     (feature lsp/TEXT_DOCUMENT_CODE_LENS
+              (fn ^:async handler [params]
+                (refresh-settings! state)
+                (let [uri (.-uri (.-text_document params))
+                      analysis (await (analyzed! state uri))
+                      document (get-in @state [:documents uri])]
+                  (python/list
+                   (for [definition (:var-definitions analysis)]
+                     (lsp/CodeLens (span document (:start definition) (:end definition))
+                                   ** :data (lisp->py {:uri uri :ns (:ns definition) :name (:name definition)}))))))
+              (lsp/CodeLensOptions ** :resolve_provider true))
+     (feature lsp/CODE_LENS_RESOLVE
+              (fn ^:async handler [lens]
+                (let [{:keys [uri ns name]} (py->lisp (.-data lens))
+                      references (occurrences (await (all-analyses! state uri)) [:var ns name] false)
+                      settings (settings-for state uri)
+                      patterns (:test-locations-regex settings ["_test\\.lpy$"])
+                      tests (when (get-in settings [:code-lens :segregate-test-references] true)
+                              (filter (fn [[reference-uri _]]
+                                        (and (not= uri reference-uri)
+                                             (some #(re/search % reference-uri) patterns))) references))
+                      main (remove (set tests) references)
+                      title (str (reference-title main "reference")
+                                 (when (seq tests) (str " | " (reference-title tests "test"))))
+                      position (.-start (.-range lens))
+                      document (get-in @state [:documents uri])
+                      offset (.offset_at_position document position)
+                      source (subs (.-source document) 0 offset)
+                      row (inc (count (filter #{\newline} source)))
+                      column (inc (- offset (inc (.rfind source "\n"))))]
+                  (lsp/CodeLens (.-range lens)
+                                ** :command (lsp/Command title "code-lens-references"
+                                                         ** :arguments #py [uri row column])))))
+     ((.command ls "code-lens-references")
+      (fn ^:async references-command [uri row column]
+        (let [analysis (await (analyzed! state uri))
+              document (get-in @state [:documents uri])
+              position (.position_to_client_units document (lsp/Position (dec row) (dec column)))
+              item (occurrence analysis (.offset_at_position document position))]
+          (python/list (keep (fn [[_ entry]] (location state entry))
+                             (occurrences (await (all-analyses! state uri)) (identity-of item) false))))))
+     (feature lsp/TEXT_DOCUMENT_PREPARE_CALL_HIERARCHY
+              (fn ^:async handler [params]
+                (let [{:keys [analysis item]} (await (query! state params))
+                      definition (definition-of analysis item)]
+                  (python/list (or (when (seq (:arglists definition))
+                                     (when-let [entry (hierarchy-item state definition)] [entry])) [])))))
+     (feature lsp/CALL_HIERARCHY_INCOMING_CALLS
+              (fn ^:async handler [params]
+                (let [item (.-item params) identity (item-identity item)
+                      analyses (await (all-analyses! state (.-uri item)))
+                      matches (for [[uri analysis] analyses call (:calls analysis)
+                                    :when (and (:caller call) (= identity (identity-of (:definition call))))]
+                                [uri call])]
+                  (python/list
+                   (keep (fn [[_ calls]]
+                           (let [[uri first-call] (first calls)
+                                 document (get-in @state [:documents uri])]
+                             (when-let [caller (hierarchy-item state (:caller first-call))]
+                               (lsp/CallHierarchyIncomingCall
+                                caller (python/list (map (fn [[_ call]]
+                                                           (let [head (:name-range call)]
+                                                             (span document (:start head) (:end head)))) calls))))))
+                         (group-by (fn [[uri call]] [uri (identity-of (:caller call))]) matches))))))
+     (feature lsp/CALL_HIERARCHY_OUTGOING_CALLS
+              (fn ^:async handler [params]
+                (let [item (.-item params) identity (item-identity item)
+                      analysis (await (analyzed! state (.-uri item)))
+                      document (get-in @state [:documents (.-uri item)])
+                      matches (filter #(and (= identity (identity-of (:caller %)))
+                                            (identity-of (:definition %))) (:calls analysis))]
+                  (python/list
+                   (keep (fn [[_ calls]]
+                           (when-let [callee (hierarchy-item state (:definition (first calls)))]
+                             (lsp/CallHierarchyOutgoingCall
+                              callee (python/list (map (fn [call]
+                                                         (let [head (:name-range call)]
+                                                           (span document (:start head) (:end head)))) calls)))))
+                         (group-by #(identity-of (:definition %)) matches))))))
      (feature lsp/TEXT_DOCUMENT_DOCUMENT_SYMBOL
               (fn ^:async handler [params]
                 (let [uri (.-uri (.-text_document params))

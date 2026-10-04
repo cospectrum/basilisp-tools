@@ -125,3 +125,144 @@
                                ** :text true :capture_output true :timeout 5)]
     (is (= 0 (.-returncode result)) (.-stderr result))
     (is (= "safe\n" (.-stdout result)))))
+
+(deftest static-package-and-overloads-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        package (.joinpath root "sample_pkg")
+        opts {:python-paths [(str root)] :python-inspection? false
+              :python-cache (bridge/create-cache)}]
+    (try
+      (.mkdir package)
+      (.write_text (.joinpath package "__init__.pyi")
+                   "from .models import Child as Public, choose, make, Decorated\n"
+                   ** :encoding "utf-8")
+      (.write_text (.joinpath package "models.py")
+                   (str "from typing import overload, Optional, Self\n"
+                        "class Base:\n"
+                        "    def __init__(self, name: str): pass\n"
+                        "    def inherited(self, amount: int) -> str: return ''\n"
+                        "    @property\n"
+                        "    def label(self) -> str: raise RuntimeError('do not execute')\n"
+                        "class Child(Base):\n"
+                        "    def again(self) -> Self: return self\n"
+                        "@overload\n"
+                        "def choose(value: str) -> Child: ...\n"
+                        "@overload\n"
+                        "def choose(value: str, count: int) -> Child: ...\n"
+                        "def choose(*args): raise RuntimeError('do not execute')\n"
+                        "def make() -> Optional[Child]: return Child('x')\n"
+                        "@unknown_decorator\n"
+                        "class Decorated: pass\n")
+                   ** :encoding "utf-8")
+      (let [public (bridge/inspect-path "sample_pkg" ["Public"] opts)
+            choose (bridge/inspect-path "sample_pkg" ["choose"] opts)
+            make (bridge/inspect-path "sample_pkg" ["make"] opts)]
+        (is (= :class (:kind public)))
+        (is (= {:module "sample_pkg.models" :path ["Child"]} (bridge/return-type public)))
+        (is (= [] (bridge/check-call public 1 [])))
+        (is (seq (bridge/check-call public 0 [])))
+        (is (= [] (bridge/check-call
+                   (bridge/inspect-path "sample_pkg" ["Public" "inherited"] (assoc opts :instance? true)) 1 [])))
+        (is (= {:module "sample_pkg.models" :path ["Child"]}
+               (bridge/return-type (bridge/inspect-path "sample_pkg" ["Public" "again"] opts))))
+        (is (= :property (:kind (bridge/inspect-path "sample_pkg" ["Public" "label"] opts))))
+        (is (= {:module "builtins" :path ["str"]}
+               (bridge/return-type (bridge/inspect-path "sample_pkg" ["Public" "label"] opts))))
+        (is (= 2 (count (:overloads choose))))
+        (is (= [] (bridge/check-call choose 1 [])))
+        (is (= [] (bridge/check-call choose 2 [])))
+        (is (seq (bridge/check-call choose 3 [])))
+        (is (= {:module "sample_pkg.models" :path ["Child"]} (bridge/return-type choose)))
+        (is (= {:module "sample_pkg.models" :path ["Child"]} (bridge/return-type make)))
+        (is (= :class (:kind (bridge/inspect-type make opts))))
+        (is (nil? (bridge/check-call (bridge/inspect-path "sample_pkg" ["Decorated"] opts) 9 []))))
+      (testing "Changing an imported file invalidates its public reexports"
+        (.write_text (.joinpath package "models.py") "class Child:\n    def replacement(self): pass\n"
+                     ** :encoding "utf-8")
+        (is (= :function (:kind (bridge/inspect-path "sample_pkg" ["Public" "replacement"] opts)))))
+      (finally (.cleanup temp)))))
+
+(deftest dataclass-constructor-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "records.py")
+                   (str "from dataclasses import dataclass, field, KW_ONLY\n"
+                        "from typing import ClassVar\n"
+                        "@dataclass\n"
+                        "class Parent:\n"
+                        "    name: str\n"
+                        "@dataclass\n"
+                        "class Child(Parent):\n"
+                        "    count: int = 1\n"
+                        "    hidden: int = field(init=False)\n"
+                        "    constant: ClassVar[str] = 'hello'\n"
+                        "    _: KW_ONLY\n"
+                        "    enabled: bool\n"
+                        "    values: list[int] = field(default_factory=list)\n"
+                        "@dataclass(init=False)\n"
+                        "class Inherited(Parent):\n"
+                        "    other: str\n")
+                   ** :encoding "utf-8")
+      (let [child (bridge/inspect-path "records" ["Child"] opts)
+            inherited (bridge/inspect-path "records" ["Inherited"] opts)]
+        (is (= ["name" "count" "enabled" "values"] (mapv :name (:parameters child))))
+        (is (= [] (bridge/check-call child 1 ["enabled"])))
+        (is (seq (bridge/check-call child 1 [])))
+        (is (seq (bridge/check-call child 3 ["enabled"])))
+        (is (= [] (bridge/check-call inherited 1 [])))
+        (is (seq (bridge/check-call inherited 0 [])))
+        (is (= {:module "builtins" :path ["list"]
+                :arguments [{:module "builtins" :path ["int"]}]}
+               (bridge/return-type (bridge/resolve-member child "values")))))
+      (finally (.cleanup temp)))))
+
+(deftest owned-and-bounded-cache-test
+  (let [first-cache (bridge/create-cache)
+        second-cache (bridge/create-cache)
+        original subprocess/run
+        patch (mock/patch "subprocess.run" ** :wraps original)
+        wrapped (.start patch)]
+    (try
+      (bridge/inspect-module "math" {:python-cache first-cache})
+      (bridge/inspect-module "math" {:python-cache first-cache})
+      (bridge/inspect-module "math" {:python-cache second-cache})
+      (is (= 2 (.-call_count wrapped)))
+      (bridge/clear-cache! first-cache)
+      (is (empty? @first-cache))
+      (is (seq @second-cache))
+      (let [modules (mapv #(str "bounded_cache_probe_" %) (range 270))
+            result (bridge/inspect-modules modules {:python-cache first-cache :python-inspection? false})]
+        (is (= 270 (count result)))
+        (is (<= (count @first-cache) 256)))
+      (finally (.stop patch)))))
+
+(deftest transient-failure-retry-test
+  (let [storage (bridge/create-cache)
+        opts {:python-cache storage}
+        patch (mock/patch "subprocess.run"
+                          ** :side_effect (subprocess/TimeoutExpired "python" 0.01))]
+    (.start patch)
+    (try
+      (is (= "inspection-timeout" (:reason (bridge/inspect-module "math" opts))))
+      (finally (.stop patch)))
+    (is (= :known (:status (bridge/inspect-module "math" opts))))
+    (is (seq (bridge/environment-paths {:python-cache storage :python-inspection? false})))))
+
+(deftest in-flight-cache-clear-test
+  (let [script "import importlib, json, threading, types\nfrom unittest.mock import patch\nimport basilisp_tools\nfrom basilisp.lang.keyword import keyword\nfrom basilisp.lang.map import map as persistent_map\nbridge = importlib.import_module(\"basilisp_tools.python\")\ncache = bridge.create_cache()\noptions = persistent_map({keyword(\"python-cache\"): cache})\nentered, release = threading.Event(), threading.Event()\ncalls = []\ndef inspect(*args, **kwargs):\n    first = not calls\n    calls.append(True)\n    if first:\n        entered.set()\n        assert release.wait(5)\n    name = json.loads(kwargs[\"input\"])[\"modules\"][0]\n    data = {name: {\"status\": \"known\", \"name\": name, \"kind\": \"module\", \"doc\": \"old\" if first else \"fresh\"}}\n    return types.SimpleNamespace(returncode=0, stdout=json.dumps(data))\nwith patch(\"subprocess.run\", side_effect=inspect):\n    thread = threading.Thread(target=lambda: bridge.inspect_module(\"cache_race\", options))\n    thread.start()\n    assert entered.wait(5)\n    bridge.clear_cache__BANG__(cache)\n    assert bridge.inspect_module(\"cache_race\", options).val_at(keyword(\"doc\")) == \"fresh\"\n    release.set()\n    thread.join(5)\n    assert not thread.is_alive()\n    assert bridge.inspect_module(\"cache_race\", options).val_at(keyword(\"doc\")) == \"fresh\"\nprint(\"safe\")\n"
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script])
+                               ** :text true :capture_output true :timeout 15)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "safe\n" (.-stdout result)))))
+
+(deftest annotation-descriptor-safety-test
+  (let [script "import importlib.util, sys\nspec = importlib.util.spec_from_file_location(\"worker\", sys.argv[1])\nworker = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(worker)\ncalls = []\nclass Annotation:\n    @property\n    def __class__(self):\n        calls.append(\"class descriptor\")\n        return str\n    def __repr__(self):\n        calls.append(\"repr\")\n        return \"danger\"\nclass Meta(type):\n    @property\n    def __module__(self):\n        calls.append(\"module descriptor\")\n        return \"danger\"\n    @property\n    def __dict__(self):\n        calls.append(\"dict descriptor\")\n        return {}\nclass Sample(metaclass=Meta):\n    @property\n    def value(self) -> str:\n        calls.append(\"property\")\n        return \"\"\nfor value in [Annotation(), list[Annotation()], Sample]:\n    worker.annotation(value)\n    worker.runtime_type(value)\nworker.runtime_member(\"sample\", Sample)\nworker.runtime_member(\"annotation\", Annotation())\nassert not calls, calls\nprint(\"safe\")\n"
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])
+                               ** :text true :capture_output true :timeout 15)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "safe\n" (.-stdout result)))))

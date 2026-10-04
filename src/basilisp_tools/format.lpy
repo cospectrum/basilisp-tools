@@ -81,8 +81,6 @@
    :blank-lines-separate-alignment? false
    :max-column-alignment-gap nil :max-column-alignment-width nil})
 
-(def ^:private runtime-options
-  #{:paths :file-pattern :project-root :read-clj-config-files? :quiet? :verbose? :ansi? :parallel?})
 (defn- invalid [message data] (throw (ex-info message data)))
 
 (defn- regex? [x] (instance? re/Pattern x))
@@ -92,8 +90,8 @@
       (and (vector? k) (op/eq 2 (count k)) (every? matcher? k))))
 
 (defn resolve-options
-  "Validate options and merge cljfmt defaults. :indents replaces defaults;
-  :extra-indents extends them. Unknown options fail instead of being ignored."
+  "Validate formatting rules and merge cljfmt defaults. :indents replaces
+  defaults; :extra-indents extends them. Preserve unknown options, as cljfmt does."
   [options]
   (when-not (map? options)
     (invalid "Formatter options must be a map" {:options options}))
@@ -103,17 +101,16 @@
                               (assoc :extra-indents
                                      (merge (:indents options) (:extra-indents options)))))
         opts (merge default-options options)]
-    (doseq [[k v] options]
-      (when-not (or (contains? default-options k) (contains? runtime-options k))
-        (invalid (str "Unknown formatter option: " k) {:option k}))
-      (when (and (.endswith (name k) "?")
-                 (not (boolean? v)))
-        (invalid (str k " must be a boolean") {:option k})))
+    ;; Clojure options use Lisp truthiness: only nil and false disable a
+    ;; switch. Unknown keys survive so shared and newer configs keep working.
     (when-not (#{:community :cursive :zprint} (:function-arguments-indentation opts))
       (invalid "Invalid :function-arguments-indentation" {}))
-    (doseq [k [:indents :extra-indents :alias-map :refer-map
+    (doseq [k [:indents :extra-indents
                :aligned-forms :extra-aligned-forms :blank-line-forms :extra-blank-line-forms]]
       (when-not (map? (get opts k)) (invalid (str k " must be a map") {:option k})))
+    (doseq [k [:alias-map :refer-map]]
+      (when-not (or (nil? (get opts k)) (map? (get opts k)))
+        (invalid (str k " must be a map or nil") {:option k})))
     (doseq [k [:max-column-alignment-gap :max-column-alignment-width]
             :let [v (get opts k)]]
       (when-not (or (nil? v) (and (integer? v) (>= v 0)))
@@ -215,6 +212,10 @@
            (op/eq "#re" (:text (first (:children node))))
            (op/eq :string (:kind (first forms))))
       (re/compile (config-value (first forms) file false))
+
+      (and (op/eq :tagged kind)
+           (#{"#inst" "#uuid"} (:text (first (:children node)))))
+      (edn/read-string (syntax/text node))
 
       :else (config-error file
                           (str "Unsupported configuration form " (name kind)
@@ -783,8 +784,7 @@
          ctx (namespace-context original opts)
          prepared (prepare original opts)
          result (render prepared opts ctx)
-         result (if (or (:align-map-columns? opts) (:align-form-columns? opts)
-                        (:align-binding-columns? opts))
+         result (if (or (:align-map-columns? opts) (:align-form-columns? opts))
                   (format-aligned result opts ctx) result)
          result (if (:normalize-newlines-at-file-end? opts)
                   (let [trimmed (re/sub "[ \t\r\n]+$" "" result)]
@@ -808,7 +808,7 @@
   (letfn [(walk [node parent index]
             (let [frame {:node node :parent-index index}
                   selected? (or (and (:align-map-columns? opts) (op/eq :map (:kind node)))
-                                (and (or (:align-form-columns? opts) (:align-binding-columns? opts))
+                                (and (:align-form-columns? opts)
                                      (configured-form? frame {:node parent} (:aligned-forms opts) ctx)))]
               (concat (when selected? [node])
                       (mapcat (fn [[i n]] (walk n node i))

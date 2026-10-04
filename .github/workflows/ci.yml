@@ -51,6 +51,8 @@ jobs:
         run: nix develop --no-update-lock-file --command uv run --locked blt check --repro --no-python-inspection src
       - name: Check workflows
         run: nix develop --no-update-lock-file --command actionlint
+      - name: Check real Python packages
+        run: nix develop --no-update-lock-file --command uv run --locked --with numpy==2.5.3 --with requests==2.34.2 --with types-requests==2.33.0.20260906 --with pydantic==2.13.5 python scripts/check_python_packages.py --timeout 10
       - name: Build distribution
         run: nix develop --no-update-lock-file --command uv build
       - name: Test installed wheel
@@ -71,7 +73,7 @@ jobs:
   compatibility:
     name: Compare with upstream tools
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       UV_PYTHON: "3.13"
     steps:
@@ -90,14 +92,22 @@ jobs:
           ref: 8ad65c1d681d2fc9022b3854f6dcaf1677d29631
           path: .clojure-lsp-reference
           persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: basilisp-lang/basilisp
+          ref: 2f993f9e53b4195316426140384c38728304341e
+          path: .basilisp-reference
+          persist-credentials: false
       - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
       - name: Compare upstream cases and verify idempotence
-        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference --corpus .basilisp-reference
       - name: Compare configuration precedence with Leiningen plugin
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt .cljfmt-reference
       - name: Compare checker diagnostics with clj-kondo
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo.py
       - name: Compare checker configuration with clj-kondo
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_config.py
+      - name: Compare checker analysis and SARIF with clj-kondo
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_output.py
       - name: Compare language server configuration with clojure-lsp
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lsp_config.py --clojure-lsp .clojure-lsp-reference

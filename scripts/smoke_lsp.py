@@ -85,7 +85,9 @@ def main():
             assert capabilities["textDocumentSync"]["change"] == 1, capabilities
             for name in ("hoverProvider", "definitionProvider", "referencesProvider",
                          "renameProvider", "completionProvider", "documentSymbolProvider",
-                         "workspaceSymbolProvider", "documentFormattingProvider"):
+                         "workspaceSymbolProvider", "documentFormattingProvider",
+                         "signatureHelpProvider", "semanticTokensProvider", "codeActionProvider",
+                         "codeLensProvider", "callHierarchyProvider", "executeCommandProvider"):
                 assert capabilities.get(name) is not None and capabilities[name] is not False, name
             send("initialized", {})
             send("shutdown", None, 2)

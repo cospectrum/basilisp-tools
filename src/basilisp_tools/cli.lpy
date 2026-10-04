@@ -32,7 +32,11 @@
                    :help "Use this .clj-kondo configuration directory.")
     (.add_argument p "--repro" ** :action "store_true"
                    :help "Ignore home configuration for reproducible checks.")
-    (.add_argument p "--format" ** :choices #py ["text" "json" "edn"]
+    (.add_argument p "--parallel" ** :action "store_true"
+                   :help "Analyze files concurrently while keeping output ordered.")
+    (.add_argument p "--dependencies" ** :action "store_true"
+                   :help "Analyze dependencies silently and exit successfully.")
+    (.add_argument p "--format" ** :choices #py ["text" "json" "edn" "sarif"]
                    :help "Output format; overrides configuration.")
     (.add_argument p "--filename" ** :metavar "NAME"
                    :help "Filename used for stdin diagnostics and namespace context.")
@@ -290,6 +294,8 @@
                  :config (vec (or (.-config args) []))
                  :config-dir (.-config_dir args)
                  :repro (.-repro args)
+                 :parallel (.-parallel args)
+                 :dependencies (.-dependencies args)
                  :filename (or (.-filename args) (when (some #(= "-" %) paths) "stdin.lpy"))
                  :python-executable (.-python_executable args)
                  :python-inspection? (.-python_inspection args)
@@ -297,8 +303,9 @@
         options (cond-> options
                   (some #(= "-" %) paths) (assoc :stdin (.read sys/stdin)))
         result (.run checker options)
-        output (.output checker result (.-format args) (keyword (.-report_level args)))]
-    (.write sys/stdout output)
+        output (when-not (.-dependencies args)
+                 (.output checker result (.-format args) (keyword (.-report_level args))))]
+    (when output (.write sys/stdout output))
     (.exit_status checker result (keyword (.-fail_level args)))))
 
 (defn- lsp-command [args]

@@ -267,10 +267,12 @@
        (is (thrown? python/Exception (fmt/load-config (put! root "chosen.clj" source))))
        (is (not (.exists marker)))))))
 
-(deftest runtime-format-options-are-validated-test
+(deftest runtime-format-options-retain-clojure-truthiness-test
   (doseq [key [:ansi? :parallel? :quiet? :verbose? :read-clj-config-files?]]
     (is (true? (get (fmt/resolve-options {key true}) key)))
     (is (false? (get (fmt/resolve-options {key false}) key)))
-    (is (thrown? python/Exception (fmt/resolve-options {key "true"}))))
+    (is (nil? (get (fmt/resolve-options {key nil}) key)))
+    (is (= 0 (get (fmt/resolve-options {key 0}) key)))
+    (is (= "true" (get (fmt/resolve-options {key "true"}) key))))
   (is (= "src" (:project-root (fmt/resolve-options {:project-root "src"}))))
   (is (thrown? python/Exception (fmt/resolve-options {:project-root 4}))))

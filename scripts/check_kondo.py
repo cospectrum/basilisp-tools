@@ -171,6 +171,37 @@ CONFIG_CASES = [('exclude-symbol', 'missing kept', '{:linters {:unresolved-symbo
   '{:config-in-call {clojure.core/identity {:ignore true}}}')]
 
 
+CONFIG_CASES.extend(
+[('redundant-do-empty', '(do)', '{}'),
+ ('redundant-do-one', '(do (inc 1))', '{}'),
+ ('redundant-do-body', '(defn f [x] (do (println x) x))', '{}'),
+ ('redundant-do-binding', '(let [x (do (println 1) 2)] x)', '{}'),
+ ('redundant-do-fn-star', '(fn* [] (do 1))', '{}'),
+ ('redundant-let-empty', '(let [] 1)', '{}'),
+ ('redundant-let-nested', '(let [x 1] (let [y 2] (+ x y)))', '{}'),
+ ('let-separate-bodies', '(let [x 1] (let [y 2] (+ x y)) x)', '{}'),
+ ('cond-truthy', '(cond true 1 false 2)', '{}'),
+ ('cond-keyword', '(cond :x 1 :else 2 :y 3)', '{}'),
+ ('cond-false-nil', '(cond false 1 nil 2 :else 3)', '{}'),
+ ('cond-missing-result', '(cond :else)', '{}'),
+ ('cond-number', '(cond 1 :x)', '{}'),
+ ('shadowed-fn-param', '(fn [x x] x)', '{}'),
+ ('single-key-default', '(get-in {} [:a])', '{}'),
+ ('single-key-enabled',
+  '(get-in {} [:a]) (assoc-in {} [:a] 1) (update-in {} [:a] inc)',
+  '{:linters {:single-key-in {:level :warning}}}'),
+ ('redundant-let-binding',
+  '(let [x 1 x x] x)',
+  '{:linters {:redundant-let-binding {:level :warning}}}'),
+ ('literal-number-call', '(1 2)', '{}'),
+ ('literal-string-call', '("s" 1)', '{}'),
+ ('literal-boolean-call', '(true 1)', '{}'),
+ ('redundancy-config-off',
+  '(do (let [] 1))',
+  '{:linters {:redundant-do {:level :off} :redundant-let {:level :off}}}'),
+ ('shadowed-cond-name', '(let [cond (fn [x] x)] (cond 1))', '{}')]
+)
+
 
 def normalize(findings):
     # The core namespace is the only intentional language-specific difference.

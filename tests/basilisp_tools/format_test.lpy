@@ -38,8 +38,7 @@
 (deftest invalid-input-test
   (doseq [source ["(foo" "[1 2)" "\"unterminated" "{:x [1}" "#_"]]
     (is (thrown? python/Exception (fmt/format-string source))))
-  (doseq [options [{:typo true} {:indentation? 2}
-                   {:function-arguments-indentation :unknown}
+  (doseq [options [{:function-arguments-indentation :unknown}
                    {:extra-indents {'x [[:inner -1]]}}
                    {:extra-indents {'x [[:block 1 2]]}}
                    {:file-pattern "plain string"}
@@ -67,7 +66,7 @@
         (.write_text (.joinpath nested ".cljfmt.edn") source ** :encoding "utf-8")
         (is (= {} (fmt/load-config nested))))
       (doseq [bad ["[]" "{:extra-indents #evil {}}"
-                   "{:indentation? \"yes\"}" "#=(python/print \"bad\")"]]
+                   "#=(python/print \"bad\")"]]
         (.write_text (.joinpath nested ".cljfmt.edn") bad ** :encoding "utf-8")
         (is (thrown? python/Exception (fmt/load-config nested))))
       (finally (.cleanup temp)))))
@@ -75,3 +74,30 @@
 (deftest api-alias-test
   (is (= (fmt/format-string "(let [x 1]\nx)")
          (fmt/reformat-string "(let [x 1]\nx)"))))
+
+(deftest formatter-option-truthiness-and-extension-test
+  (let [source "(defn f []\n        (run))"
+        expected "(defn f []\n  (run))"]
+    (doseq [value [true 0 "" [] {} :enabled]]
+      (is (= expected (fmt/format-string source {:indentation? value}))))
+    (doseq [value [false nil]]
+      (is (= source (fmt/format-string source {:indentation? value}))))
+    (is (= expected (fmt/format-string source {:future-feature? true
+                                               :integration/settings {:enabled? nil}
+                                               "editor" "test"})))
+    (is (= {:enabled? nil}
+           (:integration/settings
+            (fmt/resolve-options {:integration/settings {:enabled? nil}}))))))
+
+(deftest deprecated-alignment-option-test
+  (let [source "(let [a 1\nlonger 2]\n(+ a longer))"
+        ordinary "(let [a 1\n      longer 2]\n  (+ a longer))"
+        aligned "(let [a      1\n      longer 2]\n  (+ a longer))"]
+    (is (= ordinary (fmt/format-string source {:align-binding-columns? true})))
+    (is (= ordinary (fmt/format-string source {:align-binding-columns? true
+                                               :align-form-columns? false})))
+    (is (= aligned (fmt/format-string source {:align-binding-columns? false
+                                              :align-form-columns? true}))))
+  (is (= "(custom/run first\n            second)"
+         (fmt/format-string "(custom/run first\nsecond)"
+                            {:alias-map nil :refer-map nil}))))

@@ -3,8 +3,10 @@
   (:require [basilisp.edn :as edn]
             [basilisp.string :as str]
             [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py]
             [basilisp-tools.syntax :as syntax])
-  (:import [json] [os] [pathlib] [re] [sys] [time]))
+  (:import [concurrent.futures :as futures] [json] [os] [pathlib] [re] [sys] [time]
+           [urllib.parse :as url]))
 
 (def ^:private skipped-directories
   #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" ".clj-kondo"
@@ -315,23 +317,31 @@
          python-options {:python-executable (default-python options config)
                          :python-inspection? (:python-inspection? options true)
                          :python-paths (or (:python-paths options) [(str root) (str (.joinpath root "src"))])
-                         :python-timeout (:python-timeout options 5)}
-         analysis (mapv (fn [{:keys [source filename declarations declaration-error]}]
-                          (if declaration-error
-                            {:filename filename :findings [declaration-error]}
-                            (try
-                              (analyzer/analyze source {:filename filename :config config :project project
-                                                        :declarations declarations :python-options python-options})
-                              (catch python/Exception e
-                                {:filename filename :findings [(file-finding filename (str "Analysis failed: " e))]})))) sources)
-         findings (->> (concat @problems (mapcat :findings analysis))
+                         :python-timeout (:python-timeout options 5)
+                         :python-cache (or (:python-cache options) (py/create-cache))}
+         dependency-cache (or (:dependency-cache options) (analyzer/create-cache))
+         analyze-file (fn [{:keys [source filename declarations declaration-error]}]
+                        (if declaration-error
+                          {:filename filename :findings [declaration-error]}
+                          (try
+                            (analyzer/analyze source {:filename filename :config config :project project
+                                                      :declarations declarations :python-options python-options
+                                                      :dependency-cache dependency-cache})
+                            (catch python/Exception e
+                              {:filename filename :findings [(file-finding filename (str "Analysis failed: " e))]}))))
+         analysis (if (and (:parallel options) (> (count sources) 1))
+                    (let [executor (futures/ThreadPoolExecutor ** :max_workers (min 32 (count sources)))]
+                      (try (vec (iterator-seq (.map executor analyze-file sources)))
+                           (finally (.shutdown executor ** :wait true))))
+                    (mapv analyze-file sources))
+         findings (->> (if (:dependencies options) [] (concat @problems (mapcat :findings analysis)))
                        (keep #(file-level config %))
                        (filter #(visible-finding? config %))
                        (sort-by (juxt :filename :row :col :message)) distinct vec)
          summary (reduce #(update %1 (:level %2) (fnil inc 0))
                          {:error 0 :warning 0 :info 0 :type :summary
                           :files (count sources) :duration (python/int (* 1000 (- (time/perf_counter) started)))} findings)]
-     {:findings findings :summary summary :config config :analysis analysis
+     {:findings findings :summary summary :config config :analysis analysis :sources sources
       :report-level (:report-level options :info)})))
 
 (defn exit-status
@@ -370,6 +380,237 @@
                    (get-in config [:output :show-rule-name-in-message]))
            (str " [" (:type finding) "]")))))
 
+(defn- analysis-options [config]
+  (get config :analysis (get-in config [:output :analysis])))
+
+(defn- source-position [parsed offset]
+  (let [{:keys [line]} (syntax/offset->position parsed offset)
+        prefix (subs (:source parsed) (nth (:line-starts parsed) line) offset)]
+    {:row (inc line) :col (inc (quot (python/len (.encode prefix "utf-16-le" "surrogatepass")) 2))}))
+
+(defn- source-location [parsed filename node]
+  (let [start (source-position parsed (:start node)) end (source-position parsed (:end node))]
+    (merge {:filename filename} start {:end-row (:row end) :end-col (:col end)})))
+
+(defn- name-location [location]
+  (into {} (for [[key value] (select-keys location [:row :col :end-row :end-col])]
+             [(keyword (str "name-" (name key))) value])))
+
+(defn- unwrapped [node]
+  (if (= :metadata (:kind node)) (recur (last (syntax/forms node))) node))
+
+(defn- literal-metadata [node]
+  (when (= :metadata (:kind node))
+    (let [[metadata target] (syntax/forms node)
+          value (try (config-value metadata "source metadata" {}) (catch python/Exception _ nil))]
+      (merge (cond (keyword? value) {value true}
+                   (symbol? value) {:tag value}
+                   (string? value) {:tag value}
+                   (map? value) value)
+             (literal-metadata target)))))
+
+(defn- selected-metadata [value selector]
+  (if (true? selector) value (when value (select-keys value selector))))
+
+(defn- definition-form [nodes definition]
+  (some #(when (and (= :list (:kind %)) (= (:start %) (:scope-start definition))) %) nodes))
+
+(defn- qualified-name [analysis text]
+  (let [parts (str/split text #"/" 1)]
+    (if (= 2 (count parts))
+      (symbol (str (get (:aliases analysis) (first parts) (first parts)) "/" (second parts)))
+      (symbol (str "basilisp.core/" text)))))
+
+(defn- enclosing-definition [analysis start end]
+  (first (sort-by #(- (:scope-end %) (:scope-start %))
+                  (filter #(and (<= (:scope-start %) start) (<= end (:scope-end %)))
+                          (:var-definitions analysis)))))
+
+(defn- public-definition [analysis parsed filename nodes options config definition]
+  (let [node (definition-form nodes definition)
+        xs (syntax/forms node) head (first xs) name-node (second xs)
+        metadata (merge (literal-metadata name-node)
+                        (when (#{"defn" "defn-" "defmacro" "defmacro-" "defasync"}
+                               (last (str/split (syntax/text head) #"/")))
+                          (when-let [value (first (filter #(= :map (:kind %)) (take 2 (drop 2 xs))))]
+                            (try (config-value value "source metadata" {}) (catch python/Exception _ nil)))))
+        defined-by (qualified-name analysis (syntax/text head))
+        lint-as (get (:lint-as config) defined-by defined-by)
+        selector (get-in options [:var-definitions :meta])
+        result (merge (source-location parsed filename (or node definition))
+                      (name-location definition)
+                      (select-keys definition [:doc :fixed-arities :varargs-min-arity])
+                      (select-keys metadata [:added :deprecated :test :export])
+                      {:name (symbol (:name definition)) :ns (symbol (:ns definition))
+                       :defined-by defined-by :defined-by->lint-as lint-as})]
+    (cond-> result
+      (empty? (:fixed-arities result)) (dissoc :fixed-arities)
+      (:private definition) (assoc :private true)
+      (:macro definition) (assoc :macro true)
+      (and (:arglists options) (seq (:arglists definition))) (assoc :arglist-strs (:arglists definition))
+      selector (assoc :meta (selected-metadata metadata selector)))))
+
+(defn- public-namespace [parsed filename nodes options entry]
+  (let [node (some #(when (and (= :list (:kind %))
+                               (= "ns" (some-> % syntax/forms first syntax/text))
+                               (= (:start entry) (:start (unwrapped (second (syntax/forms %)))))) %) nodes)
+        xs (syntax/forms node)
+        metadata (merge (literal-metadata (second xs))
+                        (when-let [value (first (filter #(= :map (:kind %)) (take 2 (drop 2 xs))))]
+                          (try (config-value value "source metadata" {}) (catch python/Exception _ nil))))
+        doc (first (filter #(= :string (:kind %)) (take 1 (drop 2 xs))))
+        selector (get-in options [:namespace-definitions :meta])]
+    (cond-> (merge (source-location parsed filename (or node entry))
+                   (name-location entry) {:name (symbol (:name entry))}
+                   (select-keys metadata [:added :deprecated :no-doc]))
+      doc (assoc :doc (edn/read-string (syntax/text doc)))
+      selector (assoc :meta (selected-metadata metadata selector)))))
+
+(defn- public-namespace-usage [analysis parsed filename nodes entry]
+  (let [spec (first (filter #(and (#{:list :vector} (:kind %))
+                                  (= (:start entry) (:start (first (syntax/forms %))))) nodes))
+        pairs (partition 2 (rest (syntax/forms spec)))
+        alias-node (some (fn [[key value]] (when (#{":as" ":as-alias"} (syntax/text key)) value)) pairs)
+        alias-location (when alias-node (source-location parsed filename alias-node))]
+    (cond-> (merge (select-keys entry [:filename :row :col]) (name-location entry)
+                   {:from (symbol (:namespace analysis)) :to (symbol (:name entry))})
+      (:alias entry) (assoc :alias (symbol (:alias entry)))
+      alias-location (merge (into {} (for [[key value] (dissoc alias-location :filename)]
+                                       [(keyword (str "alias-" (name key))) value]))))))
+
+(defn- public-var-usage [analysis parsed filename calls usage]
+  (let [call (get calls (:start usage))
+        definition (:definition usage)
+        outer (enclosing-definition analysis (:start usage) (:end usage))
+        raw (subs (:source parsed) (:start usage) (:end usage))
+        prefix (when (>= (.find raw "/") 0) (first (str/split raw #"/" 1)))
+        alias (when (contains? (:aliases analysis) prefix) prefix)
+        result (merge (if call (source-location parsed filename call)
+                          (select-keys usage [:filename :row :col :end-row :end-col]))
+                      (name-location usage)
+                      (select-keys definition [:fixed-arities :varargs-min-arity :deprecated])
+                      {:name (symbol (:name usage)) :from (symbol (:from usage))
+                       :to (symbol (:ns usage))})]
+    (cond-> result
+      (empty? (:fixed-arities result)) (dissoc :fixed-arities)
+      (:macro definition) (assoc :macro true)
+      (:private definition) (assoc :private true)
+      call (assoc :arity (dec (count (syntax/forms call))))
+      (and outer (not= (:start call) (:scope-start outer))) (assoc :from-var (symbol (:name outer)))
+      alias (assoc :alias (symbol alias)))))
+
+(defn- keyword-analysis [analysis parsed filename nodes node]
+  (let [raw (syntax/text node) auto? (.startswith raw "::")
+        parts (str/split (subs raw (if auto? 2 1)) #"/" 1)
+        prefix (when (= 2 (count parts)) (first parts))
+        map-prefix (some (fn [candidate]
+                           (when (= :namespaced-map (:kind candidate))
+                             (let [keys (map first (partition 2 (syntax/forms (first (syntax/forms candidate)))))]
+                               (when (some #(= (:start %) (:start node)) keys)
+                                 (:text (first (:children candidate))))))) nodes)
+        prefix-auto? (and map-prefix (.startswith map-prefix "#::"))
+        map-ns (when map-prefix (subs map-prefix (if prefix-auto? 3 2)))
+        map-ns (if prefix-auto? (get (:aliases analysis) map-ns (if (empty? map-ns) (:namespace analysis) map-ns)) map-ns)
+        namespace-name (cond auto? (if prefix (get (:aliases analysis) prefix prefix) (:namespace analysis))
+                             (and map-prefix (= "_" prefix)) nil
+                             prefix prefix
+                             :else map-ns)
+        ns-form (some #(when (and (= :list (:kind %))
+                                  (= "ns" (some-> % syntax/forms first syntax/text))
+                                  (<= (:start %) (:start node)) (<= (:end node) (:end %))) %) nodes)
+        outer (enclosing-definition analysis (:start node) (:end node))
+        outer (when (and outer (> (:start node) (:end outer))) outer)]
+    (cond-> (merge (source-location parsed filename node)
+                   {:name (last parts) :from (symbol (if ns-form "user" (:namespace analysis)))})
+      namespace-name (assoc :ns (symbol namespace-name))
+      (and map-prefix (not prefix) (not auto?)) (assoc :namespace-from-prefix true)
+      auto? (assoc :auto-resolved true)
+      (and auto? prefix) (assoc :alias (symbol prefix))
+      outer (assoc :from-var (symbol (:name outer))))))
+
+(defn- file-analysis [analysis source options config ids]
+  (let [parsed (get-in source [:declarations :parsed])
+        filename (:filename source)
+        nodes (vec (syntax/nodes (:root parsed)))
+        calls (into {} (for [node nodes :when (= :list (:kind node))
+                             :let [head (first (syntax/forms node))]]
+                         [(:start head) node]))
+        definitions (sort-by :start (:var-definitions analysis))
+        usages (remove #(and (:unknown %) (not= "clj-kondo/unknown-namespace" (:ns %)))
+                       (:var-usages analysis))
+        recorded (set (map :start usages))
+        ;; Compiler special forms do not appear as resolved Vars in Basilisp.
+        ;; The compatible export still records defining forms such as def.
+        defining-usages (for [definition definitions
+                              :let [node (definition-form nodes definition)
+                                    head (first (syntax/forms node))]
+                              :when (and head (not (contains? recorded (:start head)))
+                                         (#{"def" "declare"} (syntax/text head)))]
+                          (merge head (source-location parsed filename head)
+                                 {:name (syntax/text head) :ns "basilisp.core" :from (:namespace analysis)
+                                  :definition {:macro true :fixed-arities #{1 2 3}}}))
+        usages (sort-by (fn [usage] [(or (:end (get calls (:start usage))) (:end usage)) (:start usage)])
+                        (concat usages defining-usages))
+        locals (mapv (fn [entry]
+                       (let [id (inc (count @ids))
+                             end (source-position parsed (:scope-end entry))]
+                         (swap! ids assoc (:id entry) id)
+                         (merge (select-keys entry [:filename :row :col :end-row :end-col])
+                                {:id id :name (symbol (:name entry)) :str (:name entry)
+                                 :scope-end-row (:row end) :scope-end-col (:col end)
+                                 :derived-location nil}))) (:locals analysis))
+        local-usages (mapv (fn [entry]
+                             (merge (select-keys entry [:filename :row :col :end-row :end-col])
+                                    (name-location entry)
+                                    {:id (get @ids (:id entry)) :name (symbol (:name entry))}))
+                           (:local-usages analysis))]
+    (cond-> {:namespace-definitions (mapv #(public-namespace parsed filename nodes options %) (:namespace-definitions analysis))
+             :namespace-usages (mapv #(public-namespace-usage analysis parsed filename nodes %)
+                                     (remove :python (:namespace-usages analysis)))
+             :var-definitions (mapv #(public-definition analysis parsed filename nodes options config %) definitions)}
+      (get options :var-usages true) (assoc :var-usages (mapv #(public-var-usage analysis parsed filename calls %) usages))
+      (:locals options) (assoc :locals locals :local-usages local-usages)
+      (:keywords options) (assoc :keywords (mapv #(keyword-analysis analysis parsed filename nodes %)
+                                                 (filter #(= :keyword (:kind %))
+                                                         (tree-seq #(seq (:children %)) syntax/forms (:root parsed))))))))
+
+(defn analysis-output
+  "Export clj-kondo's namespace, Var, and optional local analysis schema."
+  [result]
+  (let [config (:config result) selected (analysis-options config)
+        options (if (map? selected) selected {})
+        ids (atom {})
+        empty-result (cond-> {:namespace-definitions [] :namespace-usages [] :var-definitions []}
+                       (get options :var-usages true) (assoc :var-usages [])
+                       (:locals options) (assoc :locals [] :local-usages [])
+                       (:keywords options) (assoc :keywords []))]
+    (reduce (fn [out [analysis source]]
+              (if (get-in source [:declarations :parsed])
+                (merge-with into out (file-analysis analysis source options config ids)) out))
+            empty-result (map vector (:analysis result) (:sources result)))))
+
+(defn- sarif-output [findings]
+  (let [levels {:error "error" :warning "warning" :info "note" :off "none"}
+        types (sort (set (map :type findings)))
+        rules (mapv (fn [type]
+                      {:id (name type)
+                       :helpUri (str "https://github.com/cospectrum/basilisp-tools/blob/main/docs/checking.md#what-it-checks")})
+                    types)]
+    {:version "2.1.0"
+     :$schema "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json"
+     :runs [{:tool {:driver {:name "basilisp-tools"
+                             :informationUri "https://github.com/cospectrum/basilisp-tools"
+                             :rules rules}}
+             :results (mapv
+                       (fn [finding]
+                         {:level (get levels (:level finding) "warning")
+                          :ruleId (name (:type finding)) :message {:text (:message finding)}
+                          :locations [{:physicalLocation
+                                       {:artifactLocation {:uri (url/quote (.replace (:filename finding) "\\" "/") ** :safe "/:")}
+                                        :region {:startLine (max 1 (:row finding)) :startColumn (max 1 (:col finding))
+                                                 :endLine (max 1 (:end-row finding))
+                                                 :endColumn (max 1 (:end-col finding))}}}]}) findings)}]}))
+
 (defn output
   "Render deterministic text, JSON, or EDN. Report level filters text, matching clj-kondo."
   ([result] (output result nil))
@@ -378,8 +619,11 @@
    (let [{:keys [config summary]} result
          format (keyword (name (or format (get-in config [:output :format]) :text)))
          findings (mapv output-finding (:findings result))
-         data (cond-> {:findings findings} (get-in config [:output :summary]) (assoc :summary summary))]
+         data (cond-> {:findings findings}
+                (get-in config [:output :summary]) (assoc :summary summary)
+                (analysis-options config) (assoc :analysis (analysis-output result)))]
      (case format
+       :sarif (str (json/dumps (json-value (sarif-output findings)) ** :ensure_ascii false) "\n")
        :json (str (json/dumps (json-value data) ** :ensure_ascii false) "\n")
        :edn (str (pr-str data) "\n")
        :text (let [level (keyword (name (:report-level result :info)))

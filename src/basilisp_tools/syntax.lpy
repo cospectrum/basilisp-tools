@@ -269,10 +269,10 @@
 
           (or (nil? c) (op/contains old-closers c))
           (let [state (issue state :missing-delimiter (str "Expected " closer)
-                             (:offset state) (:offset state))]
-            (let [[node state] (branch kind start children
-                                       (assoc state :closers old-closers))]
-              [(assoc node :incomplete? true) state]))
+                             (:offset state) (:offset state))
+                [node state] (branch kind start children
+                                     (assoc state :closers old-closers))]
+            [(assoc node :incomplete? true) state])
 
           :else
           (let [[child next-state] (read-form state)]
