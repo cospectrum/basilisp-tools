@@ -174,7 +174,7 @@
         (is (= [] (bridge/check-call choose 2 [])))
         (is (seq (bridge/check-call choose 3 [])))
         (is (= {:module "sample_pkg.models" :path ["Child"]} (bridge/return-type choose)))
-        (is (= {:module "sample_pkg.models" :path ["Child"]} (bridge/return-type make)))
+        (is (= {:module "sample_pkg.models" :path ["Child"] :nullable? true} (bridge/return-type make)))
         (is (= :class (:kind (bridge/inspect-type make opts))))
         (is (nil? (bridge/check-call (bridge/inspect-path "sample_pkg" ["Decorated"] opts) 9 []))))
       (testing "Changing an imported file invalidates its public reexports"

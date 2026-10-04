@@ -1,0 +1,48 @@
+(ns basilisp-tools.regex-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.regex :as regex]
+            [basilisp.edn :as edn])
+  (:import [re]))
+
+(deftest java-pattern-families-test
+  (doseq [[pattern matching rejected]
+          [["\\Qfoo.bar\\E" "foo.bar" "fooXbar"]
+           ["(?<word>[a-z]+)-\\k<word>" "foo-foo" "foo-bar"]
+           ["\\p{L}+" "éλ" "123"]
+           ["[a-z&&[^aeiou]]+" "bcdf" "face"]
+           ["\\p{javaJavaIdentifierStart}+" "$foo" "123"]
+           ["\\w+" "foo_12" "é"]
+           ["(?U)\\w+" "é" "!"]
+           ["(?i)[a-z]+" "FOO" "K"]
+           ["(?i)é" "é" "É"]
+           ["(?iu)é" "É" "a"]
+           ["a++a" "" "aaa"]]]
+    (testing pattern
+      (when (seq matching) (is (some? (regex/fullmatch pattern matching))))
+      (is (nil? (regex/fullmatch pattern rejected))))))
+
+(deftest java-line-and-comment-flags-test
+  (doseq [text ["foo\n" "foo\r" "foo\r\n" "foo\u0085" "foo\u2028" "foo\u2029"]]
+    (is (= "foo" (.group (regex/search "(?m)^foo$" text)))))
+  (is (nil? (regex/search "(?m)^" "")))
+  (is (nil? (regex/search "(?m)^$" "foo\n")))
+  (is (some? (regex/search "(?dm)^foo$" "one\nfoo\ntwo")))
+  (is (nil? (regex/search "(?dm)^foo$" "one\rfoo\rtwo")))
+  (is (nil? (regex/fullmatch "(?x)[a\tb]" "\t")))
+  (is (some? (regex/fullmatch "(?x) foo # comment\n bar" "foobar"))))
+
+(deftest java-pattern-roundtrip-and-native-interop-test
+  (let [source "\\Qfoo.bar\\E"
+        pattern (regex/compile source)
+        serialized (pr-str pattern)
+        restored (edn/read-string serialized
+                                  {:default (fn [tag value]
+                                              (is (= 're tag))
+                                              (regex/compile value))})]
+    (is (regex/pattern? pattern))
+    (is (= source (regex/source pattern)))
+    (is (= pattern restored))
+    (is (some? (regex/fullmatch restored "foo.bar"))))
+  (let [native (re/compile "\\w+")]
+    (is (identical? native (regex/compile native)))
+    (is (some? (regex/fullmatch native "é")))))

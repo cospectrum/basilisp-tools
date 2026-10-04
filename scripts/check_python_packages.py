@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
+from pathlib import Path
+import subprocess
+import tempfile
 import sys
 import time
 
@@ -24,6 +28,48 @@ def get(value, key, default=None):
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+
+def check_runtime_models(executable, worker, timeout):
+    # These fixtures are deliberately executed in the development interpreter;
+    # user project sources continue to be inspected as ASTs only.
+    source = """import importlib.util, json, sys
+from typing import Generic, TypeVar
+from pydantic import BaseModel, ConfigDict, Field, create_model
+spec = importlib.util.spec_from_file_location("worker", sys.argv[1])
+worker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(worker)
+T = TypeVar("T")
+class Record(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    count: int = 0
+    external: str = Field(alias="externalName")
+    values: list[str] = Field(default_factory=list)
+class Box(BaseModel, Generic[T]):
+    value: T
+record = worker.runtime_member("Record", Record)
+box = worker.runtime_member("Box", Box[int])
+dynamic = worker.runtime_member("Dynamic", create_model("Dynamic", value=(str, ...)))
+print(json.dumps({"record": record["parameters"], "box": box["parameters"],
+                  "dynamic": dynamic["parameters"]}))
+"""
+    process = subprocess.run([executable, "-I", "-c", source, str(worker)],
+                             text=True, capture_output=True, timeout=timeout, check=True)
+    result = json.loads(process.stdout)
+    fields = {field["name"]: field for field in result["record"]}
+    require(set(fields) == {"name", "count", "externalName", "values"},
+            "Pydantic constructor fields and aliases were lost")
+    require(fields["name"]["required?"] and fields["externalName"]["required?"]
+            and not fields["count"]["required?"] and not fields["values"]["required?"],
+            "Pydantic required/default/default_factory metadata is incorrect")
+    require(fields["values"]["type-arguments"][0]["type-path"] == ["str"],
+            "Pydantic generic field annotation is unavailable")
+    require(result["box"][0]["type-path"] == ["int"],
+            "Specialized Pydantic generic model constructor lost its field type")
+    require(result["dynamic"][0]["type-path"] == ["str"],
+            "Pydantic create_model metadata is unavailable")
 
 
 def main():
@@ -45,6 +91,10 @@ def main():
     require(get(array, "type-module") and get(array, "type-path"),
             "numpy.array needs a resolved return type")
 
+    array_result = bridge.call_result(array, vector([None]), lmap({}), options)
+    require(get(array_result, "module") == "numpy" and list(get(array_result, "path", [])) == ["ndarray"],
+            "Ambiguous ndarray overloads should retain their common ndarray result")
+
     request = bridge.inspect_path("requests", vector(["get"]), options)
     require(get(request, "parameters") is not None or len(get(request, "overloads", [])) > 0,
             "requests.get stub signature is unavailable")
@@ -60,6 +110,19 @@ def main():
     base_model = bridge.inspect_path("pydantic", vector(["BaseModel"]), options)
     require(bridge.resolve_member(base_model, "model_dump") is not None,
             "Pydantic BaseModel methods should be discoverable")
+
+    check_runtime_models(args.python, Path(bridge.__file__).with_name("_inspect.py"), args.timeout)
+    with tempfile.TemporaryDirectory() as folder:
+        Path(folder, "package_models.py").write_text(
+            "from pydantic import BaseModel\n"
+            "class User(BaseModel):\n"
+            "    name: str\n", encoding="utf-8")
+        local_options = options.assoc(keyword("python-paths"), vector([folder]))
+        inherited = bridge.inspect_member(lmap({keyword("module"): "package_models",
+                                               keyword("path"): vector(["User"])}),
+                                          "model_dump", local_options)
+        require(get(inherited, "status") == keyword("known"),
+                "Static project models should inherit installed Pydantic methods")
 
     source = """(ns package-smoke (:import [numpy :as np] [requests :as requests]))
 (def values (np/array #py [1 2 3]))

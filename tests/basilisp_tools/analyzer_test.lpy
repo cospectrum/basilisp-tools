@@ -70,7 +70,7 @@
   (is (empty? (findings "(ns example (:require [basilisp.string :refer [join] :rename {join join-text}])) (join-text [])")))
   (is (= [:unused-namespace] (types "(ns example (:require [basilisp.string :as text]))")))
   (is (= [:unresolved-namespace] (types "(absent/f)")))
-  (is (= [:unresolved-symbol] (types "(ns n (:refer-basilisp :exclude [inc])) (inc 1)")))
+  (is (= [:unused-excluded-var :unresolved-symbol] (types "(ns n (:refer-basilisp :exclude [inc])) (inc 1)")))
   (is (empty? (findings "(ns n (:refer-basilisp :rename {inc add-one})) (add-one 1)")))
   (let [decls (analyzer/declarations "(ns library) (defn f [x] x)" {:filename "library.lpy"})
         result (analyzer/analyze "(ns client (:require [library :as lib])) (lib/f)"
@@ -139,5 +139,5 @@
                   "(ns sample (:refer-basilisp :rename {fn my-fn})) ((my-fn [x] x) 1)"
                   "(ns sample (:require [basilisp.core :as c])) (c/let [x 1] x)"]]
     (testing source (is (empty? (findings source)))))
-  (is (= [:unresolved-symbol] (types "(ns sample (:refer-basilisp :exclude [let])) (let 1)")))
+  (is (= [:unused-excluded-var :unresolved-symbol] (types "(ns sample (:refer-basilisp :exclude [let])) (let 1)")))
   (is (= [:invalid-arity] (types "(ns sample (:refer-basilisp :exclude [let])) (defn let [x] x) (let)"))))

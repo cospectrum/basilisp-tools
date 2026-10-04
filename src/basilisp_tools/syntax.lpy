@@ -73,31 +73,40 @@
   ;; Fixed-arity Python operations avoid variadic sequence allocation per character.
   (when (op/lt i (python/len s)) (op/getitem s i)))
 
+(defn- set-state! [state key value]
+  (op/setitem state key value)
+  state)
+
 (defn- peek-char [state]
-  (char-at (:source state) (:offset state)))
+  (char-at (op/getitem state "source") (op/getitem state "offset")))
 
 (defn- starts? [state value]
-  (.startswith (:source state) value (:offset state)))
+  (.startswith (op/getitem state "source") value (op/getitem state "offset")))
 
 (defn- issue [state code message start end]
-  (update state :diagnostics conj
-          {:code code :message message :severity :error :start start :end end}))
+  (.append (op/getitem state "diagnostics")
+           {:code code :message message :severity :error :start start :end end})
+  state)
 
 (defn- leaf [state kind end]
-  (let [start (:offset state)]
+  (let [start (op/getitem state "offset")]
     [{:kind kind :start start :end end
-      :text (subs (:source state) start end)}
-     (assoc state :offset end)]))
+      :text (subs (op/getitem state "source") start end)}
+     (set-state! state "offset" end)]))
 
 (defn- branch [kind start children state]
-  [{:kind kind :start start :end (:offset state) :children children} state])
+  [{:kind kind :start start :end (op/getitem state "offset") :children children} state])
 
 (defn- match-end [pattern state]
-  (when-let [m (.match pattern (:source state) (:offset state))]
+  (when-let [m (.match pattern (op/getitem state "source") (op/getitem state "offset"))]
+    (.end m)))
+
+(defn- match-from [pattern state offset]
+  (when-let [m (.match pattern (op/getitem state "source") offset)]
     (.end m)))
 
 (defn- take-trivia [state]
-  (let [i (:offset state) c (peek-char state)]
+  (let [i (op/getitem state "offset") c (peek-char state)]
     (cond
       (or (op/eq c "\r") (op/eq c "\n"))
       (leaf state :newline (+ i (if (starts? state "\r\n") 2 1)))
@@ -147,8 +156,8 @@
     :else nil))
 
 (defn- read-atom [state]
-  (let [i (:offset state)
-        source (:source state)
+  (let [i (op/getitem state "offset")
+        source (op/getitem state "source")
         numeric? (.match number-start-re source i)
         numeric-keyword? (and (op/eq ":" (peek-char state))
                               (some-> (char-at source (inc i)) .isnumeric))
@@ -160,12 +169,15 @@
               :else (or (match-end atom-re state) (inc i)))
         [node state] (leaf state :symbol end)
         kind (atom-kind (:text node))
-        problem (atom-error kind (:text node))]
+        problem (when-not (and (op/eq :clojure (op/getitem state "dialect"))
+                               (op/eq :symbol kind)
+                               (re/fullmatch "[^\\d/][^/\\s]*/[1-9]" (:text node)))
+                  (atom-error kind (:text node)))]
     [(assoc node :kind kind)
      (if problem (issue state :invalid-token problem i end) state)]))
 
 (defn- read-character [state]
-  (let [s (:source state) start (:offset state) first-pos (inc start)
+  (let [s (op/getitem state "source") start (op/getitem state "offset") first-pos (inc start)
         end (if (op/ge first-pos (count s))
               first-pos
               (loop [j (inc first-pos)]
@@ -173,6 +185,9 @@
                   (if (.isalnum c) (recur (inc j)) j) j)))
         body (subs s first-pos end)
         valid? (or (op/eq 1 (count body))
+                   (and (op/eq :clojure (op/getitem state "dialect"))
+                        (re/fullmatch "o[0-7]{1,3}" body)
+                        (<= (python/int (subs body 1) 8) 255))
                    (contains? #{"newline" "space" "tab" "formfeed" "backspace" "return"} body)
                    (and (.startswith body "u")
                         (try (let [v (python/int (subs body 1) 16)]
@@ -185,30 +200,45 @@
 (defn- escape-end
   "Consume a string escape, keeping spelling and reporting invalid escapes."
   [state kind]
-  (let [s (:source state) i (:offset state) c (char-at s (inc i))
+  (let [s (op/getitem state "source") i (op/getitem state "offset") c (char-at s (inc i))
         basic-end (min (count s) (+ i 2))]
     (cond
       (nil? c)
-      (issue (assoc state :offset basic-end) :invalid-escape
+      (issue (set-state! state "offset" basic-end) :invalid-escape
              "Incomplete escape sequence" i basic-end)
 
-      (op/eq kind :regex) (assoc state :offset basic-end)
+      (op/eq kind :regex) (set-state! state "offset" basic-end)
+
+      (and (op/eq :clojure (op/getitem state "dialect"))
+           (contains? #{"0" "1" "2" "3" "4" "5" "6" "7"} c))
+      (let [match (re/match "[0-7]{1,3}" (subs s (inc i)))
+            end (+ i 1 (.end match))
+            state (set-state! state "offset" end)]
+        (if (<= (python/int (.group match) 8) 255) state
+            (issue state :invalid-escape "Octal escape exceeds 255" i end)))
 
       (and (op/eq kind :bytes) (op/eq c "x"))
       (let [end (loop [j (+ i 2)]
                   (if (and (op/lt j (+ i 4)) (char-at s j)
                            (.fullmatch hex-digit-re (char-at s j)))
                     (recur (inc j)) j))
-            state (assoc state :offset end)]
+            state (set-state! state "offset" end)]
         (if (op/eq end (+ i 4)) state
             (issue state :invalid-escape "Expected two hexadecimal digits" i end)))
 
-      (op/eq kind :bytes) (assoc state :offset basic-end)
+      (op/eq kind :bytes) (set-state! state "offset" basic-end)
 
       (contains? #{"\"" "\\" "a" "b" "f" "n" "r" "t" "v"} c)
-      (assoc state :offset basic-end)
+      (set-state! state "offset" basic-end)
 
-      (and (op/eq kind :f-string) (op/eq c "{")) (assoc state :offset basic-end)
+      (and (op/eq kind :f-string) (op/eq c "{")) (set-state! state "offset" basic-end)
+
+      (and (op/eq :clojure (op/getitem state "dialect")) (op/eq c "u"))
+      (let [end (min (count s) (+ i 6))
+            digits (subs s (+ i 2) end)
+            state (set-state! state "offset" end)]
+        (if (re/fullmatch "[0-9a-fA-F]{4}" digits) state
+            (issue state :invalid-escape "Expected four hexadecimal digits" i end)))
 
       (contains? #{"u" "U"} c)
       (let [end (loop [j (+ i 2)]
@@ -217,13 +247,13 @@
             digits (subs s (+ i 2) end)
             valid? (and (contains? #{4 8} (count digits))
                         (<= (python/int digits 16) 1114111))
-            state (assoc state :offset end)]
+            state (set-state! state "offset" end)]
         (if valid? state
             (issue state :invalid-escape
                    "Unicode escape requires 4 or 8 hex digits and a valid code point" i end)))
 
       :else
-      (issue (assoc state :offset basic-end) :invalid-escape
+      (issue (set-state! state "offset" basic-end) :invalid-escape
              "Unknown string escape" i basic-end))))
 
 (declare read-form read-collection read-prefix read-string)
@@ -254,24 +284,24 @@
       state)))
 
 (defn- read-collection [state kind opener closer]
-  (let [start (:offset state)
-        old-closers (:closers state)
+  (let [start (op/getitem state "offset")
+        old-closers (op/getitem state "closers")
         [open state] (leaf state :delimiter (+ start (count opener)))]
-    (loop [state (assoc state :closers (conj old-closers closer)) children [open]]
+    (loop [state (set-state! state "closers" (conj old-closers closer)) children [open]]
       (let [c (peek-char state)]
         (cond
           (op/eq c closer)
-          (let [[close state] (leaf state :delimiter (inc (:offset state)))
+          (let [[close state] (leaf state :delimiter (inc (op/getitem state "offset")))
                 [node state] (branch kind start (conj children close)
-                                     (assoc state :closers old-closers))]
+                                     (set-state! state "closers" old-closers))]
             [node (if (contains? #{:map :reader-conditional :reader-splice} kind)
                     (check-collection node state) state)])
 
           (or (nil? c) (op/contains old-closers c))
           (let [state (issue state :missing-delimiter (str "Expected " closer)
-                             (:offset state) (:offset state))
+                             (op/getitem state "offset") (op/getitem state "offset"))
                 [node state] (branch kind start children
-                                     (assoc state :closers old-closers))]
+                                     (set-state! state "closers" old-closers))]
             [(assoc node :incomplete? true) state])
 
           :else
@@ -281,7 +311,7 @@
 (defn- read-prefix
   "Read N non-discarded forms. Comments and nested #_ remain in the tree."
   [state kind prefix n]
-  (let [start (:offset state)
+  (let [start (op/getitem state "offset")
         [head state] (leaf state :prefix (+ start (count prefix)))]
     (loop [state state children [head] left n]
       (let [[children state] (if (zero? left) [children state]
@@ -291,7 +321,7 @@
           (or (nil? (peek-char state)) (contains? close-chars (peek-char state)))
           (let [[node state] (branch kind start children
                                      (issue state :missing-form "Expected a form after reader prefix"
-                                            (:offset state) (:offset state)))]
+                                            (op/getitem state "offset") (op/getitem state "offset")))]
             [(assoc node :incomplete? true) state])
           :else
           (let [[child state] (read-form state)]
@@ -304,10 +334,10 @@
     children))
 
 (defn- read-string [state kind]
-  (let [start (:offset state) s (:source state)
+  (let [start (op/getitem state "offset") s (op/getitem state "source")
         [open state] (leaf state :delimiter (inc start))]
     (loop [state state children [open] segment-start (inc start)]
-      (let [i (:offset state) c (peek-char state)]
+      (let [i (op/getitem state "offset") c (peek-char state)]
         (cond
           (nil? c)
           (let [children (flush-string children s segment-start i)
@@ -325,27 +355,27 @@
 
           (and (op/eq kind :f-string) (op/eq c "{"))
           (let [children (flush-string children s segment-start i)
-                [expr state] (read-collection (update state :depth inc) :interpolation "{" "}")
-                state (update state :depth dec)
+                [expr state] (read-collection (set-state! state "depth" (inc (op/getitem state "depth"))) :interpolation "{" "}")
+                state (set-state! state "depth" (dec (op/getitem state "depth")))
                 state (if (op/eq 1 (count (forms expr))) state
                           (issue state :invalid-interpolation
                                  "F-string interpolation requires exactly one form"
                                  (:start expr) (:end expr)))]
-            (recur state (conj children expr) (:offset state)))
+            (recur state (conj children expr) (op/getitem state "offset")))
 
           (op/eq kind :bytes)
           (let [state (if (<= 1 (python/ord c) 127) state
                           (issue state :invalid-byte "Byte strings require ASCII characters" i (inc i)))]
-            (recur (update state :offset inc) children segment-start))
+            (recur (set-state! state "offset" (inc (op/getitem state "offset"))) children segment-start))
 
           :else
-          (recur (assoc state :offset
-                        (match-end (if (op/eq kind :f-string)
-                                     interpolation-segment-re string-segment-re) state))
+          (recur (set-state! state "offset"
+                             (match-end (if (op/eq kind :f-string)
+                                          interpolation-segment-re string-segment-re) state))
                  children segment-start))))))
 
 (defn- read-prefixed-string [state kind prefix]
-  (let [start (:offset state)
+  (let [start (op/getitem state "offset")
         [head state] (leaf state :prefix (+ start (count prefix)))
         [children state] (consume-trivia state [head])]
     (if (op/eq "\"" (peek-char state))
@@ -354,20 +384,22 @@
         [(cond-> result (:incomplete? node) (assoc :incomplete? true)) state])
       (let [[node state] (branch kind start children
                                  (issue state :missing-string "Expected a string after prefix"
-                                        (:offset state) (:offset state)))]
+                                        (op/getitem state "offset") (op/getitem state "offset")))]
         [(assoc node :incomplete? true) state]))))
 
 (defn- read-namespaced-map [state]
-  (let [start (:offset state)
+  (let [start (op/getitem state "offset")
         auto? (starts? state "#::")
         base (+ start (if auto? 3 2))
-        end (or (match-end atom-re (assoc state :offset base)) base)
-        ns-text (subs (:source state) base end)
+        end (or (match-from atom-re state base) base)
+        ns-text (subs (op/getitem state "source") base end)
         [head state] (leaf state :prefix end)
-        ;; Basilisp supports #:name and #::, not Clojure's #::alias.
-        valid? (if auto? (empty? ns-text)
-                   (and (seq ns-text) (.fullmatch identifier-re ns-text)
-                        (op/eq -1 (.find ns-text "/"))))
+        valid-name? (and (seq ns-text) (.fullmatch identifier-re ns-text)
+                         (op/eq -1 (.find ns-text "/")))
+        valid? (if auto?
+                 (or (empty? ns-text)
+                     (and (op/eq :clojure (op/getitem state "dialect")) valid-name?))
+                 valid-name?)
         state (if valid? state
                   (issue state :invalid-map-namespace "Invalid namespaced-map prefix" start end))
         [children state] (consume-trivia state [head])]
@@ -377,28 +409,39 @@
         [(cond-> result (:incomplete? node) (assoc :incomplete? true)) state])
       (let [[node state] (branch :namespaced-map start children
                                  (issue state :missing-map "Expected a map after namespace prefix"
-                                        (:offset state) (:offset state)))]
+                                        (op/getitem state "offset") (op/getitem state "offset")))]
         [(assoc node :incomplete? true) state]))))
 
 (defn- read-dispatch [state]
-  (let [i (:offset state)]
+  (let [i (op/getitem state "offset")]
     (cond
       (starts? state "#{") (read-collection state :set "#{" "}")
       (starts? state "#(") (read-collection state :anonymous-function "#(" ")")
       (starts? state "#?@(") (read-collection state :reader-splice "#?@(" ")")
       (starts? state "#?(") (read-collection state :reader-conditional "#?(" ")")
+      (and (op/eq :clojure (op/getitem state "dialect"))
+           (re/match "#\\?@?(?:[\\s,]|;[^\\r\\n]*(?:\\r\\n|[\\r\\n]))+\\(" (subs (op/getitem state "source") i)))
+      (let [kind (if (starts? state "#?@") :reader-splice :reader-conditional)
+            [prefix state] (leaf state :prefix (+ i (if (op/eq kind :reader-splice) 3 2)))
+            [trivia state] (consume-trivia state [prefix])
+            [collection state] (read-collection state kind "(" ")")]
+        [(assoc collection :start i :children (into trivia (:children collection))) state])
+      (and (op/eq :clojure (op/getitem state "dialect")) (starts? state "#^"))
+      (read-prefix state :metadata "#^" 2)
+      (and (op/eq :clojure (op/getitem state "dialect")) (starts? state "#="))
+      (read-prefix state :read-eval "#=" 1)
       (starts? state "#_") (read-prefix state :discard "#_" 1)
       (starts? state "#'") (read-prefix state :var-quote "#'" 1)
       (starts? state "#:") (read-namespaced-map state)
       (starts? state "#\"") (read-prefixed-string state :regex "#")
       (starts? state "##")
-      (let [end (or (match-end atom-re (assoc state :offset (+ i 2))) (+ i 2))
+      (let [end (or (match-from atom-re state (+ i 2)) (+ i 2))
             [node state] (leaf state :symbolic-number end)]
         [node (if (contains? #{"##Inf" "##-Inf" "##NaN"} (:text node)) state
                   (issue state :invalid-number "Unknown symbolic numeric constant" i end))])
       :else
-      (let [end (or (match-end atom-re (assoc state :offset (inc i))) (inc i))
-            tag (subs (:source state) (inc i) end)]
+      (let [end (or (match-from atom-re state (inc i)) (inc i))
+            tag (subs (op/getitem state "source") (inc i) end)]
         (cond
           (op/eq tag "b") (read-prefixed-string state :bytes "#b")
           (op/eq tag "f") (read-prefixed-string state :f-string "#f")
@@ -410,9 +453,9 @@
 
 (defn- read-form* [state]
   (or (take-trivia state)
-      (let [c (peek-char state) i (:offset state)]
+      (let [c (peek-char state) i (op/getitem state "offset")]
         (cond
-          (op/gt (:depth state) (:max-depth state))
+          (op/gt (op/getitem state "depth") (op/getitem state "max-depth"))
           (let [[node state] (leaf state :error (inc i))]
             [node (issue state :nesting-limit "Maximum syntax nesting depth exceeded" i (inc i))])
           (op/eq c "(") (read-collection state :list "(" ")")
@@ -434,30 +477,35 @@
           :else (read-atom state)))))
 
 (defn- read-form [state]
-  (let [depth (:depth state)
-        [node state] (read-form* (assoc state :depth (inc depth)))]
-    [node (assoc state :depth depth)]))
+  (let [depth (op/getitem state "depth")
+        [node state] (read-form* (set-state! state "depth" (inc depth)))]
+    [node (set-state! state "depth" depth)]))
 
 (defn parse
   "Parse all source into {:root node :diagnostics [...] :source s :line-starts [...]}.
 
   Invalid/incomplete text is retained and reported, not thrown away. :max-depth
-  (default 64, range 1..64) bounds recursive parsing of adversarial input.
+  (default 128, range 1..128) bounds recursive parsing of adversarial input.
+  :dialect :clojure additionally recognizes legacy metadata, read-eval text,
+  aliased namespace maps and array class symbols, without evaluating anything.
+  The default :basilisp dialect continues to diagnose unsupported forms.
   Diagnostics cover lexical/structural errors; runtime-sensitive reader checks,
   duplicate collection values, symbol resolution and type checks belong to analysis."
   ([source] (parse source {}))
-  ([source {:keys [max-depth] :or {max-depth 64}}]
+  ([source {:keys [max-depth dialect] :or {max-depth 128 dialect :basilisp}}]
    (when-not (string? source)
      (throw (python/TypeError "source must be a string")))
-   (when-not (and (integer? max-depth) (<= 1 max-depth 64))
-     (throw (python/ValueError "max-depth must be an integer between 1 and 64")))
-   (loop [state {:source source :offset 0 :diagnostics [] :depth 0
-                 :max-depth max-depth :closers []}
+   (when-not (and (integer? max-depth) (<= 1 max-depth 128))
+     (throw (python/ValueError "max-depth must be an integer between 1 and 128")))
+   (when-not (#{:basilisp :clojure} dialect)
+     (throw (python/ValueError "dialect must be :basilisp or :clojure")))
+   (loop [state #py {"source" source "offset" 0 "diagnostics" #py [] "depth" 0
+                     "dialect" dialect "max-depth" max-depth "closers" []}
           children []]
-     (if (op/eq (:offset state) (count source))
+     (if (op/eq (op/getitem state "offset") (count source))
        {:source source
         :root {:kind :root :start 0 :end (count source) :children children}
-        :diagnostics (:diagnostics state)
+        :diagnostics (vec (op/getitem state "diagnostics"))
         :line-starts (into [0] (map #(.end %) (iterator-seq (re/finditer "\r\n|\r|\n" source))))}
        (let [[node next-state] (read-form state)]
          (recur next-state (conj children node)))))))

@@ -1,7 +1,8 @@
 (ns basilisp-tools.lsp-config-test
   (:require [basilisp.test :refer [deftest is testing]]
-            [basilisp-tools.lsp :as lsp])
-  (:import [pathlib] [re] [tempfile]))
+            [basilisp-tools.lsp :as lsp]
+            [basilisp-tools.regex :as regex])
+  (:import [pathlib] [tempfile]))
 
 (defn- write! [root name content]
   (let [path (.joinpath root name)]
@@ -71,5 +72,77 @@
   (let [settings (lsp/read-settings "{\"document-formatting?\" false :cljfmt {:indents {#re \"with-.*\" [[:inner 0]]}}}")
         pattern (first (keys (get-in settings [:cljfmt :indents])))]
     (is (false? (:document-formatting? settings)))
-    (is (re/fullmatch pattern "with-lock")))
+    (is (regex/fullmatch pattern "with-lock")))
   (is (thrown? python/ValueError (lsp/read-settings "{:x #=(print :unsafe)}"))))
+
+(deftest client-linter-values-follow-upstream-walk-test
+  (let [settings (lsp/clean-client-settings
+                  {:linters {"literal-key" {:level "warning"
+                                            :exclude ["demo" :keep 'existing]
+                                            :nested {"flag" "value"}
+                                            :items '("item" 5)}}})
+        options (get-in settings [:linters "literal-key"])]
+    (is (= :warning (:level options)))
+    (is (= [:demo :keep 'existing] (:exclude options)))
+    (is (= {:flag :value} (:nested options)))
+    (is (= '(:item 5) (:items options)))
+    (is (= {} (:linters (lsp/clean-client-settings {:linters nil})))))
+  (let [settings (lsp/read-settings "{:linters {:example {:exclude [\"demo\"]}}}")]
+    (is (= ["demo"] (get-in settings [:linters :example :exclude])))))
+
+(deftest configuration-regex-preserves-flags-test
+  (let [plain (:pattern (lsp/read-settings "{:pattern #re \"with-.*\"}"))
+        folded (:pattern (lsp/read-settings "{:pattern #re \"(?i)with-.*\"}"))]
+    (is (= "with-.*" (regex/source plain)))
+    (is (= "(?i)with-.*" (regex/source folded)))
+    (is (not (regex/fullmatch plain "WITH-lock")))
+    (is (regex/fullmatch folded "WITH-lock"))))
+
+(deftest client-linter-values-drive-real-workspace-behavior-test
+  (let [temporary (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temporary))
+        filename (str (.joinpath root "demo.lpy"))
+        settings (lsp/clean-client-settings
+                  {:linters {:custom {"lint/check" {:level "info"}}
+                             :clojure-lsp/unused-public-var {:exclude ["demo/kept"]}}})]
+    (try
+      (write! root "lint.clj"
+              "(ns lint) (defn check [{:keys [uris params reg-diagnostic!]}]
+                 (reg-diagnostic! {:uri (first uris) :message \"Client linter ran\"
+                                   :code \"client/custom\" :level (:level params)
+                                   :range {:row 1 :col 1 :end-row 1 :end-col 2}}))")
+      (let [analysis (get (lsp/workspace-analysis
+                           {filename "(ns demo)\n(def kept 1)\n(def report 2)"}
+                           {:project-root (str root) :settings settings :python-inspection? false :cache false})
+                          filename)
+            findings (:findings analysis)
+            custom (filter #(= :client/custom (:type %)) findings)
+            unused (filter #(= :clojure-lsp/unused-public-var (:type %)) findings)]
+        (is (= 1 (count custom)) (pr-str findings))
+        (is (= :info (:level (first custom))))
+        (is (= "Client linter ran" (:message (first custom))))
+        (is (= 1 (count unused)) (pr-str findings))
+        (is (= "Unused public var 'demo/report'" (:message (first unused)))))
+      (finally (.cleanup temporary)))))
+
+(deftest client-and-file-linter-regex-filtering-test
+  (doseq [settings [(lsp/clean-client-settings {:linters {:clj-kondo {:ns-exclude-regex "demo.*"}}})
+                    (lsp/read-settings "{:linters {:clj-kondo {:ns-exclude-regex #re \"demo.*\"}}}")]]
+    (is (empty? (lsp/diagnostics-data
+                 "/tmp/demo.lpy" "x"
+                 {:namespace "demo" :findings [{:type :unresolved-symbol :level :error
+                                                :message "Unresolved x" :start 0 :end 1
+                                                :row 1 :col 1 :end-row 1 :end-col 2}]}
+                 settings)))))
+
+(deftest client-alias-exclusion-is-applied-test
+  (let [documents {"/tmp/a.lpy" "(ns a (:require [basilisp.string :as first]))"
+                   "/tmp/b.lpy" "(ns b (:require [basilisp.string :as second]))"}
+        analyze (fn [exclude]
+                  (let [settings (lsp/clean-client-settings
+                                  {:linters {:clojure-lsp/different-aliases
+                                             {:level "warning" :exclude-aliases exclude}}})]
+                    (filter #(= :clojure-lsp/different-aliases (:type %))
+                            (mapcat :findings (vals (lsp/workspace-analysis
+                                                     documents {:settings settings :python-inspection? false :cache false}))))))]
+    (is (= 2 (count (analyze []))))
+    (is (empty? (analyze ["first"])))))

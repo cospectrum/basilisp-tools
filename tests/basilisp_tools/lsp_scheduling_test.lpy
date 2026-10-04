@@ -1,0 +1,88 @@
+(ns basilisp-tools.lsp-scheduling-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.lsp])
+  (:import [asyncio] [time] [importlib] [pygls.workspace :as workspace]))
+
+(deftest analysis-workers-coalesce-and-survive-cancellation-test
+  (let [analyze-var (ns-resolve 'basilisp-tools.lsp 'analyze-document)
+        project-var (ns-resolve 'basilisp-tools.lsp 'project!)
+        analyzed (deref (ns-resolve 'basilisp-tools.lsp 'analyzed!))
+        original-analyze @analyze-var original-project @project-var
+        module (importlib/import_module "basilisp_tools.lsp")
+        analyze-name (.-__name__ original-analyze) project-name (.-__name__ original-project)
+        active (atom 0) peak (atom 0) calls (atom [])
+        uri "file:///tmp/coalesced.lpy"
+        document #(workspace/TextDocument uri ** :source %)
+        state (atom {:documents {uri (document "old")} :generation 0 :options {} :settings {} :roots []})
+        fake (fn [document _project _options _settings]
+               (swap! active inc)
+               (swap! peak max @active)
+               (swap! calls conj (.-source document))
+               (time/sleep 0.06)
+               (swap! active dec)
+               {:source (.-source document)})
+        project (fn ^:async no-project [_state _uri] {})
+        run (fn ^:async exercise []
+              (let [first (asyncio/create_task (analyzed state uri))
+                    second (asyncio/create_task (analyzed state uri))
+                    third (asyncio/create_task (analyzed state uri))]
+                (await (asyncio/sleep 0.02))
+                (swap! state assoc :generation 1 :documents {uri (document "new")})
+                (.cancel first)
+                (let [results (await (asyncio/gather second third))]
+                  (is (= [{:source "new"} {:source "new"}] (vec results)))
+                  (is (= 1 @peak))
+                  (is (= ["old" "new"] @calls))
+                  (is (= {:source "new"} (await (analyzed state uri))))
+                  (is (= 2 (count @calls))))))]
+    (try
+      (python/setattr module analyze-name fake)
+      (python/setattr module project-name project)
+      (asyncio/run (run))
+      (finally
+        (python/setattr module analyze-name original-analyze)
+        (python/setattr module project-name original-project)))))
+
+(deftest unchanged-documents-reuse-analysis-until-dependency-api-changes-test
+  (let [analyze-var (ns-resolve 'basilisp-tools.lsp 'analyze-document)
+        project-var (ns-resolve 'basilisp-tools.lsp 'project!)
+        analyzed (deref (ns-resolve 'basilisp-tools.lsp 'analyzed!))
+        module (importlib/import_module "basilisp_tools.lsp")
+        original-analyze @analyze-var original-project @project-var
+        analyze-name (.-__name__ original-analyze) project-name (.-__name__ original-project)
+        uri "file:///tmp/consumer.lpy" calls (atom 0)
+        definition {:ns "provider" :name "f" :fixed-arities #{1} :scope-end 20}
+        declarations (atom {"provider" {"f" definition}})
+        state (atom {:documents {uri (workspace/TextDocument uri ** :source "(ns consumer)")}
+                     :generation 0 :analysis-epoch 0 :options {} :settings {} :roots []})
+        fake (fn [_document _project _options _settings]
+               (swap! calls inc)
+               {:namespace "consumer" :namespace-usages [{:name "provider"}]
+                :var-usages [{:ns "provider" :name "f" :definition definition}] :calls []})
+        project (fn ^:async current-declarations [_state _uri] @declarations)
+        run (fn ^:async exercise []
+              (await (analyzed state uri))
+              (is (= 1 @calls))
+              (swap! declarations assoc-in ["provider" "f" :scope-end] 50)
+              (swap! state update :generation inc)
+              (let [result (await (analyzed state uri))]
+                (is (= 1 @calls))
+                (is (= 50 (get-in result [:var-usages 0 :definition :scope-end]))))
+              (swap! declarations assoc "unrelated" {"g" {:ns "unrelated" :name "g"}})
+              (swap! state update :generation inc)
+              (await (analyzed state uri))
+              (is (= 1 @calls))
+              (swap! declarations assoc-in ["provider" "f" :fixed-arities] #{2})
+              (swap! state update :generation inc)
+              (await (analyzed state uri))
+              (is (= 2 @calls))
+              (swap! state update :analysis-epoch inc)
+              (await (analyzed state uri))
+              (is (= 3 @calls)))]
+    (try
+      (python/setattr module analyze-name fake)
+      (python/setattr module project-name project)
+      (asyncio/run (run))
+      (finally
+        (python/setattr module analyze-name original-analyze)
+        (python/setattr module project-name original-project)))))

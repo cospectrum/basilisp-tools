@@ -3,14 +3,16 @@
   (:require [basilisp.edn :as edn]
             [basilisp.string :as str]
             [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.hooks :as hooks]
             [basilisp-tools.python :as py]
+            [basilisp-tools.regex :as regex]
             [basilisp-tools.syntax :as syntax])
-  (:import [concurrent.futures :as futures] [json] [os] [pathlib] [re] [sys] [time]
-           [urllib.parse :as url]))
+  (:import [base64] [concurrent.futures :as futures] [datetime] [decimal] [fractions] [hashlib] [json] [math] [os] [pathlib] [re] [sys] [time] [uuid] [zipfile]
+           [urllib.parse :as url] [os.path]))
 
 (def ^:private skipped-directories
   #{".git" ".hg" ".svn" ".venv" "venv" ".direnv" ".tox" ".clj-kondo"
-    "node_modules" "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
+    "node_modules" "clj-kondo.exports" "__pycache__" ".pytest_cache" ".mypy_cache" "build" "dist"})
 
 (defn- error [message] (throw (python/ValueError message)))
 
@@ -28,9 +30,21 @@
   "Merge clj-kondo configuration, including the legacy :if linter alias."
   [a b]
   (if (empty? b) a
-      (deep-merge a (cond-> b
-                      (contains? (:linters b) :if)
-                      (assoc-in [:linters :missing-else-branch] (get-in b [:linters :if]))))))
+      (let [types (get-in b [:linters :type-mismatch :namespaces])
+            a (if (contains? (:linters b) :type-mismatch)
+                (update-in a [:linters :type-mismatch :namespaces]
+                           #(merge-with
+                             (partial merge-with
+                                      (fn [left right]
+                                        (deep-merge (update left :arities merge (:arities right))
+                                                    (dissoc right :arities))))
+                             % types)) a)
+            b (cond-> b
+                (contains? (:linters b) :if)
+                (assoc-in [:linters :missing-else-branch] (get-in b [:linters :if]))
+                (contains? (:linters b) :type-mismatch)
+                (update-in [:linters :type-mismatch] dissoc :namespaces))]
+        (deep-merge a b))))
 
 (defn- literal-map [values label]
   (let [pairs (mapv vec (partition 2 values)) result (into {} pairs)]
@@ -43,7 +57,13 @@
 (defn- config-value [node label context]
   (let [kind (:kind node) forms (syntax/forms node)]
     (cond
-      (#{:nil :boolean :number :symbolic-number :character :keyword :symbol :string} kind)
+      (= :number kind)
+      (let [text (syntax/text node)]
+        (cond (str/includes? text "/") (fractions/Fraction text)
+              (.endswith text "M") (decimal/Decimal (subs text 0 (dec (count text))))
+              :else (edn/read-string text)))
+
+      (#{:nil :boolean :symbolic-number :character :keyword :symbol :string} kind)
       (edn/read-string (syntax/text node))
 
       (#{:map :vector :set :list} kind)
@@ -78,14 +98,21 @@
                  (config-value (first forms) label context)) label))
 
       (= :regex kind)
-      (let [text (syntax/text node)] (re/compile (subs text 2 (dec (count text)))))
+      (if (:allow-regex? context)
+        (let [text (syntax/text node)] (regex/compile (subs text 2 (dec (count text)))))
+        (error (str label ": regex literals are not EDN; use a pattern string")))
+
+      (and (= :tagged kind) (:source-metadata? context))
+      (list 'basilisp.core/read-string (syntax/text node))
 
       (= :tagged kind)
       (let [tag (:text (first (:children node)))
             value (config-value (first forms) label context)]
         (case tag
+          "#inst" (edn/read-string (syntax/text node))
+          "#uuid" (edn/read-string (syntax/text node))
           "#re" (if (and (contains? (:readers context) 're) (string? value))
-                  (re/compile value)
+                  (regex/compile value)
                   (error (str label ": unsupported configuration tag #re")))
           "#include" (do
                        (when-not (and (:file context) (string? value))
@@ -164,7 +191,7 @@
                  (if (.is_dir path)
                    (merge-config result (config-directory path (conj seen canonical))) result)))
              {} paths)
-     cfg)))
+     (assoc cfg :config-directories [(str (.resolve directory))]))))
 
 (defn- config-directory [directory seen]
   (let [file (.joinpath directory "config.edn")]
@@ -213,9 +240,17 @@
                                  (when-let [extra (os/getenv "CLJ_KONDO_EXTRA_CONFIG_DIR")]
                                    (config-directory (pathlib/Path extra) #{}))]
                                 (map explicit-config explicit)))]
-     (when (seq (:hooks config))
-       (error "clj-kondo :hooks are unsupported: blt does not execute Clojure hooks"))
-     (cond-> config directory (assoc :cfg-dir (str (.resolve directory)))))))
+     (cond-> (update config :config-directories #(vec (distinct %)))
+       directory (assoc :cfg-dir (str (.resolve directory))
+                        :use-import-dir (or (.is_dir (.joinpath directory "imports"))
+                                            (empty? (iterator-seq (.glob directory "*/*/config.edn")))))))))
+
+(defn- path-inputs [paths]
+  (mapcat (fn [value]
+            (let [value (str value)]
+              (if (and (not= "-" value) (not (.exists (pathlib/Path value)))
+                       (>= (.find value os/pathsep) 0))
+                (remove empty? (str/split value (re/escape os/pathsep))) [value]))) paths))
 
 (defn- walk-files [directory]
   (let [files (atom [])]
@@ -234,25 +269,156 @@
   {:filename filename :row 1 :col 1 :end-row 1 :end-col 1
    :type :file :level :error :message message})
 
-(defn- collect-files [paths]
-  (let [result (atom []) problems (atom []) seen (atom #{})]
+(defn- copy-export! [config filename content copied]
+  (when-let [directory (:cfg-dir config)]
+    (let [parts (vec (.split (.replace filename "\\" "/") "/"))
+          suffix (vec (rest (drop-while #(not= "clj-kondo.exports" %) parts)))]
+      (when (and (>= (count suffix) 3)
+                 (every? #(not (#{"" "." ".."} %)) suffix))
+        (let [base (pathlib/Path directory)
+              base (if (:use-import-dir config) (.joinpath base "imports") base)
+              target (reduce #(.joinpath %1 %2) base suffix)
+              root (.resolve base)
+              canonical (.resolve target)]
+          (when (.is_relative_to canonical root)
+            (when-not (and (.is_file target) (= content (.read_text target ** :encoding "utf-8")))
+              (.mkdir (.-parent target) ** :parents true :exist_ok true)
+              (.write_text target content ** :encoding "utf-8")
+              (swap! copied conj (str (.joinpath base (first suffix) (second suffix)))))))))))
+
+(defn- exported? [filename]
+  (contains? (set (.split (.replace filename "\\" "/") "/")) "clj-kondo.exports"))
+
+(defn- copy-exports! [paths config]
+  (let [copied (atom #{})]
+    (doseq [name paths :when (not= "-" name) :let [path (pathlib/Path name)]]
+      (cond
+        (.is_dir path)
+        (doseq [[root dirs files] (iterator-seq (os/walk path ** :followlinks false))]
+          (doseq [directory (vec dirs)
+                  :when (and (contains? skipped-directories directory)
+                             (not= "clj-kondo.exports" directory))]
+            (.remove dirs directory))
+          (doseq [filename files
+                  :let [file (.joinpath (pathlib/Path root) filename)]
+                  :when (and (exported? (str file)) (not (.is_symlink file))
+                             (contains? #{".edn" ".clj" ".cljc" ".clj_kondo" ".lpy"} (.-suffix file)))]
+            (copy-export! config (str file) (.read_text file ** :encoding "utf-8") copied)))
+        (and (.is_file path) (contains? #{".whl" ".zip" ".jar"} (.-suffix path)))
+        (let [archive (zipfile/ZipFile path)]
+          (try
+            (doseq [entry (sort (.namelist archive))
+                    :when (and (exported? entry)
+                               (contains? #{".edn" ".clj" ".cljc" ".clj_kondo" ".lpy"}
+                                          (.-suffix (pathlib/Path entry))))]
+              (copy-export! config entry (.decode (.read archive entry) "utf-8") copied))
+            (finally (.close archive))))))
+    (.write sys/stderr
+            (cond (not (:cfg-dir config)) "No configs copied because config dir (.clj-kondo) does not exist.\n"
+                  (empty? @copied) "No configs copied.\n"
+                  :else (str "Configs copied:\n"
+                             (str/join "" (map #(str "- " (os.path/relpath %) "\n") (sort @copied))))))
+    (vec (sort @copied))))
+
+(defn- collect-sources [paths options config]
+  (let [sources (atom []) problems (atom []) seen (atom #{})
+        canonical? (get-in config [:output :canonical-paths])
+        add! (fn [filename source owner]
+               (swap! sources conj {:filename filename :source source :owner owner}))]
     (doseq [name paths]
       (try
-        (let [path (pathlib/Path name)
-              files (cond
-                      (.is_symlink path) (error (str "Refusing symbolic link: " name))
-                      (.is_file path) [path]
-                      (.is_dir path) (walk-files path)
-                      :else (error (str "Path does not exist: " name)))]
-          (doseq [file files :let [canonical (str (.resolve file))]
-                  :when (not (contains? @seen canonical))]
-            (swap! seen conj canonical)
-            (swap! result conj file)))
-        (catch python/Exception e (swap! problems conj (file-finding name (str e))))))
-    {:files (vec (sort-by str @result)) :findings @problems}))
+        (if (= "-" name)
+          (when-not (contains? @seen "-")
+            (swap! seen conj "-")
+            (add! (or (:filename options) "<stdin>")
+                  (if (contains? options :stdin) (:stdin options) (.read sys/stdin)) nil))
+          (let [path (pathlib/Path name)
+                files (cond (.is_symlink path) (error (str "Refusing symbolic link: " name))
+                            (.is_file path) [path]
+                            (.is_dir path) (walk-files path)
+                            :else (error "file does not exist"))]
+            (doseq [file files :let [canonical (str (.resolve file))]
+                    :when (not (contains? @seen canonical))]
+              (swap! seen conj canonical)
+              (if (contains? #{".whl" ".zip" ".jar"} (.-suffix file))
+                (let [archive (zipfile/ZipFile file)]
+                  (try
+                    (doseq [entry (sort (.namelist archive))
+                            :when (and (.endswith entry ".lpy") (not (exported? entry)))]
+                      (add! (str (when canonical? (str canonical ":")) entry)
+                            (.decode (.read archive entry) "utf-8") canonical))
+                    (finally (.close archive))))
+                (add! (if canonical? canonical (str file)) (.read_text file ** :encoding "utf-8") canonical)))))
+        (catch python/Exception e
+          (swap! problems conj (-> (file-finding (if canonical? (str (.resolve (pathlib/Path name))) name) (str e))
+                                   (assoc :row 0 :col 0)
+                                   (dissoc :end-row :end-col))))))
+    {:sources @sources :findings @problems}))
+
+(defn- cache-directory [options config]
+  (when-not (or (false? (:cache options)) (= "false" (:cache options)))
+    (when-let [path (or (:cache-dir options)
+                        (when (string? (:cache options)) (:cache options))
+                        (when-let [directory (:cfg-dir config)]
+                          (str (.joinpath (pathlib/Path directory) ".cache"))))]
+      (.joinpath (pathlib/Path path) "blt-v2"))))
+
+(defn- fingerprint [owner]
+  (when owner
+    (try (let [stat (.stat (pathlib/Path owner))]
+           [(.-st_mtime_ns stat) (.-st_size stat)])
+         (catch python/OSError _ nil))))
+
+(defn- cache-key [filename]
+  (.hexdigest (hashlib/sha256 (.encode filename "utf-8"))))
+
+(defn- cached-entry [file]
+  (try
+    (let [entry (edn/read-string (.read_text file ** :encoding "utf-8") {:readers {'re regex/compile}})]
+      (when (and (map? entry) (string? (:owner entry))
+                 (map? (get-in entry [:declarations :definitions]))
+                 (string? (get-in entry [:declarations :namespace]))
+                 (string? (get-in entry [:declarations :parsed :source]))
+                 (= (:fingerprint entry) (fingerprint (:owner entry))))
+        entry))
+    (catch python/Exception _ nil)))
+
+(defn- cached-project [directory]
+  (if (and directory (.is_dir directory))
+    (reduce (fn [project file]
+              (if-let [entry (cached-entry file)]
+                (let [declarations (:declarations entry)]
+                  (update project (:namespace declarations) merge (:definitions declarations)))
+                project))
+            {} (sort (iterator-seq (.glob directory "*.edn"))))
+    {}))
+
+(defn- cached-declarations [source directory debug?]
+  (let [{:keys [filename owner]} source
+        digest (.hexdigest (hashlib/sha256 (.encode (:source source) "utf-8")))
+        file (when (and directory owner) (.joinpath directory (str (cache-key (pr-str [owner filename (:lang source)])) ".edn")))
+        entry (when (and file (.is_file file)) (cached-entry file))]
+    (if (and entry (= digest (:digest entry)) (= filename (:filename entry)))
+      (do (when debug? (.write sys/stderr (str "[blt] Cached declarations: " filename "\n")))
+          (:declarations entry))
+      (let [declarations (analyzer/declarations (:source source) {:filename filename})
+            declarations (if (= :edn (:lang source)) (assoc declarations :namespace "user" :definitions {}) declarations)]
+        (when file
+          (try
+            (.mkdir directory ** :parents true :exist_ok true)
+            (let [temporary (.with_suffix file (str "." (os/getpid) "." (time/monotonic_ns) ".tmp"))]
+              (try
+                (.write_text temporary
+                             (pr-str {:filename filename :owner owner :fingerprint (fingerprint owner)
+                                      :digest digest :declarations declarations}) ** :encoding "utf-8")
+                (.replace temporary file)
+                (finally (when (.exists temporary) (.unlink temporary)))))
+            (catch python/OSError e
+              (when debug? (.write sys/stderr (str "[blt] Cache write failed: " e "\n"))))))
+        declarations))))
 
 (defn- matches? [patterns filename]
-  (some #(re/search % (.replace filename "\\" "/")) patterns))
+  (some #(regex/search % (.replace filename "\\" "/")) patterns))
 
 (defn- file-level [config finding]
   (if (= :file (:type finding))
@@ -276,42 +442,35 @@
               [".venv/bin/python" ".venv/Scripts/python.exe"])
         sys/executable)))
 
+(declare analysis-options configuration-findings)
+
 (defn run
   "Analyze files as one project. '-' reads :stdin (or sys.stdin). No source is executed."
   ([] (run {}))
   ([options]
-   (let [started (time/perf_counter) config (load-config options)
-         paths (or (seq (:paths options)) (if (some? (:stdin options)) ["-"] ["."]))
-         stdin? (some #(= "-" %) paths)
-         _ (when (and stdin? (not= 1 (count paths))) (error "Stdin (-) cannot be combined with other paths"))
-         collected (if stdin? {:files [] :findings []} (collect-files paths))
+   (let [started (time/perf_counter)
+         paths (vec (path-inputs (or (seq (:paths options)) (seq (:lint options))
+                                     (if (some? (:stdin options)) ["-"] ["."]))))
+         initial-config (load-config options)
+         copied (when (:copy-configs options) (copy-exports! paths initial-config))
+         config (if (and (:dependencies options) (:copy-configs options)) (load-config options) initial-config)
+         cache-dir (cache-directory options config)
+         collected (collect-sources paths options config)
          problems (atom (:findings collected))
-         sources (if stdin?
-                   [{:filename (or (:filename options) "<stdin>")
-                     :source (if (contains? options :stdin) (:stdin options) (.read sys/stdin))}]
-                   (->> (:files collected)
-                        (keep (fn [path]
-                                (let [filename (if (get-in config [:output :canonical-paths])
-                                                 (str (.resolve path)) (str path))]
-                                  (when-not (and (:exclude-files config)
-                                                 (re/search (:exclude-files config) (.replace filename "\\" "/")))
-                                    (try
-                                      {:filename filename :source (.read_text path ** :encoding "utf-8")}
-                                      (catch python/Exception e
-                                        (swap! problems conj (file-finding filename (str e))) nil)))))) vec))
          sources (if-let [pattern (:exclude-files config)]
-                   (filterv #(not (re/search pattern (.replace (:filename %) "\\" "/"))) sources)
-                   sources)
-         sources (mapv (fn [{:keys [source filename] :as item}]
+                   (filterv #(not (regex/search pattern (.replace (:filename %) "\\" "/"))) (:sources collected))
+                   (:sources collected))
+         sources (if (and (:skip-lint options) (not (analysis-options config))) [] sources)
+         sources (mapv (fn [{:keys [filename] :as item}]
                          (try
-                           (assoc item :declarations (analyzer/declarations source {:filename filename}))
+                           (assoc item :declarations (cached-declarations (assoc item :lang (if (.endswith filename ".edn") :edn (:lang options :lpy))) cache-dir (:debug options)))
                            (catch python/Exception e
                              (assoc item :declaration-error (file-finding filename (str "Analysis failed: " e))))))
                        sources)
          project (reduce (fn [result {:keys [declarations]}]
                            (if declarations
                              (update result (:namespace declarations) merge (:definitions declarations)) result))
-                         {} sources)
+                         (cached-project cache-dir) sources)
          root (if-let [dir (:cfg-dir config)] (.-parent (pathlib/Path dir))
                       (pathlib/Path (or (:cwd options) (.cwd pathlib/Path))))
          python-options {:python-executable (default-python options config)
@@ -320,21 +479,39 @@
                          :python-timeout (:python-timeout options 5)
                          :python-cache (or (:python-cache options) (py/create-cache))}
          dependency-cache (or (:dependency-cache options) (analyzer/create-cache))
-         analyze-file (fn [{:keys [source filename declarations declaration-error]}]
-                        (if declaration-error
-                          {:filename filename :findings [declaration-error]}
-                          (try
-                            (analyzer/analyze source {:filename filename :config config :project project
-                                                      :declarations declarations :python-options python-options
-                                                      :dependency-cache dependency-cache})
-                            (catch python/Exception e
-                              {:filename filename :findings [(file-finding filename (str "Analysis failed: " e))]}))))
+         hook-cache (or (:hook-cache options) (hooks/create-cache))
+         completed (atom 0)
+         report! (fn [item]
+                   (let [done (swap! completed inc)]
+                     (when (and (= :text (get-in config [:output :format])) (get-in config [:output :progress]))
+                       (.write sys/stderr ".") (.flush sys/stderr))
+                     (when-let [callback (:file-analyzed-fn options)]
+                       (callback {:filename (:filename item)
+                                  :uri (when (:owner item) (.as_uri (.resolve (pathlib/Path (:owner item)))))
+                                  :total-files (count sources) :files-done done}))))
+         analyze-one (fn [{:keys [source filename declarations declaration-error]}]
+                       (if declaration-error
+                         {:filename filename :findings [declaration-error]}
+                         (try
+                           (let [additional (configuration-findings source filename config)]
+                             (update (analyzer/analyze source {:filename filename :config config :project project
+                                                               :declarations declarations :python-options python-options
+                                                               :lang (if (.endswith filename ".edn") :edn (:lang options :lpy))
+                                                               :dependency-cache dependency-cache :hook-cache hook-cache
+                                                               :additional-findings (filterv :start additional)})
+                                     :findings into (remove :start additional)))
+                           (catch python/Exception e
+                             {:filename filename :findings [(file-finding filename (str "Analysis failed: " e))]}))))
+         analyze-file (fn [item]
+                        (try (analyze-one item) (finally (report! item))))
          analysis (if (and (:parallel options) (> (count sources) 1))
                     (let [executor (futures/ThreadPoolExecutor ** :max_workers (min 32 (count sources)))]
                       (try (vec (iterator-seq (.map executor analyze-file sources)))
                            (finally (.shutdown executor ** :wait true))))
                     (mapv analyze-file sources))
-         findings (->> (if (:dependencies options) [] (concat @problems (mapcat :findings analysis)))
+         _ (when (and (seq sources) (= :text (get-in config [:output :format]))
+                      (get-in config [:output :progress])) (.write sys/stderr "\n"))
+         findings (->> (if (or (:dependencies options) (:skip-lint options)) [] (concat @problems (mapcat :findings analysis)))
                        (keep #(file-level config %))
                        (filter #(visible-finding? config %))
                        (sort-by (juxt :filename :row :col :message)) distinct vec)
@@ -342,7 +519,7 @@
                          {:error 0 :warning 0 :info 0 :type :summary
                           :files (count sources) :duration (python/int (* 1000 (- (time/perf_counter) started)))} findings)]
      {:findings findings :summary summary :config config :analysis analysis :sources sources
-      :report-level (:report-level options :info)})))
+      :report-level (:report-level options :info) :copied-configs copied :lang (:lang options)})))
 
 (defn exit-status
   "clj-kondo exit codes: 0 success, 2 warnings, 3 errors."
@@ -353,13 +530,49 @@
      (and (not= "error" (name fail-level)) (pos? (get-in result [:summary :warning] 0))) 2
      :else 0)))
 
-(defn- json-value [value]
+(defn json-value
+  "Normalize Clojure/Basilisp data for JSON, preserving Decimal precision for json-dumps."
+  [value]
   (cond
-    (map? value) (python/dict (python/list (map (fn [[k v]] (python/tuple [(if (keyword? k) (name k) (str k))
-                                                                           (json-value v)])) value)))
-    (or (sequential? value) (set? value)) (python/list (map json-value value))
+    (regex/pattern? value) (regex/source value)
+    (python/isinstance value uuid/UUID) (str value)
+    (python/isinstance value datetime/datetime)
+    (let [utc (.-utc datetime/timezone)
+          instant (if (.-tzinfo value) value (.replace value ** :tzinfo utc))]
+      (.strftime (.astimezone instant utc) "%Y-%m-%dT%H:%M:%SZ"))
+    (python/isinstance value datetime/date) (.isoformat value)
+    (python/isinstance value python/bytes) (.decode (base64/b64encode value) "ascii")
+    (python/isinstance value fractions/Fraction) (json-value (python/float value))
+    (python/isinstance value decimal/Decimal)
+    (if (.is_finite value) value
+        (cond (.is_nan value) "NaN" (.is_signed value) "-Infinity" :else "Infinity"))
+    (and (python/isinstance value python/float) (not (math/isfinite value)))
+    (cond (math/isnan value) "NaN" (neg? value) "-Infinity" :else "Infinity")
+    (or (map? value) (python/isinstance value python/dict))
+    (python/dict (python/list (map (fn [[k v]]
+                                     (python/tuple [(if (keyword? k) (subs (str k) 1) (str k)) (json-value v)]))
+                                   (if (map? value) value (.items value)))))
+    (or (sequential? value) (set? value)
+        (python/isinstance value (python/tuple [python/list python/tuple python/set python/frozenset])))
+    (python/list (map json-value value))
     (or (keyword? value) (symbol? value)) (str/replace (str value) #"^:" "")
     :else value))
+
+(defn- encode-json [value]
+  (cond
+    (python/isinstance value decimal/Decimal) (str value)
+    (python/isinstance value python/dict)
+    (str "{" (str/join ", " (map (fn [[key item]]
+                                   (str (json/dumps key ** :ensure_ascii false) ": " (encode-json item)))
+                                 (.items value))) "}")
+    (python/isinstance value python/list)
+    (str "[" (str/join ", " (map encode-json value)) "]")
+    :else (json/dumps value ** :ensure_ascii false :allow_nan false)))
+
+(defn json-dumps
+  "Encode data with Cheshire-compatible scalars, UTC instants, and exact Decimal numbers."
+  [value]
+  (encode-json (json-value value)))
 
 (defn- output-finding [finding]
   (select-keys finding [:filename :row :col :end-row :end-col :type :level :message]))
@@ -399,10 +612,105 @@
 (defn- unwrapped [node]
   (if (= :metadata (:kind node)) (recur (last (syntax/forms node))) node))
 
+(def compatibility-version
+  "Pinned clj-kondo behavior baseline used for minimum-version diagnostics."
+  "2026.08.04")
+
+;; Linter names are the pinned upstream catalog plus Basilisp's inspection diagnostic.
+(def ^:private configuration-linters
+  #{:alias-same-as-ns :aliased-namespace-symbol :aliased-namespace-var-usage :aliased-referred-var
+    :await-without-async-fn :bb.edn-cyclic-task-dependency :bb.edn-task-missing-docstring
+    :bb.edn-undefined-task :bb.edn-unexpected-key :case-duplicate-test :case-quoted-test
+    :case-symbol-test :clj-kondo-config :cond-else :conditional-build-up :conflicting-alias
+    :conflicting-fn-arity :consistent-alias :constant-condition :datalog-syntax :def-fn
+    :deprecated-namespace :deprecated-var :deps.edn :destructured-or-always-evaluates
+    :destructured-or-binding-of-same-map :discouraged-java-method :discouraged-namespace
+    :discouraged-tag :discouraged-var :do-template :docstring-blank
+    :docstring-leading-trailing-whitespace :docstring-no-summary :duplicate-field
+    :duplicate-key-args :duplicate-map-key :duplicate-refer :duplicate-require :duplicate-set-key
+    :dynamic-var-not-earmuffed :earmuffed-var-not-dynamic :equals-expected-position :equals-false
+    :equals-float :equals-nil :equals-true :file :format :hook :if-nil-return :if-x-x-y
+    :inline-def :invalid-arity :is-message-not-string :java-static-field-call :keyword-binding
+    :line-length :locking-suspicious-lock :loop-without-recur :main-without-gen-class
+    :min-clj-kondo-version :minus-one :misplaced-async-metadata :misplaced-docstring
+    :missing-body-in-when :missing-clause-in-try :missing-docstring :missing-else-branch
+    :missing-map-value :missing-protocol-method :missing-protocol-method-arity
+    :missing-test-assertion :multiple-async-in-deftest :namespace-name-mismatch
+    :non-arg-vec-return-type-hint :not-a-function :not-empty? :not-nil? :plus-one :private-call
+    :protocol-method-arity-mismatch :protocol-method-varargs :python-inspection :redefined-var
+    :reduce-without-init :redundant-call :redundant-declare :redundant-do :redundant-expression
+    :redundant-fn-wrapper :redundant-format :redundant-ignore :redundant-let
+    :redundant-let-binding :redundant-nested-call :redundant-primitive-coercion
+    :redundant-str-call :refer :refer-all :schema-misplaced-return :self-requiring-namespace
+    :seq-rest :shadowed-fn-param :shadowed-var :single-key-in :single-logical-operand
+    :single-operand-comparison :syntax :type-mismatch :unbound-destructuring-default
+    :underscore-in-namespace :unexpected-recur :uninitialized-var :unknown-ns-option
+    :unknown-require-option :unquote-not-syntax-quoted :unreachable-code :unresolved-excluded-var
+    :unresolved-namespace :unresolved-protocol-method :unresolved-symbol :unresolved-var
+    :unsorted-imports :unsorted-required-namespaces :unused-alias :unused-binding
+    :unused-excluded-var :unused-import :unused-namespace :unused-private-var :unused-referred-var
+    :unused-value :use :used-underscored-binding :var-same-name-except-case :warn-on-reflection})
+
+(defn- configuration-type [node]
+  (let [node (if (= :metadata (:kind node)) (last (syntax/forms node)) node)]
+    (case (:kind node)
+      :number (let [text (syntax/text node)]
+                (cond (str/includes? text "/") "clojure.lang.Ratio"
+                      (.endswith text "N") "clojure.lang.BigInt"
+                      (.endswith text "M") "java.math.BigDecimal"
+                      (re-find #"[.eE]" text) "float"
+                      :else "int"))
+      :symbolic-number "float"
+      :nil "nil" :symbol "symbol" :keyword "keyword" :character "char"
+      :string "string" :map "map" :namespaced-map "map" :vector "vector"
+      :list "list" :set "set" :boolean "java.lang.Boolean"
+      (name (:kind node)))))
+
+(defn- configuration-findings [source filename config]
+  (let [path (pathlib/Path filename)]
+    (when (and (= "config.edn" (.-name path)) (= ".clj-kondo" (.-name (.-parent path))) (.exists path))
+      (let [parsed (syntax/parse source) expr (unwrapped (first (syntax/forms (:root parsed))))
+            fields (when (= :map (:kind expr)) (partition 2 (syntax/forms expr)))
+            values (into {} (for [[key value] fields :when (= :keyword (:kind key))]
+                              [(keyword (subs (syntax/text key) 1)) value]))
+            findings (atom [])
+            emit! (fn [node type message]
+                    (let [level (get-in config [:linters type :level] :warning)]
+                      (when-not (or (= :off level) (= true (:ignore config))
+                                    (and (coll? (:ignore config)) (some #{type} (:ignore config))))
+                        (swap! findings conj
+                               (merge (if node (merge (source-location parsed filename node) (select-keys node [:start :end]))
+                                          {:filename "<clj-kondo>" :row 1 :col 1})
+                                      {:type type :level level :message message})))))
+            map-value! (fn [value]
+                         (when (and value (not (contains? #{:map :namespaced-map} (:kind (unwrapped value)))))
+                           (emit! value :clj-kondo-config
+                                  (str "Expected a map, but got: " (configuration-type value)))))
+            minimum (:min-clj-kondo-version config)]
+        (when (and (string? minimum) (pos? (compare minimum compatibility-version)))
+          (let [value (:min-clj-kondo-version values)
+                same? (and value (= :string (:kind value))
+                           (= minimum (edn/read-string (syntax/text value))))]
+            (emit! (if same? value expr) :min-clj-kondo-version
+                   (str "Version " compatibility-version " below configured minimum " minimum))))
+        (doseq [key [:linters :lint-as :output :hooks]] (map-value! (get values key)))
+        (when (= :map (:kind (unwrapped (:linters values))))
+          (doseq [[key value] (partition 2 (syntax/forms (unwrapped (:linters values))))
+                  :when (= :keyword (:kind key))
+                  :let [name (keyword (subs (syntax/text key) 1))]]
+            (cond
+              (contains? configuration-linters name) (map-value! value)
+              (nil? (namespace name)) (emit! key :clj-kondo-config (str "Unexpected linter name: " name)))))
+        (doseq [[key _] fields :when (= :keyword (:kind key))
+                :let [name (keyword (subs (syntax/text key) 1))]
+                :when (and (not= :min-clj-kondo-version name) (contains? configuration-linters name))]
+          (emit! key :clj-kondo-config "Linter config should go under :linters"))
+        @findings))))
+
 (defn- literal-metadata [node]
   (when (= :metadata (:kind node))
     (let [[metadata target] (syntax/forms node)
-          value (try (config-value metadata "source metadata" {}) (catch python/Exception _ nil))]
+          value (try (config-value metadata "source metadata" {:allow-regex? true :source-metadata? true}) (catch python/Exception _ nil))]
       (merge (cond (keyword? value) {value true}
                    (symbol? value) {:tag value}
                    (string? value) {:tag value}
@@ -433,9 +741,15 @@
                         (when (#{"defn" "defn-" "defmacro" "defmacro-" "defasync"}
                                (last (str/split (syntax/text head) #"/")))
                           (when-let [value (first (filter #(= :map (:kind %)) (take 2 (drop 2 xs))))]
-                            (try (config-value value "source metadata" {}) (catch python/Exception _ nil)))))
-        defined-by (qualified-name analysis (syntax/text head))
-        lint-as (get (:lint-as config) defined-by defined-by)
+                            (try (config-value value "source metadata" {:allow-regex? true :source-metadata? true}) (catch python/Exception _ nil)))))
+        protocol (some #(when (and (= :list (:kind %))
+                                   (= "defprotocol" (some-> % syntax/forms first syntax/text))
+                                   (< (:start %) (:scope-start definition))
+                                   (<= (:scope-end definition) (:end %))) %) nodes)
+        defined-by (or (:defined-by definition)
+                       (if protocol 'basilisp.core/defprotocol
+                           (qualified-name analysis (syntax/text head))))
+        lint-as (or (:defined-by->lint-as definition) (get (:lint-as config) defined-by defined-by))
         selector (get-in options [:var-definitions :meta])
         result (merge (source-location parsed filename (or node definition))
                       (name-location definition)
@@ -447,8 +761,21 @@
       (empty? (:fixed-arities result)) (dissoc :fixed-arities)
       (:private definition) (assoc :private true)
       (:macro definition) (assoc :macro true)
+      protocol (assoc :protocol-ns (symbol (:namespace analysis))
+                      :protocol-name (symbol (syntax/text (second (syntax/forms protocol)))))
       (and (:arglists options) (seq (:arglists definition))) (assoc :arglist-strs (:arglists definition))
-      selector (assoc :meta (selected-metadata metadata selector)))))
+      selector (assoc :meta (selected-metadata metadata selector))
+      (get-in options [:var-definitions :callstack])
+      (assoc :callstack
+             (mapv (fn [candidate]
+                     (let [head (first (syntax/forms candidate))
+                           resolved (qualified-name analysis (syntax/text head))]
+                       {:ns (symbol (namespace resolved)) :name (symbol (name resolved))}))
+                   (sort-by #(- (:end %) (:start %))
+                            (filter #(and (= :list (:kind %))
+                                          (<= (:start %) (:scope-start definition))
+                                          (<= (:scope-end definition) (:end %))
+                                          (= :symbol (:kind (first (syntax/forms %))))) nodes)))))))
 
 (defn- public-namespace [parsed filename nodes options entry]
   (let [node (some #(when (and (= :list (:kind %))
@@ -457,7 +784,7 @@
         xs (syntax/forms node)
         metadata (merge (literal-metadata (second xs))
                         (when-let [value (first (filter #(= :map (:kind %)) (take 2 (drop 2 xs))))]
-                          (try (config-value value "source metadata" {}) (catch python/Exception _ nil))))
+                          (try (config-value value "source metadata" {:allow-regex? true :source-metadata? true}) (catch python/Exception _ nil))))
         doc (first (filter #(= :string (:kind %)) (take 1 (drop 2 xs))))
         selector (get-in options [:namespace-definitions :meta])]
     (cond-> (merge (source-location parsed filename (or node entry))
@@ -471,14 +798,16 @@
                                   (= (:start entry) (:start (first (syntax/forms %))))) nodes))
         pairs (partition 2 (rest (syntax/forms spec)))
         alias-node (some (fn [[key value]] (when (#{":as" ":as-alias"} (syntax/text key)) value)) pairs)
-        alias-location (when alias-node (source-location parsed filename alias-node))]
+        alias-location (when alias-node (source-location parsed filename alias-node))
+        spec? (some? spec)]
     (cond-> (merge (select-keys entry [:filename :row :col]) (name-location entry)
                    {:from (symbol (:namespace analysis)) :to (symbol (:name entry))})
+      (and spec? (not alias-node)) (merge {:alias-row nil :alias-col nil :alias-end-row nil :alias-end-col nil})
       (:alias entry) (assoc :alias (symbol (:alias entry)))
       alias-location (merge (into {} (for [[key value] (dissoc alias-location :filename)]
                                        [(keyword (str "alias-" (name key))) value]))))))
 
-(defn- public-var-usage [analysis parsed filename calls usage]
+(defn- public-var-usage [analysis parsed filename calls options usage]
   (let [call (get calls (:start usage))
         definition (:definition usage)
         outer (enclosing-definition analysis (:start usage) (:end usage))
@@ -488,7 +817,7 @@
         result (merge (if call (source-location parsed filename call)
                           (select-keys usage [:filename :row :col :end-row :end-col]))
                       (name-location usage)
-                      (select-keys definition [:fixed-arities :varargs-min-arity :deprecated])
+                      (into {} (remove (comp nil? second) (select-keys definition [:fixed-arities :varargs-min-arity :deprecated])))
                       {:name (symbol (:name usage)) :from (symbol (:from usage))
                        :to (symbol (:ns usage))})]
     (cond-> result
@@ -497,7 +826,14 @@
       (:private definition) (assoc :private true)
       call (assoc :arity (dec (count (syntax/forms call))))
       (and outer (not= (:start call) (:scope-start outer))) (assoc :from-var (symbol (:name outer)))
-      alias (assoc :alias (symbol alias)))))
+      alias (assoc :alias (symbol alias))
+      (:refer usage) (assoc :refer true)
+      (:defmethod usage) (assoc :defmethod true :dispatch-val-str (:dispatch-val-str usage))
+      (:derived-location usage) (assoc :derived-location true)
+      (:derived-name-location usage) (assoc :derived-name-location true)
+      (and (:context options) (not (true? (:context options))))
+      (assoc :context (select-keys (:context usage) (:context options)))
+      (and (true? (:context options)) (:context usage)) (assoc :context (:context usage)))))
 
 (defn- keyword-analysis [analysis parsed filename nodes node]
   (let [raw (syntax/text node) auto? (.startswith raw "::")
@@ -528,6 +864,142 @@
       (and auto? prefix) (assoc :alias (symbol prefix))
       outer (assoc :from-var (symbol (:name outer))))))
 
+(defn- refer-usages [analysis parsed filename nodes]
+  (for [entry (:namespace-usages analysis) :when (not (:python entry))
+        :let [spec (some #(when (and (#{:list :vector} (:kind %))
+                                     (= (:start entry) (:start (first (syntax/forms %))))) %) nodes)]
+        [option values] (partition 2 (rest (syntax/forms spec)))
+        :when (= ":refer" (syntax/text option))
+        value (syntax/forms values) :when (= :symbol (:kind value))]
+    (merge (source-location parsed filename value) value
+           {:name (syntax/text value) :ns (:name entry)
+            :from (:namespace analysis) :refer true})))
+
+(defn- contextual [record options]
+  (let [context (:context record) record (dissoc record :context)]
+    (cond-> record
+      (and (true? (:context options)) (some? context)) (assoc :context context)
+      (and (:context options) (not (true? (:context options))))
+      (assoc :context (select-keys context (:context options))))))
+
+(defn- shallow-body-ranges [analysis parsed options]
+  (when (get-in options [:var-definitions :shallow])
+    (let [nodes (vec (syntax/nodes (:root parsed)))]
+      (vec
+       (mapcat
+        (fn [definition]
+          (let [node (definition-form nodes definition)
+                xs (syntax/forms node)
+                head (some-> xs first syntax/text)
+                tail (drop 2 xs)
+                function? (#{"defn" "defn-" "defmacro" "defmacro-" "defasync"} head)
+                args (drop-while #(#{:string :map} (:kind %)) tail)
+                bodies (cond
+                         function? (if (= :vector (:kind (first args)))
+                                     (rest args)
+                                     (mapcat #(rest (syntax/forms %)) (filter #(= :list (:kind %)) args)))
+                         (#{"def" "defonce"} head) (when (seq tail) [(last tail)]))]
+            (mapv #(vector (:start %) (:end %)) bodies)))
+        (:var-definitions analysis))))))
+
+(defn- in-ranges? [ranges node]
+  (some (fn [[start end]] (and (<= start (:start node)) (<= (:end node) end))) ranges))
+
+(defn- symbol-analysis [analysis parsed filename options]
+  (let [result (atom [])
+        skipped (shallow-body-ranges analysis parsed options)
+        edn? (or (= :edn (:lang options)) (.endswith filename ".edn"))
+        required (set (concat (map :name (:namespace-usages analysis)) [(:namespace analysis)]))]
+    (letfn [(visit [node quoted?]
+              (let [kind (:kind node) xs (syntax/forms node)
+                    quote-call? (and (= :list kind) (= "quote" (some-> xs first syntax/text)))
+                    quoted? (or quoted? (= :quote kind))]
+                (when (and (not (in-ranges? skipped node)) quoted? (= :symbol kind) (>= (.find (syntax/text node) "/") 0))
+                  (let [raw (syntax/text node) [prefix name] (str/split raw #"/" 1)
+                        namespace-name (get (:aliases analysis) prefix prefix)]
+                    (swap! result conj
+                           (contextual
+                            (cond-> (merge (source-location parsed filename node)
+                                           {:from (when-not edn? (symbol (:namespace analysis))) :symbol (symbol raw)
+                                            :name (symbol name) :lang (if edn? :edn :clj)})
+                              (and (not edn?) (contains? required namespace-name)) (assoc :to (symbol namespace-name)))
+                            options))))
+                (doseq [child (if quote-call? (rest xs) xs)]
+                  (when-not (or quote-call? (#{:discard :syntax-quote} kind)) (visit child quoted?)))))]
+      (visit (:root parsed) edn?))
+    @result))
+
+(defn- instance-analysis [analysis parsed filename options]
+  (let [result (atom []) skipped (shallow-body-ranges analysis parsed options)]
+    (letfn [(visit [node]
+              (let [xs (syntax/forms node) head (first xs) raw (some-> head syntax/text)
+                    method (when (= :list (:kind node))
+                             (cond (and raw (.startswith raw ".") (not (.startswith raw ".-")) (not= "." raw)) head
+                                   (= "." raw) (let [member (nth xs 2 nil)]
+                                                 (if (= :list (:kind member)) (first (syntax/forms member)) member))))]
+                (when (and method (not (in-ranges? skipped method)) (= :symbol (:kind method)))
+                  (let [text (syntax/text method)]
+                    (when-not (.startswith text "-")
+                      (swap! result conj
+                             (merge {:filename filename :method-name (if (.startswith text ".") (subs text 1) text)}
+                                    (name-location (source-location parsed filename method)))))))
+                (when-not (or (#{:quote :syntax-quote :discard} (:kind node)) (= "quote" raw))
+                  (doseq [child xs] (visit child)))))]
+      (visit (:root parsed)))
+    @result))
+
+(defn- keyword-records [analysis parsed filename nodes options]
+  (let [skipped (shallow-body-ranges analysis parsed options)
+        live (remove #(in-ranges? skipped %)
+                     (tree-seq #(seq (:children %)) syntax/forms (:root parsed)))
+        local-starts (set (map :start (:locals analysis)))
+        destructuring (for [node live :when (= :map (:kind node))
+                            [key values] (partition 2 (syntax/forms node))
+                            :when (and (= :keyword (:kind key)) (= :vector (:kind values))
+                                       (= "keys" (name (edn/read-string (syntax/text key)))))
+                            :when (some #(contains? local-starts (:start %)) (syntax/forms values))]
+                        [key values])
+        modifiers (set (map (comp :start first) destructuring))
+        overrides (into {} (map (juxt :start identity) (:keywords analysis)))
+        keywords (map (fn [node]
+                        (cond-> (merge (keyword-analysis analysis parsed filename nodes node)
+                                       (into {} (remove (comp nil? second)
+                                                        (select-keys (get overrides (:start node))
+                                                                     [:reg :context :derived-location]))))
+                          (contains? modifiers (:start node)) (assoc :keys-destructuring-ns-modifier true)))
+                      (filter #(= :keyword (:kind %)) live))
+        derived (for [[key values] destructuring value (syntax/forms values)
+                      :let [raw (syntax/text value) parts (str/split raw #"/" 1)
+                            key-record (keyword-analysis analysis parsed filename nodes key)
+                            prefix (when (= 2 (count parts)) (first parts))]]
+                  (cond-> (merge (source-location parsed filename value)
+                                 (select-keys key-record [:from :from-var])
+                                 {:name (last parts) :keys-destructuring true})
+                    (or prefix (:ns key-record)) (assoc :ns (or (some-> prefix symbol) (:ns key-record)))))
+        edn? (or (= :edn (:lang options)) (.endswith filename ".edn"))
+        generated (for [entry (:keywords analysis) :when (:generated entry)]
+                    (cond-> (merge (select-keys entry [:filename :row :col :end-row :end-col :name])
+                                   (into {} (remove (comp nil? second)
+                                                    (select-keys entry [:reg :context :derived-location])))
+                                   {:from (when-not edn? (symbol (:namespace analysis)))})
+                      (:ns entry) (assoc :ns (symbol (:ns entry)))
+                      (:alias entry) (assoc :alias (symbol (:alias entry)))
+                      (:auto-resolved entry) (assoc :auto-resolved true)))
+        records (concat keywords derived generated)
+        records (if edn? (map #(assoc % :from nil) records) records)]
+    (mapv #(contextual % options) (distinct (sort-by (juxt :row :col) records)))))
+
+(defn- protocol-analysis [analysis parsed filename config]
+  (mapv (fn [entry]
+          (let [defined-by (symbol (:defined-by entry))
+                location (source-location parsed filename {:start (:scope-start entry) :end (:scope-end entry)})]
+            (merge location (name-location entry)
+                   {:protocol-name (symbol (:protocol-name entry)) :protocol-ns (symbol (:protocol-ns entry))
+                    :method-name (symbol (:name entry)) :impl-ns (symbol (:ns entry))
+                    :defined-by defined-by :defined-by->lint-as (get (:lint-as config) defined-by defined-by)
+                    :derived-location (:derived-location entry)})))
+        (:implementations analysis)))
+
 (defn- file-analysis [analysis source options config ids]
   (let [parsed (get-in source [:declarations :parsed])
         filename (:filename source)
@@ -535,9 +1007,19 @@
         calls (into {} (for [node nodes :when (= :list (:kind node))
                              :let [head (first (syntax/forms node))]]
                          [(:start head) node]))
-        definitions (sort-by :start (:var-definitions analysis))
+        definitions (sort-by (fn [entry] [(:scope-end entry) (:start entry)
+                                          (cond (.startswith (:name entry) "map->") 2
+                                                (.startswith (:name entry) "->") 1
+                                                :else 0)])
+                             (:var-definitions analysis))
         usages (remove #(and (:unknown %) (not= "clj-kondo/unknown-namespace" (:ns %)))
                        (:var-usages analysis))
+        defmethods (into {} (for [node nodes :when (= :list (:kind node))
+                                  :let [[head name-node dispatch-value] (syntax/forms node)]
+                                  :when (= "defmethod" (syntax/text head))]
+                              [(:start name-node) (syntax/text dispatch-value)]))
+        usages (map #(if (contains? defmethods (:start %))
+                       (assoc % :defmethod true :dispatch-val-str (get defmethods (:start %))) %) usages)
         recorded (set (map :start usages))
         ;; Compiler special forms do not appear as resolved Vars in Basilisp.
         ;; The compatible export still records defining forms such as def.
@@ -549,8 +1031,17 @@
                           (merge head (source-location parsed filename head)
                                  {:name (syntax/text head) :ns "basilisp.core" :from (:namespace analysis)
                                   :definition {:macro true :fixed-arities #{1 2 3}}}))
+        special-usages (for [node nodes :when (= :list (:kind node))
+                             :let [head (first (syntax/forms node))]
+                             :when (and (= "quote" (syntax/text head))
+                                        (not (contains? recorded (:start head)))
+                                        (not (some #(and (#{:quote :discard :syntax-quote} (:kind %))
+                                                         (<= (:start %) (:start node)) (<= (:end node) (:end %))) nodes)))]
+                         (merge head (source-location parsed filename head)
+                                {:name "quote" :ns "basilisp.core" :from (:namespace analysis)
+                                 :definition {:macro true :fixed-arities #{1}}}))
         usages (sort-by (fn [usage] [(or (:end (get calls (:start usage))) (:end usage)) (:start usage)])
-                        (concat usages defining-usages))
+                        (concat usages defining-usages special-usages (refer-usages analysis parsed filename nodes)))
         locals (mapv (fn [entry]
                        (let [id (inc (count @ids))
                              end (source-position parsed (:scope-end entry))]
@@ -558,34 +1049,38 @@
                          (merge (select-keys entry [:filename :row :col :end-row :end-col])
                                 {:id id :name (symbol (:name entry)) :str (:name entry)
                                  :scope-end-row (:row end) :scope-end-col (:col end)
-                                 :derived-location nil}))) (:locals analysis))
+                                 :derived-location (:derived-location entry)}))) (remove :generated (:locals analysis)))
         local-usages (mapv (fn [entry]
                              (merge (select-keys entry [:filename :row :col :end-row :end-col])
                                     (name-location entry)
                                     {:id (get @ids (:id entry)) :name (symbol (:name entry))}))
-                           (:local-usages analysis))]
+                           (filter #(contains? @ids (:id %)) (:local-usages analysis)))]
     (cond-> {:namespace-definitions (mapv #(public-namespace parsed filename nodes options %) (:namespace-definitions analysis))
              :namespace-usages (mapv #(public-namespace-usage analysis parsed filename nodes %)
                                      (remove :python (:namespace-usages analysis)))
              :var-definitions (mapv #(public-definition analysis parsed filename nodes options config %) definitions)}
-      (get options :var-usages true) (assoc :var-usages (mapv #(public-var-usage analysis parsed filename calls %) usages))
+      (get options :var-usages true) (assoc :var-usages (mapv #(public-var-usage analysis parsed filename calls options %) usages))
       (:locals options) (assoc :locals locals :local-usages local-usages)
-      (:keywords options) (assoc :keywords (mapv #(keyword-analysis analysis parsed filename nodes %)
-                                                 (filter #(= :keyword (:kind %))
-                                                         (tree-seq #(seq (:children %)) syntax/forms (:root parsed))))))))
+      (:keywords options) (assoc :keywords (keyword-records analysis parsed filename nodes options))
+      (:symbols options) (assoc :symbols (symbol-analysis analysis parsed filename options))
+      (:instance-invocations options) (assoc :instance-invocations (instance-analysis analysis parsed filename options))
+      (:protocol-impls options) (assoc :protocol-impls (protocol-analysis analysis parsed filename config)))))
 
 (defn analysis-output
   "Export clj-kondo's namespace, Var, and optional local analysis schema."
   [result]
   (let [config (:config result) selected (analysis-options config)
-        options (if (map? selected) selected {})
+        options (assoc (if (map? selected) selected {}) :lang (:lang result))
         ids (atom {})
         empty-result (cond-> {:namespace-definitions [] :namespace-usages [] :var-definitions []}
                        (get options :var-usages true) (assoc :var-usages [])
                        (:locals options) (assoc :locals [] :local-usages [])
-                       (:keywords options) (assoc :keywords []))]
+                       (:keywords options) (assoc :keywords [])
+                       (:symbols options) (assoc :symbols [])
+                       (:instance-invocations options) (assoc :instance-invocations [])
+                       (:protocol-impls options) (assoc :protocol-impls []))]
     (reduce (fn [out [analysis source]]
-              (if (get-in source [:declarations :parsed])
+              (if (and (:namespace analysis) (get-in source [:declarations :parsed]))
                 (merge-with into out (file-analysis analysis source options config ids)) out))
             empty-result (map vector (:analysis result) (:sources result)))))
 
@@ -594,7 +1089,7 @@
         types (sort (set (map :type findings)))
         rules (mapv (fn [type]
                       {:id (name type)
-                       :helpUri (str "https://github.com/cospectrum/basilisp-tools/blob/main/docs/checking.md#what-it-checks")})
+                       :helpUri "https://github.com/cospectrum/basilisp-tools/blob/main/docs/checking.md#what-it-checks"})
                     types)]
     {:version "2.1.0"
      :$schema "https://docs.oasis-open.org/sarif/sarif/v2.1.0/errata01/os/schemas/sarif-schema-2.1.0.json"
@@ -608,8 +1103,8 @@
                           :locations [{:physicalLocation
                                        {:artifactLocation {:uri (url/quote (.replace (:filename finding) "\\" "/") ** :safe "/:")}
                                         :region {:startLine (max 1 (:row finding)) :startColumn (max 1 (:col finding))
-                                                 :endLine (max 1 (:end-row finding))
-                                                 :endColumn (max 1 (:end-col finding))}}}]}) findings)}]}))
+                                                 :endLine (max 1 (or (:end-row finding) (:row finding)))
+                                                 :endColumn (max 1 (or (:end-col finding) (:col finding)))}}}]}) findings)}]}))
 
 (defn output
   "Render deterministic text, JSON, or EDN. Report level filters text, matching clj-kondo."
@@ -623,8 +1118,8 @@
                 (get-in config [:output :summary]) (assoc :summary summary)
                 (analysis-options config) (assoc :analysis (analysis-output result)))]
      (case format
-       :sarif (str (json/dumps (json-value (sarif-output findings)) ** :ensure_ascii false) "\n")
-       :json (str (json/dumps (json-value data) ** :ensure_ascii false) "\n")
+       :sarif (str (json-dumps (sarif-output findings)) "\n")
+       :json (str (json-dumps data) "\n")
        :edn (str (pr-str data) "\n")
        :text (let [level (keyword (name (:report-level result :info)))
                    rank {:info 0 :warning 1 :error 2}
@@ -634,3 +1129,18 @@
                                             (when (not= level :error) (str ", warnings: " (:warning summary))))) lines)]
                (if (seq lines) (str (str/join "\n" lines) "\n") ""))
        (error (str "Unsupported output format: " format))))))
+
+(defn merge-configs
+  "Combine a sequence of clj-kondo configurations using the same merge rules."
+  [configs]
+  (reduce merge-config {} configs))
+
+(defn resolve-config
+  "Resolve configuration without analyzing source."
+  ([] (load-config))
+  ([options] (load-config options)))
+
+(defn config-hash
+  "Return a SHA-256 digest of an EDN configuration representation."
+  [config]
+  (.hexdigest (hashlib/sha256 (.encode (str config) "utf-8"))))

@@ -1,0 +1,79 @@
+(ns basilisp-tools.lsp-clean-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.lsp :as lsp]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.syntax :as syntax]))
+
+(defn- cleaned
+  ([source settings] (cleaned source settings []))
+  ([source settings findings]
+   (let [edits ((deref (ns-resolve 'basilisp-tools.lsp 'clean-namespace-edits))
+                source (syntax/parse source) {:settings settings :findings findings})]
+     (reduce (fn [text [start end replacement]]
+               (str (subs text 0 start) replacement (subs text end)))
+             source (sort-by first > edits)))))
+
+(deftest namespace-block-layout-test
+  (let [source "(ns foo\n (:require [z]\n   [a])\n (:import [decimal] [math]))"]
+    (is (= "(ns foo\n (:require\n  [z]\n  [a])\n (:import\n  [decimal]\n  [math]))"
+           (cleaned source {:clean {:ns-inner-blocks-indentation :next-line}})))
+    (is (= "(ns foo\n (:require [z]\n           [a])\n (:import [decimal]\n          [math]))"
+           (cleaned source {:clean {:ns-inner-blocks-indentation :same-line}})))
+    (is (= source (cleaned source {:clean {:ns-inner-blocks-indentation :keep}})))
+    (is (= source (cleaned source {})))
+    (is (= (cleaned source {:clean {:ns-inner-blocks-indentation :same-line}})
+           (cleaned source {:keep-require-at-start? true})))))
+
+(deftest refer-sorting-and-width-test
+  (let [source "(ns foo.bar\n (:require\n   [some :refer [Dee foo bar baz bla blowning]]))"
+        settings {:clean {:ns-inner-blocks-indentation :next-line :sort {:refer {:max-line-length 30}}}}
+        expected "(ns foo.bar\n (:require\n  [some :refer [bar baz bla\n                blowning Dee\n                foo]]))"]
+    (is (= expected (cleaned source settings)))
+    (is (= expected (cleaned expected settings))))
+  (let [source "(ns foo (:require [some :refer [z A b]]))"]
+    (is (= "(ns foo (:require [some :refer [A b z]]))" (cleaned source {})))
+    (is (= source (cleaned source {:clean {:sort {:refer nil}}})))
+    (is (= source (cleaned source {:clean {:sort {:refer false}}})))
+    (is (= "(ns foo (:require [some :refer [A b z]]))"
+           (cleaned source {:clean {:sort {:refer {:max-line-length 0}}}})))))
+
+(deftest python-member-refers-and-load-order-test
+  (let [source "(ns foo\n (:import [z :refer [zeta alpha]] [a])\n (:require [y] [b]))"
+        expected "(ns foo\n (:import [z :refer [alpha zeta]] [a])\n (:require [y] [b]))"]
+    (is (= expected (cleaned source {:clean {:sort {:require true :import true :ns true}}})))))
+
+(deftest namespace-clean-preserves-trivia-and-loads-test
+  (let [source "(ns foo (:require [dep :as d :refer [gone kept]]))"
+        findings [{:type :unused-alias :start (.find source "d :refer")}
+                  {:type :unused-referred-var :start (.find source "gone")}]]
+    (is (= "(ns foo (:require [dep :refer [kept]]))" (cleaned source {} findings))))
+  (let [source "(ns foo (:require [dep :refer [gone]]))"
+        findings [{:type :unused-referred-var :start (.find source "gone")}]]
+    (is (= "(ns foo (:require [dep]))" (cleaned source {} findings))))
+  (let [source "(ns foo\n (:require [z] ; keep attachment\n   #_[unused] [a :refer [z ; keep member\n a]]))"
+        result (cleaned source {:clean {:ns-inner-blocks-indentation :next-line :sort {:refer true}}})]
+    (is (= 2 (count (filter #(= :comment (:kind %)) (syntax/tokens (:root (syntax/parse result)))))))
+    (is (<= 0 (.find result "#_[unused]")))
+    (is (<= 0 (.find result "[z ; keep member\n a]")))
+    (is (empty? (:diagnostics (syntax/parse result)))))
+  (let [source "(ns foo (:require [dep :refer [gone ; retained\n kept]]))"
+        findings [{:type :unused-referred-var :start (.find source "gone")}]
+        result (cleaned source {} findings)]
+    (is (<= 0 (.find result "; retained")))
+    (is (<= 0 (.find result "kept")))
+    (is (not (<= 0 (.find result "gone"))))
+    (is (empty? (:diagnostics (syntax/parse result))))))
+
+(deftest namespace-clean-preserves-reader-resolution-test
+  (doseq [expression ["::s/hello" "\u0060s/join" "\u0060(join \"-\" [1 2])"]]
+    (let [namespace (gensym "blt-clean-runtime-")
+          source (str "(ns " namespace " (:require [basilisp.string :as s :refer [join]])) " expression)
+          analysis (analyzer/analyze source)
+          result (cleaned source {} (:findings analysis))]
+      (try
+        (let [before (load-string source)]
+          ;; Clear namespace state so previously loaded aliases/refers cannot
+          ;; conceal a cleanup that changes subsequent reader resolution.
+          (remove-ns namespace)
+          (is (= before (load-string result))))
+        (finally (remove-ns namespace))))))

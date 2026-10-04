@@ -1,0 +1,98 @@
+(ns basilisp-tools.lsp-refactor-safety-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp.string :as str]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.lsp :as lsp]
+            [basilisp-tools.syntax :as syntax]))
+
+(defn- apply-edits [source edits]
+  (reduce (fn [source [start end replacement]]
+            (str (subs source 0 start) replacement (subs source end)))
+          source (sort-by first > edits)))
+
+(defn- evaluate [source]
+  (load-string (str "(ns user) " source)))
+
+(defn- analyze [source]
+  (analyzer/analyze source {:filename "/tmp/blt-refactor-safety.lpy"}))
+
+(defn- inline [source marker]
+  (apply-edits source (lsp/refactor-edits source (analyze source)
+                                          "inline-function" (.rfind source marker) [])))
+
+(defn- reorder [source]
+  (let [uri "file:///tmp/blt-refactor-safety.lpy"
+        edits ((deref (ns-resolve 'basilisp-tools.lsp 'parameter-edits))
+               {uri source} {uri (analyze source)} uri (inc (.find source "[x y]")) 1)]
+    (apply-edits source (get edits uri))))
+
+(deftest inline-preserves-evaluation-and-capture-test
+  (doseq [source
+          ["(defn safety-f [x y] (+ x y)) (let [x 10] (safety-f 1 x))"
+           "(defn safety-f [x y] (+ x y)) (let [+ (fn [& _] :shadow)] (safety-f 1 2))"
+           "(def events (atom [])) (defn safety-f [x y] [x y @events]) (safety-f (do (swap! events conj :first) 1) (do (swap! events conj :second) 2))"
+           "(defn safety-f [x y] (let [y (+ x y)] [x y])) (safety-f 2 3)"
+           "(defn safety-f [x y] ;; retained body comment\n (+ x y)) (safety-f 2 3)"
+           "(defn safety-f [x y] #_ignored (+ x y)) (safety-f 2 3)"]]
+    (let [result (inline source "(safety-f")]
+      (is (not= source result))
+      (is (empty? (:diagnostics (syntax/parse result))))
+      (is (= (evaluate source) (evaluate result)) result))))
+
+(deftest inline-retains-sensitive-source-test
+  (doseq [source
+          ["(defn safety-f [x y] (+ x y)) (safety-f 1 ; keep\n 2)"
+           "(defn safety-f [x y] (+ x y)) (safety-f 1 #_keep 2)"
+           "(defn safety-f [x y] {:pre [(pos? x)]} (+ x y)) (safety-f 1 2)"
+           "(defn safety-f [x y] {:post [(pos? %)]} (+ x y)) (safety-f 1 2)"
+           "(defn safety-f ([x y] (+ x y)) ([x] x)) (safety-f 1 2)"
+           "(defn safety-f [x y] (recur y x)) (safety-f 1 2)"]]
+    (is (= source (inline source "(safety-f")))))
+
+(deftest parameter-reordering-preserves-effects-test
+  (doseq [source
+          ["(defn safety-f [x y] [x y]) (safety-f 1 2)"
+           "(def events (atom [])) (defn safety-f [x y] [x y @events]) (safety-f (do (swap! events conj :first) 1) (do (swap! events conj :second) 2))"
+           "(defn safety-f [x y] [x y]) [(safety-f 1 2) (safety-f 3 4)]"
+           "(defn safety-f [x y] [x y]) (let [blt-callee :old blt-arg0 :a blt-arg1 :b] (safety-f blt-arg0 blt-arg1))"]]
+    (let [result (reorder source)]
+      (is (not= source result))
+      (is (empty? (:diagnostics (syntax/parse result))))
+      (is (= (evaluate source) (evaluate result)) result))))
+
+(deftest parameter-reordering-declines-ambiguous-source-test
+  (doseq [source
+          ["(defn safety-f [x y] [x y]) (safety-f 1 ; keep\n 2)"
+           "(defn safety-f [x y] [x y]) (safety-f 1 #_keep 2)"
+           "(defn safety-f [x y] [x y]) (map safety-f [1] [2])"
+           "(defn safety-f [x y] [x y]) (let [callback safety-f] (callback 1 2))"
+           "(defn safety-f [x y] [x y]) (safety-f (safety-f 1 2) 3)"]]
+    (is (= source (reorder source)))))
+
+(deftest generated-inline-bindings-do-not-collide-test
+  (let [names (map #(str "arg" %) (range 12))
+        source (str "(defn safety-f [" (str/join " " names) "] [" (str/join " " names) "]) "
+                    "(let [blt-inline1 :occupied] (safety-f " (str/join " " (range 12)) "))")
+        result (inline source "(safety-f")]
+    (is (not= source result))
+    (is (= (vec (range 12)) (evaluate result)))))
+
+(deftest lookup-refactors-preserve-defaults-test
+  (doseq [target ["{}" "{:a nil}" "{:a {}}" "{:a {:b nil}}" "{:a {:b 7}}"]
+          command ["get-in-less" "get-in-none"]
+          default ["" " :fallback"]]
+    (let [source (str "(get-in " target " [:a :b]" default ")")
+          result (apply-edits source (lsp/refactor-edits source (analyze source) command 0 []))]
+      (is (not= source result))
+      (is (= (evaluate source) (evaluate result)) result))))
+
+(deftest python-lookup-refactors-preserve-runtime-protocols-test
+  (doseq [source ["(get #py {:a 1} :a)"
+                  "(get-in #py {:a #py {:b 7}} [:a :b])"
+                  "(get-in #py {:a #py {:b nil}} [:a :b] :fallback)"
+                  "(get-in #py {:a #py {}} [:a :b] :fallback)"
+                  "(:a #py {:a 1})"
+                  "(:a #py {:a 1} :fallback)"]
+          command ["get-in-more" "get-in-all" "get-in-less" "get-in-none"]]
+    (let [result (apply-edits source (lsp/refactor-edits source (analyze source) command 0 []))]
+      (is (= (evaluate source) (evaluate result)) (str command " " result)))))

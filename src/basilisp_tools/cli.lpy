@@ -2,8 +2,9 @@
   "The blt command line interface."
   (:require [basilisp.string :as str]
             [basilisp-tools.format :as fmt]
+            [basilisp-tools.regex :as regex]
             [basilisp-tools.syntax :as syntax])
-  (:import [argparse] [importlib] [difflib] [os] [os.path :as pathutil] [pathlib] [re] [stat] [sys] [tempfile]
+  (:import [argparse] [importlib] [difflib] [logging] [os] [os.path :as pathutil] [pathlib] [re] [stat] [sys] [tempfile]
            [importlib.metadata :as metadata]
            [concurrent.futures :as futures]))
 
@@ -32,14 +33,26 @@
                    :help "Use this .clj-kondo configuration directory.")
     (.add_argument p "--repro" ** :action "store_true"
                    :help "Ignore home configuration for reproducible checks.")
-    (.add_argument p "--parallel" ** :action "store_true"
+    (.add_argument p "--parallel" ** :action argparse/BooleanOptionalAction :default false
                    :help "Analyze files concurrently while keeping output ordered.")
-    (.add_argument p "--dependencies" ** :action "store_true"
+    (.add_argument p "--dependencies" "--no-warnings" ** :action "store_true"
                    :help "Analyze dependencies silently and exit successfully.")
+    (.add_argument p "--copy-configs" ** :action "store_true"
+                   :help "Copy exported configurations from dependencies into the project config directory.")
+    (.add_argument p "--skip-lint" ** :action "store_true"
+                   :help "Skip analysis while performing configuration-copy tasks.")
+    (.add_argument p "--cache" ** :nargs "?" :const "true" :default "true" :metavar "BOOL_OR_DIR"
+                   :help "Use persistent analysis caching; false disables it, or supply a cache directory.")
+    (.add_argument p "--cache-dir" ** :metavar "DIR"
+                   :help "Directory for persistent analysis caches.")
+    (.add_argument p "--debug" ** :action "store_true"
+                   :help "Write analysis and configuration debugging information to stderr.")
     (.add_argument p "--format" ** :choices #py ["text" "json" "edn" "sarif"]
                    :help "Output format; overrides configuration.")
     (.add_argument p "--filename" ** :metavar "NAME"
                    :help "Filename used for stdin diagnostics and namespace context.")
+    (.add_argument p "--lang" ** :choices #py ["lpy" "edn"] :default "lpy"
+                   :help "Analyze Basilisp code or EDN data; .edn filenames select EDN automatically.")
     (.add_argument p "--fail-level" ** :choices #py ["warning" "error"] :default "warning"
                    :help "Minimum severity causing a nonzero exit (default: warning).")
     (.add_argument p "--report-level" ** :choices #py ["info" "warning" "error"] :default "info"
@@ -52,9 +65,40 @@
                    :help "Timeout for Python inspection (default: 5).")))
 
 (defn- add-lsp-options! [commands]
-  (let [p (.add_parser commands "lsp" ** :help "Start the stdio language server."
-                       :description "Serve editor features over LSP on stdin/stdout."
-                       :epilog "Configure your editor to launch: blt lsp")]
+  (let [p (.add_parser commands "lsp" ** :help "Language server and project-wide editor operations."
+                       :description "Serve LSP over stdio, or apply editor operations to a project."
+                       :epilog "Configure your editor to launch: blt lsp. Use --dry to preview file changes.")]
+    (.add_argument p "lsp_command" ** :nargs "?" :default "listen"
+                   :choices #py ["listen" "clean-ns" "diagnostics" "format" "rename" "references" "dump"]
+                   :help "Operation to perform; listen starts the language server (default).")
+    (.add_argument p "--version" ** :action "version"
+                   :version (str "blt " (metadata/version "basilisp-tools")))
+    (.add_argument p "-p" "--project-root" ** :metavar "DIR"
+                   :help "Project directory for batch operations.")
+    (.add_argument p "-n" "--namespace" ** :action "append" :metavar "NS"
+                   :help "Limit the operation to a namespace; may be repeated.")
+    (.add_argument p "--filenames" ** :action "append" :metavar "PATHS"
+                   :help "Select files or directories, separated by commas or the platform path separator.")
+    (.add_argument p "--ns-exclude-regex" ** :metavar "REGEX"
+                   :help "Exclude matching namespaces from batch operations.")
+    (.add_argument p "--dry" ** :action "store_true"
+                   :help "Show proposed changes without writing files.")
+    (.add_argument p "--raw" ** :action "store_true"
+                   :help "Print results without progress messages or color.")
+    (.add_argument p "--from" ** :dest "from_symbol" :metavar "SYMBOL"
+                   :help "Qualified symbol or namespace for rename and references.")
+    (.add_argument p "--to" ** :dest "to_symbol" :metavar "SYMBOL"
+                   :help "Replacement symbol or namespace for rename.")
+    (.add_argument p "-o" "--output" ** :metavar "EDN"
+                   :help "Output settings, such as {:format :json} or {:filter-keys [:analysis]}.")
+    (.add_argument p "--analysis" ** :metavar "EDN"
+                   :help "Analysis options, e.g. {:type :project-only}. Types: project-only, project-namespaces-only, project-and-shallow-analysis, project-and-full-dependencies.")
+    (.add_argument p "--log-path" ** :metavar "FILE"
+                   :help "Write server logs to this file instead of stderr.")
+    (.add_argument p "--trace-level" ** :choices #py ["off" "messages" "verbose"] :default "off"
+                   :help "Protocol trace logging (default: off).")
+    (.add_argument p "--trace" ** :action "store_true" :help "Enable verbose protocol trace logging.")
+    (.add_argument p "--verbose" ** :action "store_true" :help "Enable informational logs on stderr.")
     (.add_argument p "-s" "--settings" ** :metavar "EDN"
                    :help "Force LSP settings over client and .lsp/config.edn settings.")
     (.add_argument p "--python" ** :dest "python_executable" :metavar "EXECUTABLE"
@@ -85,6 +129,8 @@
                  ** :dest "format_function_arguments_indentation"
                  :choices #py ["community" "cursive" "zprint"]
                  :help "Override the function argument indentation style.")
+  (.add_argument p "--lein-profile" ** :dest "format_lein_profiles" :action "append" :metavar "PROFILE"
+                 :help "Select a literal Leiningen profile when reading project.clj; may be repeated.")
   (.add_argument p "--file-pattern" ** :dest "format_file_pattern" :metavar "REGEX"
                  :help "Match paths relative to each searched directory.")
   (doseq [option [:max-column-alignment-gap :max-column-alignment-width]]
@@ -138,7 +184,9 @@
 (defn- report [message] (.write sys/stderr (str message "\n")))
 
 (defn- configuration [args]
-  (let [discovery {:read-clj-config-files? (.-format_read_clj_config_files args)}
+  (let [discovery (cond-> {:read-clj-config-files? (.-format_read_clj_config_files args)}
+                    (.-format_lein_profiles args)
+                    (assoc :lein-profiles (mapv keyword (.-format_lein_profiles args))))
         base (if-let [path (.-config args)]
                (let [p (pathlib/Path path)]
                  (when-not (.is_file p) (error (str "Configuration file does not exist: " path)))
@@ -152,7 +200,7 @@
         options (cond-> options
                   (.-format_function_arguments_indentation args)
                   (assoc :function-arguments-indentation (keyword (.-format_function_arguments_indentation args)))
-                  (.-format_file_pattern args) (assoc :file-pattern (re/compile (.-format_file_pattern args)))
+                  (.-format_file_pattern args) (assoc :file-pattern (regex/compile (.-format_file_pattern args)))
                   (some? (.-quiet args)) (assoc :quiet? (.-quiet args))
                   (some? (.-verbose args)) (assoc :verbose? (.-verbose args)))]
     ;; --project-root changes displayed paths. Leiningen's configured paths
@@ -173,7 +221,7 @@
       (.sort dirs)
       (doseq [name (sort files)
               :let [p (.joinpath (pathlib/Path root) name)]
-              :when (and (re/search pattern (.as_posix (.relative_to p (pathlib/Path path))))
+              :when (and (regex/search pattern (.as_posix (.relative_to p (pathlib/Path path))))
                          (.is_file p) (not (.is_symlink p)))]
         (swap! result conj p)))
     @result))
@@ -296,7 +344,13 @@
                  :repro (.-repro args)
                  :parallel (.-parallel args)
                  :dependencies (.-dependencies args)
-                 :filename (or (.-filename args) (when (some #(= "-" %) paths) "stdin.lpy"))
+                 :copy-configs (.-copy_configs args)
+                 :skip-lint (.-skip_lint args)
+                 :cache (case (.-cache args) "true" true "false" false (.-cache args))
+                 :cache-dir (.-cache_dir args)
+                 :debug (.-debug args)
+                 :filename (or (.-filename args) (when (some #(= "-" %) paths) "<stdin>"))
+                 :lang (keyword (.-lang args))
                  :python-executable (.-python_executable args)
                  :python-inspection? (.-python_inspection args)
                  :python-timeout (.-python_timeout args)}
@@ -308,20 +362,252 @@
     (when output (.write sys/stdout output))
     (.exit_status checker result (keyword (.-fail_level args)))))
 
+(defn- batch-paths [root values]
+  (mapv #(str (.absolute (.joinpath root %)))
+        (mapcat #(remove empty? (re/split (str "[," (re/escape os/pathsep) "]") %)) values)))
+
+(defn- batch-context [server args options]
+  (let [root (.resolve (pathlib/Path (or (.-project_root args) (.cwd pathlib/Path))))
+        _ (when-not (.is_dir root) (error (str "Project directory does not exist: " root)))
+        settings (.load_settings server {:root (str root) :force-settings (:force-settings options)
+                                         :python-options options})
+        requested (batch-paths root (or (.-filenames args) []))
+        ignored (:source-paths-ignore-regex settings ["target.*"])
+        roots (keep (fn [path]
+                      (let [path (.absolute (.joinpath root path))
+                            relative (pathutil/relpath path root)]
+                        (when (and (.exists path) (not (some #(regex/fullmatch % relative) ignored)))
+                          (str path)))) (or (:source-paths settings) ["src" "test"]))
+        roots (distinct (concat roots requested))
+        files (if (seq roots) (collect-files roots {}) [])
+        files (filterv #(not (some (fn [pattern] (regex/fullmatch pattern (str %)))
+                                   (:paths-ignore-regex settings))) files)
+        documents (into {} (map (fn [path] [(str path) (.decode (.read_bytes path) "utf-8")]) files))
+        options (assoc (.workspace_options server (str root) settings options)
+                       :settings settings :project-root (str root))
+        analyses (.workspace_analysis server documents options)
+        namespaces (set (or (.-namespace args) []))
+        excluded (when (.-ns_exclude_regex args) (regex/compile (.-ns_exclude_regex args)))
+        selected (into {}
+                       (filter (fn [[filename _]]
+                                 (let [path (pathlib/Path filename) ns-name (:namespace (get analyses filename))]
+                                   (and (if (seq namespaces)
+                                          (contains? namespaces ns-name)
+                                          (or (empty? requested)
+                                              (some #(let [selected (pathlib/Path %)]
+                                                       (or (= path selected)
+                                                           (and (.is_dir selected) (.is_relative_to path selected))))
+                                                    requested)))
+                                        (not (and excluded ns-name (regex/fullmatch excluded ns-name))))))
+                               documents))]
+    {:root root :settings settings :documents documents :selected selected
+     :analyses analyses :options (assoc options :analyses analyses)}))
+
+(defn- apply-offset-edits [source edits]
+  (let [ordered (sort-by first edits)]
+    (loop [remaining ordered previous-end 0]
+      (when-let [[start end replacement] (first remaining)]
+        (when-not (and (integer? start) (integer? end) (<= previous-end start end (count source))
+                       (string? replacement))
+          (error "Refactoring produced overlapping or invalid edits."))
+        (recur (next remaining) end)))
+    (reduce (fn [text [start end replacement]]
+              (str (subs text 0 start) replacement (subs text end))) source (reverse ordered))))
+
+(defn- apply-batch-edits! [context edits renames args]
+  (let [root (:root context)
+        changes (vec (keep (fn [[filename edits]]
+                             (let [source (get (:documents context) filename)
+                                   _ (when-not source (error (str "Edit targets an unknown document: " filename)))
+                                   formatted (apply-offset-edits source edits)]
+                               (when (not= source formatted)
+                                 (when (seq (:diagnostics (syntax/parse formatted)))
+                                   (error (str "Refactoring would leave invalid source: " filename)))
+                                 {:path (pathlib/Path filename) :source source
+                                  :original (.encode source "utf-8") :formatted formatted
+                                  :label (pathutil/relpath filename root)}))) edits))]
+    ;; Validate every target and snapshot before the first write.
+    (doseq [{:keys [path original]} changes]
+      (when (or (.is_symlink path) (not= original (.read_bytes path)))
+        (error (str "File changed while preparing edits: " path))))
+    (doseq [[old new] renames]
+      (let [source (get (:documents context) old)
+            origin (pathlib/Path old)
+            target (.resolve (pathlib/Path new))]
+        (when-not (and source (.is_relative_to (.resolve origin) root)
+                       (not (.is_symlink origin))
+                       (= (.encode source "utf-8") (.read_bytes origin))
+                       (.is_relative_to target root) (not (.exists target)))
+          (error (str "Cannot rename " old " to " new)))))
+    (if (.-dry args)
+      (do
+        (doseq [{:keys [source formatted label]} changes]
+          (.write sys/stdout (diff source formatted label)))
+        (doseq [[old new] renames]
+          (.write sys/stdout (str "rename from " (pathutil/relpath old root)
+                                  "\nrename to " (pathutil/relpath new root) "\n"))))
+      (do
+        (doseq [{:keys [path original formatted]} changes]
+          (replace-file! path original formatted))
+        (doseq [[old new] renames]
+          (let [target (.resolve (pathlib/Path new))]
+            (.mkdir (.-parent target) ** :parents true :exist_ok true)
+            (when (or (not (.is_relative_to (.resolve target) root)) (.exists target))
+              (error (str "Rename target changed while preparing edits: " target)))
+            (os/rename old target)))))
+    (+ (count changes) (count renames))))
+
+(defn- print-batch-data [data format]
+  (.write sys/stdout
+          (str (case format
+                 :json (.json_dumps (importlib/import_module "basilisp_tools.check") data)
+                 :edn (pr-str data)
+                 (error (str "Unsupported output format: " format))) "\n")))
+
+(defn- batch-command [server args options]
+  (let [command (.-lsp_command args)
+        _ (doseq [[required value] (case command
+                                     "rename" [["--from" (.-from_symbol args)] ["--to" (.-to_symbol args)]]
+                                     "references" [["--from" (.-from_symbol args)]]
+                                     [])]
+            (when-not value (error (str command " requires " required))))
+        requested-analysis (if (.-analysis args) (.read_settings server (.-analysis args) "--analysis") {})
+        default-mode (case command "format" :project-namespaces-only
+                           "references" :project-and-full-dependencies
+                           "diagnostics" :project-and-shallow-analysis :project-only)
+        mode (keyword (:type requested-analysis default-mode))
+        _ (when-not (contains? #{:project-only :project-namespaces-only
+                                 :project-and-shallow-analysis :project-and-full-dependencies} mode)
+            (error (str "Unsupported analysis type: " mode)))
+        analysis-options (assoc requested-analysis :type mode)
+        context (batch-context server args (assoc options :analysis analysis-options))
+        {:keys [root settings documents selected analyses options]} context
+        output (if (.-output args) (.read_settings server (.-output args) "--output") {})
+        selected-analysis (select-keys analyses (keys selected))]
+    (case command
+      ("clean-ns" "format")
+      (let [formatter-path (.joinpath root (:cljfmt-config-path settings ".cljfmt.edn"))
+            formatter-options (.merge_settings server (:cljfmt settings {})
+                                               (if (.is_file formatter-path) (fmt/load-config formatter-path) {}))
+            formatter-options (fmt/with-analysis-indents formatter-options (mapcat :var-definitions (vals analyses)))
+            edits (into {} (map (fn [[filename source]]
+                                  [filename
+                                   (if (= command "format")
+                                     [[0 (count source) (fmt/format-string source formatter-options)]]
+                                     (.refactor_edits server source (assoc (get analyses filename) :settings settings)
+                                                      "clean-ns" 0 []))]) selected))
+            changed (apply-batch-edits! context edits {} args)]
+        (when (and (not (.-dry args)) (not (.-raw args)))
+          (.write sys/stdout (str (if (= command "format") "Formatted " "Cleaned ") changed " files\n")))
+        (if (and (.-dry args) (pos? changed)) 1 0))
+
+      ("rename" "references")
+      (let [result (.batch_query server documents options command
+                                 {:from (.-from_symbol args) :to (.-to_symbol args) :include-declaration? true})]
+        (if (= command "rename")
+          (let [changed (apply-batch-edits! context (:edits result) (:renames result {}) args)]
+            (when (and (not (.-dry args)) (not (.-raw args)))
+              (.write sys/stdout (str "Renamed " (.-from_symbol args) " to " (.-to_symbol args) "\n")))
+            (if (pos? changed) (:exit-code result 0) 1))
+          (do
+            (if (:format output)
+              (print-batch-data (:result result) (:format output))
+              (doseq [item (:result result)]
+                (.write sys/stdout (str (.as_uri (.absolute (pathlib/Path (:filename item))))
+                                        ":" (:row item) ":" (:col item) "\n"))))
+            (:exit-code result 0))))
+
+      ("diagnostics" "dump")
+      (let [diagnostics (into {} (keep (fn [[filename source]]
+                                         (let [items (.diagnostics_data server filename source
+                                                                        (get analyses filename) settings)]
+                                           (when (seq items)
+                                             [(.as_uri (.absolute (pathlib/Path filename))) items]))) selected))
+            all-diagnostics (mapcat val diagnostics)
+            filenames (into {} (map (fn [filename] [(.as_uri (.absolute (pathlib/Path filename))) filename]) (keys selected)))]
+        (if (= command "diagnostics")
+          (do
+            (cond
+              (empty? diagnostics) (.write sys/stdout "No diagnostics found!\n")
+              (:format output) (print-batch-data diagnostics (:format output))
+              :else
+              (doseq [[uri items] (sort-by key diagnostics) item items]
+                (let [filename (get filenames uri)
+                      label (if (:canonical-paths output) filename (pathutil/relpath filename root))
+                      start (get-in item [:range :start])
+                      level (case (:severity item) 1 "error" 2 "warning" "info")]
+                  (.write sys/stdout (str label ":" (inc (:line start)) ":" (inc (:character start))
+                                          ": " level ": [" (name (:code item)) "] " (:message item) "\n")))))
+            (cond (some #(= 1 (:severity %)) all-diagnostics) 3
+                  (some #(= 2 (:severity %)) all-diagnostics) 2
+                  :else 0))
+          (let [checker (importlib/import_module "basilisp_tools.check")
+                analyzer (importlib/import_module "basilisp_tools.analyzer")
+                config (.load_config checker
+                                     (cond-> {:cwd (str root)}
+                                       (:kondo-config-dir settings)
+                                       (assoc :config-dir (str (.absolute (.joinpath root (:kondo-config-dir settings)))))))
+                sources (mapv (fn [[filename source]]
+                                {:filename filename :source source
+                                 :declarations (.declarations analyzer source {:filename filename})}) selected)
+                exported (.analysis_output checker {:analysis (mapv #(get selected-analysis (:filename %)) sources)
+                                                    :sources sources :config (assoc config :analysis (if (seq analysis-options) analysis-options true))})
+                dump {:project-root (str root) :source-paths (or (:source-paths settings) ["src" "test"])
+                      :classpath (:python-paths options) :settings settings :clj-kondo-settings config
+                      :analysis exported :findings (vec (mapcat :findings (vals selected-analysis)))
+                      :diagnostics diagnostics
+                      :dep-graph (into {} (map (fn [[_ analysis]]
+                                                 [(:namespace analysis)
+                                                  (vec (distinct (map :name (:namespace-usages analysis))))]) selected-analysis))}
+                dump (if (contains? output :filter-keys) (select-keys dump (:filter-keys output)) dump)]
+            (print-batch-data dump (:format output :edn))
+            0))))))
+
 (defn- lsp-command [args]
   (let [server (importlib/import_module "basilisp_tools.lsp")
         options (cond-> {:python-inspection? (.-python_inspection args)
                          :python-timeout (.-python_timeout args)}
                   (.-python_executable args) (assoc :python-executable (.-python_executable args))
+                  (.-log_path args) (assoc :log-path (.-log_path args) :log-configured? true)
+                  (or (.-trace args) (.-verbose args) (not= "off" (.-trace_level args)))
+                  (assoc :log-level (if (or (.-trace args) (= "verbose" (.-trace_level args))) logging/DEBUG logging/INFO))
                   (.-settings args) (assoc :force-settings (.read_settings server (.-settings args) "--settings")))]
-    (.start server options)))
+    (if (= "listen" (.-lsp_command args))
+      (do
+        (when (or (.-log_path args) (.-verbose args) (.-trace args) (not= "off" (.-trace_level args)))
+          (let [level (cond (or (.-trace args) (= "verbose" (.-trace_level args))) logging/DEBUG
+                            (or (.-verbose args) (= "messages" (.-trace_level args))) logging/INFO
+                            :else logging/WARNING)
+                handler (if (.-log_path args)
+                          (logging/FileHandler (.-log_path args) ** :encoding "utf-8")
+                          (logging/StreamHandler sys/stderr))]
+            (logging/basicConfig ** :level level :handlers #py [handler] :force true)))
+        (.start server options))
+      (batch-command server args options))))
+
+(defn- normalized-arguments [argv]
+  ;; Preserve flag-style usage while accepting upstream boolean values.
+  (let [argv (vec (or argv (rest sys/argv)))]
+    (loop [args argv result []]
+      (if-let [arg (first args)]
+        (cond
+          (and (= arg "--parallel") (contains? #{"true" "false"} (second args)))
+          (recur (nnext args) (conj result (if (= "true" (second args)) "--parallel" "--no-parallel")))
+          (.startswith arg "--parallel=")
+          (let [value (subs arg (count "--parallel="))]
+            (if (contains? #{"true" "false"} value)
+              (recur (next args) (conj result (if (= "true" value) "--parallel" "--no-parallel")))
+              (recur (next args) (conj result arg))))
+          (= arg "--") (into result args)
+          :else (recur (next args) (conj result arg)))
+        result))))
 
 (defn main
   "Run blt. Format: 0 success, 1 changes required, 2 error.
   Check: 0 clean, 2 warnings, 3 analysis errors; invalid CLI input returns 2."
   ([] (main nil))
   ([argv]
-   (let [args (.parse_args (parser) argv)]
+   (let [args (.parse_args (parser) (normalized-arguments argv))]
      (try
        (case (.-command args)
          "format" (format-command args)

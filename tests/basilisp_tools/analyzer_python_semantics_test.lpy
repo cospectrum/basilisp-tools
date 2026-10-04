@@ -1,0 +1,99 @@
+(ns basilisp-tools.analyzer-python-semantics-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as bridge])
+  (:import [pathlib] [tempfile] [sys]))
+
+(def ^:private module-source
+  (str
+   "from typing import TypeVar, overload, Literal\n"
+   "from collections.abc import Sequence, Iterable, Mapping, MutableMapping\n"
+   "T = TypeVar(\"T\")\n"
+   "def sequence_first(value: Sequence[T]) -> T:\n"
+   "    assert isinstance(value, Sequence)\n"
+   "    return value[0]\n"
+   "def iterable_first(value: Iterable[T]) -> T:\n"
+   "    return next(iter(value))\n"
+   "def mapping_first(value: Mapping[str, T]) -> T:\n"
+   "    assert isinstance(value, Mapping)\n"
+   "    return value[\"value\"]\n"
+   "def append_one(value: list[int]) -> list[int]:\n"
+   "    assert isinstance(value, list)\n"
+   "    value.append(1)\n"
+   "    return value\n"
+   "def mutate(value: MutableMapping[str, int]) -> int:\n"
+   "    assert isinstance(value, MutableMapping)\n"
+   "    value[\"value\"] = 1\n"
+   "    return value[\"value\"]\n"
+   "def pair(value: tuple[int, str]) -> str:\n"
+   "    assert isinstance(value, tuple)\n"
+   "    return value[1].upper()\n"
+   "@overload\n"
+   "def choose(value: int) -> str: ...\n"
+   "@overload\n"
+   "def choose(value: str) -> int: ...\n"
+   "def choose(value):\n"
+   "    return str(value) if isinstance(value, int) else len(value)\n"
+   "def names(value: Sequence[str]) -> list[str]:\n"
+   "    return [item.upper() for item in value]\n"
+   "def nullable(value: str | None) -> str:\n"
+   "    return value or \"fallback\"\n"))
+
+(def ^:private cases
+  [["native-list-generic" "(.upper (m/sequence-first #py [\"alpha\"]))" true]
+   ["persistent-vector-generic" "(.upper (m/sequence-first [\"alpha\"]))" true]
+   ["persistent-list-iterable" "(.upper (m/iterable-first (list \"alpha\")))" true]
+   ["persistent-vector-iterable" "(.upper (m/iterable-first [\"alpha\"]))" true]
+   ["native-dict-generic" "(.upper (m/mapping-first #py {\"value\" \"alpha\"}))" true]
+   ["persistent-map-generic" "(.upper (m/mapping-first {\"value\" \"alpha\"}))" true]
+   ["native-list-mutable" "(m/append-one #py [1 2])" true]
+   ["persistent-vector-mutable-negative" "(m/append-one [1 2])" false]
+   ["native-dict-mutable" "(m/mutate #py {\"value\" 2})" true]
+   ["persistent-map-mutable-negative" "(m/mutate {\"value\" 2})" false]
+   ["native-tuple-pair" "(m/pair #py (1 \"alpha\"))" true]
+   ["persistent-vector-tuple-negative" "(m/pair [1 \"alpha\"])" false]
+   ["overload-return-int" "(+ 1 (m/choose \"alpha\"))" true]
+   ["overload-return-str" "(.upper (m/choose 1))" true]
+   ["list-native-string-elements" "(m/names #py [\"a\" \"b\"])" true]
+   ["vector-string-elements" "(m/names [\"a\" \"b\"])" true]
+   ["nullable-nil" "(m/nullable nil)" true]
+   ["nullable-str" "(m/nullable \"value\")" true]
+   ["native-tuple-sequence" "(.upper (m/sequence-first #py (\"alpha\")))" true]
+   ["native-set-iterable" "(.upper (m/iterable-first #py #{\"alpha\"}))" true]
+   ["persistent-set-iterable" "(.upper (m/iterable-first #{\"alpha\"}))" true]
+   ["native-dict-iterable" "(.upper (m/iterable-first #py {\"alpha\" 1}))" true]
+   ["persistent-map-iterable" "(.upper (m/iterable-first {\"alpha\" 1}))" true]
+   ["vector-constructor-sequence" "(.upper (m/sequence-first (vector \"alpha\")))" true]
+   ["python-list-constructor" "(m/append-one (python/list [1 2]))" true]
+   ["python-dict-constructor" "(m/mutate (python/dict #py {\"value\" 2}))" true]])
+
+(deftest native-python-and-persistent-collection-semantics-test
+  ;; These original fixtures execute under Basilisp as an independent oracle.
+  ;; The analyzer itself is configured for static inspection of their source.
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        module "blt_python_semantics_fixture"
+        filename (.joinpath root "blt_python_semantics_runtime.lpy")
+        options {:filename (str filename)
+                 :config {:linters {:type-mismatch {:level :error}}}
+                 :python-options {:python-paths [(str root)]
+                                  :python-inspection? false
+                                  :python-cache (bridge/create-cache)}}]
+    (try
+      (.write_text (.joinpath root (str module ".py")) module-source ** :encoding "utf-8")
+      (.insert sys/path 0 (str root))
+      (doseq [[name expression success?] cases]
+        (let [source (str "(ns blt-python-semantics-runtime (:import [" module " :as m])) " expression)
+              runtime (try {:success? true :value (load-string source)}
+                           (catch python/Exception error {:success? false :error (str error)}))
+              findings (:findings (analyzer/analyze source options))
+              errors (filter #(contains? #{:type-mismatch :invalid-arity :unresolved-symbol :unresolved-var
+                                           :unresolved-namespace :syntax :not-a-function} (:type %)) findings)]
+          (is (= success? (:success? runtime)) (str name " runtime " runtime))
+          (if success?
+            (is (empty? errors) (str name " " errors))
+            (is (some #(= :type-mismatch (:type %)) errors) (str name " must report incompatible native collection")))))
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules module nil)
+        (.cleanup temp)))))

@@ -1,5 +1,6 @@
 (ns basilisp-tools.cli-test
   (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp.string :as str]
             [basilisp-tools.cli :as cli])
   (:import [io] [json] [os] [pathlib] [stat] [tempfile]
            [unittest.mock :as mock]))
@@ -225,3 +226,160 @@
     (is (= 0 (:code result)))
     (is (= "" (:out result)))
     (is (= "" (:err result)))))
+
+(deftest checker-optional-booleans-test
+  (doseq [flags [["--parallel" "true"] ["--parallel" "false"]
+                 ["--parallel=true"] ["--parallel=false"] ["--no-parallel"]]]
+    (let [result (run-cli (concat ["check" "--repro" "--no-python-inspection" "--cache" "false"
+                                   "--format" "json"] flags ["-"]) "(ns boolean-options) missing")]
+      (is (= 3 (:code result)))
+      (is (= "unresolved-symbol" (.get (first (.get (json/loads (:out result)) "findings")) "type"))))))
+
+(deftest lsp-batch-workflow-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (.resolve (pathlib/Path (.-name temporary)))
+        source (.joinpath root "src" "demo")
+        first-file (.joinpath source "a.lpy")
+        second-file (.joinpath source "b.lpy")
+        clean-file (.joinpath source "clean.lpy")
+        invoke (fn [args] (run-cli (concat ["lsp"] args ["--project-root" (str root)
+                                                         "--no-python-inspection" "--raw"]) ""))
+        environment (.dict mock/patch os/environ #py {"HOME" (str root) "XDG_CONFIG_HOME" (str (.joinpath root "config"))})]
+    (.start environment)
+    (try
+      (.mkdir source ** :parents true)
+      (.write_text first-file "(ns demo.a)\n(defn work [value]\nvalue)\n(work 1)\n" ** :encoding "utf-8")
+      (.write_text second-file "(ns demo.b (:require [demo.a :as a]))\n(a/work 2)\n" ** :encoding "utf-8")
+      (.write_text clean-file "(ns demo.clean (:require [demo.a :as unused]))\n" ** :encoding "utf-8")
+      (testing "Dry formatting is read-only and file selection is honored"
+        (let [original (.read_bytes first-file)
+              result (invoke ["format" "--dry" "--filenames" "src/demo/a.lpy"])]
+          (is (= 1 (:code result)))
+          (is (.startswith (:out result) "--- a/src/demo/a.lpy"))
+          (is (= original (.read_bytes first-file))))
+        (is (= 0 (:code (invoke ["format" "--filenames" "src/demo/a.lpy"]))))
+        (is (str/includes? (.read_text first-file ** :encoding "utf-8") "\n  value)")))
+      (testing "Qualified references and rename share the project index"
+        (let [result (invoke ["references" "--from" "demo.a/work" "--output" "{:format :json}"])]
+          (is (= 0 (:code result)))
+          (is (= 3 (count (json/loads (:out result))))))
+        (let [original (.read_bytes first-file)
+              result (invoke ["rename" "--from" "demo.a/work" "--to" "demo.a/run-work" "--dry"])]
+          (is (= 0 (:code result)))
+          (is (str/includes? (:out result) "run-work"))
+          (is (= original (.read_bytes first-file))))
+        (is (= 0 (:code (invoke ["rename" "--from" "demo.a/work" "--to" "demo.a/run-work"]))))
+        (is (str/includes? (.read_text first-file ** :encoding "utf-8") "(defn run-work"))
+        (is (str/includes? (.read_text second-file ** :encoding "utf-8") "(a/run-work 2)")))
+      (testing "Namespace cleanup preserves load-only dependencies"
+        (is (= 0 (:code (invoke ["clean-ns" "--namespace" "demo.clean"]))))
+        (let [text (.read_text clean-file ** :encoding "utf-8")]
+          (is (not (str/includes? text ":as unused")))
+          (is (str/includes? text "demo.a"))))
+      (testing "Dump exposes selected analysis fields as JSON"
+        (let [result (invoke ["dump" "--output" "{:format :json :filter-keys [:analysis :source-paths]}"])
+              data (json/loads (:out result))]
+          (is (= 0 (:code result)))
+          (is (= #{"analysis" "source-paths"} (set (.keys data))))
+          (is (= 3 (count (.get (.get data "analysis") "namespace-definitions"))))))
+      (testing "Missing symbols return an unsuccessful query"
+        (is (= 1 (:code (invoke ["references" "--from" "demo.a/absent"])))))
+      (testing "Namespace rename moves the file and updates consumers"
+        (let [renamed (.joinpath source "renamed.lpy")
+              original (.read_bytes first-file)
+              result (invoke ["rename" "--from" "demo.a" "--to" "demo.renamed" "--dry"])]
+          (is (= 0 (:code result)))
+          (is (str/includes? (:out result) "rename to src/demo/renamed.lpy"))
+          (is (= original (.read_bytes first-file)))
+          (is (not (.exists renamed)))
+          (is (= 0 (:code (invoke ["rename" "--from" "demo.a" "--to" "demo.renamed"]))))
+          (is (not (.exists first-file)))
+          (is (str/includes? (.read_text renamed ** :encoding "utf-8") "(ns demo.renamed)"))
+          (is (str/includes? (.read_text second-file ** :encoding "utf-8") "[demo.renamed :as a]"))))
+      (testing "Diagnostics use LSP ranges and an error exit status"
+        (.write_text (.joinpath source "bad.lpy") "(ns demo.bad)\nmissing\n" ** :encoding "utf-8")
+        (let [result (invoke ["diagnostics" "--namespace" "demo.bad" "--output" "{:format :json}"])
+              data (json/loads (:out result))
+              findings (first (.values data))]
+          (is (= 3 (:code result)))
+          (is (= 1 (count findings)))
+          (is (= "unresolved-symbol" (.get (first findings) "code")))
+          (is (= 1 (.get (.get (.get (first findings) "range") "start") "line")))))
+      (finally (.stop environment) (.cleanup temporary)))))
+
+(deftest formatter-lein-profile-cli-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        original (.cwd pathlib/Path)]
+    (try
+      (.write_text (.joinpath root "project.clj")
+                   "(defproject sample \"0\" :cljfmt {:indentation? true} :profiles {:release {:cljfmt {:indentation? false}}})"
+                   ** :encoding "utf-8")
+      (os/chdir root)
+      (let [source "(let [value 1]\nvalue)"
+            result (run-cli ["format" "--lein-profile" "release" "-"] source)]
+        (is (= 0 (:code result)))
+        (is (= source (:out result))))
+      (finally (os/chdir original) (.cleanup temporary)))))
+
+(deftest checker-edn-cli-test
+  (let [base ["check" "--repro" "--no-python-inspection" "--cache" "false" "--format" "json"]]
+    (doseq [args [["--lang" "edn"] ["--filename" "settings.edn"]]]
+      (let [result (run-cli (concat base args ["-"]) "{:name unresolved :values (missing 1)}")]
+        (is (= 0 (:code result)))
+        (is (empty? (.get (json/loads (:out result)) "findings")))))
+    (let [result (run-cli (concat base ["--lang" "edn" "-"]) "{:a 1 :a 2}")]
+      (is (= 3 (:code result)))
+      (is (some #(= "duplicate-map-key" (.get % "type"))
+                (.get (json/loads (:out result)) "findings"))))))
+
+(deftest lsp-batch-settings-propagation-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (.resolve (pathlib/Path (.-name temporary)))
+        source (.joinpath root "src")
+        invoke (fn [args] (run-cli (concat ["lsp"] args ["--project-root" (str root)
+                                                         "--no-python-inspection" "--raw"]) ""))
+        environment (.dict mock/patch os/environ #py {"HOME" (str root) "XDG_CONFIG_HOME" (str (.joinpath root "config"))})]
+    (.start environment)
+    (try
+      (.mkdir source)
+      (.write_text (.joinpath source "helper.lpy") "(ns helper)\n(defn z [] 1)\n(defn a [] 1)\n" ** :encoding "utf-8")
+      (.write_text (.joinpath source "sample.lpy")
+                   "(ns sample\n  (:require [helper :refer [z a]]))\n(z)\n(a)\n" ** :encoding "utf-8")
+      (testing "Cleanup uses the selected layout settings"
+        (let [result (invoke ["clean-ns" "--namespace" "sample" "--dry"
+                              "--settings" "{:clean {:sort {:refer false}}}"])]
+          (is (= 0 (:code result)))
+          (is (= "" (:out result)))))
+      (testing "Namespace selection takes precedence and exclusion patterns match whole names"
+        (let [args ["dump" "--namespace" "sample" "--filenames" "src/helper.lpy"
+                    "--ns-exclude-regex" "sam"
+                    "--output" "{:format :json :filter-keys [:analysis]}"]
+              result (invoke args)
+              names (.get (.get (json/loads (:out result)) "analysis") "namespace-definitions")]
+          (is (= 0 (:code result)))
+          (is (= ["sample"] (mapv #(.get % "name") names))))
+        (is (= 2 (:code (invoke ["dump" "--analysis" "{:type :unknown}"])))))
+      (testing "Namespace-only analysis omits var details"
+        (let [result (invoke ["dump" "--analysis" "{:type :project-namespaces-only}"
+                              "--output" "{:format :json :filter-keys [:analysis]}"])
+              data (.get (json/loads (:out result)) "analysis")]
+          (is (= 0 (:code result)))
+          (is (= 2 (count (.get data "namespace-definitions"))))
+          (is (empty? (.get data "var-definitions")))
+          (is (empty? (.get data "var-usages")))))
+      (testing "Formatting uses analyzed macro indentation metadata when requested"
+        (let [file (.joinpath source "styled.lpy")]
+          (.write_text file "(ns styled)\n(defmacro ^{:style/indent 1} custom [x & body] nil)\n(custom a\nb)\n" ** :encoding "utf-8")
+          (is (= 0 (:code (invoke ["format" "--namespace" "styled" "--analysis" "{:type :project-only}"]))))
+          (is (str/includes? (.read_text file ** :encoding "utf-8") "(custom a\n  b)"))))
+      (testing "Dump reports the checker configuration actually used"
+        (let [config (.joinpath root ".lint")]
+          (.mkdir config)
+          (.write_text (.joinpath config "config.edn") "{:linters {:unresolved-symbol {:level :off}}}" ** :encoding "utf-8"))
+        (let [result (invoke ["dump" "--settings" "{:kondo-config-dir \".lint\"}"
+                              "--output" "{:format :json :filter-keys [:clj-kondo-settings]}"])
+              config (.get (json/loads (:out result)) "clj-kondo-settings")]
+          (is (= 0 (:code result)))
+          (is (= "off" (.get (.get (.get config "linters") "unresolved-symbol") "level")))))
+      (finally (.stop environment) (.cleanup temporary)))))

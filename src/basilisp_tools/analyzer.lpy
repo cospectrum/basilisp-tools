@@ -3,14 +3,41 @@
   (:require [basilisp.string :as str]
             [basilisp.edn :as edn]
             [basilisp-tools.syntax :as syntax]
-            [basilisp-tools.python :as py])
-  (:import [pathlib] [sys] [re] [operator :as op] [basilisp.lang.util :as util]))
+            [basilisp-tools.python :as py]
+            [basilisp-tools.hooks :as hooks]
+            [basilisp-tools.regex :as regex])
+  (:import [pathlib] [sys] [re] [bisect] [operator :as op] [basilisp.lang.util :as util]))
 
 (def ^:private warning-types
   #{:unused-binding :unused-import :unused-namespace :unused-referred-var
-    :unused-private-var :unresolved-namespace :unresolved-var :redefined-var
+    :unused-private-var :not-empty? :unresolved-namespace :unresolved-var :redefined-var
     :duplicate-require :missing-else-branch :python-inspection :unused-value
-    :redundant-do :redundant-let :cond-else :constant-condition :shadowed-fn-param})
+    :redundant-do :redundant-let :cond-else :constant-condition :shadowed-fn-param
+    :inline-def :missing-test-assertion :unbound-destructuring-default :unknown-require-option
+    :unknown-ns-option :misplaced-docstring :deprecated-var :deprecated-namespace :refer-all
+    :use :case-quoted-test :docstring-blank :consistent-alias :single-operand-comparison
+    :single-logical-operand :missing-clause-in-try :missing-body-in-when :redundant-expression
+    :loop-without-recur :discouraged-var :discouraged-namespace :discouraged-tag
+    :earmuffed-var-not-dynamic :uninitialized-var :self-requiring-namespace
+    :underscore-in-namespace :duplicate-refer :redundant-declare :line-length
+    :unresolved-protocol-method :missing-protocol-method :protocol-method-arity-mismatch
+    :unquote-not-syntax-quoted :duplicate-key-args :aliased-namespace-var-usage
+    :destructured-or-binding-of-same-map :unreachable-code :do-template :clj-kondo-config :min-clj-kondo-version
+    :non-arg-vec-return-type-hint :misplaced-async-metadata})
+(def ^:private disabled-types
+  #{:single-key-in :redundant-let-binding :def-fn :used-underscored-binding
+    :unsorted-required-namespaces :unsorted-imports :reduce-without-init :not-nil?
+    :if-x-x-y :refer :if-nil-return :case-symbol-test :missing-docstring
+    :docstring-no-summary :docstring-leading-trailing-whitespace :shadowed-var
+    :redundant-fn-wrapper :keyword-binding :redundant-call :aliased-namespace-symbol
+    :dynamic-var-not-earmuffed :seq-rest :equals-false :equals-true :equals-nil
+    :equals-float :plus-one :minus-one :unused-alias :alias-same-as-ns
+    :equals-expected-position :missing-protocol-method-arity :destructured-or-always-evaluates
+    :var-same-name-except-case :conditional-build-up})
+(def ^:private info-types
+  #{:aliased-referred-var :unresolved-excluded-var :unused-excluded-var
+    :redundant-nested-call :redundant-str-call :is-message-not-string
+    :redundant-format :redundant-primitive-coercion :redundant-ignore})
 (def ^:private special-names
   #{"if" "do" "def" "fn*" "let*" "loop*" "recur" "throw" "try" "catch"
     "finally" "quote" "var" "set!" "new" "." "import*" "await" "yield"
@@ -40,10 +67,13 @@
 
 (defn- selected [node]
   (let [pairs (partition 2 (syntax/forms node))]
-    (or (some (fn [[feature value]] (when (= ":lpy" (token feature)) value)) pairs)
-        (some (fn [[feature value]] (when (= ":default" (token feature)) value)) pairs))))
+    (some (fn [[feature value]] (when (#{":lpy" ":default"} (token feature)) value)) pairs)))
 
-(defn- forms [node]
+;; Memoization is bound to one analysis/declaration invocation, including threads.
+;; Entries retain their node so Python cannot recycle its identity within a run.
+(def ^:dynamic ^:private *node-cache* nil)
+(declare forms)
+(defn- uncached-forms [node]
   (let [children (syntax/forms node)]
     (if (python/any (python/map #(contains? #{:reader-conditional :reader-splice} (:kind %)) children))
       (vec (mapcat (fn [child]
@@ -52,6 +82,16 @@
                        :reader-splice (if-let [value (selected child)] (forms value) [])
                        [child])) children))
       children)))
+
+(defn- forms [node]
+  (if *node-cache*
+    (let [cache (op/getitem *node-cache* 0) key (python/id node)]
+      (if-let [entry (.get cache key)]
+        (op/getitem entry 0)
+        (let [value (uncached-forms node)]
+          (op/setitem cache key #py [value node])
+          value)))
+    (uncached-forms node)))
 
 (defn- merge-config [a b]
   (cond
@@ -67,9 +107,9 @@
 (defn- expand-ignore [config]
   (let [ignored (:ignore config)
         types (if (true? ignored)
-                (into warning-types [:syntax :unresolved-symbol :invalid-arity :unexpected-recur
-                                     :duplicate-map-key :duplicate-set-key :type-mismatch :not-a-function
-                                     :single-key-in :redundant-let-binding])
+                (into (into (into warning-types disabled-types) info-types) [:syntax :unresolved-symbol :invalid-arity :unexpected-recur
+                                                                             :duplicate-map-key :duplicate-set-key :type-mismatch :not-a-function
+                                                                             :single-key-in :redundant-let-binding :duplicate-field])
                 ignored)]
     (if ignored
       (reduce #(assoc-in %1 [:linters %2 :level] :off) (dissoc config :ignore) types)
@@ -78,13 +118,22 @@
 (defn- merge-settings [a b]
   (merge-config a (expand-ignore b)))
 
-(defn- config-data
+(declare config-data)
+(defn- decode-config-data
   "Decode only literal data in source configuration, without invoking reader tags."
   [node]
   (let [xs (forms node)]
     (case (:kind node)
-      (:nil :boolean :number :symbolic-number :character :keyword :symbol :string)
-      (edn/read-string (syntax/text node))
+      :nil nil
+      :boolean (op/eq "true" (token node))
+      :symbol (symbol (token node))
+      :keyword (let [raw (token node)]
+                 (if (.startswith raw "::") (edn/read-string raw) (keyword (subs raw 1))))
+      :number (let [raw (token node)]
+                (if (re/fullmatch "[+-]?[0-9]+" raw) (python/int raw) (edn/read-string raw)))
+      :string (let [raw (syntax/text node)]
+                (if (neg? (.find raw "\\")) (subs raw 1 (dec (count raw))) (edn/read-string raw)))
+      (:symbolic-number :character) (edn/read-string (syntax/text node))
       :map (into {} (map (fn [[k v]] [(config-data k) (config-data v)]) (partition 2 xs)))
       :vector (mapv config-data xs)
       :list (apply list (map config-data xs))
@@ -94,15 +143,50 @@
                   (with-meta (config-data value) (if (keyword? m) {m true} m)))
       (throw (python/ValueError "clj-kondo source configuration must be literal data")))))
 
+(defn- config-data [node]
+  (if *node-cache*
+    (let [cache (op/getitem *node-cache* 1) key (python/id node)]
+      (if-let [entry (.get cache key)]
+        (op/getitem entry 0)
+        (let [value (decode-config-data node)]
+          (op/setitem cache key #py [value node])
+          value)))
+    (decode-config-data node)))
+
+(defn- quoted-data [node]
+  (let [node (unwrap node) children (forms node)]
+    (case (:kind node)
+      :quote (list 'quote (quoted-data (first children)))
+      :list (apply list (map quoted-data children))
+      :vector (mapv quoted-data children)
+      :set (set (map quoted-data children))
+      :map (into {} (map (fn [[key value]] [(quoted-data key) (quoted-data value)]) (partition 2 children)))
+      (config-data node))))
+
+(defn- constant-data
+  "Return [value] only when the code form has a statically known literal value."
+  [node]
+  (let [node (unwrap node) kind (:kind node)]
+    (try
+      (cond
+        (contains? literal-kinds kind) [(config-data node)]
+        (op/eq :quote kind) [(quoted-data (first (forms node)))]
+        (#{:map :vector :set} kind)
+        (let [values (mapv constant-data (forms node))]
+          (when (every? some? values)
+            [(case kind :map (into {} (map vec (partition 2 (map first values))))
+                   :vector (mapv first values) :set (set (map first values)))])))
+      (catch python/Exception _ nil))))
+
 (defn- map-settings [node]
-  (when (= :map (:kind node))
+  (when (op/eq :map (:kind node))
     (into {} (keep (fn [[k v]]
                      (when (#{":clj-kondo/config" ":clj-kondo/ignore" ":clj-kondo/lint-as"} (token k))
                        [(keyword (subs (token k) 1)) (config-data v)])))
           (partition 2 (forms node)))))
 
 (defn- metadata-settings [node]
-  (when (= :metadata (:kind node))
+  (when (op/eq :metadata (:kind node))
     (let [[metadata target] (forms node)]
       (merge (map-settings metadata) (metadata-settings target)))))
 
@@ -111,7 +195,7 @@
     (contains? settings :clj-kondo/ignore) (assoc :ignore (:clj-kondo/ignore settings))))
 
 (defn- regex-matches? [pattern value]
-  (and (string? pattern) (boolean (re/search pattern value))))
+  (and (or (string? pattern) (regex/pattern? pattern)) (boolean (regex/search pattern value))))
 
 (defn- namespace-groups [config ns-name filename]
   (keep (fn [{:keys [pattern filename-pattern name]}]
@@ -128,23 +212,26 @@
              out []]
         (if-let [child (first children)]
           (let [target (second children)
-                ignored (when (= :discard (:kind child))
+                ignored (when (op/eq :discard (:kind child))
                           (let [value (first (forms child))]
                             (cond
-                              (= ":clj-kondo/ignore" (token value)) true
-                              (= :map (:kind value)) (:clj-kondo/ignore (map-settings value))
+                              (op/eq ":clj-kondo/ignore" (token value)) true
+                              (op/eq :map (:kind value)) (:clj-kondo/ignore (map-settings value))
                               :else nil)))]
             (recur (rest children)
                    (if (and ignored target)
-                     (conj out {:start (:start target) :end (:end target) :ignore ignored}) out)))
+                     (conj out {:start (:start target) :end (:end target) :ignore ignored :directive (first (forms child))}) out)))
           out)))
     (syntax/nodes root))))
 
 (defn- ignored-at? [ctx node type]
-  (some (fn [{:keys [start end ignore]}]
-          (and (<= start (:start node)) (<= (:end node) end)
-               (or (true? ignore) (some #{type} ignore))))
-        (:ignored-ranges ctx)))
+  (when (op/ne :redundant-ignore type)
+    (some (fn [{:keys [start end ignore directive]}]
+            (when (and (<= start (:start node)) (<= (:end node) end)
+                       (or (#{true :all} ignore) (some #{type} ignore)))
+              (swap! (:state ctx) update :used-ignores (fnil conj #{}) (:start directive))
+              true))
+          (:ignored-ranges ctx))))
 
 (defn- canonical-call [name]
   (str/replace (str/replace (str name) #"^clojure.core/" "basilisp.core/")
@@ -160,17 +247,29 @@
           (some #{(canonical-call excluded)} (:callstack ctx)))
         (get-in (context-config ctx) [:linters type :skip-args])))
 
-(defn- utf16-column [parsed offset position]
-  (let [prefix (subs (:source parsed) (nth (:line-starts parsed) (:line position)) offset)]
-    (inc (if (.isascii prefix) (python/len prefix)
-             (op/floordiv (python/len (.encode prefix "utf-16-le" "surrogatepass")) 2)))))
+(defn- location-data [parsed]
+  (let [cache (when *node-cache* (op/getitem *node-cache* 2))
+        key (python/id parsed)]
+    (or (when cache (.get cache key))
+        (let [value #py [(python/list (:line-starts parsed)) (.isascii (:source parsed)) parsed]]
+          (when cache (op/setitem cache key value))
+          value))))
+
+(defn- utf16-column [parsed offset line starts ascii?]
+  (let [start (op/getitem starts line)]
+    (op/add 1 (if ascii? (op/sub offset start)
+                  (let [prefix (subs (:source parsed) start offset)]
+                    (if (.isascii prefix) (python/len prefix)
+                        (op/floordiv (python/len (.encode prefix "utf-16-le" "surrogatepass")) 2)))))))
 
 (defn- location [parsed filename node]
-  (let [start (syntax/offset->position parsed (:start node))
-        end (syntax/offset->position parsed (:end node))]
-    {:filename filename :start (:start node) :end (:end node)
-     :row (inc (:line start)) :col (utf16-column parsed (:start node) start)
-     :end-row (inc (:line end)) :end-col (utf16-column parsed (:end node) end)}))
+  (let [data (location-data parsed) starts (op/getitem data 0) ascii? (op/getitem data 1)
+        start (:start node) end (:end node)
+        start-line (op/sub (bisect/bisect_right starts start) 1)
+        end-line (op/sub (bisect/bisect_right starts end) 1)]
+    {:filename filename :start start :end end
+     :row (op/add 1 start-line) :col (utf16-column parsed start start-line starts ascii?)
+     :end-row (op/add 1 end-line) :end-col (utf16-column parsed end end-line starts ascii?)}))
 
 (defn- parameters-arity [params]
   (let [names (mapv token (forms params))
@@ -186,37 +285,61 @@
 
 (defn- function-bodies [tail]
   (let [tail (drop-while #(#{:string :map} (:kind (unwrap %))) tail)]
-    (if (= :vector (:kind (unwrap (first tail))))
-      [{:params (unwrap (first tail)) :body (vec (rest tail))}]
+    (if (op/eq :vector (:kind (unwrap (first tail))))
+      [{:params (unwrap (first tail)) :return-hint (first tail) :body (vec (rest tail))}]
       (vec (keep (fn [body]
                    (let [xs (forms body)]
-                     (when (= :vector (:kind (unwrap (first xs))))
-                       {:params (unwrap (first xs)) :body (vec (rest xs)) :scope body}))) tail)))))
+                     (when (op/eq :vector (:kind (unwrap (first xs))))
+                       {:params (unwrap (first xs)) :return-hint (first xs) :body (vec (rest xs)) :scope body}))) tail)))))
 
 (defn- metadata-private? [node]
   (when (op/eq :metadata (:kind node))
     (let [[meta-node target] (forms node)]
-      (or (= ":private" (token meta-node))
-          (and (= :map (:kind meta-node))
-               (some (fn [[key value]] (and (= ":private" (token key)) (= "true" (token value))))
+      (or (op/eq ":private" (token meta-node))
+          (and (op/eq :map (:kind meta-node))
+               (some (fn [[key value]] (and (op/eq ":private" (token key)) (op/eq "true" (token value))))
                      (partition 2 (forms meta-node))))
           (metadata-private? target)))))
+
+(defn- node-metadata [node]
+  (when (op/eq :metadata (:kind node))
+    (let [[m target] (forms node)
+          decoded (try (config-data m) (catch python/Exception _ nil))]
+      (merge (node-metadata target)
+             (cond (keyword? decoded) {decoded true}
+                   (map? decoded) decoded
+                   (or (symbol? decoded) (string? decoded)) {:tag decoded}
+                   :else {})))))
+
+(defn- metadata-entry-node [node key]
+  (when (op/eq :metadata (:kind node))
+    (let [[metadata target] (forms node)
+          found (case (:kind metadata)
+                  :map (some (fn [[name value]] (when (= (str key) (token name)) value))
+                             (partition 2 (forms metadata)))
+                  :keyword (when (= (str key) (token metadata)) metadata)
+                  (:symbol :string) (when (op/eq :tag key) metadata)
+                  nil)]
+      (or found (metadata-entry-node target key)))))
 
 (defn- definition [parsed filename ns-name node name-node tail macro? private?]
   (let [head-name (last (str/split (or (token (first (forms node))) "") #"/"))
         function? (#{"defn" "defn-" "defasync" "defmacro" "defmacro-"} head-name)
         bodies (when function? (function-bodies tail))
         initializer (last tail)
-        init-forms (when (= :list (:kind initializer)) (forms initializer))
+        init-forms (when (op/eq :list (:kind initializer)) (forms initializer))
         bodies (if (and (empty? bodies) (#{"fn" "fn*"} (token (first init-forms))))
-                 (function-bodies (if (= :symbol (:kind (second init-forms))) (drop 2 init-forms) (rest init-forms)))
+                 (function-bodies (if (op/eq :symbol (:kind (second init-forms))) (drop 2 init-forms) (rest init-forms)))
                  bodies)
         doc (when (or function? (> (count tail) 1))
               (first (filter #(= :string (:kind %)) (take 2 tail))))
-        settings (merge (metadata-settings name-node)
-                        (map-settings (first (filter #(= :map (:kind %)) (take 2 tail)))))]
+        attr-node (when function? (first (filter #(= :map (:kind %)) (take 2 tail))))
+        metadata (merge (node-metadata name-node)
+                        (when attr-node (try (config-data attr-node) (catch python/Exception _ nil))))
+        settings (merge (metadata-settings name-node) (map-settings attr-node))]
     (merge (location parsed filename (unwrap name-node))
-           {:name (token name-node) :ns ns-name :macro (boolean macro?) :private (boolean private?)
+           (select-keys metadata [:deprecated :dynamic :added])
+           {:name (token name-node) :ns ns-name :meta metadata :type-hint (:tag metadata) :generated (:generated name-node) :derived-location (:derived-location name-node) :macro (boolean macro?) :private (boolean (if (contains? metadata :private) (:private metadata) private?))
             :scope-start (:start node) :scope-end (:end node)
             :scope-row (:row (location parsed filename node)) :scope-col (:col (location parsed filename node))
             :scope-end-row (:end-row (location parsed filename node)) :scope-end-col (:end-col (location parsed filename node))}
@@ -232,58 +355,63 @@
   "Read namespace and top-level definitions without evaluating the source."
   ([source] (declarations source {}))
   ([source {:keys [filename] :or {filename "<stdin>"}}]
-   (let [parsed (syntax/parse source)
-         top (forms (:root parsed))
-         ns-node (first (filter #(and (= :list (:kind %))
-                                      (= "ns" (token (first (forms %))))) top))
-         ns-name (or (token (second (forms ns-node))) "user")
-         aliases (into {} (for [clause (drop 2 (forms ns-node))
-                                :when (= ":require" (token (first (forms clause))))
-                                spec (rest (forms clause))
-                                :let [xs (forms spec)]
-                                [option value] (partition 2 (rest xs))
-                                :when (= ":as" (token option))]
-                            [(token value) (token (first xs))]))
-         defs (atom {})]
-     (doseq [node top :when (= :list (:kind node))]
-       (let [[head name-node & tail] (forms node) raw (token head)
-             parts (when raw (str/split raw #"/"))
-             prefix (when (> (count parts) 1) (str/join "/" (butlast parts)))
-             h (if (and prefix (#{"basilisp.core" "basilisp.test"} (get aliases prefix prefix))) (last parts) raw)]
-         (cond
-           (#{"defn" "defn-" "defasync" "defmacro" "defmacro-" "def" "defonce" "defmulti" "deftest"} h)
-           (when (= :symbol (:kind (unwrap name-node)))
-             (swap! defs assoc (token name-node)
-                    (definition parsed filename ns-name node name-node tail
-                      (#{"defmacro" "defmacro-"} h)
-                      (or (#{"defn-" "defmacro-"} h) (metadata-private? name-node)))))
-           (= h "declare")
-           (doseq [name-node (rest (forms node))]
-             (swap! defs assoc (token name-node)
-                    (assoc (definition parsed filename ns-name node name-node [] false false)
-                           :declared true)))
-           (#{"defprotocol" "deftype" "defrecord"} h)
-           (do
-             (swap! defs assoc (token name-node)
-                    (definition parsed filename ns-name node name-node [] false false))
-             (when (= h "defprotocol")
-               (doseq [method tail :when (= :list (:kind method))]
-                 (let [[method-name & params] (forms method)
-                       arglists (filter #(= :vector (:kind %)) params)]
-                   (swap! defs assoc (token method-name)
-                          (merge (definition parsed filename ns-name method method-name [] false false)
-                                 (merge-arities (map parameters-arity arglists))
-                                 {:arglists (mapv syntax/text arglists)})))))
-             (when (#{"deftype" "defrecord"} h)
-               (let [n (count (forms (first tail)))]
-                 (swap! defs assoc (str "->" (token name-node))
+   (binding [*node-cache* (or *node-cache* #py {0 (python/dict) 1 (python/dict) 2 (python/dict)})]
+     (let [parsed (syntax/parse source)
+           top (forms (:root parsed))
+           ns-node (first (filter #(and (op/eq :list (:kind %))
+                                        (op/eq "ns" (token (first (forms %))))) top))
+           ns-name (or (token (second (forms ns-node))) "user")
+           aliases (into {} (for [clause (drop 2 (forms ns-node))
+                                  :when (op/eq ":require" (token (first (forms clause))))
+                                  spec (rest (forms clause))
+                                  :let [xs (forms spec)]
+                                  [option value] (partition 2 (rest xs))
+                                  :when (op/eq ":as" (token option))]
+                              [(token value) (token (first xs))]))
+           defs (atom {})]
+       (doseq [node top :when (op/eq :list (:kind node))]
+         (let [[head name-node & tail] (forms node) raw (token head)
+               parts (when raw (str/split raw #"/"))
+               prefix (when (> (count parts) 1) (str/join "/" (butlast parts)))
+               h (if (and prefix (#{"basilisp.core" "basilisp.test"} (get aliases prefix prefix))) (last parts) raw)]
+           (cond
+             (#{"defn" "defn-" "defasync" "defmacro" "defmacro-" "def" "defonce" "defmulti" "deftest"} h)
+             (when (op/eq :symbol (:kind (unwrap name-node)))
+               (swap! defs assoc (token name-node)
+                      (definition parsed filename ns-name node name-node tail
+                        (#{"defmacro" "defmacro-"} h)
+                        (or (#{"defn-" "defmacro-"} h) (metadata-private? name-node)))))
+             (op/eq h "declare")
+             (doseq [name-node (rest (forms node))]
+               (when-not (contains? @defs (token name-node))
+                 (swap! defs assoc (token name-node)
                         (assoc (definition parsed filename ns-name node name-node [] false false)
-                               :name (str "->" (token name-node)) :fixed-arities #{n}))
-                 (when (= "defrecord" h)
-                   (swap! defs assoc (str "map->" (token name-node))
+                               :declared true))))
+             (#{"defprotocol" "deftype" "defrecord"} h)
+             (do
+               (swap! defs assoc (token name-node)
+                      (definition parsed filename ns-name node name-node [] false false))
+               (when (op/eq h "defprotocol")
+                 (doseq [method tail :when (op/eq :list (:kind method))]
+                   (let [[method-name & params] (forms method)
+                         arglists (filter #(= :vector (:kind %)) params)]
+                     (swap! defs assoc (token method-name)
+                            (merge (definition parsed filename ns-name method method-name [] false false)
+                                   (merge-arities (map parameters-arity arglists))
+                                   {:arglists (mapv syntax/text arglists)
+                                    :protocol-ns ns-name :protocol-name (token name-node)})))))
+               (when (#{"deftype" "defrecord"} h)
+                 (let [n (count (forms (first tail)))]
+                   (swap! defs assoc (str "->" (token name-node))
                           (assoc (definition parsed filename ns-name node name-node [] false false)
-                                 :name (str "map->" (token name-node)) :fixed-arities #{1})))))))))
-     {:namespace ns-name :definitions @defs :parsed parsed})))
+                                 :name (str "->" (token name-node)) :fixed-arities #{n}))
+                   (when (op/eq "defrecord" h)
+                     (swap! defs assoc (str "map->" (token name-node))
+                            (assoc (definition parsed filename ns-name node name-node [] false false)
+                                   :name (str "map->" (token name-node)) :fixed-arities #{1})))))))))
+       {:namespace ns-name :namespace-meta (node-metadata (second (forms ns-node)))
+        :definitions (with-meta @defs {:namespace-meta (node-metadata (second (forms ns-node)))})
+        :parsed parsed}))))
 
 (defn- var-info [ns-name name value]
   (let [m (meta value)
@@ -293,7 +421,8 @@
                                fixed (count (take-while #(not= '& %) args))]]
                      (if (< fixed (count args)) {:varargs-min-arity fixed} {:fixed-arities #{fixed}}))]
     (merge {:name (str name) :ns ns-name :doc (:doc m) :macro (:macro m)
-            :private (:private m) :filename (:file m)
+            :meta (select-keys m [:style/indent :added :deprecated :dynamic :private])
+            :private (:private m) :deprecated (:deprecated m) :dynamic (:dynamic m) :filename (:file m)
             :row (:line m) :col (inc (or (:col m) 0))
             :arglists (mapv str arglists)}
            (when (seq signatures) (merge-arities signatures)))))
@@ -309,7 +438,7 @@
 
 (defn- load-namespace-definitions [ctx ns-name]
   (or (get-in @(:state ctx) [:opts :project ns-name])
-      (when (= ns-name "basilisp.core") @core-definitions)
+      (when (op/eq ns-name "basilisp.core") @core-definitions)
       (let [opts (:opts @(:state ctx))
             python-options (:python-options opts {})
             environment (or (:dependency-paths @(:state ctx))
@@ -347,17 +476,31 @@
   ([ns-name] (namespace-symbols ns-name {}))
   ([ns-name opts] (namespace-definitions {:state (atom {:opts opts})} ns-name)))
 
-(defn- loc [ctx node] (location (:parsed ctx) (:filename ctx) node))
-(defn- emit! [ctx key value] (swap! (:state ctx) update key conj value))
+(defn- loc [ctx node]
+  (if-let [cache (:locations ctx)]
+    (let [key (python/tuple [(:start node) (:end node)])]
+      (or (.get cache key)
+          (.setdefault cache key (location (:parsed ctx) (:filename ctx) node))))
+    (location (:parsed ctx) (:filename ctx) node)))
+(def ^:private event-keys
+  [:findings :namespace-definitions :namespace-usages :var-usages :locals :local-usages
+   :python-usages :keywords :implementations :calls :python-expressions])
+
+(defn- emit! [ctx key value]
+  (.append (get @(:state ctx) key) value))
+
+(defn- linter-enabled? [ctx type]
+  (op/ne :off (get-in (context-config ctx) [:linters type :level]
+                      (if (disabled-types type) :off :warning))))
 
 (defn- finding! [ctx node type message]
   (let [config (or (:lint-config (meta node)) (context-config ctx))
-        level (get-in config [:linters type :level] (cond (#{:single-key-in :redundant-let-binding} type) :off
+        level (get-in config [:linters type :level] (cond (disabled-types type) :off (info-types type) :info
                                                           (warning-types type) :warning :else :error))
         duplicate? (and (#{:unresolved-symbol :unresolved-namespace :unresolved-var} type)
                         (not (get-in config [:linters type :report-duplicates]))
                         (contains? (:reported-findings @(:state ctx)) [type message]))]
-    (when (and (not= :off level) node (not duplicate?)
+    (when (and (op/ne :off level) node (not duplicate?)
                (not (skip-linter? (assoc ctx :config config) type))
                (not (ignored-at? ctx node type)))
       (swap! (:state ctx) update :reported-findings conj [type message])
@@ -367,83 +510,160 @@
                     (get-in @(:state ctx) [:opts :config :linters type :level]
                             (if (warning-types type) :warning :error))
                     level)]
-        (emit! ctx :findings (merge (loc ctx node) {:type type :level level :message message}))))))
+        (emit! ctx :findings (cond-> (merge (loc ctx node) {:type type :level level :message message})
+                               (:no-end node) (dissoc :end-row :end-col)))))))
 
 (defn- current-ns [ctx] (:namespace @(:state ctx)))
 
 (defn- mark-namespace! [ctx ns-name]
   (swap! (:state ctx) update :used-namespaces conj ns-name))
 
+(defn- python-path [name]
+  (mapv #(util/munge % ** :allow_builtins true) (str/split name #"[.]")))
+
 (defn- import-spec! [ctx spec]
-  (let [xs (if (= :symbol (:kind spec)) [spec] (forms spec))
+  (let [xs (if (op/eq :symbol (:kind spec)) [spec] (forms spec))
         module-node (first xs) module-name (token module-node)
         options (into {} (map (fn [[a b]] [(token a) b]) (partition 2 (rest xs))))
         alias (or (token (get options ":as")) module-name)]
     (when module-name
-      (let [entry {:name module-name :alias alias :node module-node :python true}]
+      (when (get-in @(:state ctx) [:imports alias])
+        (finding! ctx module-node :duplicate-require (str "Duplicate require of " module-name)))
+      (let [native-name (str/join "." (python-path module-name))
+            entry {:name native-name :alias alias :node module-node :python true}]
         (swap! (:state ctx) assoc-in [:imports alias] entry)
-        (emit! ctx :namespace-usages (merge (loc ctx module-node) {:name module-name :alias alias :python true}))
+        (emit! ctx :namespace-usages (merge (loc ctx module-node) {:name native-name :alias alias :python true}))
         (doseq [refer (forms (get options ":refer"))]
           (swap! (:state ctx) assoc-in [:python-refers (token refer)]
                  (assoc entry :member (token refer) :node refer)))))))
 
+(declare excluded?)
+
+(defn- lint-require! [ctx spec ns-node ns-name xs]
+  (let [options (into {} (map (fn [[a b]] [(token a) b]) (partition 2 (rest xs))))
+        alias-node (or (get options ":as") (get options ":as-alias"))
+        alias (token alias-node)
+        state @(:state ctx)
+        config (context-config ctx)]
+    (when alias-node
+      (swap! (:state ctx) assoc-in [:alias-nodes alias] alias-node))
+    (when (op/eq ":all" (token (get options ":refer")))
+      (mark-namespace! ctx ns-name))
+    (when (get options ":as-alias")
+      (mark-namespace! ctx ns-name))
+    (when-let [discouraged (get-in config [:linters :discouraged-namespace (symbol ns-name)])]
+      (finding! (cond-> ctx (:level discouraged) (assoc :config (assoc-in config [:linters :discouraged-namespace :level] (:level discouraged))))
+                ns-node :discouraged-namespace (or (:message discouraged) (str "Discouraged namespace: " ns-name))))
+    (when-let [deprecated (:deprecated (:namespace-meta (meta (namespace-definitions ctx ns-name))))]
+      (when-not (excluded? ctx :deprecated-namespace ns-name)
+        (finding! ctx ns-node :deprecated-namespace
+                  (str "Namespace " ns-name " is deprecated" (when (string? deprecated) (str " since " deprecated)) "."))))
+    (when (contains? (:requires state) ns-name)
+      (finding! ctx ns-node :duplicate-require (str "Duplicate require of " ns-name)))
+    (when (and alias (contains? (:aliases state) alias) (not= ns-name (get-in state [:aliases alias])))
+      (finding! ctx alias-node :conflicting-alias (str "Conflicting alias for " ns-name)))
+    (when (= ns-name (current-ns ctx))
+      (finding! ctx spec :self-requiring-namespace (str "Namespace is requiring itself: " ns-name))
+      (mark-namespace! ctx ns-name))
+    (when (= alias ns-name)
+      (finding! ctx alias-node :alias-same-as-ns (str "Alias " alias " is the same as namespace")))
+    (doseq [[option _] (partition 2 (rest xs))
+            :when (and (op/eq :keyword (:kind option))
+                       (not (#{":as" ":as-alias" ":refer" ":refer-macros" ":only" ":exclude" ":rename" ":reload" ":reload-all" ":include-macros"} (token option))))]
+      (finding! ctx option :unknown-require-option (str "Unknown require option: " (token option))))
+    (when-let [preferred (get-in config [:linters :consistent-alias :aliases (symbol ns-name)])]
+      (when (and alias (not= alias (str preferred)))
+        (finding! ctx alias-node :consistent-alias (str "Inconsistent alias. Expected " preferred " instead of " alias "."))))
+    (when-let [referred (get options ":refer")]
+      (if (op/eq ":all" (token referred))
+        (when-not (some #(= ns-name (str %)) (get-in config [:linters :refer-all :exclude]))
+          (finding! ctx referred :refer-all "use alias or :refer"))
+        (do
+          (when-not (some #(= ns-name (str %)) (get-in config [:linters :refer :exclude]))
+            (finding! ctx (first (filter #(= ":refer" (token %)) xs)) :refer "require with :refer"))
+          (loop [nodes (forms referred) seen #{}]
+            (when-let [child (first nodes)]
+              (when (contains? seen (token child))
+                (finding! ctx child :duplicate-refer (str "Duplicate refer: " (token child))))
+              (recur (rest nodes) (conj seen (token child))))))))))
+
 (defn- require-spec! [ctx spec prefix]
   (let [spec (unwrap spec)
-        xs (if (= :symbol (:kind spec)) [spec] (forms spec))
+        xs (if (op/eq :symbol (:kind spec)) [spec] (forms spec))
         ns-node (first xs) raw-name (token ns-node)
-        ns-name (when raw-name (if prefix (str prefix "." raw-name) raw-name))]
+        ns-name (when raw-name (if prefix (str prefix "." raw-name) raw-name))
+        prefix-list? (and (some #(#{:vector :list} (:kind %)) (rest xs))
+                          (not (op/eq :keyword (:kind (second xs)))))]
     (when ns-name
-      (if (some #(#{:vector :list} (:kind %)) (rest xs))
-        (if (= :keyword (:kind (second xs)))
-          (let [options (into {} (map (fn [[a b]] [(token a) b]) (partition 2 (rest xs))))
-                alias (or (token (get options ":as")) (token (get options ":as-alias")))]
-            (swap! (:state ctx) assoc-in [:requires ns-name] {:node ns-node :simple false})
-            (when alias (swap! (:state ctx) assoc-in [:aliases alias] ns-name))
-            (emit! ctx :namespace-usages (merge (loc ctx ns-node) {:name ns-name :alias alias}))
-            (if (= ":all" (token (get options ":refer")))
-              (do (swap! (:state ctx) assoc :refer-all true)
-                  (doseq [[name info] (namespace-definitions ctx ns-name)]
-                    (when-not (:private info)
-                      (swap! (:state ctx) assoc-in [:refers name] {:ns ns-name :name name :node ns-node :all true}))))
-              (doseq [refer (forms (or (get options ":refer") (get options ":only")))]
-                (swap! (:state ctx) assoc-in [:refers (token refer)]
-                       {:ns ns-name :name (token refer) :node refer})))
-            (doseq [[original renamed] (partition 2 (forms (get options ":rename")))]
-              (let [refer-node (get-in @(:state ctx) [:refers (token original) :node])]
-                (swap! (:state ctx) update :refers dissoc (token original))
-                (swap! (:state ctx) assoc-in [:refers (token renamed)]
-                       {:ns ns-name :name (token original) :node renamed :renamed true
-                        :refer-node refer-node :rename-node original}))))
-          (doseq [child (rest xs)] (require-spec! ctx child ns-name)))
+      (if prefix-list?
+        (doseq [child (rest xs)] (require-spec! ctx child ns-name))
         (let [options (into {} (map (fn [[a b]] [(token a) b]) (partition 2 (rest xs))))
-              alias (or (token (get options ":as")) (token (get options ":as-alias")))]
-          (swap! (:state ctx) assoc-in [:requires ns-name] {:node ns-node :simple (empty? (rest xs))})
+              alias (or (token (get options ":as")) (token (get options ":as-alias")))
+              excluded (set (map token (forms (get options ":exclude"))))]
+          (lint-require! ctx spec ns-node ns-name xs)
+          (swap! (:state ctx) assoc-in [:requires ns-name]
+                 {:node ns-node :simple (empty? (rest xs)) :alias-only (boolean (get options ":as-alias"))})
           (when alias (swap! (:state ctx) assoc-in [:aliases alias] ns-name))
-          (when (= ":all" (token (get options ":refer")))
-            (swap! (:state ctx) assoc :refer-all true))
-          (emit! ctx :namespace-usages (merge (loc ctx ns-node) {:name ns-name :alias alias})))))))
+          (emit! ctx :namespace-usages (merge (loc ctx ns-node) {:name ns-name :alias alias}))
+          (if (op/eq ":all" (token (get options ":refer")))
+            (do (swap! (:state ctx) assoc :refer-all true)
+                (doseq [[name info] (namespace-definitions ctx ns-name)]
+                  (when-not (or (:private info) (contains? excluded name))
+                    (swap! (:state ctx) assoc-in [:refers name] {:ns ns-name :name name :node ns-node :all true}))))
+            (doseq [refer (forms (or (get options ":refer") (get options ":only")))]
+              (when-not (or (contains? excluded (token refer)) (contains? (:refers @(:state ctx)) (token refer)))
+                (swap! (:state ctx) assoc-in [:refers (token refer)]
+                       {:ns ns-name :name (token refer) :node refer}))))
+          (doseq [[original renamed] (partition 2 (forms (get options ":rename")))]
+            (let [refer-node (get-in @(:state ctx) [:refers (token original) :node])]
+              (swap! (:state ctx) update :refers dissoc (token original))
+              (swap! (:state ctx) assoc-in [:refers (token renamed)]
+                     {:ns ns-name :name (token original) :node renamed :renamed true
+                      :refer-node refer-node :rename-node original}))))))))
 
 (defn- analyze-ns! [ctx node]
   (let [[_ name-node & clauses] (forms node)]
     (when name-node
-      (emit! ctx :namespace-definitions (merge (loc ctx (unwrap name-node)) {:name (token name-node)})))
-    (doseq [clause clauses :when (= :list (:kind clause))]
-      (let [[head & specs] (forms clause)]
+      (let [filename (:filename ctx) stem (.-stem (pathlib/Path filename))
+            expected (str/replace (last (str/split (token name-node) #"[.]")) "-" "_")]
+        (when (and (not (.startswith filename "<")) (re/search #"[.](lpy|clj|cljc)$" filename)
+                   (not= stem expected) (op/ne stem "__init__"))
+          (finding! ctx (unwrap name-node) :namespace-name-mismatch
+                    (str "Namespace name does not match file name: " (token name-node)))))
+      (when (and (token name-node) (.find (token name-node) "_") (>= (.find (token name-node) "_") 0))
+        (finding! ctx (unwrap name-node) :underscore-in-namespace (str "Avoid underscore in namespace name: " (token name-node))))
+      (emit! ctx :namespace-definitions (merge (loc ctx (unwrap name-node)) {:name (token name-node)} (select-keys (node-metadata name-node) [:deprecated :doc]))))
+    (doseq [clause clauses :when (op/eq :list (:kind clause))]
+      (let [[head & specs] (forms clause)
+            type (if (op/eq ":import" (token head)) :unsorted-imports :unsorted-required-namespaces)]
+        (when (#{":import" ":require" ":require-macros"} (token head))
+          (let [names (map #(if (op/eq :symbol (:kind %)) % (first (forms %))) specs)
+                lower? (op/ne :case-sensitive (get-in (context-config ctx) [:linters type :sort]))
+                sort-name #(if lower? (str/lower-case (token %)) (token %))]
+            (when-let [[_ node] (first (filter (fn [[a b]] (and (token a) (token b) (pos? (compare (sort-name a) (sort-name b)))))
+                                               (partition 2 1 names)))]
+              (finding! ctx node type (str "Unsorted " (if (op/eq :unsorted-imports type) "import: " "namespace: ") (token node))))))
+        (when (op/eq ":use" (token head))
+          (finding! ctx head :use "use :require with alias or :refer"))
         (case (token head)
           (":require" ":require-macros" ":use") (doseq [spec specs] (require-spec! ctx spec nil))
           ":import" (doseq [spec specs] (import-spec! ctx spec))
           (":refer-basilisp" ":refer-clojure")
           (doseq [[option value] (partition 2 specs)]
             (case (token option)
-              ":exclude" (swap! (:state ctx) update :core-excluded into (map token (forms value)))
+              ":exclude" (doseq [excluded (forms value)]
+                           (swap! (:state ctx) update :core-excluded conj (token excluded))
+                           (swap! (:state ctx) assoc-in [:excluded-nodes (token excluded)] excluded)
+                           (when-not (contains? @core-definitions (token excluded))
+                             (finding! ctx excluded :unresolved-excluded-var (str "Unresolved excluded var: " (token excluded)))))
               ":only" (swap! (:state ctx) assoc :core-only (set (map token (forms value))))
               ":rename" (doseq [[a b] (partition 2 (forms value))]
                           (swap! (:state ctx) update :core-excluded conj (token a))
                           (swap! (:state ctx) assoc-in [:core-renamed (token b)] (token a)))
               nil))
-          nil)))))
+          (finding! ctx clause :unknown-ns-option (str "Unknown ns option: " (syntax/text clause))))))))
 
-(declare walk! walk-body! bind-pattern! walk-call! walk-thread! call-context python-return)
+(declare walk! walk-body! bind-pattern! walk-call! walk-thread! call-context python-return python-value tagged nonnil-value)
 
 (defn- excluded? [ctx type value]
   (let [config (context-config ctx)
@@ -452,14 +672,14 @@
         direct? (some #(and (symbol? %) (= (str %) value)) exclusions)
         patterns? (some #(regex-matches? % value) (:exclude-patterns options))]
     (or direct?
-        (and (#{:unresolved-symbol :unused-binding} type) patterns?)
-        (and (= type :unused-namespace) (some #(regex-matches? % value) exclusions))
-        (and (= type :unresolved-var)
+        (and (#{:unresolved-symbol :unused-binding :used-underscored-binding :deprecated-namespace} type) patterns?)
+        (and (op/eq type :unused-namespace) (some #(regex-matches? % value) exclusions))
+        (and (op/eq type :unresolved-var)
              (some #(and (symbol? %) (nil? (namespace %))
                          (.startswith value (str % "/"))) exclusions))
-        (and (= type :unresolved-namespace)
+        (and (op/eq type :unresolved-namespace)
              (some (set exclusions) (namespace-groups config value (:filename ctx))))
-        (and (= type :unresolved-symbol)
+        (and (op/eq type :unresolved-symbol)
              (some (fn [entry]
                      (when (list? entry)
                        (let [[call names] entry]
@@ -483,7 +703,7 @@
     (doseq [[_ entry] imports
             :let [module (get-in @(:state ctx) [:python-modules (:name entry)])]]
       (cond
-        (= :missing (:status module))
+        (op/eq :missing (:status module))
         (do (finding! ctx (:node entry) :unresolved-namespace
                       (str "Unresolved Python module: " (:name entry)))
             (swap! (:state ctx) update :reported-python-modules conj (:name entry)))
@@ -493,27 +713,53 @@
                   (str "Unable to inspect Python module " (:name entry) " (" (:reason module) ")"))))))
 
 (defn- python-reference! [ctx node module-name member-name]
-  (let [module (python-module ctx module-name)
+  (let [path (when member-name (python-path member-name))
+        native-name (when member-name (str/join "." path))
+        module (python-module ctx module-name)
         member (if member-name
                  (if (>= (.find member-name ".") 0)
-                   (py/inspect-path module-name (str/split member-name #"[.]")
+                   (py/inspect-path module-name path
                                     (get-in @(:state ctx) [:opts :python-options] {}))
-                   (py/resolve-member module member-name))
+                   (py/resolve-member module native-name))
                  module)
         entry (merge (loc ctx node) {:name (or member-name module-name) :ns module-name
-                                     :python true :definition member})]
+                                     :python true :definition member :python-module module-name
+                                     :python-path (or path [])})]
     (mark-namespace! ctx module-name)
     (emit! ctx :python-usages entry)
     (cond
-      (and (= :missing (:status module))
+      (and (op/eq :missing (:status module))
            (not (contains? (:reported-python-modules @(:state ctx)) module-name)))
       (finding! ctx node :unresolved-namespace (str "Unresolved namespace " module-name ". Are you missing an import?"))
-      (and member-name (= :known (:status module)) (nil? member))
+      (and member-name (op/eq :known (:status module)) (nil? member))
       (finding! ctx node :unresolved-symbol (str "Unresolved symbol: " module-name "/" member-name)))
     (when member
       (merge {:python-member member :python-module module-name
-              :python-path (if member-name (str/split member-name #"[.]") [])}
+              :python-path (or path [])}
+             (when-let [type (py/callable-type member)]
+               (select-keys (python-value type) [:python-type :tag]))
              (when (#{:variable :property} (:kind member)) (python-return module-name member))))))
+
+(defn- lint-reference! [ctx env node info]
+  (when (and info (:ns info) (:name info))
+    (let [fq (str (:ns info) "/" (:name info))
+          config (context-config ctx)
+          where (or (:call-node env) node)
+          caller (:caller env)
+          exclusions (get-in config [:linters :deprecated-var :exclude (symbol fq)])
+          matches? (fn [pattern value] (if (symbol? pattern) (= (str pattern) value) (regex-matches? pattern value)))
+          excluded (or (some #(matches? % (current-ns ctx)) (:namespaces exclusions))
+                       (some #(matches? % (str (:ns caller) "/" (:name caller))) (:defs exclusions)))
+          discouraged (settings-for-call (get-in config [:linters :discouraged-var]) fq)]
+      (when (and (:private info) (not= (:ns info) (current-ns ctx)) (not (:private-access? env)))
+        (finding! ctx where :private-call (str "private var #'" fq " is called")))
+      (when (and (:deprecated info) (not excluded)
+                 (not= [(:ns info) (:name info)] [(:ns caller) (:name caller)]))
+        (finding! ctx where :deprecated-var
+                  (str "#'" fq " is deprecated" (when-not (true? (:deprecated info)) (str " since " (:deprecated info))))))
+      (when discouraged
+        (finding! ctx where :discouraged-var
+                  (or (:message discouraged) (str "Discouraged var: " fq)))))))
 
 (defn- resolve-symbol! [ctx env node]
   (let [name (token node) state @(:state ctx)
@@ -525,7 +771,7 @@
       (do (swap! (:state ctx) update :used-locals conj (:id local))
           (emit! ctx :local-usages (merge (loc ctx node) (select-keys local [:id :name :ns])))
           local)
-      (and (= name "/") (contains? @core-definitions name))
+      (and (op/eq name "/") (contains? @core-definitions name))
       (get @core-definitions name)
       (contains? special-names name) {:name name :special true}
       (or (.startswith name ".") (.endswith name "#") (#{"&env" "&form"} name)) {:name name}
@@ -533,16 +779,34 @@
       (let [prefix (subs name 0 slash) member (subs name (inc slash))
             imported (get-in state [:imports prefix])
             ns-name (get-in state [:aliases prefix] prefix)
-            known-ns (or (= ns-name (:namespace state)) (= ns-name "basilisp.core")
+            known-ns (or (= ns-name (:namespace state)) (op/eq ns-name "basilisp.core")
                          (contains? (:requires state) ns-name) (contains? (get-in state [:opts :project]) ns-name))
             defs (if (= ns-name (:namespace state)) (:definitions state)
                      (when known-ns (namespace-definitions ctx ns-name)))
             info (get defs member)]
         (cond
-          (= prefix "python") (python-reference! ctx node "builtins" member)
+          (op/eq prefix "python") (python-reference! ctx node "builtins" member)
           imported (python-reference! ctx node (:name imported) member)
           known-ns
-          (do (mark-namespace! ctx ns-name)
+          (do (when (contains? (:aliases state) prefix)
+                (swap! (:state ctx) update :used-aliases conj prefix))
+              (lint-reference! ctx env node info)
+              (when (and (= prefix ns-name) (not (:generated node))
+                         (not (contains? (:aliases state) prefix))
+                         (not (excluded? ctx :aliased-namespace-symbol ns-name)))
+                (let [aliases (sort (keep (fn [[alias target]] (when (= target ns-name) alias)) (:aliases state)))]
+                  (when (seq aliases)
+                    (finding! ctx node :aliased-namespace-symbol
+                              (str (if (= 1 (count aliases)) "An alias is" "Multiple aliases are")
+                                   " defined for " ns-name ": " (str/join ", " aliases))))))
+              (when (get-in state [:requires ns-name :alias-only])
+                (finding! ctx node :aliased-namespace-var-usage
+                          (str "Namespace only aliased but wasn't loaded: " ns-name)))
+              (mark-namespace! ctx ns-name)
+              (when (and (contains? (:aliases state) prefix)
+                         (some #(and (= ns-name (:ns %)) (= member (:name %))) (vals (:refers state))))
+                (finding! ctx (or (:call-node env) node) :aliased-referred-var
+                          (str "Var " member " is referred but used via alias: " prefix)))
               (swap! (:state ctx) update :used-vars conj [ns-name member])
               (emit! ctx :var-usages (merge (loc ctx node)
                                             {:name member :ns ns-name :from (:namespace state) :definition info}))
@@ -574,7 +838,8 @@
                                         {:name (:name referred) :ns (:ns referred) :unknown true}))
                      (when core? (get @core-definitions core-name)))]
         (if info
-          (do (when referred
+          (do (lint-reference! ctx env node info)
+              (when referred
                 (swap! (:state ctx) update :used-refers conj name)
                 (mark-namespace! ctx (:ns referred)))
               (swap! (:state ctx) update :used-vars conj [(:ns info) (:name info)])
@@ -590,18 +855,18 @@
               nil))))))
 
 (defn- python-hint [ctx env node]
-  (when (= :metadata (:kind node))
+  (when (op/eq :metadata (:kind node))
     (let [[metadata target] (forms node)
-          hint (if (= :map (:kind metadata))
-                 (some (fn [[key value]] (when (= ":tag" (token key)) value)) (partition 2 (forms metadata)))
+          hint (if (op/eq :map (:kind metadata))
+                 (some (fn [[key value]] (when (op/eq ":tag" (token key)) value)) (partition 2 (forms metadata)))
                  metadata)
           text (token hint) parts (when text (str/split text #"/"))
           prefix (first parts) state @(:state ctx)]
-      (or (when (and (= :symbol (:kind hint))
-                     (or (= "python" prefix) (contains? (:imports state) prefix)
+      (or (when (and (op/eq :symbol (:kind hint))
+                     (or (op/eq "python" prefix) (contains? (:imports state) prefix)
                          (contains? (:python-refers state) text)))
             (when-let [info (resolve-symbol! ctx env hint)]
-              {:python-type {:module (:python-module info) :path (:python-path info)}}))
+              (python-value {:module (:python-module info) :path (:python-path info)})))
           (python-hint ctx env target)))))
 
 (defn- binding! [ctx env node value]
@@ -609,50 +874,232 @@
         node (unwrap node) name (token node)
         info (merge value hint (loc ctx node)
                     {:id (str (:filename ctx) ":" (:start node)) :name name :ns (current-ns ctx)
+                     :generated (:generated node) :derived-location (:derived-location node)
                      :ignore-unused (or (:ignore-unused value) (and (:fn-args env) (:ignore-fn-args env)))
                      :scope-start (:start (:scope env)) :scope-end (:end (:scope env))})]
+    (let [config (context-config ctx) opts (get-in config [:linters :shadowed-var])
+          shadowed (or (get-in @(:state ctx) [:definitions name]) (get @core-definitions name))]
+      (when (and shadowed (not (some #(= name (str %)) (:exclude opts)))
+                 (or (nil? (:include opts)) (some #(= name (str %)) (:include opts))))
+        (finding! ctx node :shadowed-var
+                  (str "Shadowed var: " (:ns shadowed) "/" (:name shadowed)
+                       (when-let [suggestion (get (:suggestions opts) (symbol (str (:ns shadowed) "/" name)))]
+                         (str ". Consider using " suggestion " instead."))))))
+    (when (and (:fn-args env) (:tag hint))
+      (swap! (:state ctx) assoc-in [:binding-expectations (:id info)] (:tag hint)))
     (emit! ctx :locals (with-meta info {:lint-config (context-config ctx)}))
-    (when (contains? (:parameter-bindings env) name)
+    (when (and (not (.startswith name "_")) (contains? (:parameter-bindings env) name))
       (finding! ctx node :shadowed-fn-param (str "Shadowed fn param: " name)))
     (cond-> (assoc-in env [:locals name] info)
       (:parameter-bindings env) (update :parameter-bindings conj name))))
 
-(defn- bind-pattern! [ctx env pattern value]
-  (let [original pattern pattern (unwrap pattern) xs (forms pattern)]
-    (case (:kind pattern)
-      :symbol (if (= "&" (token pattern)) env (binding! ctx env original value))
-      :vector (let [element (first (get-in value [:python-type :arguments]))]
-                (loop [scope env remaining xs]
-                  (if-let [child (first remaining)]
-                    (cond
-                      (= "&" (token child)) (recur scope (rest remaining))
-                      (= ":as" (token child))
-                      (recur (bind-pattern! ctx scope (second remaining)
-                                            {:ignore-unused (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-as])})
-                             (rest (rest remaining)))
-                      :else (recur (bind-pattern! ctx scope child
-                                                  (cond-> (select-keys value [:ignore-unused])
-                                                    element (assoc :python-type element)))
-                                   (rest remaining)))
-                    scope)))
+(declare call-identity)
+
+(defn- conditional-build-step? [ctx env pattern init]
+  (let [name (token (unwrap pattern))
+        previous (get-in env [:locals name])
+        [head _predicate then otherwise :as parts] (forms init)
+        [assoc-head map-node :as then-parts] (forms then)
+        identity (call-identity ctx env assoc-head)
+        uses (when (and previous (:start init) (:end init))
+               (filter #(and (= (:id previous) (:id %))
+                             (<= (:start init) (:start %))
+                             (<= (:end %) (:end init)))
+                       (:local-usages @(:state ctx))))]
+    (and (= :symbol (:kind (unwrap pattern)))
+         (= :list (:kind init)) (= 4 (count parts)) (= "if" (token head))
+         (= :list (:kind then)) (>= (count then-parts) 4)
+         (= :symbol (:kind map-node)) (= name (token map-node))
+         (= :symbol (:kind otherwise)) (= name (token otherwise))
+         (= "assoc" (token assoc-head)) (= "assoc" (:name identity)) (= "basilisp.core" (:ns identity))
+         (= 2 (count uses)))))
+
+(defn- lint-conditional-build-up! [ctx bindings steps]
+  (when (some #(every? true? %) (partition 2 1 steps))
+    (finding! ctx bindings :conditional-build-up
+              "Prefer cond-> to build a map with successive conditional assocs.")))
+
+(defn- destructured-names [pattern]
+  (let [node (unwrap pattern) children (forms node)]
+    (case (:kind node)
+      :symbol (if (= "&" (token node)) #{} #{(token node)})
+      :vector (reduce into #{} (map destructured-names children))
       :map
-      (reduce (fn [scope [key value]]
-                (let [name (token key)]
-                  (cond
-                    (or (= name ":keys") (= name ":syms") (= name ":strs")
-                        (and (= :keyword (:kind key)) (.endswith name "/keys")))
-                    (reduce (fn [scope binding]
-                              (let [name (token binding) local-name (last (str/split name #"/"))]
-                                (binding! ctx scope (assoc binding :text local-name)
-                                          {:ignore-unused (and (:fn-args env)
-                                                               (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-keys-in-fn-args]))})))
-                            scope (forms value))
-                    (= name ":as") (bind-pattern! ctx scope value
-                                                  {:ignore-unused (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-as])})
-                    (= name ":or") (do (doseq [[_ default] (partition 2 (forms value))]
-                                         (walk! ctx env default)) scope)
-                    :else (bind-pattern! ctx scope key nil))))
-              env (partition 2 xs))
+      (reduce into #{}
+              (for [[key value] (partition 2 children)]
+                (cond
+                  (= ":or" (token key)) #{}
+                  (= ":as" (token key)) (destructured-names value)
+                  (or (contains? #{":keys" ":strs" ":syms"} (token key))
+                      (some #(.endswith (or (token key) "") %) ["/keys" "/strs" "/syms"]))
+                  (set (map #(last (str/split (str/replace (token %) #"^:" "") #"/")) (forms value)))
+                  :else (destructured-names key))))
+      #{})))
+
+;; Traverse default expressions with lexical shadowing. Quoted forms are data.
+;; Real analyzer identities handle the conditional step; this helper is only for
+;; otherwise-invalid references to bindings introduced by the same map.
+(defn- default-free-symbols [node names bound]
+  (let [node (unwrap node) children (forms node)
+        scan #(default-free-symbols % names bound)
+        scan-bindings
+        (fn [pairs initial]
+          (reduce (fn [[found scope] [pattern init]]
+                    [(into found (default-free-symbols init names scope))
+                     (into scope (destructured-names pattern))])
+                  [[] initial] pairs))]
+    (case (:kind node)
+      :symbol (if (and (contains? names (token node)) (not (contains? bound (token node)))) [node] [])
+      (:quote :var-quote :discard) []
+      :syntax-quote (mapcat #(when (= :unquote (:kind %)) (mapcat scan (forms %))) (syntax/nodes node))
+      :list
+      (let [head (token (first children)) tail (rest children)]
+        (cond
+          (contains? #{"quote" "var" "basilisp.core/quote" "basilisp.core/var"} head) []
+          (contains? #{"fn" "fn*" "basilisp.core/fn"} head)
+          (let [named (when (= :symbol (:kind (first tail))) (first tail))
+                tail (if named (rest tail) tail)
+                scope (cond-> bound named (conj (token named)))]
+            (mapcat (fn [{:keys [params body]}]
+                      (mapcat #(default-free-symbols % names
+                                                     (into scope (destructured-names params))) body))
+                    (function-bodies tail)))
+          (contains? #{"letfn" "basilisp.core/letfn"} head)
+          (let [bindings (forms (first tail))
+                scope (into bound (map #(token (first (forms %))) bindings))]
+            (concat (mapcat (fn [binding]
+                              (mapcat (fn [{:keys [params body]}]
+                                        (mapcat #(default-free-symbols % names (into scope (destructured-names params))) body))
+                                      (function-bodies (rest (forms binding))))) bindings)
+                    (mapcat #(default-free-symbols % names scope) (rest tail))))
+          (contains? #{"for" "doseq" "basilisp.core/for" "basilisp.core/doseq"} head)
+          (let [[found scope]
+                (reduce (fn [[found scope] [pattern init]]
+                          (cond
+                            (= ":let" (token pattern))
+                            (let [[nested nested-scope] (scan-bindings (partition 2 (forms init)) scope)]
+                              [(into found nested) nested-scope])
+                            (#{":when" ":while"} (token pattern))
+                            [(into found (default-free-symbols init names scope)) scope]
+                            :else
+                            [(into found (default-free-symbols init names scope))
+                             (into scope (destructured-names pattern))]))
+                        [[] bound] (partition 2 (forms (first tail))))]
+            (into found (mapcat #(default-free-symbols % names scope) (rest tail))))
+          (contains? #{"catch" "basilisp.core/catch"} head)
+          (concat (scan (first tail))
+                  (mapcat #(default-free-symbols % names (conj bound (token (second tail)))) (drop 2 tail)))
+          (contains? #{"let" "loop" "binding" "with-open" "dotimes" "basilisp.core/let"} head)
+          (let [[found scope] (scan-bindings (partition 2 (forms (first tail))) bound)]
+            (into found (mapcat #(default-free-symbols % names scope) (rest tail))))
+          (contains? #{"if-let" "if-some" "when-let" "when-some"} head)
+          (let [[found scope] (scan-bindings (partition 2 (forms (first tail))) bound)]
+            (into found (concat (default-free-symbols (second tail) names scope)
+                                (mapcat #(default-free-symbols % names
+                                                               (if (contains? #{"if-let" "if-some"} head) bound scope))
+                                        (drop 2 tail)))))
+          :else (mapcat scan children)))
+      (mapcat scan children))))
+
+(defn- lint-destructured-defaults! [ctx pattern]
+  (let [names (destructured-names pattern)]
+    (doseq [[key defaults] (partition 2 (forms (unwrap pattern)))
+            :when (= ":or" (token key))
+            [binding expression] (partition 2 (forms defaults))
+            :when (not (and (= :symbol (:kind expression)) (= (token binding) (token expression))))
+            node (default-free-symbols expression names #{})]
+      (finding! ctx node :destructured-or-binding-of-same-map
+                (str "Destructured :or refers to binding of same map: " (token node))))))
+
+;; Branch order is meaningful before reader-condition selection.
+(defn- lint-reader-conditional-order! [ctx node]
+  (when (contains? #{:reader-conditional :reader-splice} (:kind node))
+    (doseq [[feature _value] (butlast (partition 2 (syntax/forms node)))
+            :when (= ":default" (token feature))]
+      (finding! ctx feature :unreachable-code
+                "Unreachable code: default reader conditional branch should go last"))))
+
+(defn- bind-pattern! [ctx env pattern value]
+  (let [original pattern pattern (unwrap pattern) xs (forms pattern) destructure-value value]
+    (case (:kind pattern)
+      :symbol (if (op/eq "&" (token pattern)) env (binding! ctx env original value))
+      :vector
+      (loop [scope env remaining xs index 0]
+        (if-let [child (first remaining)]
+          (cond
+            (op/eq "&" (token child))
+            (recur (bind-pattern! ctx scope (second remaining)
+                                  (merge (select-keys value [:ignore-unused]) {:tag :nilable/seq}))
+                   (drop 2 remaining) index)
+            (op/eq ":as" (token child))
+            (recur (bind-pattern! ctx scope (second remaining)
+                                  (assoc value :ignore-unused (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-as])))
+                   (drop 2 remaining) index)
+            :else
+            (let [element (if (contains? value :elements)
+                            (nth (:elements value) index (tagged :nil))
+                            (when-let [type (py/element-type (:python-type value) index
+                                                             (get-in @(:state ctx) [:opts :python-options] {}))]
+                              (python-value type)))
+                  inferred (merge (select-keys value [:ignore-unused])
+                                  (when (op/eq :any (:tag value)) {:tag :any}) element)]
+              (recur (bind-pattern! ctx scope child inferred) (rest remaining) (inc index))))
+          scope))
+      :map
+      (let [_ (lint-destructured-defaults! ctx pattern)
+            pairs (partition 2 xs)
+            names (set (mapcat (fn [[key value]]
+                                 (cond
+                                   (or (#{":keys" ":syms" ":strs"} (token key)) (.endswith (or (token key) "") "/keys"))
+                                   (map #(last (str/split (token %) #"/")) (forms value))
+                                   (op/eq :symbol (:kind key)) [(token key)]
+                                   :else [])) pairs))]
+        (doseq [[key defaults] pairs :when (op/eq ":or" (token key))
+                [binding _default] (partition 2 (forms defaults))
+                :when (not (contains? names (token binding)))]
+          (finding! ctx binding :unbound-destructuring-default (str (token binding) " is not bound in this destructuring form")))
+        (let [scope (reduce (fn [scope [key value]]
+                              (let [name (token key)]
+                                (cond
+                                  (or (op/eq name ":keys") (op/eq name ":syms") (op/eq name ":strs")
+                                      (and (op/eq :keyword (:kind key)) (.endswith name "/keys")))
+                                  (reduce (fn [scope binding]
+                                            (let [name (token binding)
+                                                  local-name (if (op/eq :keyword (:kind binding)) (basilisp.core/name (config-data binding))
+                                                                 (last (str/split name #"/")))]
+                                              (when (and (op/eq :keyword (:kind binding)) (not (.startswith name "::")) (neg? (.find name "/")))
+                                                (finding! ctx binding :keyword-binding (str "Keyword binding should be a symbol: :" local-name)))
+                                              (let [lookup-key (case (token key)
+                                                                 ":strs" local-name
+                                                                 ":syms" (symbol name)
+                                                                 (if (.endswith (token key) "/keys")
+                                                                   (keyword (subs (token key) 1 (- (count (token key)) 5)) local-name)
+                                                                   (keyword (if (.startswith name ":") (subs name 1) name))))
+                                                    inferred (get-in destructure-value [:map-values lookup-key])
+                                                    inferred (or inferred
+                                                                 (when-let [type (:python-type destructure-value)]
+                                                                   (when-let [element (py/element-type type lookup-key (get-in @(:state ctx) [:opts :python-options] {}))]
+                                                                     (python-value element))))]
+                                                (binding! ctx scope (assoc binding :text local-name)
+                                                          (merge (when (:fn-args env) {:tag :any}) inferred
+                                                                 {:ignore-unused (and (:fn-args env)
+                                                                                      (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-keys-in-fn-args]))})))))
+                                          scope (forms value))
+                                  (op/eq name ":as") (bind-pattern! ctx scope value
+                                                                    (assoc destructure-value :ignore-unused (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-as])))
+                                  (op/eq name ":or") scope
+                                  :else (bind-pattern! ctx scope key nil))))
+                            env (partition 2 xs))]
+          (doseq [[key defaults] pairs :when (op/eq ":or" (token key))
+                  [binding default] (partition 2 (forms defaults))]
+            (when (op/eq :list (:kind default))
+              (finding! ctx default :destructured-or-always-evaluates "Default :or value is always evaluated."))
+            (let [name (token binding)
+                  outer (get-in env [:locals name])
+                  defaults-scope (if outer (assoc-in scope [:locals name] outer)
+                                     (update scope :locals dissoc name))]
+              (walk! ctx defaults-scope default)))
+          scope))
       (do (finding! ctx pattern :syntax "Unsupported binding form") env))))
 
 (defn- walk-body! [ctx env nodes]
@@ -663,37 +1110,105 @@
           :when (and (contains? literal-kinds (:kind node))
                      (not (re/search "[\\r\\n]" (syntax/text node))))]
     (finding! ctx node :unused-value (str "Unused value: " (syntax/text node))))
-  (walk-body! ctx env nodes))
+  (let [nodes (vec nodes)]
+    (reduce (fn [_ [index node]]
+              (walk! ctx (assoc env :tail? (and (:tail? env true) (= index (dec (count nodes))))) node))
+            nil (map-indexed vector nodes))))
 
 (defn- walk-bindings! [ctx env bindings]
-  (when-not (= :vector (:kind bindings))
+  (when-not (op/eq :vector (:kind bindings))
     (finding! ctx (or bindings (:scope env)) :syntax "Binding form requires a vector"))
-  (let [xs (forms bindings)]
+  (let [xs (forms bindings) steps (atom [])]
     (when (odd? (count xs))
       (finding! ctx bindings :syntax "Binding vector requires an even number of forms"))
-    (reduce (fn [scope [pattern init]]
-              (let [value (walk! ctx scope init)]
-                (when (and (= :symbol (:kind pattern)) (= :symbol (:kind init))
-                           (= (token pattern) (token init)) (contains? (:locals scope) (token pattern)))
-                  (finding! ctx pattern :redundant-let-binding (str "Redundant let binding: " (token init))))
-                (bind-pattern! ctx scope pattern value)))
-            env (partition 2 xs))))
+    (let [result (reduce (fn [scope [pattern init]]
+                           (let [value (walk! ctx scope init)
+                                 _ (when (:conditional-build? env) (swap! steps conj (boolean (conditional-build-step? ctx scope pattern init))))
+                                 entered (when (:context-manager? env) (py/context-type (:python-type value) (get-in @(:state ctx) [:opts :python-options] {})))
+                                 value (if entered (merge (dissoc value :tag) (python-value entered)) value)
+                                 value (if (:first-binding? env)
+                                         (or (first (:elements value))
+                                             (when-let [type (py/iterated-type (:python-type value) (get-in @(:state ctx) [:opts :python-options] {}))]
+                                               (python-value type))) value)
+                                 value (if (:nonnil-binding? env) (nonnil-value value) value)
+                                 value (if (:loop-bindings? env) (dissoc value :tag :python-type) value)]
+                             (when (and (op/eq :symbol (:kind pattern)) (op/eq :symbol (:kind init))
+                                        (= (token pattern) (token init)) (contains? (:locals scope) (token pattern)))
+                               (finding! ctx pattern :redundant-let-binding (str "Redundant let binding: " (token init))))
+                             (bind-pattern! ctx scope pattern value)))
+                         env (partition 2 xs))]
+      (when (:conditional-build? env) (lint-conditional-build-up! ctx bindings @steps))
+      result)))
+
+(declare tag-python)
+
+(defn- basilisp-callable-type [bodies returns parameter-tags async?]
+  (let [multiple? (> (count bodies) 1)
+        signatures
+        (mapv (fn [body value]
+                (let [nodes (forms (:params body))
+                      fixed (take-while #(not= "&" (token %)) nodes)
+                      rest-node (second (drop (count fixed) nodes))
+                      tags (get parameter-tags (if rest-node :varargs (count fixed)))
+                      parameters (mapv (fn [index node]
+                                         (let [raw (token node)
+                                               named? (and (op/eq :symbol (:kind (unwrap node))) (not= "_" raw))]
+                                           (merge (tag-python (nth tags index nil))
+                                                  {:name (if named? (util/munge raw ** :allow_builtins true) (str "arg" index))
+                                                   :kind (if (or multiple? (not named?)) :positional-only :positional-or-keyword)
+                                                   :required? true}))) (range (count fixed)) fixed)
+                      parameters (cond-> parameters rest-node
+                                         (conj {:name (or (token rest-node) "args") :kind :var-positional :required? false}))]
+                  (merge (:python-type value) {:kind :function :parameters parameters :async? async?}))) bodies returns)]
+    (when (seq signatures)
+      (py/callable-type (cond-> (first signatures) multiple? (assoc :overloads signatures))))))
 
 (defn- walk-function! [ctx env tail]
-  (let [named (when (= :symbol (:kind (unwrap (first tail)))) (first tail))
+  (let [named (when (op/eq :symbol (:kind (unwrap (first tail)))) (first tail))
         tail (if named (rest tail) tail)
         bodies (function-bodies tail)
         info (merge-arities (map #(parameters-arity (:params %)) bodies))
+        seen (atom #{})
+        _ (doseq [{:keys [params body return-hint]} bodies]
+            (when-let [async-node (metadata-entry-node return-hint :async)]
+              (when (:async (node-metadata return-hint))
+                (finding! ctx async-node :misplaced-async-metadata
+                          "Misplaced :async metadata; expected on fn name or fn form instead.")))
+            (let [arity (parameters-arity params)
+                  key (or (:varargs-min-arity arity) (first (:fixed-arities arity)))]
+              (when (contains? @seen key)
+                (finding! ctx params :conflicting-fn-arity (str "More than one function overload with arity " key ".")))
+              (swap! seen conj key))
+            (when (and (> (count body) 1) (op/eq :string (:kind (first body))))
+              (finding! ctx (first body) :misplaced-docstring "Misplaced docstring.")))
         env (if named (binding! ctx env named (assoc info :ignore-unused true)) env)
-        returns (mapv (fn [{:keys [params body scope]}]
+        returns (mapv (fn [{:keys [params body scope return-hint]}]
                         (let [arity (parameters-arity params)
                               arity (if-let [minimum (:varargs-min-arity arity)] {:fixed-arities #{(inc minimum)}} arity)
-                              scope (assoc env :scope (or scope (:scope env) params) :recur arity :parameter-bindings #{} :fn-args true)
-                              scope (bind-pattern! ctx scope params nil)]
-                          (select-keys (walk-statements! ctx (dissoc scope :parameter-bindings :fn-args) body)
-                                       [:python-type :return-info]))) bodies)
-        common (when (and (seq returns) (apply = returns)) (first returns))]
-    (cond-> (assoc info :arglists (mapv #(syntax/text (:params %)) bodies))
+                              scope (assoc env :scope (or scope (:scope env) params) :tail? true :recur arity :recur-used (atom false) :parameter-bindings #{} :fn-args true)
+                              scope (bind-pattern! ctx scope params {:tag :any})
+                              value (when-not (or (get-in (context-config ctx) [:analysis :var-definitions :shallow])
+                                                  (get-in (context-config ctx) [:output :analysis :var-definitions :shallow]))
+                                      (select-keys (walk-statements! ctx (dissoc scope :parameter-bindings :fn-args :literal-function-async?) body)
+                                                   [:python-type :return-info :tag]))]
+                          (or (python-hint ctx env return-hint) value))) bodies)
+        common (when (and (seq returns) (apply = returns)) (first returns))
+        common (if (and (:async? env) (:python-type common))
+                 {:python-type {:module "collections.abc" :path ["Coroutine"] :arguments [nil nil (:python-type common)]}} common)
+        parameter-tags (into {} (for [{:keys [params]} bodies
+                                      :let [parameters (take-while #(not= "&" (token %)) (forms params))
+                                            variadic? (:varargs-min-arity (parameters-arity params))]]
+                                  [(if variadic? :varargs (count parameters))
+                                   (mapv #(get-in @(:state ctx) [:binding-expectations (str (:filename ctx) ":" (:start (unwrap %)))]) parameters)]))
+        return-by-arity (into {} (map (fn [body value]
+                                        (let [arity (parameters-arity (:params body))]
+                                          [(if (:varargs-min-arity arity) :varargs (first (:fixed-arities arity)))
+                                           (if (and (:async? env) (:python-type value))
+                                             {:python-type {:module "collections.abc" :path ["Coroutine"] :arguments [nil nil (:python-type value)]}}
+                                             value)])) bodies returns))]
+    (cond-> (assoc info :tag :fn :parameter-tags parameter-tags :return-by-arity return-by-arity
+                   :python-type (basilisp-callable-type bodies returns parameter-tags (:async? env))
+                   :arglists (mapv #(syntax/text (:params %)) bodies))
       (seq common) (assoc :return-info common))))
 
 (defn- expected-arities [info]
@@ -712,6 +1227,373 @@
               (str (when (:ns info) (str (:ns info) "/")) (:name info)
                    " is called with " n (if (= 1 n) " arg" " args")
                    " but expects " (expected-arities info)))))
+
+(def ^:private tag-parents
+  {:pos-int #{:nat-int :int :number} :nat-int #{:int :number} :neg-int #{:int :number}
+   :int #{:number} :long #{:number} :short #{:number} :byte #{:number}
+   :double #{:number} :float #{:number} :ratio #{:number}
+   :true #{:boolean} :false #{:boolean}
+   :string #{:char-sequence :seqable} :char-sequence #{:seqable} :nil #{:seqable}
+   :list #{:seq :sequential :seqable :coll :stack} :seq #{:seqable :sequential :coll}
+   :vector #{:seqable :sequential :associative :coll :ifn :stack :ilookup}
+   :map #{:seqable :associative :coll :ifn :ilookup}
+   :set #{:seqable :coll :ifn :ilookup} :keyword #{:ifn} :symbol #{:ifn}
+   :fn #{:ifn} :class #{:ifn} :transducer #{:ifn :fn} :atom #{:ideref} :var #{:ifn :ideref}
+   :coll #{:seqable} :sequential #{:seqable :coll} :associative #{:seqable :coll :ifn :ilookup}
+   :sorted-map #{:map :seqable :associative :coll :ifn :ilookup}
+   :sorted-set #{:set :seqable :coll :ifn :ilookup} :future #{:ideref} :array #{:seqable :ilookup}})
+(def ^:private tag-possibilities
+  {:int #{:neg-int :nat-int :pos-int :long :short :float :double}
+   :long #{:int :neg-int :nat-int :pos-int :short :float :double}
+   :short #{:int :neg-int :nat-int :pos-int :long :float :double}
+   :pos-int #{:long :short :float :double} :nat-int #{:pos-int :long :short :float :double}
+   :neg-int #{:long :short :float :double} :byte #{:int :long :short :float :double}
+   :double #{:float} :float #{:double}
+   :coll #{:map :sorted-map :vector :set :sorted-set :list :associative :seq :sequential :ifn :stack :ilookup}
+   :seqable #{:coll :vector :set :sorted-set :map :associative :char-sequence :string :nil
+              :list :seq :sequential :ifn :stack :sorted-map :ilookup :array}
+   :ifn #{:fn :transducer :symbol :keyword :map :set :sorted-set :vector :associative
+          :seqable :coll :sequential :stack :sorted-map :var :ideref :ilookup}
+   :stack #{:list :vector :seq :sequential :seqable :coll :ifn :associative :ilookup}
+   :sequential #{:seq :list :vector :ifn :associative :stack :ilookup}
+   :ilookup #{:map :set :sorted-set :sorted-map :coll :seqable :ifn :associative :vector :sequential :stack :array}})
+(def ^:private tag-labels
+  {:pos-int "positive integer" :neg-int "negative integer" :nat-int "natural integer"
+   :int "integer" :seqable "seqable collection" :coll "collection" :associative "associative collection"
+   :ifn "function" :fn "function" :double "double" :ilookup "ILookup"})
+(defn- tag-label [tag]
+  (cond
+    (map? tag) "map"
+    (set? tag) (str/join " or " (map tag-label tag))
+    (op/eq "nilable" (namespace tag)) (str (tag-label (keyword (name tag))) " or nil")
+    :else (get tag-labels tag (if tag (name tag) "unknown"))))
+(defn- compatible-tag? [actual expected]
+  (cond
+    (or (nil? actual) (nil? expected) (#{:any :truthy} actual) (op/eq :any expected)) true
+    (op/eq :seqable-or-transducer actual) (compatible-tag? #{:seqable :transducer} expected)
+    (op/eq :seqable-or-transducer expected) (compatible-tag? actual #{:seqable :transducer})
+    (map? expected) (compatible-tag? actual :map)
+    (map? actual) (compatible-tag? :map expected)
+    (set? actual) (some #(compatible-tag? % expected) actual)
+    (set? expected) (some #(compatible-tag? actual %) expected)
+    (op/eq "nilable" (namespace expected)) (or (op/eq :nil actual) (compatible-tag? actual (keyword (name expected))))
+    (op/eq "nilable" (namespace actual)) (or (compatible-tag? :nil expected) (compatible-tag? (keyword (name actual)) expected))
+    :else (or (= actual expected) (contains? (get tag-parents actual) expected)
+              ;; Broad inferred categories must not reject a possible subtype.
+              (contains? (get tag-parents expected) actual)
+              (contains? (get tag-possibilities actual) expected))))
+(defn- tag-python [tag]
+  (when-let [name (get {:string "str" :char "str" :int "int" :pos-int "int" :nat-int "int" :neg-int "int"
+                        :long "int" :short "int" :byte "int" :double "float" :float "float" :boolean "bool" :true "bool" :false "bool"
+                        :nil "NoneType"} tag)]
+    {:module "builtins" :path [name]}))
+(defn- python-type-tag [type]
+  (let [variants (:union type)
+        tags (when variants (mapv python-type-tag variants))
+        tag (cond
+              variants (when (every? some? tags) (set (mapcat #(if (set? %) % [%]) tags)))
+              (:bound type) (python-type-tag (:bound type))
+              (= "builtins" (:module type)) (get {"str" :string "int" :int "float" :double "bool" :boolean "NoneType" :nil "type" :class}
+                                                 (first (:path type)))
+              (and (#{"collections.abc" "typing"} (:module type)) (= ["Callable"] (:path type))) :fn
+              (and (= "re" (:module type)) (= ["Pattern"] (:path type))) :regex
+              (and (= "fractions" (:module type)) (= ["Fraction"] (:path type))) :ratio
+              (and (= "decimal" (:module type)) (= ["Decimal"] (:path type))) :number
+              (= "basilisp.lang.vector" (:module type)) :vector
+              (= "basilisp.lang.map" (:module type)) :map
+              (= "basilisp.lang.set" (:module type)) :set
+              (= "basilisp.lang.list" (:module type)) :list
+              (= "basilisp.lang.keyword" (:module type)) :keyword
+              (= "basilisp.lang.symbol" (:module type)) :symbol
+              :else nil)]
+    (if (and tag (:nullable? type)) (conj (if (set? tag) tag #{tag}) :nil) tag)))
+
+(defn- python-value [type]
+  (let [tag (python-type-tag type) callable (py/callable-metadata type)]
+    (cond-> {:python-type type}
+      tag (assoc :tag tag)
+      callable (assoc :python-member callable))))
+
+(defn- tagged [tag]
+  (let [type (tag-python tag)]
+    (cond-> {:tag tag} type (assoc :python-type type))))
+(defn- lookup-value [value key default]
+  (if (contains? (:map-values value) key)
+    (get (:map-values value) key)
+    (when (:map-closed? value) (or default (tagged :nil)))))
+
+(defn- spec-value [spec]
+  (if (op/eq :keys (:op spec))
+    {:tag :map :map-values (into {} (map (fn [[key value]] [key (spec-value value)]) (:req spec))) :map-closed? false}
+    (tagged spec)))
+
+(defn- check-value-spec! [ctx node value expected key]
+  (cond
+    (nil? expected) nil
+    (op/eq :keys (:op expected))
+    (cond
+      (and (op/eq :nil (:tag value)) (:nilable expected)) nil
+      (not (compatible-tag? (:tag value) :map))
+      (finding! ctx node :type-mismatch (str "Expected: map, received: " (tag-label (:tag value)) "."))
+      :else
+      (do
+        (doseq [[required _] (:req expected)
+                :when (and (:map-closed? value) (not (contains? (:map-values value) required)))]
+          (finding! ctx node :type-mismatch (str "Missing required key: " (pr-str required))))
+        (doseq [[key spec] (merge (:opt expected) (:req expected))
+                :let [entry (get (:map-values value) key)]
+                :when entry]
+          (check-value-spec! ctx (or (:node entry) node) entry spec (when-not (:node entry) key)))))
+    (op/eq :rest (:op expected))
+    (doseq [entry (:elements value)]
+      (check-value-spec! ctx (or (:node entry) node) entry (:spec expected) key))
+    (and (:tag value) (not (compatible-tag? (:tag value) expected)))
+    (finding! ctx node :type-mismatch
+              (str "Expected: " (tag-label expected) ", received: " (tag-label (:tag value))
+                   (if (nil? key) "." (str " for key " (pr-str key)))))
+    :else nil))
+
+(defn- expanded-specs [ctx node specs args]
+  (loop [remaining specs out []]
+    (if-let [spec (first remaining)]
+      (if (op/eq :rest (:op spec))
+        (let [width (- (count args) (count out))
+              tail (:last spec)
+              width (if tail (max 0 (dec width)) width)
+              repeated (:spec spec)
+              group (if (vector? repeated) repeated [repeated])
+              _ (when (and (seq group) (pos? (mod width (count group))))
+                  (finding! ctx (or (last args) node) :type-mismatch "Insufficient input."))]
+          (into (into out (take width (cycle group))) (when tail [tail])))
+        (recur (rest remaining) (conj out spec)))
+      out)))
+
+(defn- core-spec [name n]
+  (cond
+    (#{"inc" "dec" "abs" "quot" "rem" "mod" "+" "-" "*" "/" "max" "min" "<" ">" "<=" ">=" "=="} name)
+    {:args (vec (repeat n :number)) :ret (if (#{"<" ">" "<=" ">=" "=="} name) :boolean :number)}
+    (#{"count" "empty?" "seq" "first" "second" "last" "rest" "next" "ffirst" "nfirst" "fnext" "nnext" "butlast" "reverse" "vec" "set" "not-empty"} name)
+    {:args [:seqable] :ret (get {"count" :nat-int "empty?" :boolean "seq" :nilable/seq "rest" :seq
+                                 "next" :nilable/seq "reverse" :seq "vec" :vector "set" :set} name)}
+    (#{"map" "mapv" "mapcat" "filter" "filterv" "remove" "keep" "keep-indexed" "map-indexed" "take-while" "drop-while" "every?" "not-every?" "some" "not-any?"} name)
+    {:args (vec (cons :ifn (repeat (dec n) :seqable))) :ret (cond (= 1 n) :transducer
+                                                                  (#{"mapv" "filterv"} name) :vector
+                                                                  (#{"every?" "not-every?" "not-any?"} name) :boolean
+                                                                  (op/eq "some" name) nil
+                                                                  :else :seq)}
+    (op/eq "reduce" name) {:args (if (= 2 n) [:ifn :seqable] [:ifn :any :seqable])}
+    (op/eq "reduce-kv" name) {:args [:ifn :any :associative]}
+    (op/eq "apply" name) {:args (vec (concat [:ifn] (repeat (max 0 (- n 2)) :any) [:seqable]))}
+    (op/eq "conj" name) {:args [:nilable/coll] :ret :coll}
+    (#{"assoc" "dissoc" "update" "assoc-in" "update-in"} name) {:args [:nilable/associative]}
+    (op/eq "subs" name) {:args [:string :int :int] :ret :string}
+    (op/eq "nth" name) {:args [:seqable :int]}
+    (#{"take" "drop" "take-last" "drop-last" "split-at"} name) {:args [:number :seqable] :ret :seq}
+    (op/eq "get" name) {:args [#{:string :array :nil :set :ilookup :map}]}
+    (op/eq "contains?" name) {:args [#{:associative :string :nil :set}] :ret :boolean}
+    (op/eq "keyword" name) {:args (if (= n 1) [#{:nil :symbol :string :keyword}] [:nilable/string :string])
+                            :ret (if (= n 1) :nilable/keyword :keyword)}
+    (op/eq "symbol" name) {:args (if (= n 1) [#{:symbol :string}] [:nilable/string :string]) :ret :symbol}
+    (op/eq "deref" name) {:args [:ideref]}
+    (#{"reset!" "swap!" "compare-and-set!"} name) {:args [:atom]}
+    (op/eq "atom" name) {:ret :atom}
+    (op/eq "list" name) {:ret :list}
+    (#{"vector" "vec"} name) {:ret :vector}
+    (#{"hash-map" "array-map" "sorted-map" "zipmap"} name) {:ret :map}
+    (#{"hash-set" "sorted-set"} name) {:ret :set}
+    (op/eq "namespace" name) {:ret :nilable/string}
+    (#{"str" "name" "pr-str" "prn-str" "format"} name) {:ret :string}
+    (#{"cons" "concat" "range" "repeat" "repeatedly" "iterate" "interpose" "interleave" "distinct" "dedupe" "sort" "sort-by"} name) {:ret :seq}
+    (and name (.endswith name "?")) {:ret :boolean}
+    :else nil))
+(defn- shared-type-signatures
+  "Known Basilisp library contracts. String patterns follow Python re semantics.
+  The arity check leaves invalid-arity diagnostics to the existing call analyzer."
+  [ns-name function-name arity]
+  (let [ns-name (str ns-name) function-name (str function-name)]
+    (cond
+      (= "basilisp.string" ns-name)
+      (cond
+        (and (= 1 arity) (= "blank?" function-name))
+        {:args [:nilable/string] :ret :boolean}
+
+        (and (= 1 arity) (#{"alpha?" "alphanumeric?" "digits?"} function-name))
+        {:args [:string] :ret :boolean}
+
+        (and (= 1 arity) (#{"capitalize" "title-case" "lower-case" "upper-case"
+                            "reverse" "trim" "ltrim" "rtrim" "trim-newlines"
+                            "re-quote-replacement"} function-name))
+        {:args [:string] :ret :string}
+
+        (and (= 2 arity) (#{"ends-with?" "starts-with?" "includes?"} function-name))
+        {:args [:string :string] :ret :boolean}
+
+        (and (#{2 3} arity) (#{"index-of" "last-index-of"} function-name))
+        {:args (if (= 2 arity) [:string :string] [:string :string :nilable/int])
+         :ret :nilable/int}
+
+        (and (#{1 2} arity) (= "join" function-name))
+        {:args (if (= 1 arity) [:nilable/seqable] [:string :nilable/seqable]) :ret :string}
+
+        (and (#{2 3} arity) (= "split" function-name))
+        {:args (if (= 2 arity) [:string #{:string :regex}]
+                   [:string #{:string :regex} :nilable/int])
+         :ret :vector}
+
+        (and (= 1 arity) (= "split-lines" function-name))
+        {:args [:string] :ret :vector}
+
+        (and (#{2 3} arity) (#{"lpad" "rpad"} function-name))
+        {:args (if (= 2 arity) [:string :int] [:string :int :string]) :ret :string}
+
+        (and (= 3 arity) (#{"replace" "replace-first"} function-name))
+        {:args [:string #{:string :regex} #{:string :ifn}] :ret :string}
+
+        :else nil)
+
+      (= "basilisp.set" ns-name)
+      (cond
+        (and (pos? arity) (#{"difference" "intersection"} function-name))
+        {:args (into [:set] (repeat (dec arity) :seqable)) :ret :set}
+
+        (and (pos? arity) (#{"union" "symmetric-difference"} function-name))
+        {:args (vec (repeat arity :set)) :ret :set}
+
+        (and (= 2 arity) (= "disjoint?" function-name))
+        {:args [:set :seqable] :ret :boolean}
+
+        (and (= 2 arity) (#{"subset?" "superset?"} function-name))
+        {:args [:set :set] :ret :boolean}
+
+        (and (= 2 arity) (= "select" function-name))
+        {:args [:ifn :nilable/seqable] :ret :set}
+
+        (and (= 2 arity) (#{"index" "project"} function-name))
+        {:args [:nilable/seqable :nilable/seqable] :ret (if (= "index" function-name) :map :set)}
+
+        (and (= 1 arity) (= "map-invert" function-name))
+        {:args [:nilable/map] :ret :map}
+
+        (and (= 2 arity) (= "rename-keys" function-name))
+        {:args [:map :nilable/map] :ret :map}
+
+        (and (= 2 arity) (= "rename" function-name))
+        {:args [:nilable/seqable :nilable/map] :ret :set}
+
+        (and (#{2 3} arity) (= "join" function-name))
+        {:args (if (= 2 arity) [:seqable :seqable] [:seqable :seqable :nilable/map]) :ret :set}
+
+        :else nil)
+
+      :else nil)))
+
+(defn- function-return [info n]
+  (or (get-in info [:return-by-arity n])
+      (when (and (:varargs-min-arity info) (>= n (:varargs-min-arity info)))
+        (get-in info [:return-by-arity :varargs]))
+      (:return-info info)))
+
+(defn- function-spec [ctx info n]
+  (let [config (context-config ctx)
+        fq (when (:ns info) (str (:ns info) "/" (:name info)))
+        custom (when fq (settings-for-call (get-in config [:linters :type-mismatch :namespaces]) fq))
+        custom (or custom
+                   (get-in config [:linters :type-mismatch :namespaces (symbol (:ns info "user")) (symbol (:name info ""))])
+                   (get-in config [:linters :type-mismatch :namespaces
+                                   (symbol (str/replace (:ns info "user") #"^basilisp.core$" "clojure.core")) (symbol (:name info ""))]))
+        arity (or (get-in custom [:arities n]) (get-in custom [:arities :varargs]))
+        inferred (or (get-in info [:parameter-tags n])
+                     (when (and (:varargs-min-arity info) (>= n (:varargs-min-arity info)))
+                       (get-in info [:parameter-tags :varargs])))]
+    (or arity (when inferred {:args inferred})
+        (when (op/eq "basilisp.core" (:ns info)) (core-spec (:name info) n))
+        (shared-type-signatures (:ns info) (:name info) n))))
+(declare lint-extra-types! merge-values)
+
+(defn- collection-value [kind values]
+  {:tag kind :elements (vec values)
+   :python-type {:module (str "basilisp.lang." (name kind))
+                 :path [(get {:list "PersistentList" :vector "PersistentVector" :set "PersistentSet"} kind)]
+                 :arguments [(py/union-type (map :python-type values))]}})
+
+(defn- arithmetic-value [function values]
+  (let [tags (map :tag values)
+        integers #{:int :pos-int :nat-int :neg-int :long :short :byte}
+        scalar (into integers [:double :float])]
+    (cond
+      (and (op/ne "/" function) (every? integers tags)) (tagged :int)
+      (and (seq tags) (every? scalar tags) (some #{:double :float} tags)) (tagged :double)
+      :else (tagged :number))))
+
+(defn- lint-types! [ctx node info args values]
+  (lint-extra-types! ctx node info args values)
+  (let [spec (function-spec ctx info (count args))
+        specs (:args spec)
+        expected (expanded-specs ctx node specs args)]
+    (doseq [[arg value expected] (map vector args values expected)]
+      (check-value-spec! ctx arg value expected nil)
+      (when (and expected (:id value) (op/eq :any (:tag value))
+                 (not-any? #(re/search #"/(?:if|if-not|if-let|if-some|when|when-not|when-let|when-some|cond|case|condp|and|or)$" %)
+                           (rest (:callstack ctx))))
+        (swap! (:state ctx) assoc-in [:binding-expectations (:id value)] expected)))
+    (when (and (op/eq :symbol (:kind (first (forms node)))) (:tag info)
+               (not (compatible-tag? (:tag info) :ifn)))
+      (finding! ctx node :type-mismatch (str (str/capitalize (tag-label (:tag info))) " cannot be called as a function.")))
+    (when (op/eq "basilisp.core" (:ns info))
+      (when (and (op/eq "str" (:name info)) (= 1 (count values)) (op/eq :string (:tag (first values))))
+        (finding! ctx node :redundant-str-call "Single argument to str already is a string"))
+      (when (and (op/eq "=" (:name info)) (some #(= :double (:tag %)) values))
+        (finding! ctx node :equals-float "Equality comparison of floating point numbers"))
+      (when (and (op/eq "empty?" (:name info)) (op/eq "basilisp.core/not" (second (:callstack ctx)))
+                 (compatible-tag? (:tag (first values)) :seq) (:tag (first values))
+                 (op/ne :any (:tag (first values))))
+        (finding! ctx node :not-empty? "Use (seq x) instead of (not (empty? x)) when x is a seq")))
+    (cond
+      (and (op/eq "basilisp.core" (:ns info)) (#{"inc" "dec" "abs" "quot" "rem" "mod" "+" "-" "*" "/" "max" "min"} (:name info)))
+      (arithmetic-value (:name info) values)
+      (and (op/eq "basilisp.core" (:ns info)) (#{"list" "vector" "hash-set"} (:name info)))
+      (collection-value (get {"list" :list "vector" :vector "hash-set" :set} (:name info)) values)
+      (and (op/eq "basilisp.core" (:ns info)) (#{"vec" "set"} (:name info)))
+      (let [kind (if (op/eq "vec" (:name info)) :vector :set)
+            element (py/iterated-type (:python-type (first values)) (get-in @(:state ctx) [:opts :python-options] {}))]
+        (cond-> (collection-value kind (:elements (first values)))
+          element (assoc-in [:python-type :arguments] [element])
+          (not (contains? (first values) :elements)) (dissoc :elements)))
+      (op/eq :keyword (:tag info)) (lookup-value (first values) (:literal-value info) (second values))
+      (op/eq :map (:tag info)) (when-let [[key] (constant-data (first args))] (lookup-value info key (second values)))
+      (and (op/eq "basilisp.core" (:ns info)) (op/eq "get" (:name info)) (:map-values (first values)))
+      (when-let [[key] (constant-data (second args))] (lookup-value (first values) key (nth values 2 nil)))
+      (and (op/eq "basilisp.core" (:ns info)) (op/eq "nth" (:name info)) (:elements (first values)))
+      (let [index (first (constant-data (second args)))]
+        (when (and (int? index) (<= 0 index) (< index (count (:elements (first values)))))
+          (get (:elements (first values)) index)))
+      (#{"identity" "with-meta" "vary-meta"} (:name info)) (first values)
+      (and (op/eq "basilisp.core" (:ns info)) (op/eq "assoc" (:name info)) (#{:nil :map} (:tag (first values))))
+      (reduce (fn [out [[key-node _] [value-node value]]]
+                (if-let [[key] (constant-data key-node)]
+                  (assoc-in out [:map-values key] (assoc value :node value-node))
+                  (assoc out :map-closed? false :map-values {})))
+              (merge {:tag :map :map-values {} :map-closed? true} (dissoc (first values) :tag))
+              (partition 2 (map vector (rest args) (rest values))))
+      (and (op/eq "basilisp.core" (:ns info)) (op/eq "dissoc" (:name info)) (op/eq :map (:tag (first values))))
+      (reduce (fn [out key-node]
+                (if-let [[key] (constant-data key-node)]
+                  (update out :map-values dissoc key)
+                  (assoc out :map-closed? false :map-values {})))
+              (first values) (rest args))
+      (and (#{"assoc" "update" "assoc-in" "update-in" "conj"} (:name info)) (op/eq "basilisp.core" (:ns info)))
+      (dissoc (first values) :map-values :map-closed? :elements)
+      (and (op/eq "not-empty" (:name info)) (op/eq "basilisp.core" (:ns info)))
+      (merge-values [(first values) (tagged :nil)])
+      (and (op/eq "namespace" (:name info)) (op/eq "basilisp.core" (:ns info)))
+      (python-value {:module "builtins" :path ["str"] :nullable? true})
+      (and (op/eq "basilisp.core" (:ns info)) (#{"get" "nth" "aget"} (:name info)) (:python-type (first values)))
+      (when-let [type (py/element-type (:python-type (first values))
+                                       (first (constant-data (second args)))
+                                       (get-in @(:state ctx) [:opts :python-options] {}))]
+        (python-value type))
+      (:ret spec) (spec-value (:ret spec))
+      :else (function-return info (count args)))))
 
 (defn python-keyword-name
   "Decode a literal Python keyword argument using Basilisp's name munging."
@@ -737,9 +1619,104 @@
     (when problem (finding! ctx (first problem) :syntax (second problem)))
     {:positional (count positional) :keywords names :valid? (nil? problem)}))
 
+(declare call-identity)
+
+(defn- python-call-value [ctx node member args values injected]
+  (let [{:keys [positional keywords valid?]} (python-arguments ctx node args)
+        supplied (vec (take positional values))
+        supplied (if injected (if (:last? injected) (conj supplied (:value injected)) (vec (cons (:value injected) supplied))) supplied)
+        positional-types (mapv :python-type supplied)
+        keyword-values (take-nth 2 (drop (+ positional 2) values))
+        keyword-types (zipmap keywords (map :python-type keyword-values))
+        problems (when valid? (py/check-call member (count supplied) keywords))
+        candidates (when (and valid? (empty? problems)) (py/call-signatures member positional-types keyword-types (get-in @(:state ctx) [:opts :python-options] {})))]
+    (when (and (:type-guard member) (not (:async? member)))
+      (swap! (:state ctx) assoc-in [:guard-calls (:start node)]
+             {:guard (py/return-type (:type-guard member)) :type-is? (:type-is? member)}))
+    (let [calls (:calls @(:state ctx))]
+      (when (pos? (python/len calls))
+        (let [index (op/sub (python/len calls) 1)]
+          (op/setitem calls index (assoc (op/getitem calls index)
+                                         :positional-types positional-types :keyword-types keyword-types :signatures candidates)))))
+    (doseq [problem problems] (finding! ctx node (:type problem) (:message problem)))
+    (when (and valid? (empty? problems) (empty? candidates)
+               (or (seq (:parameters member)) (seq (:overloads member))))
+      (finding! ctx node :type-mismatch
+                (str "No Python signature accepts argument types ("
+                     (str/join ", " (concat (map py/type-label positional-types)
+                                            (map (fn [[name type]] (str name "=" (py/type-label type))) keyword-types))) ")")))
+    (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types (get-in @(:state ctx) [:opts :python-options] {})))]
+      (python-value type))))
+
+(defn- merge-values [values]
+  (let [known (filter some? values)
+        python-types (map :python-type values)
+        tags (map :tag values)
+        type (when (every? some? python-types) (py/union-type python-types))
+        tag (when (and (seq tags) (every? some? tags)) (if (apply = tags) (first tags) (set (mapcat #(if (set? %) % [%]) tags))))]
+    (cond-> (when (and (seq known) (= (count known) (count values)) (apply = known)) (first known))
+      type (assoc :python-type type)
+      tag (assoc :tag tag))))
+
+(defn- nonnil-value [value]
+  (let [type (:python-type value)
+        variants (remove #(and (op/eq "builtins" (:module %)) (= ["NoneType"] (:path %))) (:union type))]
+    (cond-> value
+      type (assoc :python-type (if (:union type) (py/union-type variants) (dissoc type :nullable?)))
+      (set? (:tag value)) (assoc :tag (disj (:tag value) :nil)))))
+
+(defn- narrow-environment [ctx env condition truthy?]
+  (let [condition (unwrap condition)
+        xs (when (op/eq :list (:kind condition)) (forms condition))
+        identity (when xs (call-identity ctx env (first xs)))
+        name (when (#{"basilisp.core" "builtins" "python"} (:ns identity)) (:name identity))
+        name (or name (when (op/eq "python/isinstance" (token (first xs))) "isinstance"))
+        target (if xs (second xs) condition)
+        local-name (when (op/eq :symbol (:kind target)) (token target))
+        value (get-in env [:locals local-name])
+        guard-call (get-in @(:state ctx) [:guard-calls (:start condition)])
+        guard-type (:guard guard-call)
+        tags {"string?" :string "number?" :number "integer?" :int "int?" :int "float?" :double
+              "map?" :map "vector?" :vector "set?" :set "seq?" :seq "list?" :list
+              "keyword?" :keyword "symbol?" :symbol "boolean?" :boolean "fn?" :fn
+              "nil?" :nil}
+        tag (get tags name)
+        class-node (when (op/eq "isinstance" name) (nth xs 2 nil))
+        class-token (token class-node)
+        class-parts (when class-token (str/split class-token #"/"))
+        class-module (when class-node (or (get-in @(:state ctx) [:imports (first class-parts) :name])
+                                          (when (op/eq "python" (first class-parts)) "builtins")))
+        narrowed (cond
+                   (and value guard-type truthy?) (merge (dissoc value :tag) (python-value guard-type))
+                   (and value guard-type (:type-is? guard-call) (not truthy?))
+                   (let [type (:python-type value)
+                         variants (or (:union type) (when type [(dissoc type :nullable?)]))
+                         remaining (remove #(true? (py/type-compatible? % guard-type (get-in @(:state ctx) [:opts :python-options] {}))) variants)]
+                     (when (seq remaining)
+                       (merge (dissoc value :tag) (python-value (cond-> (py/union-type remaining) (:nullable? type) (assoc :nullable? true))))))
+                   (and value (op/eq "not" name)) nil
+                   (and value (#{"some?" "nil?"} name))
+                   (if (= truthy? (op/eq "some?" name)) (nonnil-value value) (merge value (tagged :nil)))
+                   (and value tag truthy?) (merge value (tagged tag))
+                   (and value class-module truthy?)
+                   (merge (dissoc value :tag) (python-value {:module class-module :path (python-path (last class-parts))}))
+                   (and value class-module (not truthy?))
+                   (let [type (:python-type value)
+                         expected {:module class-module :path (python-path (last class-parts))}
+                         variants (or (:union type) (when type [(dissoc type :nullable?)]))
+                         remaining (remove #(true? (py/type-compatible? % expected (get-in @(:state ctx) [:opts :python-options] {}))) variants)]
+                     (when (seq remaining)
+                       (merge (dissoc value :tag) (python-value (cond-> (py/union-type remaining) (:nullable? type) (assoc :nullable? true))))))
+                   (and value (not xs) truthy?) (nonnil-value value)
+                   :else nil)]
+    (cond
+      (op/eq "not" name) (narrow-environment ctx env (second xs) (not truthy?))
+      narrowed (assoc-in env [:locals local-name] narrowed)
+      :else env)))
+
 (defn- python-return [module member]
   (if-let [type (py/return-type member)]
-    {:python-type type}
+    (python-value type)
     (when-let [annotation (:return-type member)]
       (when (re/fullmatch "[A-Za-z_][A-Za-z0-9_.]*" annotation)
         (let [parts (str/split annotation #"[.]")
@@ -753,39 +1730,46 @@
            (merge (loc ctx node)
                   {:name (or (:name info) (token head)) :ns (:ns info)
                    :name-range (loc ctx head) :arguments (mapv #(loc ctx %) args)
-                   :definition info :caller (:caller env) :implicit-arguments 0 :arity (count args)}
+                   :definition info :caller (:caller env) :callstack (:callstack ctx) :context (:context ctx)
+                   :implicit-arguments 0 :arity (count args)}
                   extra))))
 
 (defn- walk-python-method! [ctx env node head args]
   (let [injected (:thread-target env)
         receiver-injected? (and injected (or (not (:last? injected)) (empty? args)))
-        target (if receiver-injected? (:value injected) (walk! ctx env (first args)))
+        target (if receiver-injected? (:value injected) (walk! ctx (dissoc env :thread-target) (first args)))
         receiver (if receiver-injected? (:node injected) (first args))
         arguments (if receiver-injected? args (rest args))
         extra-positional (if (and injected (not receiver-injected?)) 1 0)
         env (dissoc env :thread-target)
-        instance? (boolean (:python-type target))
-        object (or (:python-type target)
+        direct? (and (:python-module target) (#{:function :class} (get-in target [:python-member :kind])))
+        instance? (and (not direct?) (boolean (:python-type target)))
+        object (if instance? (:python-type target)
                    (when (:python-module target) {:module (:python-module target) :path (:python-path target)}))
         raw (token head) field? (.startswith raw ".-")
         member-name (subs raw (if field? 2 1))
         member (when object
-                 (py/inspect-path (:module object) (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))
-                                  (assoc (get-in @(:state ctx) [:opts :python-options] {}) :instance? instance?)))]
-    (walk-body! ctx env (remove #(= "**" (token %)) arguments))
+                 (if instance?
+                   (py/inspect-member object (util/munge member-name ** :allow_builtins true)
+                                      (get-in @(:state ctx) [:opts :python-options] {}))
+                   (py/inspect-path (:module object) (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))
+                                    (get-in @(:state ctx) [:opts :python-options] {}))))
+        values (mapv #(if (op/eq "**" (token %)) nil (walk! ctx (assoc env :tail? false) %)) arguments)]
     (when object
       (record-call! ctx env node head arguments member
                     {:name member-name :ns (:module object) :python true
                      :implicit-arguments 1 :receiver-range (loc ctx receiver)})
       (emit! ctx :python-usages (merge (loc ctx head) {:name member-name :ns (:module object)
-                                                       :python true :definition member}))
+                                                       :python true :definition member
+                                                       :python-module (:module object)
+                                                       :python-path (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))}))
       (if (nil? member)
         (finding! ctx head :unresolved-symbol (str "Unresolved Python member: " member-name))
-        (when-not field?
-          (let [{:keys [positional keywords valid?]} (python-arguments ctx node arguments)]
-            (doseq [problem (when valid? (py/check-call member (+ positional extra-positional) keywords))]
-              (finding! ctx node (:type problem) (:message problem)))))))
-    (when member (python-return (:module object) member))))
+        nil))
+    (when member
+      (if field? (python-return (:module object) member)
+          (python-call-value ctx node member arguments values
+                             (when (pos? extra-positional) injected))))))
 
 (defn- walk-call! [ctx env node injected]
   (let [[head & args] (forms node)
@@ -793,56 +1777,59 @@
     (cond
       (and (pos? injected) (#{"->" "->>" "some->" "some->>" "doto"} (token head)))
       (walk-thread! ctx env (cons nil args))
-      (and (= :symbol (:kind head)) (#{"." ".-"} (token head)))
+      (and (op/eq :symbol (:kind head)) (#{"." ".-"} (token head)))
       (let [target (first args) specification (second args)
-            nested? (= :list (:kind specification))
+            nested? (op/eq :list (:kind specification))
             member-node (if nested? (first (forms specification)) specification)
             member-name (token member-node)
-            method-head (assoc member-node :text (str (if (= ".-" (token head)) ".-" ".") member-name))
+            method-head (assoc member-node :text (str (if (op/eq ".-" (token head)) ".-" ".") member-name))
             arguments (if nested? (rest (forms specification)) (drop 2 args))]
         (if member-name
           (walk-python-method! ctx env node method-head (cons target arguments))
           (walk-body! ctx env args)))
-      (and (= :symbol (:kind head)) (= ".." (token head)))
+      (and (op/eq :symbol (:kind head)) (op/eq ".." (token head)))
       (let [initial (walk! ctx env (first args))]
         (loop [steps (rest args) value initial previous (first args)]
           (if-let [step (first steps)]
-            (let [listed? (= :list (:kind step))
+            (let [listed? (op/eq :list (:kind step))
                   member-node (if listed? (first (forms step)) step)
                   method-head (assoc member-node :text (str "." (token member-node)))
                   result (walk-python-method! ctx (assoc env :thread-target {:value value :node previous})
                                               step method-head (if listed? (rest (forms step)) []))]
               (recur (rest steps) result step))
             value)))
-      (and (= :symbol (:kind head)) (.startswith (token head) "."))
+      (and (op/eq :symbol (:kind head)) (.startswith (token head) "."))
       (walk-python-method! ctx env node head args)
       :else
-      (let [env (dissoc env :thread-target)
-            info (walk! ctx env head)]
+      (let [thread (:thread-target env)
+            env (dissoc env :thread-target)
+            info (walk! ctx (assoc env :call-node node) head)
+            values (mapv #(if (op/eq "**" (token %)) nil (walk! ctx (assoc env :tail? false) %)) args)
+            typed-args (if thread (if (:last? thread) (conj (vec args) (:node thread)) (cons (:node thread) args)) args)
+            typed-values (if thread (if (:last? thread) (conj values (:value thread)) (cons (:value thread) values)) values)]
         (record-call! ctx env node head args (or (:python-member info) info)
                       (merge {:implicit-arguments injected :arity (+ injected (count args))}
                              (when (:python-member info) {:python true :ns (:python-module info)})))
-        (walk-body! ctx env (remove #(= "**" (token %)) args))
         (if-let [member (:python-member info)]
-          (let [{:keys [positional keywords valid?]} (python-arguments ctx node args)]
-            (doseq [problem (when valid? (py/check-call member (+ injected positional) keywords))]
-              (finding! ctx node (:type problem) (:message problem)))
-            (if (= :class (:kind member))
-              (or (python-return (:python-module info) member)
-                  {:python-type {:module (:python-module info) :path (:python-path info)}})
-              (python-return (:python-module info) member)))
-          (do (check-arity! ctx node info (+ injected (count args)))
-              (:return-info info)))))))
+          (or (python-call-value ctx node member args values thread)
+              (when (op/eq :class (:kind member))
+                {:python-type {:module (:python-module info) :path (:python-path info)}}))
+          (do (check-arity! ctx node
+                            (if (#{:keyword :map :set :vector} (:tag info))
+                              (merge info {:ns nil :name (str/capitalize (name (:tag info)))
+                                           :fixed-arities (if (op/eq :set (:tag info)) #{1} #{1 2})}) info)
+                            (+ injected (count args)))
+              (lint-types! ctx node info typed-args typed-values)))))))
 
 (defn- walk-thread! [ctx env args]
   (let [initial (walk! ctx env (first args))
-        doto? (= "doto" (:name (:call-identity ctx)))
+        doto? (op/eq "doto" (:name (:call-identity ctx)))
         last? (contains? #{"->>" "some->>"} (:name (:call-identity ctx)))]
     (loop [steps (rest args) value initial previous (first args)]
       (if-let [step (first steps)]
-        (let [result (if (= :list (:kind step))
+        (let [result (if (op/eq :list (:kind step))
                        (walk-call! ctx (assoc env :thread-target {:value value :node previous :last? last?}) step 1)
-                       (if (and (= :symbol (:kind step)) (.startswith (token step) "."))
+                       (if (and (op/eq :symbol (:kind step)) (.startswith (token step) "."))
                          (walk-python-method! ctx (assoc env :thread-target {:value value :node previous}) step step [])
                          (let [call-ctx (call-context ctx env step)
                                info (walk! call-ctx env step)]
@@ -862,54 +1849,121 @@
       (if-let [binding (first xs)]
         (let [value (second xs)]
           (cond
-            (= ":let" (token binding)) (recur (drop 2 xs) (walk-bindings! ctx scope value))
+            (op/eq ":let" (token binding)) (recur (drop 2 xs) (walk-bindings! ctx scope value))
             (#{":when" ":while"} (token binding))
-            (do (walk! ctx scope value) (recur (drop 2 xs) scope))
+            (do (walk! ctx scope value) (recur (drop 2 xs) (narrow-environment ctx scope value true)))
             :else (let [info (walk! ctx scope value)
-                        element (first (get-in info [:python-type :arguments]))]
+                        element (py/iterated-type (:python-type info) (get-in @(:state ctx) [:opts :python-options] {}))]
                     (recur (drop 2 xs) (bind-pattern! ctx scope binding
-                                                      (when element {:python-type element}))))))
-        (walk-body! ctx scope body)))))
+                                                      (when element (python-value element)))))))
+        (do (walk-body! ctx scope body)
+            (tagged (if (op/eq "for" (token (first (forms node)))) :seq :nil)))))))
 
 (defn- duplicate-literals! [ctx node]
-  (let [xs (forms node) keys (if (= :map (:kind node)) (take-nth 2 xs) xs)]
+  (let [xs (forms node) keys (if (op/eq :map (:kind node)) (take-nth 2 xs) xs)]
+    (when (and (op/eq :map (:kind node)) (odd? (count xs)))
+      (finding! ctx (last xs) :missing-map-value (str "missing value for key " (syntax/text (last xs)))))
     (loop [xs (seq keys) seen #{}]
       (when-let [key (first xs)]
-        (let [value (when (literal-kinds (:kind key)) [(:kind key) (syntax/text key)])]
+        (let [value (try [:data (if-let [[value] (constant-data key)] value (config-data key))] (catch python/Exception _ nil))]
           (when (and value (contains? seen value))
-            (finding! ctx key (if (= :map (:kind node)) :duplicate-map-key :duplicate-set-key)
-                      (str "Duplicate " (if (= :map (:kind node)) "map" "set") " key: " (syntax/text key))))
+            (finding! ctx key (if (op/eq :map (:kind node)) :duplicate-map-key :duplicate-set-key)
+                      (if (op/eq :edn (get-in @(:state ctx) [:opts :lang]))
+                        (str (if (op/eq :map (:kind node)) "duplicate key " "duplicate set element ") (syntax/text key))
+                        (str "Duplicate " (if (op/eq :map (:kind node)) "map" "set") " key: " (syntax/text key)))))
           (recur (rest xs) (conj seen value)))))))
 
 (defn- walk-syntax-quote! [ctx env node]
-  (doseq [child (forms node)]
-    (if (#{:unquote :unquote-splicing} (:kind child))
-      (walk-body! ctx env (forms child))
-      (walk-syntax-quote! ctx env child))))
+  (if (op/eq :symbol (:kind node))
+    (let [raw (token node) state @(:state ctx) slash (.rfind raw "/")
+          prefix (when (pos? slash) (subs raw 0 slash))
+          referred (get-in state [:refers raw])
+          core-name (get-in state [:core-renamed raw] raw)
+          ns-name (or (get-in state [:aliases prefix]) (:ns referred)
+                      (when (or (contains? (:requires state) prefix) (= prefix (:namespace state))) prefix)
+                      (when (and (nil? prefix) (contains? (:definitions state) raw)) (:namespace state))
+                      (when (and (nil? prefix) (contains? @core-definitions core-name)
+                                 (not (contains? (:core-excluded state) core-name))) "basilisp.core"))
+          name (if prefix (subs raw (inc slash)) (or (:name referred) (when (= "basilisp.core" ns-name) core-name) raw))]
+      (when ns-name
+        (mark-namespace! ctx ns-name)
+        (when (contains? (:aliases state) prefix) (swap! (:state ctx) update :used-aliases conj prefix))
+        (when referred (swap! (:state ctx) update :used-refers conj raw))
+        (swap! (:state ctx) update :used-vars conj [ns-name name])
+        (emit! ctx :var-usages (merge (loc ctx node)
+                                      {:name name :ns ns-name :from (:namespace state) :syntax-quote true
+                                       :definition (get (if (= ns-name (:namespace state)) (:definitions state) (namespace-definitions ctx ns-name)) name)}))))
+    (doseq [child (forms node)]
+      (if (#{:unquote :unquote-splicing} (:kind child))
+        (walk-body! ctx env (forms child))
+        (walk-syntax-quote! ctx env child)))))
+
+(declare call-identity)
+
+(defn- protocol-definitions [ctx info]
+  (when (and info (:ns info) (:name info))
+    (let [defs (if (= (:ns info) (current-ns ctx)) (:definitions @(:state ctx))
+                   (namespace-definitions ctx (:ns info)))]
+      (into {} (filter (fn [[_ method]] (and (= (:ns info) (:protocol-ns method))
+                                             (= (:name info) (:protocol-name method)))) defs)))))
 
 (defn- walk-methods! [ctx env nodes]
-  (doseq [node nodes]
-    (let [xs (forms node)]
-      (if (and (= :list (:kind node)) (= :vector (:kind (second xs))))
-        (walk-function! ctx (assoc env :scope node) (rest xs))
-        (walk! ctx env node)))))
+  (let [groups (loop [remaining nodes protocol nil out []]
+                 (if-let [node (first remaining)]
+                   (if (and (op/eq :list (:kind node)) (op/eq :vector (:kind (second (forms node)))))
+                     (recur (rest remaining) protocol (conj out [protocol node]))
+                     (do (walk! ctx env node)
+                         (recur (rest remaining) node out)))
+                   out))
+        implemented (atom {})]
+    (doseq [[protocol node] groups]
+      (let [[method-name & tail] (forms node)
+            info (when protocol (call-identity ctx env (or (:protocol-node env) protocol)))
+            methods (protocol-definitions ctx info)
+            definition (get methods (token method-name))
+            entry (merge (loc ctx method-name)
+                         {:name (token method-name) :ns (current-ns ctx)
+                          :protocol-ns (:ns info) :protocol-name (:name info)
+                          :type-name (if (:protocol-node env) (token protocol) (:type-name env)) :defined-by (:defined-by env)
+                          :definition definition :scope-start (:start node) :scope-end (:end node)})
+            value (walk-function! ctx (assoc env :scope node :caller entry) tail)]
+        (emit! ctx :implementations entry)
+        (swap! implemented update (:start protocol) (fnil conj #{}) (token method-name))
+        (when (and (seq methods) (nil? definition))
+          (finding! ctx method-name :unresolved-protocol-method (str "Unresolved protocol method: " (token method-name))))
+        (when definition
+          (doseq [arity (:fixed-arities value) :when (not (contains? (:fixed-arities definition) arity))]
+            (finding! ctx method-name :protocol-method-arity-mismatch
+                      (str "Protocol method " (token method-name) " is implemented with arity " arity
+                           " but expects " (str/join ", " (sort (:fixed-arities definition))))))
+          (let [missing (sort (remove (:fixed-arities value) (:fixed-arities definition)))]
+            (when (seq missing)
+              (finding! ctx protocol :missing-protocol-method-arity
+                        (str "Protocol method " (token method-name)
+                             (if (= 1 (count missing)) " arity " " arities ") (str/join ", " missing)
+                             (if (= 1 (count missing)) " is not implemented" " are not implemented"))))))))
+    (doseq [protocol (distinct (map first groups)) :when protocol]
+      (let [methods (protocol-definitions ctx (call-identity ctx env (or (:protocol-node env) protocol)))
+            missing (sort (remove (get @implemented (:start protocol)) (keys methods)))]
+        (when (seq missing)
+          (finding! ctx protocol :missing-protocol-method (str "Missing protocol method(s): " (str/join ", " missing))))))))
 
 (defn- call-identity [ctx env head]
   (let [raw (token head) state @(:state ctx)
-        parts (when raw (str/split raw #"/"))
-        prefix (when (> (count parts) 1) (str/join "/" (butlast parts)))
-        member (last parts)
+        slash (if raw (.rfind raw "/") -1)
+        prefix (when (pos? slash) (subs raw 0 slash))
+        member (if prefix (subs raw (inc slash)) raw)
         renamed (get-in state [:core-renamed raw])
         core-name (or renamed raw)
         core? (and (or renamed (not (contains? (:core-excluded state) raw)))
                    (or (nil? (:core-only state)) (contains? (:core-only state) core-name)))]
     (cond
-      (not= :symbol (:kind head)) nil
+      (op/ne :symbol (:kind head)) nil
       (contains? (:locals env) raw) nil
       (and (nil? prefix) (contains? special-names raw)) {:name raw :ns "basilisp.core"}
       prefix (let [ns-name (get-in state [:aliases prefix] prefix)]
                (or (get (if (= ns-name (:namespace state)) (:definitions state)
-                            (when-not (or (= "python" prefix) (contains? (:imports state) prefix))
+                            (when-not (or (op/eq "python" prefix) (contains? (:imports state) prefix))
                               (namespace-definitions ctx ns-name))) member)
                    {:name member :ns ns-name}))
       (contains? (:definitions state) raw) (get-in state [:definitions raw])
@@ -925,6 +1979,7 @@
                       (settings-for-call (:lint-as (context-config ctx))
                                          (str (:ns identity) "/" (:name identity)))))]
     (cond
+      (and (op/eq "basilisp.template" (:ns identity)) (op/eq "do-template" (:name identity))) "do-template"
       (and (symbol? lint-as)
            (#{"clojure.core" "basilisp.core" "clojure.test" "basilisp.test" "clj-kondo.lint-as"} (namespace lint-as)))
       (basilisp.core/name lint-as)
@@ -939,9 +1994,249 @@
         config (context-config ctx)
         local-config (when (and fq-name (:config-in-call config))
                        (settings-for-call (:config-in-call config) fq-name))
-        config (-> config (merge-settings (:call-config identity)) (merge-settings local-config))]
+        config (if (or (:call-config identity) local-config)
+                 (-> config (merge-settings (:call-config identity)) (merge-settings local-config)) config)]
     (cond-> (assoc ctx :config config :call-identity identity)
       fq-name (update :callstack conj (canonical-call fq-name)))))
+
+(def ^:private wrapper-inlined
+  #{"+" "-" "*" "/" "inc" "dec" "quot" "rem" "mod" "max" "min"
+    "=" "==" "<" ">" "<=" ">=" "count" "get" "nth" "aget" "alength"
+    "boolean" "char" "byte" "int" "float" "double" "long" "short"
+    "nil?" "pos?" "neg?" "zero?" "identical?" "compare" "num"
+    "bit-and" "bit-or" "bit-xor" "bit-not" "bit-shift-left" "bit-shift-right"})
+
+(def ^:private assertion-pure-calls
+  #{"=" "not=" "==" "<" ">" "<=" ">=" "+" "-" "*" "/" "inc" "dec"
+    "not" "str" "subs" "format" "count" "first" "second" "last" "rest"
+    "next" "get" "get-in" "nth" "assoc" "dissoc" "conj" "disj" "into"
+    "vec" "set" "list" "vector" "hash-map" "hash-set" "identity" "seq"
+    "reverse" "sort" "sort-by" "max" "min" "quot" "rem" "mod" "abs"})
+
+(defn- lint-wrapper! [ctx env node name]
+  (when (or (op/eq :anonymous-function (:kind node)) (#{"fn" "fn*"} name))
+    (let [anonymous? (op/eq :anonymous-function (:kind node))
+          xs (forms node)
+          tail (rest xs)
+          named? (op/eq :symbol (:kind (first tail)))
+          tail (if named? (rest tail) tail)
+          params-node (first tail)
+          body (when (op/eq :vector (:kind params-node)) (second tail))
+          body-xs (if anonymous? xs (when (op/eq :list (:kind body)) (forms body)))
+          head (first body-xs)
+          args (vec (rest body-xs))
+          parameter-names (if anonymous?
+                            (mapv #(str "%" (inc %)) (range (count args)))
+                            (mapv token (forms params-node)))
+          argument-names (mapv #(let [text (token %)] (if (op/eq "%" text) "%1" text)) args)
+          info (when head (call-identity ctx env head))
+          local (get-in env [:locals (token head)])
+          callable? (or (op/eq :keyword (:kind head)) local
+                        (and info (not (:macro info))
+                             (or (:fixed-arities info) (:varargs-min-arity info))
+                             (not (contains? special-names (:name info)))
+                             (not (and (op/eq "basilisp.core" (:ns info))
+                                       (contains? wrapper-inlined (:name info))))))]
+      (when (and callable? (seq args)
+                 (or anonymous? (and (not named?) (= 2 (count tail))))
+                 (= parameter-names argument-names)
+                 (every? #(= :symbol (:kind %)) args)
+                 (not (some #(= (token head) %) parameter-names))
+                 (not-any? #{"&" "%&"} parameter-names))
+        (finding! ctx node :redundant-fn-wrapper "Redundant fn wrapper")))))
+
+(defn- lint-format! [ctx node name]
+  (when (#{"format" "printf"} name)
+    (let [[_ format-node & args] (forms node)
+          format-node (unwrap format-node)]
+      (when (op/eq :string (:kind format-node))
+        (let [text (config-data format-node)
+              pieces (vec (iterator-seq
+                           (re/finditer "%(?:\\(([^)]*)\\))?([-+#0 ]*)(\\*|[0-9]*)(?:\\.(\\*|[0-9]+))?[hlL]?([diouxXeEfFgGcrsa%])" text)))
+              positional (remove #(or (.group % 1) (op/eq "%" (.group % 5))) pieces)
+              named (filter #(.group % 1) pieces)
+              expected (reduce (fn [total match]
+                                 (+ total 1 (if (op/eq "*" (.group match 3)) 1 0)
+                                    (if (op/eq "*" (.group match 4)) 1 0))) 0 positional)
+              supplied (count args)
+              mapping? (and (= 1 supplied) (#{:map :python-map} (:kind (unwrap (first args)))))
+              masked (reduce (fn [value match]
+                               (str (subs value 0 (.start match)) (subs value (.end match))))
+                             text (reverse pieces))
+              invalid? (str/includes? masked "%")]
+          ;; A no-argument Basilisp format call returns its string unchanged.
+          (when (and (pos? supplied) invalid?)
+            (finding! ctx format-node :format "Invalid Python format string."))
+          (when (and (not invalid?) (pos? supplied)
+                     (or (and (empty? named) (not mapping?) (not= expected supplied))
+                         (and (seq named) (zero? expected) (not= 1 supplied))))
+            (finding! ctx format-node :format
+                      (str "Format string expects " (if (seq named) 1 expected)
+                           " arguments instead of " supplied ".")))
+          (when (and (not invalid?) (zero? supplied) (zero? expected) (empty? named))
+            (finding! ctx format-node :redundant-format "Format string contains no format specifiers")))))))
+
+(defn- lint-extra! [ctx env node name]
+  (when (linter-enabled? ctx :redundant-fn-wrapper) (lint-wrapper! ctx env node name))
+  (lint-format! ctx node name)
+  (let [identity (:call-identity ctx)
+        pure? (and (op/eq "basilisp.core" (:ns identity))
+                   (or (contains? assertion-pure-calls name)
+                       (and name (.endswith name "?"))))
+        stack (rest (:callstack ctx))
+        enclosing (drop-while #{"basilisp.core/let" "basilisp.test/testing"} stack)
+        parent (:parent-node ctx)
+        body? (or (not (#{"let" "testing"} (:parent-name ctx)))
+                  (some #(= (:start %) (:start node)) (drop 2 (forms parent))))]
+    (when (and pure? body? (op/eq "basilisp.test/deftest" (first enclosing)))
+      (finding! ctx node :missing-test-assertion "missing test assertion"))
+    (when (and pure? body?
+               (or (op/eq "basilisp.test/deftest" (first enclosing))
+                   (and (#{"do" "defn" "defn-" "fn" "let" "when" "when-not" "when-let" "when-some" "when-first" "loop" "binding" "with-open" "doseq" "try"} (:parent-name ctx))
+                        (some #(= (:start %) (:start node))
+                              (let [body (drop (if (#{"do" "try"} (:parent-name ctx)) 1 2) (forms parent))
+                                    body (if (op/eq "try" (:parent-name ctx))
+                                           (take-while #(not (and (op/eq :list (:kind %))
+                                                                  (#{"catch" "finally"} (token (first (forms %)))))) body)
+                                           body)]
+                                (if (op/eq "doseq" (:parent-name ctx)) body (butlast body)))))))
+      (finding! ctx node :unused-value "Unused value"))
+    (when (and (op/eq "reduce" name) (= 3 (count (forms node))))
+      (let [reducer (call-identity ctx env (second (forms node)))
+            fq (str (:ns reducer) "/" (:name reducer))]
+        (when (and (not (#{"basilisp.core/+" "basilisp.core/*"} fq))
+                   (not (some #(= fq (canonical-call %)) (get-in (context-config ctx) [:linters :reduce-without-init :exclude]))))
+          (finding! ctx node :reduce-without-init "Reduce called without explicit initial value."))))))
+
+;; Check contracts after arguments have been analyzed.
+(defn- lint-extra-types! [ctx node info args values]
+  (when (op/ne :off (get-in (context-config ctx) [:linters :type-mismatch :level]))
+    (when (and (op/eq "basilisp.test" (:ns info)) (op/eq "is" (:name info))
+               (= 2 (count args)) (:tag (second values))
+               (not (compatible-tag? (:tag (second values)) :string)))
+      (finding! ctx (second args) :is-message-not-string "Test assertion message should be a string"))
+    (when (and (op/eq "basilisp.core" (:ns info)) (= 1 (count values)))
+      (let [expected (get {"boolean" :boolean "char" :char} (:name info))
+            actual (:tag (first values))]
+        (when (and expected (or (= expected actual)
+                                (and (op/eq :boolean expected) (#{:true :false} actual))))
+          (finding! ctx node :redundant-primitive-coercion
+                    (str "Redundant " (:name info) " coercion: expression already has type "
+                         (basilisp.core/name expected))))))))
+
+(defn- lint-style! [ctx node name]
+  (let [[_ & args] (forms node)
+        n (count args)
+        parent (:parent-name ctx)
+        children (fn [x] (when (op/eq :list (:kind x)) (forms x)))
+        first-call (children (first args))
+        config (context-config ctx)]
+    (when (and (= 1 n) (#{"=" "not=" ">" "<" ">=" "<=" "=="} name))
+      (finding! ctx node :single-operand-comparison
+                (str "Single operand use of basilisp.core/" name " is always " (if (op/eq "not=" name) "false" "true"))))
+    (when (#{"assoc" "dissoc"} name)
+      (loop [keys (seq (if (op/eq "assoc" name) (take-nth 2 (rest args)) (rest args))) seen {}]
+        (when-let [key (first keys)]
+          (let [identity (or (constant-data key) (when (op/eq :symbol (:kind key)) [(symbol (token key))]))
+                previous (get seen identity 0)]
+            (when (and identity (= 1 previous))
+              (finding! ctx key :duplicate-key-args
+                        (str "Duplicate key arg supplied to " (token (first (forms node))) ": " (syntax/text key))))
+            (recur (rest keys) (if identity (assoc seen identity (inc previous)) seen))))))
+    (when (and (= 1 n) (#{"and" "or"} name))
+      (finding! ctx node :single-logical-operand (str "Single arg use of " name " always returns the arg itself")))
+    (when (and (= name parent) (#{"*" "+" "and" "or" "lazy-cat" "max" "merge" "min" "str"} name))
+      (finding! ctx node :redundant-nested-call (str "Redundant nested call: " name)))
+    (when (and (op/eq "try" name)
+               (not-any? #(and (op/eq :list (:kind %)) (#{"catch" "finally"} (token (first (forms %))))) args))
+      (finding! ctx node :missing-clause-in-try "Missing catch or finally in try"))
+    (when (and (#{"when" "when-not" "when-let" "when-some" "when-first"} name) (= 1 n))
+      (finding! ctx node :missing-body-in-when (str "Missing body in " name)))
+    (when (and (#{"if" "if-not" "if-let" "if-some"} name) (= 2 n))
+      (finding! ctx node :missing-else-branch "Missing else branch."))
+    (when (and (#{"if" "if-not" "if-let" "if-some"} name) (= 3 n))
+      (let [preferred (cond (op/eq :nil (:kind (nth args 2)))
+                            (get {"if" "when" "if-not" "when-not" "if-let" "when-let" "if-some" "when-some"} name)
+                            (op/eq :nil (:kind (second args))) (get {"if" "when-not" "if-not" "when"} name))]
+        (when preferred (finding! ctx node :if-nil-return (str "For nil return, prefer " preferred "."))))
+      (when (and (op/eq "if" name) (op/eq :symbol (:kind (first args))) (= (token (first args)) (token (second args))))
+        (finding! ctx node :if-x-x-y "If condition and then branch are the same; use (or x y)")))
+    (when (and (op/eq "nil?" name) (#{"not" "when-not" "if-not"} parent))
+      (finding! ctx node :not-nil?
+                (get {"not" "Use (some? x) instead of (not (nil? x))"
+                      "when-not" "Use (when (some? x) ...) instead of (when-not (nil? x) ...)"
+                      "if-not" "Use (if (some? x) ...) instead of (if-not (nil? x) ...)"} parent)))
+    (when (and (op/eq "seq" name) (op/eq "rest" (token (first first-call))))
+      (finding! ctx node :seq-rest "Prefer (next x) over (seq (rest x))"))
+    (when (and (= 2 n) (op/eq "=" name))
+      (doseq [[literal type message]
+              [["true" :equals-true "Prefer (true? x) over (= true x)"]
+               ["false" :equals-false "Prefer (false? x) over (= false x)"]
+               ["nil" :equals-nil "Prefer (nil? x) over (= nil x)"]]
+              :when (some #(= literal (token %)) args)]
+        (finding! ctx node type message)))
+    (when (and (= 2 n) (#{"+" "-"} name)
+               (or (op/eq "1" (token (second args))) (and (op/eq "+" name) (op/eq "1" (token (first args))))))
+      (finding! ctx node (if (op/eq "+" name) :plus-one :minus-one)
+                (if (op/eq "+" name) "Prefer (inc x) over (+ 1 x)" "Prefer (dec x) over (- x 1)")))
+    (when (and (= 2 n) (#{"=" "not="} name))
+      (let [opts (get-in config [:linters :equals-expected-position])
+            position (:position opts :first)
+            constant? #(contains? literal-kinds (:kind %))
+            candidate (if (op/eq :last position) (first args) (second args))
+            other (if (op/eq :last position) (second args) (first args))]
+        (when (and (constant? candidate) (not (constant? other))
+                   (or (not (:only-in-test-assertion opts)) (op/eq "is" parent)))
+          (finding! ctx candidate :equals-expected-position (str "Write expected value " (basilisp.core/name position))))))
+    (when (and (= 1 n) (op/ne "str" name))
+      (let [fq (str "basilisp.core/" name)
+            opts (get-in config [:linters :redundant-call])
+            default #{"->" "->>" "some->" "some->>" "cond->" "cond->>" "comp" "partial" "merge" "merge-with" "conj" "concat" "into" "max" "min" "+" "*" "distinct"}
+            include (into default (map #(last (str/split (str %) #"/")) (:include opts)))]
+        (when (and (contains? include name) (not (some #(= fq (canonical-call %)) (:exclude opts))))
+          (finding! ctx node :redundant-call (str "Single arg use of " fq " always returns the arg itself")))))
+    (when (and (op/eq "def" name) (= 1 n))
+      (finding! ctx node :uninitialized-var "Uninitialized var"))
+    (when (and (#{"def" "defn" "defn-" "defmacro" "defmacro-" "defonce"} name)
+               (some #(re/search #"/(?:defn-?|defmacro-?|fn|fn\*)$" %) (rest (:callstack ctx))))
+      (finding! ctx node :inline-def "inline def"))
+    (when (and (op/eq "def" name) (op/eq :list (:kind (last args)))
+               (#{"fn" "fn*"} (token (first (forms (last args))))))
+      (finding! ctx (last args) :def-fn "Use defn instead of def + fn"))
+    (when (#{"def" "defonce" "defn" "defn-" "defasync" "defmacro" "defmacro-"} name)
+      (let [name-node (first args) nm (token name-node) metadata (node-metadata name-node)
+            earmuffed? (and nm (> (count nm) 2) (.startswith nm "*") (.endswith nm "*"))
+            doc-node (when (and (or (op/ne "def" name) (> n 2)) (op/eq :string (:kind (second args)))) (second args))
+            doc (when doc-node (config-data doc-node))]
+        (when (#{"defn" "defn-" "defasync"} name)
+          (when-let [hint (metadata-entry-node name-node :tag)]
+            (finding! ctx hint :non-arg-vec-return-type-hint
+                      (str "Prefer placing return type hint on arg vector: " (token hint)))))
+        (when (and earmuffed? (not (:dynamic metadata)))
+          (finding! ctx (unwrap name-node) :earmuffed-var-not-dynamic (str "Var has earmuffed name but is not declared dynamic: " nm)))
+        (when (and (:dynamic metadata) (not earmuffed?))
+          (finding! ctx (unwrap name-node) :dynamic-var-not-earmuffed (str "Var is declared dynamic but name is not earmuffed: " nm)))
+        (when (and doc-node (str/blank? doc))
+          (finding! ctx doc-node :docstring-blank "Docstring should not be blank."))
+        (when (and doc-node (not= doc (str/trim doc)))
+          (finding! ctx doc-node :docstring-leading-trailing-whitespace "Docstring should not have leading or trailing whitespace."))
+        (when (and (#{"defn" "defmacro"} name) (nil? doc) (not (:private metadata)))
+          (finding! ctx node :missing-docstring "Missing docstring."))
+        (when (and doc-node (not (re/search "[.!?](?:\\n|$)" doc)))
+          (finding! ctx doc-node :docstring-no-summary "First line of the docstring should be a capitalized sentence ending with punctuation."))))
+    (when (op/eq "case" name)
+      (let [seen (atom #{}) clauses (partition 2 (rest args))]
+        (doseq [[test _] clauses
+                candidate (if (op/eq :list (:kind test)) (forms test) [test])]
+          (when (op/eq :quote (:kind candidate))
+            (finding! ctx candidate :case-quoted-test "Case test is compile time constant and should not be quoted."))
+          (when (op/eq :symbol (:kind candidate))
+            (finding! ctx candidate :case-symbol-test "Case test symbol is compile time constant and is never evaluated."))
+          (let [value (try (config-data candidate) (catch python/Exception _ (syntax/text candidate)))]
+            (when (contains? @seen value)
+              (finding! ctx candidate
+                        :case-duplicate-test (str "Duplicate case test constant: " (pr-str value))))
+            (swap! seen conj value)))))))
 
 (defn- lint-call! [ctx node name]
   (let [[head & args] (forms node)
@@ -953,14 +2248,14 @@
                               "when-some" "future" "catch"} parent-name)
         body (drop (if (#{"do" "try" "future"} parent-name) 1 2) parent-forms)
         body? (some #(= (:start %) (:start node)) body)]
-    (when (and (= "do" name) (not (#{"fn*" "let*"} parent-name))
+    (when (and (op/eq "do" name) (not (#{"fn*" "let*"} parent-name))
                (or (< (count args) 2) (and implicit body?)))
       (finding! ctx node :redundant-do "redundant do"))
-    (when (and (= "let" name)
-               (or (and (= :vector (:kind (first args))) (empty? (forms (first args))))
-                   (and (= "let" parent-name) (= 3 (count parent-forms)) body?)))
+    (when (and (op/eq "let" name)
+               (or (and (op/eq :vector (:kind (first args))) (empty? (forms (first args))))
+                   (and (op/eq "let" parent-name) (= 3 (count parent-forms)) body?)))
       (finding! ctx node :redundant-let "Redundant let expression."))
-    (when (= "cond" name)
+    (when (op/eq "cond" name)
       (when (odd? (count args))
         (finding! ctx node :syntax "cond requires even number of forms"))
       (let [conditions (vec (take-nth 2 args))]
@@ -969,29 +2264,130 @@
                       truthy? (and (literal-kinds (:kind condition))
                                    (not (#{"nil" "false"} (token condition))))]
                 :when truthy?]
-          (when (not= ":else" (token condition))
+          (when (op/ne ":else" (token condition))
             (finding! ctx condition :cond-else "use :else as the catch-all test expression in cond"))
           (when (< (inc i) (count conditions))
             (finding! ctx (nth conditions (inc i)) :constant-condition "Unreachable code")))))
     (when (and (#{"get-in" "assoc-in" "update-in"} name)
-               (= :vector (:kind (second args))) (= 1 (count (forms (second args)))))
+               (op/eq :vector (:kind (second args))) (= 1 (count (forms (second args)))))
       (finding! ctx (second args) :single-key-in (str name " with single key")))
     (when-let [description (get {:number "a number" :symbolic-number "a number"
                                  :string "a string" :boolean "a boolean"} (:kind head))]
       (finding! ctx head :not-a-function (str description " is not a function")))))
 
-(defn- walk-list! [ctx env node]
+(defn- walk-list-unhooked! [ctx env node]
   (let [head (first (forms node))
-        ctx (call-context ctx env head)
+        ctx (if (:prepared-call? ctx) (dissoc ctx :prepared-call?) (call-context ctx env head))
         config (context-config ctx)
         identity (:call-identity ctx)
         skipped? (and (:skip-comments config)
-                      (= "basilisp.core" (:ns identity)) (= "comment" (:name identity)))]
+                      (op/eq "basilisp.core" (:ns identity)) (op/eq "comment" (:name identity)))]
     (if skipped?
       (resolve-symbol! ctx env head)
       (let [name (dispatch-name ctx identity)]
-        (lint-call! ctx node name)
-        (walk-list-form! (assoc ctx :parent-node node :parent-name name) env node)))))
+        (when-not (:generated node)
+          (lint-call! ctx node name)
+          (lint-style! ctx node name)
+          (lint-extra! ctx env node name))
+        (let [result (walk-list-form! (assoc ctx :parent-node node :parent-name name) env node)]
+          (when (#{"def" "defonce" "defn" "defn-" "defasync" "defmacro" "defmacro-" "defmulti" "deftest"} name)
+            (let [defined-name (token (second (forms node)))
+                  original (when (:ns identity) (symbol (str (:ns identity) "/" (:name identity))))
+                  mapped (symbol (str (if (= "deftest" name) "basilisp.test" "basilisp.core") "/" name))]
+              (when (get-in @(:state ctx) [:definitions defined-name])
+                (swap! (:state ctx) update-in [:definitions defined-name]
+                       #(cond-> (assoc % :defined-by original :defined-by->lint-as mapped)
+                          (:hook-origin ctx) (assoc :hook-origin (:hook-origin ctx)))))))
+          result)))))
+
+(defn- walk-list! [ctx env node]
+  (let [call-ctx (call-context ctx env (first (forms node)))
+        hook (hooks/apply-call
+              {:config (context-config call-ctx) :call-identity (:call-identity call-ctx)
+               :namespace (current-ns ctx) :filename (:filename ctx) :parsed (:parsed ctx) :context (:context ctx)
+               :locals (:locals env) :callstack (:callstack call-ctx)
+               :hook-cache (get-in @(:state ctx) [:opts :hook-cache])
+               :resolve (fn [options]
+                          (let [value (:name options)
+                                identity (when-not (contains? (:locals env) (str value))
+                                           (call-identity ctx env {:kind :symbol :text (str value)}))]
+                            (when (and (:ns identity) (:name identity))
+                              {:ns (symbol (:ns identity)) :name (symbol (:name identity))})))
+               :ns-analysis (fn [ns-name options]
+                              {(get options :lang :clj)
+                               (into {} (map (fn [[name entry]]
+                                               [(symbol name) (assoc entry :name (symbol name) :ns (symbol (:ns entry)))])
+                                             (if (= (current-ns ctx) (str ns-name))
+                                               (:definitions @(:state ctx))
+                                               (namespace-definitions ctx (str ns-name)))))})}
+              node)]
+    (if hook
+      (do (doseq [finding (:findings hook)]
+            (let [start (syntax/position->offset (:parsed ctx) {:line (dec (:row finding 1)) :character (dec (:col finding 1))})
+                  end (syntax/position->offset (:parsed ctx) {:line (dec (:end-row finding (:row finding 1))) :character (dec (:end-col finding (:col finding 1)))})
+                  node (merge node finding {:start start :end end})
+                  type (:type finding)
+                  config (context-config call-ctx)
+                  level (get-in config [:linters type :level] (if (op/eq :hook type) :error :off))]
+              (finding! (assoc call-ctx :config (assoc-in config [:linters type :level] level)) node type (:message finding))))
+          (if-let [replacement (:node hook)]
+            (let [identity (:call-identity call-ctx)
+                  origin (when (:ns identity) (symbol (str (:ns identity) "/" (:name identity))))
+                  ctx (assoc ctx :context (:context hook) :hook-origin origin)]
+              (if (op/eq :list (:kind replacement))
+                (walk-list-unhooked! ctx env replacement)
+                (walk! ctx env replacement)))
+            (walk-list-unhooked! (assoc call-ctx :prepared-call? true) env node)))
+      (walk-list-unhooked! (assoc call-ctx :prepared-call? true) env node))))
+
+(defn- template-key [node]
+  (let [node (unwrap node) kind (:kind node) children (syntax/forms node)]
+    (cond
+      (= :map kind) [kind (set (map (fn [[key value]] [(template-key key) (template-key value)])
+                                    (partition 2 children)))]
+      (= :set kind) [kind (set (map template-key children))]
+      (seq children) [kind (mapv template-key children)]
+      :else [kind (token node)])))
+
+(defn- replace-template [node replacements]
+  (when node
+    (let [node (cond-> node
+                 (:children node) (update :children #(mapv (fn [child] (replace-template child replacements)) %)))
+          node (get replacements (template-key node) node)]
+      (assoc node :generated true :derived-location true))))
+
+(defn- walk-do-template! [ctx env node]
+  (let [[_ argv expression & values] (forms node)
+        parameters (forms argv) size (count parameters)]
+    (cond
+      (zero? size)
+      (finding! ctx node :do-template "No args defined. Expected at least 1.")
+      (empty? values)
+      (finding! ctx node :do-template (str "No values provided. Expected: multiple of " size "."))
+      (not (zero? (mod (count values) size)))
+      (finding! ctx node :do-template (str "Incorrect number of values provided. Expected: multiple of " size ".")))
+    (if (zero? size)
+      (when expression (walk! ctx env (replace-template expression {})))
+      (reduce (fn [_ arguments]
+                (walk! ctx env (replace-template expression
+                                                 (zipmap (map template-key parameters) arguments))))
+              nil (partition size values)))))
+
+(defn- walk-condition! [ctx env node nil-test?]
+  (let [value (walk! ctx (assoc env :tail? false) node)
+        tag (:tag value)
+        tags (if (set? tag) tag #{tag})
+        known? (every? #(and % (keyword? %) (not (#{:any :boolean :seqable :ideref :ifn :ilookup} %))
+                             (not= "nilable" (namespace %))) tags)
+        false? (and known? (every? (if nil-test? #{:nil} #{:nil :false}) tags))
+        true? (and known? (not-any? (if nil-test? #{:nil} #{:nil :false}) tags))]
+    (when (and (op/eq "basilisp.core" (:ns (:call-identity ctx)))
+               (not (:generated node))
+               (not (and (:name value) (not (:id value))))
+               (not (and false? (:literal-nil? value))))
+      (cond false? (finding! ctx node :constant-condition "Condition always false")
+            true? (finding! ctx node :constant-condition "Condition always true")))
+    value))
 
 (defn- walk-list-form! [ctx env node]
   (let [[head & args] (forms node)
@@ -1003,42 +2399,55 @@
                   "for" "doseq" "dotimes" "->" "->>" "some->" "some->>" "doto"
                   "cond->" "cond->>" "as->" "recur" "try" "catch" "case" "condp"
                   "defprotocol" "deftype" "defrecord" "reify" "extend-type" "extend-protocol"
-                  "defmethod" "defmulti" "deftest" "are" "is" "if"} name))
+                  "defmethod" "defmulti" "deftest" "are" "is" "if" "do-template"} name))
       (resolve-symbol! ctx env head))
     (let [dispatch-value name]
       (cond
         (op/eq dispatch-value "ns")
         (analyze-ns! ctx node)
+        (op/eq dispatch-value "do-template")
+        (walk-do-template! ctx env node)
         (contains? #{"quote" "comment*" "def-catch-all"} dispatch-value)
         nil
         (op/eq dispatch-value "var")
-        (walk-body! ctx env args)
+        (walk-body! ctx (assoc env :private-access? true) args)
         (contains? #{"def" "defonce"} dispatch-value)
         (let [name (token (first args))
-              value (walk-body! ctx (assoc env :caller (get-in @(:state ctx) [:definitions name]))
-                                (drop-while #(= :string (:kind %)) (rest args)))]
-          (swap! (:state ctx) update-in [:definitions name] merge
-                 (select-keys value [:python-type :python-member :python-module :python-path :return-info :arglists :fixed-arities :varargs-min-arity]))
+              value (when-not (or (get-in (context-config ctx) [:analysis :var-definitions :shallow])
+                                  (get-in (context-config ctx) [:output :analysis :var-definitions :shallow]))
+                      (walk-body! ctx (assoc env :caller (get-in @(:state ctx) [:definitions name]))
+                                  (drop-while #(= :string (:kind %)) (rest args))))]
+          (swap! (:state ctx) update-in [:definitions name]
+                 #(merge (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args) false (metadata-private? (first args))))
+                         (when-not (:dynamic (node-metadata (first args)))
+                           (select-keys value [:python-type :python-member :python-module :python-path :return-info :return-by-arity :tag :parameter-tags :arglists :fixed-arities :varargs-min-arity]))))
           value)
         (contains? #{"defn" "defn-" "defasync" "defmacro" "defmacro-"} dispatch-value)
         (let [name (token (first args))
-              value (walk-function! ctx (assoc env :scope node :caller (get-in @(:state ctx) [:definitions name])) (rest args))]
-          (swap! (:state ctx) update-in [:definitions name] merge value)
+              value (walk-function! ctx (assoc env :scope node :async? (or (op/eq "defasync" dispatch-value) (:async (node-metadata (first args)))) :caller (get-in @(:state ctx) [:definitions name])) (rest args))]
+          (swap! (:state ctx) update-in [:definitions name]
+                 #(merge (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args)
+                                 (#{"defmacro" "defmacro-"} name) (#{"defn-" "defmacro-"} name))) value))
           value)
         (op/eq dispatch-value "declare")
-        nil
+        (doseq [arg args :when (contains? (:seen-definitions @(:state ctx)) (token arg))]
+          (finding! ctx node :redundant-declare (str "Redundant declare: " (token arg))))
         (contains? #{"fn" "fn*"} dispatch-value)
-        (walk-function! ctx (assoc env :scope node) args)
+        (walk-function! ctx (assoc env :scope node :async? (boolean (or (:literal-function-async? env) (:async (node-metadata (first args)))))) args)
         (contains? #{"let" "let*" "loop" "loop*" "with-open"} dispatch-value)
-        (let [scope (walk-bindings! ctx (assoc env :scope node) (first args))
+        (let [scope (walk-bindings! ctx (assoc env :scope node :context-manager? (op/eq "with-open" name) :conditional-build? (and (op/eq "let" name) (linter-enabled? ctx :conditional-build-up)) :loop-bindings? (#{"loop" "loop*"} name)) (first args))
+              used (atom false)
               scope (if (#{"loop" "loop*"} name)
-                      (assoc scope :recur {:fixed-arities #{(quot (count (forms (first args))) 2)}}) scope)]
-          (walk-statements! ctx scope (rest args)))
+                      (assoc scope :tail? true :recur-used used :recur {:fixed-arities #{(quot (count (forms (first args))) 2)}}) scope)
+              value (walk-statements! ctx scope (rest args))]
+          (when (and (op/eq "loop" name) (not @used))
+            (finding! ctx node :loop-without-recur "Loop without recur."))
+          value)
         (contains? #{"if-let" "if-some" "when-let" "when-some" "when-first"} dispatch-value)
-        (let [scope (walk-bindings! ctx (assoc env :scope node) (first args))
-              then (select-keys (walk! ctx scope (second args)) [:python-type :return-info])
+        (let [scope (walk-bindings! ctx (assoc env :scope node :nonnil-binding? true :first-binding? (op/eq "when-first" name)) (first args))
+              then (select-keys (walk! ctx scope (second args)) [:python-type :return-info :tag])
               otherwise (select-keys (walk-body! ctx (if (#{"if-let" "if-some"} name) env scope) (drop 2 args))
-                                     [:python-type :return-info])]
+                                     [:python-type :return-info :tag])]
           (when (= then otherwise) then))
         (op/eq dispatch-value "letfn")
         (let [bindings (forms (first args))
@@ -1062,44 +2471,77 @@
         (contains? #{"->" "->>" "some->" "some->>" "doto"} dispatch-value)
         (walk-thread! ctx env args)
         (contains? #{"cond->" "cond->>"} dispatch-value)
-        (do (walk! ctx env (first args))
-            (doseq [[test step] (partition 2 (rest args))]
-              (walk! ctx env test)
-              (if (= :list (:kind step)) (walk-call! ctx env step 1)
-                  (let [ctx (call-context ctx env step)]
-                    (check-arity! ctx step (walk! ctx env step) 1)))))
+        (let [initial (walk! ctx env (first args))]
+          (reduce (fn [value [test step]]
+                    (walk! ctx env test)
+                    (let [scope (assoc env :thread-target {:value value :node (first args) :last? (op/eq "cond->>" name)})]
+                      (or (if (op/eq :list (:kind step))
+                            (walk-call! ctx scope step 1)
+                            (let [info (walk! ctx env step)]
+                              (check-arity! ctx step info 1) (:return-info info)))
+                          value)))
+                  initial (partition 2 (rest args))))
         (op/eq dispatch-value "as->")
         (let [value (walk! ctx env (first args))
               scope (bind-pattern! ctx (assoc env :scope node) (second args) value)]
           (walk-body! ctx scope (drop 2 args)))
         (op/eq dispatch-value "recur")
         (do (walk-body! ctx env args)
-            (if-let [info (:recur env)]
+            (when-let [used (:recur-used env)] (reset! used true))
+            (if-let [info (when (:tail? env true) (:recur env))]
               (check-arity! ctx head (assoc info :name "recur") (count args))
               (finding! ctx head :unexpected-recur "Unexpected recur")))
         (contains? #{"do" "finally"} dispatch-value)
         (walk-statements! ctx env args)
         (op/eq dispatch-value "try")
-        (do (walk-body! ctx env args) nil)
+        (do (walk-body! ctx (dissoc env :recur :recur-used) args) nil)
         (op/eq dispatch-value "catch")
         (do (walk! ctx env (first args))
             (walk-body! ctx (bind-pattern! ctx (assoc env :scope node) (second args) nil) (drop 2 args)))
         (op/eq dispatch-value "case")
         (do (walk! ctx env (first args))
-            (let [clauses (rest args)]
-              (doseq [[_ expr] (partition 2 clauses)] (walk! ctx env expr))
-              (when (odd? (count clauses)) (walk! ctx env (last clauses)))))
+            (let [clauses (rest args)
+                  values (mapv (fn [[_ expr]] (walk! ctx env expr)) (partition 2 clauses))
+                  values (if (odd? (count clauses)) (conj values (walk! ctx env (last clauses))) values)]
+              (merge-values values)))
+        (op/eq dispatch-value "cond")
+        (let [fallback? (not-any? #(and (contains? literal-kinds (:kind %))
+                                        (not (#{"nil" "false"} (token %)))) (take-nth 2 args))]
+          (loop [pairs (partition 2 args) scope env values (if fallback? [(tagged :nil)] [])]
+            (if-let [[condition expression] (first pairs)]
+              (do (walk! ctx scope condition)
+                  (recur (rest pairs) (narrow-environment ctx scope condition false)
+                         (conj values (walk! ctx (narrow-environment ctx scope condition true) expression))))
+              (merge-values values))))
         (op/eq dispatch-value "condp")
         (do (walk-body! ctx env (take 2 args))
-            (walk-body! ctx env (remove #(= ":>>" (token %)) (drop 2 args))))
+            (walk-body! ctx env (remove #(= ":>>" (token %)) (drop 2 args))) nil)
+        (contains? #{"and" "or"} dispatch-value)
+        (loop [remaining args scope env values []]
+          (if-let [arg (first remaining)]
+            (let [value (walk! ctx scope arg)]
+              (recur (rest remaining) (narrow-environment ctx scope arg (op/eq "and" name)) (conj values value)))
+            (merge-values values)))
         (op/eq dispatch-value "defprotocol")
-        nil
+        (doseq [method (rest args) :when (op/eq :list (:kind method))
+                params (rest (forms method)) :when (op/eq :vector (:kind params))
+                arg (forms params) :when (op/eq "&" (token arg))]
+          (finding! ctx arg :protocol-method-varargs "Protocol methods do not support varargs."))
         (contains? #{"deftype" "defrecord"} dispatch-value)
         (let [fields (second args)
               scope (bind-pattern! ctx (assoc env :scope node) fields {:ignore-unused true})]
-          (walk-methods! ctx scope (drop 2 args)))
+          (doseq [[name fields] (group-by token (forms fields))
+                  :when (> (count fields) 1)
+                  field fields]
+            (finding! ctx field :duplicate-field (str "Duplicate field name: " name)))
+          (walk-methods! ctx (assoc scope :type-name (token (first args)) :defined-by (str "basilisp.core/" name)) (drop 2 args)))
         (contains? #{"reify" "extend-type" "extend-protocol"} dispatch-value)
-        (walk-methods! ctx env args)
+        (let [env (assoc env :defined-by (str "basilisp.core/" name))
+              env (cond (op/eq "extend-protocol" name) (assoc env :protocol-node (first args))
+                        (op/eq "extend-type" name) (assoc env :type-name (token (first args)))
+                        :else env)]
+          (when (op/eq "extend-protocol" name) (walk! ctx env (first args)))
+          (walk-methods! ctx env (if (op/eq "extend-protocol" name) (rest args) args)))
         (op/eq dispatch-value "defmethod")
         (do (walk-body! ctx env (take 2 args))
             (walk-function! ctx (assoc env :scope node) (drop 2 args)))
@@ -1110,24 +2552,40 @@
           (walk-body! ctx env (rest tail)))
         (op/eq dispatch-value "deftest")
         (walk-body! ctx env (rest args))
-        (contains? #{"are" "is"} dispatch-value)
+        (op/eq dispatch-value "are")
         (walk-body! ctx (assoc env :quiet true) args)
+        (op/eq dispatch-value "is")
+        (let [values (mapv #(walk! ctx (assoc env :quiet true) %) args)]
+          (lint-extra-types! ctx node (:call-identity ctx) args values))
         (contains? #{"import" "import*"} dispatch-value)
         (doseq [spec args] (import-spec! ctx spec))
         (op/eq dispatch-value "require")
-        (doseq [spec args] (require-spec! ctx (if (= :quote (:kind spec)) (first (forms spec)) spec) nil))
+        (doseq [spec args] (require-spec! ctx (if (op/eq :quote (:kind spec)) (first (forms spec)) spec) nil))
+        (contains? #{"when" "when-not"} dispatch-value)
+        (do (walk-condition! ctx env (first args) false)
+            (merge-values [(walk-statements! ctx (narrow-environment ctx env (first args) (op/eq "when" name)) (rest args)) (tagged :nil)]))
+        (op/eq dispatch-value "await")
+        (let [value (walk! ctx env (first args))]
+          (when-not (:async? env)
+            (finding! ctx node :await-without-async-fn "Use of await is only allowed in functions with ^:async metadata."))
+          (when-let [type (py/awaited-type (:python-type value) (get-in @(:state ctx) [:opts :python-options] {}))]
+            (python-value type)))
         (op/eq dispatch-value "if")
         (do (when-not (<= 2 (count args) 3)
               (finding! ctx head :invalid-arity (str "if is called with " (count args) " args but expects 2 or 3")))
-            (walk! ctx env (first args))
-            (let [then (select-keys (walk! ctx env (second args)) [:python-type :return-info])
-                  otherwise (select-keys (walk-body! ctx env (drop 2 args)) [:python-type :return-info])]
-              (when (= then otherwise) then)))
+            (walk-condition! ctx env (first args) false)
+            (let [then (walk! ctx (narrow-environment ctx env (first args) true) (second args))
+                  otherwise (if (> (count args) 2)
+                              (walk-body! ctx (narrow-environment ctx env (first args) false) (drop 2 args))
+                              (tagged :nil))]
+              (merge-values [then otherwise])))
         :else (walk-call! ctx env node 0)))))
 
 (defn- walk-node! [ctx env node]
   (when node
-    (let [node (unwrap node)
+    (let [metadata (node-metadata node)
+          node (unwrap node)
+          env (cond-> env (:async metadata) (assoc :literal-function-async? true))
           dispatch-value (:kind node)]
       (cond
         (op/eq dispatch-value :symbol)
@@ -1135,15 +2593,34 @@
         (op/eq dispatch-value :list)
         (walk-list! ctx env node)
         (op/eq dispatch-value :anonymous-function)
-        (let [names (set (keep #(when (and (= :symbol (:kind %)) (re/fullmatch "%(?:[1-9][0-9]*|&)?" (token %))) (token %))
+        (let [_ (lint-extra! ctx env node nil)
+              names (set (keep #(when (and (op/eq :symbol (:kind %)) (re/fullmatch "%(?:[1-9][0-9]*|&)?" (token %))) (token %))
                                (syntax/nodes node)))
               env (reduce (fn [scope name]
                             (assoc-in scope [:locals name]
                                       {:id (str (:filename ctx) ":" (:start node) ":" name) :name name :ns (current-ns ctx)}))
-                          (assoc env :scope node :recur {:varargs-min-arity 0}) names)]
-          (walk-call! ctx env node 0))
+                          (assoc env :scope node :async? (boolean (:literal-function-async? env)) :recur {:varargs-min-arity 0}) names)
+              result (walk-list! ctx env (assoc node :kind :list))
+              result (if (:async? env)
+                       {:python-type {:module "collections.abc" :path ["Coroutine"] :arguments [nil nil (:python-type result)]}}
+                       result)
+              fixed (apply max 0 (keep #(when (re/fullmatch "%[1-9][0-9]*" %) (python/int (subs % 1))) names))
+              fixed (if (contains? names "%") (max fixed 1) fixed)]
+          (merge {:tag :fn :return-info result
+                  :python-type (py/callable-type
+                                (merge (:python-type result)
+                                       {:kind :function
+                                        :parameters (cond-> (mapv (fn [index] {:name (str "arg" index) :kind :positional-only :required? true}) (range fixed))
+                                                      (contains? names "%&") (conj {:name "args" :kind :var-positional :required? false}))}))}
+                 (if (contains? names "%&") {:varargs-min-arity fixed} {:fixed-arities #{fixed}})))
+        (op/eq dispatch-value :deref)
+        (do (walk-body! ctx env (forms node)) nil)
         (op/eq dispatch-value :quote)
-        nil
+        (let [value (first (forms node))]
+          (tagged (case (:kind value) :symbol :symbol :list :list :vector :vector :map :map :set :set :keyword :keyword :any)))
+        (contains? #{:unquote :unquote-splicing} dispatch-value)
+        (do (finding! ctx node :unquote-not-syntax-quoted "Unquote is not inside syntax-quote.")
+            (walk-body! ctx env (forms node)))
         (op/eq dispatch-value :syntax-quote)
         (walk-syntax-quote! ctx env node)
         (op/eq dispatch-value :discard)
@@ -1155,44 +2632,97 @@
         (op/eq dispatch-value :tagged)
         (let [tag (subs (:text (first (:children node))) 1)
               config (context-config ctx)
+              discouraged (get-in config [:linters :discouraged-tag (symbol tag)])
+              _ (when discouraged
+                  (finding! (cond-> ctx (:level discouraged) (assoc :config (assoc-in config [:linters :discouraged-tag :level] (:level discouraged))))
+                            node :discouraged-tag (or (:message discouraged) (str "Discouraged tag: " tag))))
                 ;; #py preserves expression evaluation, unlike arbitrary data reader tags.
-              defaults (when-not (= "py" tag)
+              defaults (when-not (op/eq "py" tag)
                          {:linters {:unresolved-symbol {:level :off}
                                     :invalid-arity {:level :off}}})
               config (-> config (merge-settings defaults)
                          (merge-settings (get-in config [:config-in-tag (symbol tag)])))]
-          (if (= "py" tag)
+          (if (op/eq "py" tag)
             (let [value (first (forms node))
                   type (get {:vector "list" :list "tuple" :map "dict" :set "set"} (:kind value))]
               (if type
                 (do (when (#{:map :set} (:kind value)) (duplicate-literals! ctx value))
-                    (walk-body! (assoc ctx :config config) env (forms value))
-                    {:python-type {:module "builtins" :path [type]}})
+                    (let [values (mapv #(walk! (assoc ctx :config config) env %) (forms value))
+                          types (mapv :python-type values)
+                          arguments (case type
+                                      "dict" [(py/widen-literals (py/union-type (take-nth 2 types)))
+                                              (py/widen-literals (py/union-type (take-nth 2 (rest types))))]
+                                      "tuple" types
+                                      [(py/widen-literals (py/union-type types))])]
+                      {:python-type {:module "builtins" :path [type] :arguments arguments}}))
                 (walk! (assoc ctx :config config) env value)))
             (walk-body! (assoc ctx :config config) env (forms node))))
-        (contains? #{:map :set} dispatch-value)
-        (do (duplicate-literals! ctx node) (walk-body! ctx env (forms node)) nil)
+        (op/eq dispatch-value :map)
+        (let [xs (forms node)
+              values (mapv #(assoc (or (walk! ctx env %) {}) :node %) xs)
+              pairs (partition 2 (map vector xs values))
+              keys (mapv (fn [[[key _] _]] (constant-data key)) pairs)]
+          (duplicate-literals! ctx node)
+          {:tag :map :map-closed? (every? some? keys)
+           :map-values (reduce (fn [out [known [[_ _] [_ value]]]]
+                                 (if known (assoc out (first known) value) {}))
+                               {} (map vector keys pairs))
+           :python-type {:module "basilisp.lang.map" :path ["PersistentMap"]
+                         :arguments [(py/union-type (map :python-type (take-nth 2 values)))
+                                     (py/union-type (map :python-type (take-nth 2 (rest values))))]}})
+        (op/eq dispatch-value :set)
+        (let [values (mapv #(walk! ctx env %) (forms node))]
+          (duplicate-literals! ctx node)
+          {:tag :set :elements values
+           :python-type {:module "basilisp.lang.set" :path ["PersistentSet"] :arguments [(py/union-type (map :python-type values))]}})
         (op/eq dispatch-value :keyword)
-        (when (.startswith (token node) "::")
-          (let [name (subs (token node) 2) slash (.find name "/")]
-            (when (pos? slash)
-              (let [prefix (subs name 0 slash) ns-name (get-in @(:state ctx) [:aliases prefix])]
-                (if ns-name (mark-namespace! ctx ns-name)
-                    (finding! ctx node :unresolved-namespace
-                              (str "Unresolved namespace " prefix ". Are you missing a require?")))))))
+        (do (when (.startswith (token node) "::")
+              (let [name (subs (token node) 2) slash (.find name "/")]
+                (when (pos? slash)
+                  (let [prefix (subs name 0 slash) ns-name (get-in @(:state ctx) [:aliases prefix])]
+                    (if ns-name (do (mark-namespace! ctx ns-name)
+                                    (swap! (:state ctx) update :used-aliases conj prefix))
+                        (finding! ctx node :unresolved-namespace
+                                  (str "Unresolved namespace " prefix ". Are you missing a require?")))))))
+            {:tag :keyword :literal-value (try (config-data node) (catch python/Exception _ nil))})
+        (op/eq dispatch-value :vector)
+        (let [values (mapv #(assoc (or (walk! ctx env %) {}) :node %) (forms node))]
+          {:tag :vector :elements values
+           :python-type {:module "basilisp.lang.vector" :path ["PersistentVector"] :arguments [(py/union-type (map :python-type values))]}})
         (contains? #{:string :bytes :number :boolean :character :symbolic-number} dispatch-value)
-        (let [type (case dispatch-value
-                     (:string :character) "str"
-                     :bytes "bytes"
-                     :boolean "bool"
-                     :symbolic-number "float"
-                     (if (re/search "[.eE]" (token node)) "float" "int"))]
-          {:python-type {:module "builtins" :path [type]}})
-        (contains? #{:regex :nil} dispatch-value) nil
+        (let [literal (try (config-data node) (catch python/Exception _ nil))
+              cls (when (some? literal) (python/type literal))
+              type (when cls {:module (.-__module__ cls) :path [(.-__name__ cls)]})
+              tag (case dispatch-value
+                    :string :string :character :char :boolean :boolean
+                    (:number :symbolic-number)
+                    (cond
+                      (python/isinstance literal python/int) (cond (pos? literal) :pos-int (neg? literal) :neg-int :else :nat-int)
+                      (python/isinstance literal python/float) :double
+                      (op/eq "fractions" (:module type)) :ratio
+                      :else :number)
+                    :any)]
+          (cond-> {:tag tag}
+            type (assoc :python-type
+                        (cond-> type
+                          (python/isinstance literal #py (python/str python/int python/bool))
+                          (assoc :literal-values [literal])))))
+        (op/eq dispatch-value :nil) (assoc (tagged :nil) :literal-nil? true)
+        (op/eq dispatch-value :regex) {:tag :regex}
         :else (walk-body! ctx env (forms node))))))
 
 (defn- walk! [ctx env node]
   (let [value (walk-node! ctx env node)]
+    (when (op/eq :keyword (:kind node))
+      (let [raw (token node) auto? (.startswith raw "::")
+            text (subs raw (if auto? 2 1))
+            parts (str/split text #"/" 2)
+            prefix (when (> (count parts) 1) (first parts))
+            ns-name (if auto? (if prefix (get-in @(:state ctx) [:aliases prefix]) (current-ns ctx)) prefix)]
+        (emit! ctx :keywords (merge (loc ctx node)
+                                    {:name (last parts) :ns ns-name :auto-resolved auto? :alias (when auto? prefix)
+                                     :reg (:reg node) :context (:context ctx)
+                                     :generated (:generated node) :derived-location (:derived-location node)}))))
     (when (:python-type value)
       (emit! ctx :python-expressions (merge (loc ctx node) (select-keys value [:python-type]))))
     value))
@@ -1205,6 +2735,19 @@
                        (not (.startswith (:name binding) "_"))
                        (not (excluded? (assoc ctx :config (:lint-config (meta binding))) :unused-binding (:name binding))))]
       (finding! ctx binding :unused-binding (str "unused binding " (:name binding))))
+    (doseq [binding (:locals state)
+            :when (and (contains? (:used-locals state) (:id binding))
+                       (.startswith (:name binding) "_")
+                       (not (excluded? ctx :used-underscored-binding (:name binding))))]
+      (finding! ctx binding :used-underscored-binding (str "Used binding is marked as unused: " (:name binding))))
+    (doseq [[alias node] (:alias-nodes state) :when (not (contains? (:used-aliases state) alias))]
+      (finding! ctx node :unused-alias (str "Unused alias: " alias)))
+    (doseq [[name node] (:excluded-nodes state)
+            :when (and (contains? @core-definitions name)
+                       (not (contains? (:definitions state) name))
+                       (not (contains? (:refers state) name))
+                       (not-any? #(= name (:name %)) (:locals state)))]
+      (finding! ctx node :unused-excluded-var (str "Unused excluded var: " name)))
     (doseq [[alias entry] (:imports state)
             :when (not (contains? (:used-namespaces state) (:name entry)))]
       (finding! ctx (:node entry) :unused-import (str "Unused import " alias)))
@@ -1215,7 +2758,8 @@
       (finding! ctx (:node entry) :unused-referred-var
                 (str "#'" (:ns entry) "/" (:name entry) " is referred but never used")))
     (doseq [[name entry] (:requires state)
-            :when (and (not (:simple entry)) (not (contains? (:used-namespaces state) name))
+            :when (and (or (not (:simple entry)) (get-in (context-config ctx) [:linters :unused-namespace :simple-libspec]))
+                       (not (contains? (:used-namespaces state) name))
                        (not (excluded? ctx :unused-namespace name)))]
       (finding! ctx (:node entry) :unused-namespace
                 (str "namespace " name " is required but never used")))
@@ -1231,44 +2775,90 @@
   :python-options controls bounded inspection of Python imports."
   ([source] (analyze source {}))
   ([source {:keys [filename] :or {filename "<stdin>"} :as opts}]
-   (let [{:keys [namespace definitions parsed]} (or (:declarations opts) (declarations source opts))
-         config (expand-ignore (:config opts))
-         ns-config (reduce (fn [cfg name]
-                             (merge-config cfg (get-in config [:config-in-ns name])))
-                           {} (concat (namespace-groups config namespace filename) [(symbol namespace)]))
-         config (merge-settings config ns-config)
-         ns-node (first (filter #(and (= :list (:kind %)) (= "ns" (token (first (forms %)))))
-                                (forms (:root parsed))))
-         ns-settings (merge (metadata-settings (second (forms ns-node)))
-                            (map-settings (first (filter #(= :map (:kind %)) (drop 2 (forms ns-node))))))
-         config (merge-settings config (source-settings ns-settings))
-         opts (assoc opts :config config)
-         state (atom {:opts opts :namespace namespace :definitions definitions
-                      :findings [] :namespace-definitions [] :namespace-usages []
-                      :var-definitions (vec (vals definitions)) :var-usages []
-                      :locals [] :local-usages [] :python-usages [] :calls [] :python-expressions []
-                      :reported-findings #{} :reported-python-modules #{} :python-modules {} :seen-definitions #{} :imports {} :python-refers {} :aliases {} :requires {} :refers {}
-                      :core-excluded #{} :core-renamed {}
-                      :used-locals #{} :used-vars #{} :used-namespaces #{} :used-refers #{} :used-python-refers #{}})
-         ctx {:state state :parsed parsed :filename filename
-              :ignored-ranges (when (>= (.find source "clj-kondo/ignore") 0)
-                                (ignored-ranges (:root parsed)))}]
-     (doseq [problem (:diagnostics parsed)]
-       (finding! ctx problem :syntax (:message problem)))
-     (doseq [node (forms (:root parsed))
-             :when (and (= :list (:kind node)) (= "ns" (token (first (forms node)))))]
-       (analyze-ns! ctx node))
-     (prepare-imports! ctx)
-     (doseq [node (forms (:root parsed))]
-       (let [xs (forms node) head (token (first xs)) name-node (second xs)]
-         (when (#{"def" "defonce" "defn" "defn-" "defasync" "defmacro" "defmacro-" "defmulti"} head)
-           (let [name (token name-node)]
-             (when (contains? (:seen-definitions @state) name)
-               (finding! ctx node :redefined-var (str "redefined var #'" namespace "/" name)))
-             (swap! state update :seen-definitions conj name)))
-         (when-not (= "ns" head) (walk! ctx {:locals {} :scope (:root parsed)} node))))
-     (unused! ctx)
-     (swap! state assoc :var-definitions (vec (sort-by :start (vals (:definitions @state)))))
-     (-> (select-keys @state [:namespace :definitions :findings :namespace-definitions :namespace-usages
-                              :var-definitions :var-usages :locals :local-usages :python-usages :calls :python-expressions :aliases :imports :python-refers :refers :core-excluded :core-renamed :core-only])
-         (update :findings #(vec (sort-by (juxt :row :col :type) %)))))))
+   (binding [*node-cache* (or *node-cache* #py {0 (python/dict) 1 (python/dict) 2 (python/dict)})]
+     (let [{:keys [namespace definitions parsed]} (or (:declarations opts) (declarations source opts))
+           config (expand-ignore (:config opts))
+           ns-config (reduce (fn [cfg name]
+                               (merge-config cfg (get-in config [:config-in-ns name])))
+                             {} (concat (namespace-groups config namespace filename) [(symbol namespace)]))
+           config (merge-settings config ns-config)
+           ns-node (first (filter #(and (op/eq :list (:kind %)) (op/eq "ns" (token (first (forms %)))))
+                                  (forms (:root parsed))))
+           ns-settings (merge (metadata-settings (second (forms ns-node)))
+                              (map-settings (first (filter #(= :map (:kind %)) (drop 2 (forms ns-node))))))
+           config (merge-settings config (source-settings ns-settings))
+           opts (assoc opts :config config)
+           state (atom {:opts opts :namespace namespace :definitions definitions
+                        :findings #py [] :namespace-definitions #py [] :namespace-usages #py []
+                        :var-definitions (vec (vals definitions)) :var-usages #py []
+                        :locals #py [] :local-usages #py [] :python-usages #py [] :keywords #py [] :implementations #py [] :protocol-methods (vec (filter :protocol-name (vals definitions))) :calls #py [] :python-expressions #py []
+                        :binding-expectations {} :reported-findings #{} :reported-python-modules #{} :python-modules {} :seen-definitions #{} :imports {} :python-refers {} :aliases {} :requires {} :refers {}
+                        :core-excluded #{} :core-renamed {}
+                        :alias-nodes {} :excluded-nodes {} :used-aliases #{} :used-locals #{} :used-vars #{} :used-namespaces #{"basilisp.core"} :used-refers #{} :used-python-refers #{}})
+           ctx {:state state :parsed parsed :filename filename :locations (python/dict)
+                :ignored-ranges (when (>= (.find source "clj-kondo/ignore") 0)
+                                  (ignored-ranges (:root parsed)))}]
+       (doseq [problem (:diagnostics parsed)]
+         (if (and (op/eq :edn (:lang opts)) (op/eq :missing-delimiter (:code problem)))
+           (let [closing (last (str/split (:message problem) #" "))
+                 collection (last (filter #(and (:incomplete? %) (= (:end %) (:start problem))
+                                                (= closing (get {:map "}" :set "}" :vector "]" :list ")"} (:kind %))))
+                                          (syntax/nodes (:root parsed))))
+                 opening (get {:map "{" :set "{" :vector "[" :list "("} (:kind collection))]
+             (if collection
+               (do (finding! ctx (assoc collection :no-end true) :syntax
+                             (str "Found an opening " opening " with no matching " closing))
+                   (finding! ctx (assoc problem :no-end true) :syntax
+                             (str "Expected a " closing " to match " opening " from line " (:row (loc ctx collection)))))
+               (finding! ctx problem :syntax (:message problem))))
+           (finding! ctx problem :syntax (:message problem))))
+       (when (>= (.find source "#?") 0)
+         (doseq [node (syntax/nodes (:root parsed))] (lint-reader-conditional-order! ctx node)))
+       (when-not (op/eq :edn (:lang opts))
+         (doseq [node (forms (:root parsed))
+                 :when (and (op/eq :list (:kind node)) (op/eq "ns" (token (first (forms node)))))]
+           (analyze-ns! ctx node))
+         (prepare-imports! ctx)
+         (doseq [node (forms (:root parsed))]
+           (let [xs (forms node) head (token (first xs)) name-node (second xs)]
+             (when (#{"def" "defonce" "defn" "defn-" "defasync" "defmacro" "defmacro-" "defmulti"} head)
+               (let [name (token name-node)]
+                 (let [clashes (when (linter-enabled? ctx :var-same-name-except-case) (sort (filter #(and (not= name %) (= (str/lower-case name) (str/lower-case %)))
+                                                                                                    (:seen-definitions @state))))]
+                   (when (seq clashes)
+                     (finding! ctx node :var-same-name-except-case
+                               (str "Var name " name " differs only in case from: " (str/join ", " clashes)))))
+                 (when (contains? (:seen-definitions @state) name)
+                   (finding! ctx node :redefined-var (str "redefined var #'" namespace "/" name)))
+                 (swap! state update :seen-definitions conj name)))
+             (when-not (op/eq "ns" head) (walk! ctx {:locals {} :scope (:root parsed)} node))))
+         (unused! ctx))
+       (when (op/eq :edn (:lang opts))
+         (doseq [node (syntax/nodes (:root parsed)) :when (#{:map :set} (:kind node))]
+           (duplicate-literals! ctx node)))
+       (when-let [maximum (get-in config [:linters :line-length :max-line-length])]
+         (let [settings (get-in config [:linters :line-length])]
+           (doseq [[line-index line] (map-indexed vector (str/split-lines source))
+                   :let [length (op/floordiv (python/len (.encode line "utf-16-le" "surrogatepass")) 2)
+                         start (nth (:line-starts parsed) line-index)]
+                   :when (and (> length maximum)
+                              (not (and (:exclude-urls settings) (str/includes? line "http")))
+                              (not (and (:exclude-pattern settings) (regex-matches? (:exclude-pattern settings) line))))]
+             (finding! ctx {:start (+ start (min maximum (count line))) :end (+ start (max 0 (dec (count line))))}
+                       :line-length (str "Line is longer than " maximum " characters.")))))
+       (doseq [finding (:additional-findings opts) :when (some? (:start finding))]
+         (let [type (:type finding)
+               config (if (or (get-in config [:linters type :level]) (nil? (:level finding))) config
+                          (assoc-in config [:linters type :level] (:level finding)))]
+           (finding! (assoc ctx :config config) finding type (:message finding))))
+       (doseq [{:keys [ignore directive]} (:ignored-ranges ctx)
+               :when (and (not (contains? (:used-ignores @state) (:start directive)))
+                          (not (:derived-location directive))
+                          (not (and (sequential? ignore)
+                                    (some (set (get-in config [:linters :redundant-ignore :exclude])) ignore))))]
+         (finding! ctx directive :redundant-ignore "Redundant ignore"))
+       (swap! state assoc :var-definitions (vec (sort-by :start (vals (:definitions @state)))))
+       (swap! state (fn [state] (reduce (fn [out key] (update out key vec)) state event-keys)))
+       (-> (select-keys @state [:namespace :definitions :findings :namespace-definitions :namespace-usages
+                                :var-definitions :var-usages :locals :local-usages :python-usages :keywords :implementations :protocol-methods :calls :python-expressions :python-modules :aliases :imports :python-refers :refers :core-excluded :core-renamed :core-only])
+           (update :findings #(vec (sort-by (juxt :row :col :type) %))))))))

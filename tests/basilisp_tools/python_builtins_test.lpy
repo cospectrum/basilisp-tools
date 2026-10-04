@@ -1,0 +1,148 @@
+(ns basilisp-tools.python-builtins-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.python :as bridge]))
+
+(def infer bridge/builtin-call-result)
+(def integer {:module "builtins" :path ["int"]})
+(def string {:module "builtins" :path ["str"]})
+(def number-list {:module "builtins" :path ["list"] :arguments [integer]})
+(def text-list {:module "builtins" :path ["list"] :arguments [string]})
+(def mapping {:module "builtins" :path ["dict"] :arguments [string integer]})
+(def pair {:module "builtins" :path ["tuple"] :arguments [string integer]})
+(defn native [name arguments]
+  {:module "builtins" :path [name] :arguments arguments})
+(defn iterator [element]
+  {:module "collections.abc" :path ["Iterator"] :arguments [element]})
+
+(deftest builtin-constructor-and-iterator-inference-test
+  (doseq [name ["list" "set" "frozenset"]]
+    (is (= (native name [integer]) (infer {:builtin-call name} [number-list] {} {}))))
+  (is (= (native "list" [string]) (infer {:builtin-call "list"} [mapping] {} {})))
+  (is (= (native "list" [integer])
+         (infer {:builtin-call "list"}
+                [(native "tuple" [(assoc integer :literal-values [1]) (assoc integer :literal-values [2])])] {} {})))
+  (is (= pair (infer {:builtin-call "tuple"} [pair] {} {})))
+  (is (= (native "tuple" [integer {:ellipsis? true}]) (infer {:builtin-call "tuple"} [number-list] {} {})))
+  (is (= (native "tuple" []) (infer {:builtin-call "tuple"} [] {} {})))
+  (is (= number-list (infer {:builtin-call "sorted"} [number-list] {"reverse" {:module "builtins" :path ["bool"]}} {})))
+  (doseq [name ["iter" "reversed"]]
+    (is (= (iterator integer) (infer {:builtin-call name} [number-list] {} {}))))
+  (is (= integer (infer {:builtin-call "next"} [(iterator integer)] {} {})))
+  (is (= (assoc integer :nullable? true)
+         (infer {:builtin-call "next"} [(iterator integer) {:module "builtins" :path ["NoneType"]}] {} {})))
+  (is (= (iterator (native "tuple" [integer string])) (infer {:builtin-call "enumerate"} [text-list] {} {})))
+  (is (= (iterator (native "tuple" [integer string]))
+         (infer {:builtin-call "enumerate"} [] {"iterable" text-list "start" integer} {})))
+  (is (= (iterator (native "tuple" [string integer])) (infer {:builtin-call "zip"} [text-list number-list] {} {})))
+  (is (= (iterator {:never? true}) (infer {:builtin-call "zip"} [] {} {}))))
+
+(deftest builtin-dict-inference-test
+  (is (= mapping (infer {:builtin-call "dict"} [mapping] {} {})))
+  (is (= mapping (infer {:builtin-call "dict"} [(native "list" [pair])] {} {})))
+  (is (= mapping (infer {:builtin-call "dict"} [] {"x" integer "y" integer} {})))
+  (is (= mapping (infer {:builtin-call "dict"} [mapping] {"x" integer} {})))
+  (doseq [[name expected] [["dict.keys" {:module "collections.abc" :path ["KeysView"] :arguments [string]}]
+                           ["dict.values" {:module "collections.abc" :path ["ValuesView"] :arguments [integer]}]
+                           ["dict.items" {:module "collections.abc" :path ["ItemsView"] :arguments [string integer]}]
+                           ["dict.copy" mapping]
+                           ["list.copy" number-list]
+                           ["set.copy" (native "set" [integer])]
+                           ["frozenset.copy" (native "frozenset" [integer])]]]
+    (let [receiver (case name "list.copy" number-list "set.copy" (native "set" [integer])
+                         "frozenset.copy" (native "frozenset" [integer]) mapping)]
+      (is (= expected (infer {:builtin-call name :receiver-type receiver} [] {} {})))
+      (is (= expected (infer {:builtin-call name} [receiver] {} {})))))
+  (is (= (assoc integer :nullable? true) (infer {:builtin-call "dict.get" :receiver-type mapping} [string] {} {})))
+  (is (= {:union [integer string]} (infer {:builtin-call "dict.get" :receiver-type mapping} [string string] {} {})))
+  (is (= integer (infer {:builtin-call "dict.get"} [mapping string integer] {} {}))))
+
+(deftest builtin-conservative-inference-test
+  (is (nil? (infer {:name "list" :type-module "builtins" :type-path ["list"]} [number-list] {} {})))
+  (is (nil? (infer {:builtin-call "list"} [number-list number-list] {} {})))
+  (is (nil? (infer {:builtin-call "sorted"} [number-list] {"unknown" integer} {})))
+  (is (nil? (infer {:builtin-call "enumerate"} [text-list] {"iterable" text-list} {})))
+  (is (nil? (infer {:builtin-call "next"} [(iterator nil)] {} {})))
+  (is (nil? (infer {:builtin-call "next"} [(iterator nil) string] {} {})))
+  (is (= (native "dict" [nil nil]) (infer {:builtin-call "dict"} [nil] {} {})))
+  (is (nil? (infer {:builtin-call "dict.get" :receiver-type mapping} [] {} {}))))
+
+(deftest persistent-collection-conversion-inference-test
+  (doseq [[module name] [["basilisp.lang.vector" "PersistentVector"]
+                         ["basilisp.lang.list" "PersistentList"]
+                         ["basilisp.lang.set" "PersistentSet"]]]
+    (is (= text-list
+           (infer {:builtin-call "list"} [{:module module :path [name] :arguments [string]}] {} {}))))
+  (let [persistent {:module "basilisp.lang.map" :path ["PersistentMap"] :arguments [string integer]}]
+    (is (= text-list (infer {:builtin-call "list"} [persistent] {} {})))
+    (is (= mapping (infer {:builtin-call "dict"} [persistent] {} {})))))
+
+(deftest builtin-results-agree-with-trusted-runtime-test
+  (let [values #py [1 2] words #py ["alpha" "beta"] dictionary #py {"x" 1}
+        cases [["list" [number-list] {} (python/list values)]
+               ["set" [number-list] {} (python/set values)]
+               ["frozenset" [number-list] {} (python/frozenset values)]
+               ["sorted" [number-list] {} (python/sorted values)]
+               ["tuple" [number-list] {} (python/tuple values)]
+               ["iter" [number-list] {} (python/iter values)]
+               ["reversed" [number-list] {} (python/reversed values)]
+               ["dict.keys" [] mapping (.keys dictionary)]
+               ["dict.values" [] mapping (.values dictionary)]
+               ["dict.items" [] mapping (.items dictionary)]
+               ["zip" [text-list number-list] {} (python/zip words values)]
+               ["enumerate" [text-list] {} (python/enumerate words)]]]
+    (doseq [[marker args receiver result] cases]
+      (let [inferred (infer (cond-> {:builtin-call marker} (seq receiver) (assoc :receiver-type receiver)) args {} {})
+            expected (bridge/iterated-type inferred)
+            actual (python/next (python/iter result))]
+        (if (= ["tuple"] (:path expected))
+          (is (= (mapv #(.-__name__ (python/type %)) actual)
+                 (mapv #(first (:path %)) (:arguments expected))))
+          (is (= (.-__name__ (python/type actual)) (first (:path expected))))))))
+  (let [pairs #py ["ab" "cd"]
+        expected (infer {:builtin-call "dict"} [text-list] {} {})
+        actual (python/dict pairs)]
+    (is (= (native "dict" [string string]) expected))
+    (is (= "b" (.__getitem__ actual "a")))))
+
+(deftest scalar-and-callable-builtin-inference-test
+  (doseq [name ["len" "hash" "id" "ord"]]
+    (is (= integer (infer {:builtin-call name} [string] {} {}))))
+  (doseq [name ["repr" "ascii" "bin" "oct" "hex" "chr"]]
+    (is (= string (infer {:builtin-call name} [integer] {} {}))))
+  (doseq [name ["any" "all"]]
+    (is (= {:module "builtins" :path ["bool"]} (infer {:builtin-call name} [number-list] {} {}))))
+  (is (= {:module "builtins" :path ["range"]} (infer {:builtin-call "range"} [integer] {} {})))
+  (is (= (iterator string) (infer {:builtin-call "filter"} [nil text-list] {} {})))
+  (let [callable (bridge/callable-type {:kind :function :status :known :type-module "builtins" :type-path ["str"]
+                                        :parameters [{:name "value" :kind :positional-only :required? true
+                                                      :type-module "builtins" :type-path ["int"]}]})]
+    (is (= (iterator string) (infer {:builtin-call "map"} [callable number-list] {} {})))
+    (is (nil? (infer {:name "map"} [callable number-list] {} {})))
+    (is (= (iterator nil) (infer {:builtin-call "map"} [nil number-list] {} {}))))
+  (let [thunk (bridge/callable-type {:kind :function :status :known :type-module "builtins" :type-path ["str"]
+                                     :parameters []})]
+    (is (= (iterator string) (infer {:builtin-call "iter"} [thunk string] {} {}))))
+  (is (= integer (bridge/iterated-type (infer {:builtin-call "range"} [integer] {} {}))))
+  (let [range-value (python/next (python/iter (python/range 2)))
+        map-value (python/next (python/map python/str #py [1 2]))
+        filter-value (python/next (python/filter nil #py [0 1]))]
+    (is (= "int" (.-__name__ (python/type range-value))))
+    (is (= "str" (.-__name__ (python/type map-value))))
+    (is (= "int" (.-__name__ (python/type filter-value)))))
+  (is (nil? (infer {:builtin-call "map"} [nil] {} {}))))
+
+(deftest verified-worker-identities-drive-call-results
+  (let [opts {:cache (bridge/create-cache)}
+        list (bridge/inspect-path "builtins" ["list"] opts)
+        iterator (bridge/inspect-path "builtins" ["iter"] opts)
+        next (bridge/inspect-path "builtins" ["next"] opts)
+        items (bridge/inspect-member mapping "items" opts)]
+    (is (= "list" (:builtin-call list)))
+    (is (= "dict.items" (:builtin-call items)))
+    (is (= text-list
+           (bridge/call-result list [{:module "basilisp.lang.vector" :path ["PersistentVector"] :arguments [string]}] {} opts)))
+    (is (= string (bridge/call-result next [(bridge/call-result iterator [text-list] {} opts)] {} opts)))
+    (is (= pair (bridge/iterated-type (bridge/call-result items [] {} opts) opts)))
+    (is (= text-list
+           (bridge/call-result list [(bridge/call-result (bridge/inspect-member mapping "keys" opts) [] {} opts)] {} opts)))
+    (is (= integer (bridge/iterated-type (bridge/call-result (bridge/inspect-path "builtins" ["range"] opts) [integer] {} opts) opts)))))

@@ -1,0 +1,290 @@
+(ns basilisp-tools.python-callable-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [subprocess] [sys]))
+
+(def str-type {:module "builtins" :path ["str"]})
+(def int-type {:module "builtins" :path ["int"]})
+(def bool-type {:module "builtins" :path ["bool"]})
+
+(def source
+  (str "from typing import Callable, ParamSpec, TypeVar, Concatenate, overload\n"
+       "from typing_extensions import TypeVarTuple, Unpack\n"
+       "P = ParamSpec('P')\nR = TypeVar('R')\nTs = TypeVarTuple('Ts')\n"
+       "raise RuntimeError('Project source must never be executed')\n"
+       "def identity(f: Callable[P, R]) -> Callable[P, R]: ...\n"
+       "def apply(f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R: ...\n"
+       "def bind_prefix(f: Callable[Concatenate[int, P], R]) -> Callable[P, R]: ...\n"
+       "def add_prefix(f: Callable[P, R]) -> Callable[Concatenate[int, P], R]: ...\n"
+       "def callback(text: str, /, count: int = 1, *, loud: bool = False) -> str: ...\n"
+       "def with_prefix(context: int, text: str, *, count: int = 1) -> str: ...\n"
+       "def zero() -> str: ...\n"
+       "def declared() -> Callable[[str, int], bool]: ...\n"
+       "def declared_zero() -> Callable[[], str]: ...\n"
+       "def unknown() -> Callable[..., str]: ...\n"
+       "def tuple_identity(value: tuple[Unpack[Ts]]) -> tuple[Unpack[Ts]]: ...\n"
+       "def strip_head(value: tuple[int, Unpack[Ts]]) -> tuple[Unpack[Ts]]: ...\n"
+       "@overload\ndef overloaded(value: int) -> str: ...\n"
+       "@overload\ndef overloaded(value: str) -> int: ...\n"
+       "def overloaded(value): ...\n"
+       "class Widget: pass\n"
+       "from typing import Generic\n"
+       "H = TypeVar(\u0027H\u0027)\nZ = TypeVar(\u0027Z\u0027)\n"
+       "class Array(Generic[Unpack[Ts]]):\n    shape: tuple[Unpack[Ts]]\n"
+       "class Concrete(Array[int, str]): pass\n"
+       "class Mixed(Generic[H, Unpack[Ts], Z]):\n    shape: tuple[H, Unpack[Ts], Z]\n"
+       "class MixedConcrete(Mixed[bool, int, str, float]): pass\n"
+       "PackAlias = tuple[Unpack[Ts]]\n"
+       "def alias() -> PackAlias[int, str]: ...\n"
+       "from typing_extensions import TypedDict, NotRequired, Required\n"
+       "class Movie(TypedDict):\n    title: str\n    year: NotRequired[int]\n"
+       "class ExtendedMovie(Movie, total=False):\n    director: Required[str]\n    rating: int\n"
+       "class Payload(TypedDict, Generic[H]):\n    value: H\n"
+       "def keyword_movie(**kwargs: Unpack[Movie]) -> str: ...\n"
+       "def keyword_extended(**kwargs: Unpack[ExtendedMovie]) -> str: ...\n"
+       "def keyword_generic(**kwargs: Unpack[Payload[H]]) -> H: ...\n"
+       "def keyword_shadow(title: int, /, **kwargs: Unpack[Movie]) -> str: ...\n"
+       "def keyword_unknown(**kwargs: Unpack[Missing]) -> str: ...\n"
+       "def collect(*args: Unpack[Ts]) -> tuple[Unpack[Ts]]: ...\n"
+       "def tied(first: tuple[Unpack[Ts]], *args: Unpack[Ts]) -> tuple[Unpack[Ts]]: ...\n"
+       "def prepend(head: H, *args: Unpack[Ts], loud: bool = False) -> tuple[H, Unpack[Ts]]: ...\n"
+       "def surrounded(*args: Unpack[tuple[H, Unpack[Ts], Z]]) -> tuple[H, Unpack[Ts], Z]: ...\n"
+       "def constrained_pack(*args: Unpack[tuple[int, Unpack[Ts], str]]) -> tuple[Unpack[Ts]]: ...\n"
+       "def fixed_pack(*args: Unpack[tuple[int, str]]) -> bool: ...\n"
+       "def homogeneous(*args: Unpack[tuple[H, ...]]) -> list[H]: ...\n"
+       "Other = TypeVarTuple('Other')\n"
+       "def ambiguous(*args: Unpack[tuple[Unpack[Ts], Unpack[Other]]]) -> tuple[Unpack[Ts]]: ...\n"
+       "class Collected(Generic[Unpack[Ts]]):\n    def __init__(self, *args: Unpack[Ts]): ...\n    shape: tuple[Unpack[Ts]]\n"))
+
+(defn with-source [f]
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))]
+    (try
+      (.write_text (.joinpath root "callbacks.py") source ** :encoding "utf-8")
+      (f {:python-paths [(str root)] :python-inspection? false :cache (py/create-cache)})
+      (finally (.cleanup temp)))))
+
+(deftest callable-roundtrip-retains-parameter-contract
+  (with-source
+    (fn [opts]
+      (let [callback (py/inspect-path "callbacks" ["callback"] opts)
+            ref (py/callable-type callback)
+            restored (py/callable-metadata ref)]
+        (is (= (:parameters callback) (:parameters restored)))
+        (is (= str-type (py/call-result restored [str-type] {} opts)))
+        (is (= [] (py/check-call restored 1 ["loud"])))
+        (is (seq (py/check-call restored 0 ["text"])))
+        (is (seq (py/check-call restored 3 [])))
+        (is (empty? (py/call-signatures restored [int-type] {} opts)))
+        (is (= ["type"] (:path (py/callable-type (py/inspect-path "callbacks" ["Widget"] opts)))))))))
+
+(deftest paramspec-identity-and-forwarded-arguments
+  (with-source
+    (fn [opts]
+      (let [callback (py/callable-type (py/inspect-path "callbacks" ["callback"] opts))
+            identity (py/inspect-path "callbacks" ["identity"] opts)
+            forwarded (py/callable-metadata (py/call-result identity [callback] {} opts))
+            apply (py/inspect-path "callbacks" ["apply"] opts)]
+        (is (= (:parameters (py/callable-metadata callback)) (:parameters forwarded)))
+        (is (= str-type (py/call-result forwarded [str-type] {"loud" bool-type} opts)))
+        (is (= str-type (py/call-result apply [callback str-type] {"loud" bool-type} opts)))
+        (is (empty? (py/call-signatures apply [callback] {} opts)))
+        (is (empty? (py/call-signatures apply [callback int-type] {} opts)))
+        (is (empty? (py/call-signatures apply [callback str-type] {"loud" int-type} opts)))
+        (is (= [] (:parameters (py/callable-metadata
+                                (py/call-result identity
+                                                [(py/callable-type (py/inspect-path "callbacks" ["zero"] opts))]
+                                                {} opts)))))))))
+
+(deftest concatenate-adds-and-removes-only-positional-prefix
+  (with-source
+    (fn [opts]
+      (let [original (py/callable-type (py/inspect-path "callbacks" ["with_prefix"] opts))
+            removed (py/callable-metadata (py/call-result (py/inspect-path "callbacks" ["bind_prefix"] opts) [original] {} opts))
+            added (py/callable-metadata (py/call-result (py/inspect-path "callbacks" ["add_prefix"] opts) [original] {} opts))]
+        (is (= ["text" "count"] (mapv :name (:parameters removed))))
+        (is (= str-type (py/call-result removed [str-type] {"count" int-type} opts)))
+        (is (seq (py/check-call removed 0 [])))
+        (is (= :positional-only (:kind (first (:parameters added)))))
+        (is (= str-type (py/call-result added [int-type int-type str-type] {} opts)))
+        (is (empty? (py/call-signatures added [str-type int-type str-type] {} opts)))))))
+
+(deftest annotated-callables-and-overloads
+  (with-source
+    (fn [opts]
+      (let [declared (py/callable-metadata (py/call-result (py/inspect-path "callbacks" ["declared"] opts) [] {} opts))
+            zero (py/callable-metadata (py/call-result (py/inspect-path "callbacks" ["declared_zero"] opts) [] {} opts))
+            unknown (py/callable-metadata (py/call-result (py/inspect-path "callbacks" ["unknown"] opts) [] {} opts))
+            overloads (py/callable-metadata (py/callable-type (py/inspect-path "callbacks" ["overloaded"] opts)))]
+        (is (= bool-type (py/call-result declared [str-type int-type] {} opts)))
+        (is (seq (py/check-call declared 0 ["arg0" "arg1"])))
+        (is (= str-type (py/call-result zero [] {} opts)))
+        (is (seq (py/check-call zero 1 [])))
+        (is (nil? (py/check-call unknown 8 ["anything"])))
+        (is (= str-type (py/call-result unknown [int-type] {} opts)))
+        (is (= str-type (py/call-result overloads [int-type] {} opts)))
+        (is (= int-type (py/call-result overloads [str-type] {} opts)))))))
+
+(deftest variadic-tuples-bind-and-expand-type-packs
+  (with-source
+    (fn [opts]
+      (let [tuple {:module "builtins" :path ["tuple"] :arguments [int-type str-type bool-type]}
+            identity (py/inspect-path "callbacks" ["tuple_identity"] opts)
+            strip (py/inspect-path "callbacks" ["strip_head"] opts)]
+        (is (= tuple (py/call-result identity [tuple] {} opts)))
+        (is (= (assoc tuple :arguments [str-type bool-type]) (py/call-result strip [tuple] {} opts)))
+        (is (= (assoc tuple :arguments []) (py/call-result identity [(assoc tuple :arguments [])] {} opts)))
+        (is (empty? (py/call-signatures strip [(assoc tuple :arguments [str-type bool-type])] {} opts)))))))
+
+(deftest paramspec-preserves-overload-correlations
+  (with-source
+    (fn [opts]
+      (let [overloaded (py/callable-type (py/inspect-path "callbacks" ["overloaded"] opts))
+            forwarded (py/callable-metadata
+                       (py/call-result (py/inspect-path "callbacks" ["identity"] opts) [overloaded] {} opts))
+            apply (py/inspect-path "callbacks" ["apply"] opts)]
+        (is (= 2 (count (:overloads forwarded))))
+        (is (= str-type (py/call-result forwarded [int-type] {} opts)))
+        (is (= int-type (py/call-result forwarded [str-type] {} opts)))
+        (is (= str-type (py/call-result apply [overloaded int-type] {} opts)))
+        (is (= int-type (py/call-result apply [overloaded str-type] {} opts)))))))
+
+(deftest callable-variance-is-contravariant-in-parameters
+  (let [object-type {:module "builtins" :path ["object"]}
+        callable (fn [parameter result]
+                   {:module "collections.abc" :path ["Callable"]
+                    :arguments [{:parameter-list? true :arguments [parameter]} result]})]
+    (is (true? (py/type-compatible? (callable object-type str-type) (callable str-type object-type))))
+    (is (false? (py/type-compatible? (callable str-type object-type) (callable object-type str-type))))
+    (is (nil? (py/type-compatible? (callable nil str-type) (callable str-type str-type))))))
+
+(deftest function-attributes-support-singledispatch-registration
+  (let [metadata (py/inspect-path "basilisp.lang.obj" ["lrepr" "register"] {:cache (py/create-cache)})]
+    (is (= :known (:status metadata)))
+    (is (= :function (:kind metadata)))))
+
+(deftest generic-classes-and-aliases-capture-complete-type-packs
+  (with-source
+    (fn [opts]
+      (let [array {:module "callbacks" :path ["Array"] :arguments [int-type str-type]}
+            mixed {:module "callbacks" :path ["Mixed"] :arguments [bool-type int-type str-type {:module "builtins" :path ["float"]}]}
+            shape #(py/return-type (py/inspect-member % "shape" opts))]
+        (is (= {:module "builtins" :path ["tuple"] :arguments [int-type str-type]} (shape array)))
+        (is (= {:module "builtins" :path ["tuple"] :arguments []} (shape (assoc array :arguments []))))
+        (is (= (:arguments mixed) (:arguments (shape mixed))))
+        (is (= [int-type str-type] (:arguments (shape {:module "callbacks" :path ["Concrete"]}))))
+        (is (= (:arguments mixed) (:arguments (shape {:module "callbacks" :path ["MixedConcrete"]}))))
+        (is (= [int-type str-type] (:arguments (py/call-result (py/inspect-path "callbacks" ["alias"] opts) [] {} opts))))
+        (is (= "Ts" (:typevar (first (:arguments (shape (assoc array :arguments [{:typevar "Unknown" :variadic? true :unpack? true}])))))))
+        (is (= "Ts" (:typevar (first (:arguments (shape (dissoc array :arguments)))))))))))
+
+(deftest unpacked-positional-parameters-capture-heterogeneous-arguments
+  (with-source
+    (fn [opts]
+      (let [collect (py/inspect-path "callbacks" ["collect"] opts)
+            prepend (py/inspect-path "callbacks" ["prepend"] opts)
+            surrounded (py/inspect-path "callbacks" ["surrounded"] opts)
+            constrained (py/inspect-path "callbacks" ["constrained_pack"] opts)]
+        (is (= [int-type str-type bool-type] (:arguments (py/call-result collect [int-type str-type bool-type] {} opts))))
+        (is (= [] (:arguments (py/call-result collect [] {} opts))))
+        (is (= [str-type int-type bool-type] (:arguments (py/call-result prepend [str-type int-type bool-type] {"loud" bool-type} opts))))
+        (is (empty? (py/call-signatures prepend [str-type int-type] {"loud" int-type} opts)))
+        (is (= [str-type int-type bool-type] (:arguments (py/call-result surrounded [str-type int-type bool-type] {} opts))))
+        (is (= [str-type bool-type] (:arguments (py/call-result surrounded [str-type bool-type] {} opts))))
+        (is (seq (py/check-call surrounded 1 [])))
+        (is (= [bool-type] (:arguments (py/call-result constrained [int-type bool-type str-type] {} opts))))
+        (is (empty? (py/call-signatures constrained [str-type bool-type str-type] {} opts)))
+        (is (empty? (py/call-signatures constrained [int-type bool-type int-type] {} opts)))
+        (is (seq (py/check-call constrained 1 [])))))))
+
+(deftest fixed-homogeneous-and-ambiguous-positional-unpacks
+  (with-source
+    (fn [opts]
+      (let [fixed (py/inspect-path "callbacks" ["fixed_pack"] opts)
+            homogeneous (py/inspect-path "callbacks" ["homogeneous"] opts)
+            ambiguous (py/inspect-path "callbacks" ["ambiguous"] opts)]
+        (is (= bool-type (py/call-result fixed [int-type str-type] {} opts)))
+        (is (seq (py/check-call fixed 1 [])))
+        (is (seq (py/check-call fixed 3 [])))
+        (is (empty? (py/call-signatures fixed [str-type int-type] {} opts)))
+        (is (= [str-type] (:arguments (py/call-result homogeneous [str-type str-type] {} opts))))
+        (is (= #{int-type str-type} (set (:union (first (:arguments (py/call-result homogeneous [str-type int-type] {} opts)))))))
+        (is (= [] (py/check-call homogeneous 0 [])))
+        (is (= [] (py/check-call ambiguous 3 [])))
+        (is (= "Ts" (:typevar (first (:arguments (py/call-result ambiguous [int-type str-type] {} opts))))))))))
+
+(deftest variadic-constructor-retains-the-entire-instance-pack
+  (with-source
+    (fn [opts]
+      (let [constructor (py/inspect-path "callbacks" ["Collected"] opts)
+            instance (py/call-result constructor [int-type str-type bool-type] {} opts)]
+        (is (= [int-type str-type bool-type] (:arguments instance)))
+        (is (= [int-type str-type bool-type]
+               (:arguments (py/return-type (py/inspect-member instance "shape" opts)))))))))
+
+(deftest repeated-type-packs-merge-types-and-require-matching-lengths
+  (with-source
+    (fn [opts]
+      (let [tied (py/inspect-path "callbacks" ["tied"] opts)
+            tuple {:module "builtins" :path ["tuple"] :arguments [int-type str-type]}]
+        (is (= tuple (py/call-result tied [tuple int-type str-type] {} opts)))
+        (is (empty? (py/call-signatures tied [tuple int-type] {} opts)))
+        (let [result (py/call-result tied [tuple str-type bool-type] {} opts)]
+          (is (= #{int-type str-type} (set (:union (first (:arguments result))))))
+          (is (= #{str-type bool-type} (set (:union (second (:arguments result)))))))))))
+
+(deftest typeddict-keyword-unpacks-expand-required-and-optional-fields
+  (with-source
+    (fn [opts]
+      (let [movie (py/inspect-path "callbacks" ["keyword_movie"] opts)
+            extended (py/inspect-path "callbacks" ["keyword_extended"] opts)
+            generic (py/inspect-path "callbacks" ["keyword_generic"] opts)
+            shadow (py/inspect-path "callbacks" ["keyword_shadow"] opts)
+            unknown (py/inspect-path "callbacks" ["keyword_unknown"] opts)]
+        (is (= #{["title" true] ["year" false]} (set (map #(vector (:name %) (:required? %)) (:parameters movie)))))
+        (is (every? #(= :keyword-only (:kind %)) (:parameters movie)))
+        (is (= str-type (py/call-result movie [] {"title" str-type} opts)))
+        (is (= str-type (py/call-result movie [] {"title" str-type "year" int-type} opts)))
+        (is (seq (py/check-call movie 0 [])))
+        (is (seq (py/check-call movie 0 ["title" "unknown"])))
+        (is (empty? (py/call-signatures movie [] {"title" int-type} opts)))
+        (is (empty? (py/call-signatures movie [] {"title" str-type "year" str-type} opts)))
+        (is (= str-type (py/call-result extended [] {"title" str-type "director" str-type} opts)))
+        (is (seq (py/check-call extended 0 ["title"])))
+        (is (= bool-type (py/call-result generic [] {"value" bool-type} opts)))
+        (is (seq (py/check-call shadow 1 [])))
+        (is (= str-type (py/call-result shadow [int-type] {"title" str-type} opts)))
+        (is (= [] (py/check-call unknown 0 ["anything"])))
+        (is (= str-type (py/call-result unknown [] {"anything" int-type} opts)))))))
+
+(deftest installed-runtime-typeddict-keywords-use-safe-source-fallback
+  (with-open [directory (tempfile/TemporaryDirectory)]
+    (let [file (.joinpath (pathlib/Path directory) "keyword_fixture.py")
+          fixture (str "from typing import TypedDict\n"
+                       "try:\n    from typing import Unpack, NotRequired\n"
+                       "except ImportError:\n    from typing_extensions import Unpack, NotRequired\n"
+                       "class Options(TypedDict):\n    name: str\n    count: NotRequired[int]\n"
+                       "def receive(**kwargs: Unpack[Options]) -> str:\n    return kwargs['name']\n")
+          program (str "import importlib.util, sys\n"
+                       "def load(name, path):\n"
+                       "    spec = importlib.util.spec_from_file_location(name, path)\n"
+                       "    module = importlib.util.module_from_spec(spec)\n"
+                       "    sys.modules[name] = module\n"
+                       "    spec.loader.exec_module(module)\n"
+                       "    return module\n"
+                       "worker = load('inspection_worker', sys.argv[1])\n"
+                       "fixture = load('keyword_fixture', sys.argv[2])\n"
+                       "assert fixture.receive(name='works') == 'works'\n"
+                       "metadata = worker.runtime_signature(fixture.receive)\n"
+                       "params = {p['name']: p for p in metadata['parameters']}\n"
+                       "assert set(params) == {'name', 'count'}, metadata\n"
+                       "assert params['name']['kind'] == 'keyword-only' and params['name']['required?'], metadata\n"
+                       "assert params['name']['type-path'] == ['str'], metadata\n"
+                       "assert params['count']['kind'] == 'keyword-only' and not params['count']['required?'], metadata\n"
+                       "assert params['count']['type-path'] == ['int'], metadata\n")]
+      (.write_text file fixture ** :encoding "utf-8")
+      (let [result (subprocess/run [sys/executable "-I" "-c" program
+                                    (str (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py"))
+                                    (str file)]
+                                   ** :capture_output true :text true :timeout 20)]
+        (is (= 0 (.-returncode result)) (.-stderr result))))))

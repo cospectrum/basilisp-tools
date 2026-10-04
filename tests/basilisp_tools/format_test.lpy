@@ -101,3 +101,37 @@
   (is (= "(custom/run first\n            second)"
          (fmt/format-string "(custom/run first\nsecond)"
                             {:alias-map nil :refer-map nil}))))
+
+(deftest clojure-reader-forms-format-without-evaluation-test
+  (doseq [[source expected]
+          [["(#^:private [value]\nnext)" "(#^:private [value]\n next)"]
+           ["#::alias{:first 1\n:second 2}" "#::alias{:first 1\n         :second 2}"]
+           ["(def ^Long/1 values\n(input))" "(def ^Long/1 values\n  (input))"]
+           ["#=(java.lang.System/exit\n1)" "#=(java.lang.System/exit\n   1)"]]]
+    (testing source
+      (is (= expected (fmt/format-string source)))
+      (is (= expected (fmt/format-string expected)))))
+  (let [temp (tempfile/TemporaryDirectory)
+        marker (.joinpath (pathlib/Path (.-name temp)) "must-not-exist")]
+    (try
+      (let [source (str "#=(spit \"" marker "\" \"executed\")")]
+        (is (= source (fmt/format-string source)))
+        (is (not (.exists marker))))
+      (finally (.cleanup temp)))))
+
+(deftest deeply-nested-reader-forms-test
+  ;; Cover the supported bound in both Python 3.10 and newer interpreter CI.
+  ;; Interpolation and the mixed wrapper introduce more than one reader level.
+  (doseq [[depth wrap] [[127 #(str "[" % "]")]
+                        [127 #(str "(" % ")")]
+                        [127 #(str "'" %)]
+                        [126 #(str "^:tag " %)]
+                        [63 #(str "#f\"{" % "}\"")]
+                        [42 #(str "^:tag ([" % "])")]]]
+    (let [source (nth (iterate wrap "value") depth)
+          parsed (syntax/parse source)
+          formatted (fmt/format-string source)]
+      (is (empty? (:diagnostics parsed)))
+      (is (= source (syntax/text (:root parsed))))
+      (is (= source formatted))
+      (is (= formatted (fmt/format-string formatted))))))

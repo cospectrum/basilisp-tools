@@ -1,0 +1,102 @@
+(ns basilisp-tools.analyzer-extra-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- matching [source type]
+  (filterv #(= type (:type %))
+           (:findings (analyzer/analyze source
+                                        {:python-options {:python-inspection? false}
+                                         :config {:linters {type {:level :warning}}}}))))
+
+(deftest redundant-wrapper-test
+  (doseq [source ["#(empty %)" "#(empty %1)" "#(:name %)"
+                  "(fn [value] (empty value))"
+                  "(let [f empty] (fn [value] (f value)))"]]
+    (testing source
+      (is (= 1 (count (matching source :redundant-fn-wrapper))))))
+  (doseq [source ["(fn [value] (inc value))"
+                  "(fn [value] (when value))"
+                  "(fn named [value] (empty value))"
+                  "(fn [left right] (vector right left))"
+                  "(fn [value] (vector value value))"
+                  "(fn [value] (println value) (empty value))"
+                  "(fn [value] (value value))"
+                  "(fn [value & rest] (apply vector value rest))"
+                  "#(.strip %)" "#(vector % %)" "#(vector %2 %1)"]]
+    (testing source
+      (is (empty? (matching source :redundant-fn-wrapper)))))
+  ;; A single direct call is replaceable only when it preserves argument use.
+  (is (= (empty [1 2]) ((fn [value] (empty value)) [1 2])))
+  (is (not= (vector 1 2) ((fn [left right] (vector right left)) 1 2))))
+
+(deftest python-format-lint-test
+  (doseq [source ["(format \"hello\")" "(printf \"hello\")" "(format \"100%%\")"]]
+    (is (= 1 (count (matching source :redundant-format)))))
+  (doseq [source ["(format \"%s %s\" 1)" "(format \"%*.*f\" 1.0)"
+                  "(format \"%(name)s\" 1 2)" "(format \"%q\" 1)"]]
+    (testing source (is (= 1 (count (matching source :format))))))
+  (doseq [source ["(format \"%s\" 1)" "(format \"%*.*f\" 5 2 1.2)"
+                  "(format \"%(name)s\" {\"name\" \"Ada\"})"
+                  "(format \"%% %s\" \"ok\")"
+                  "(format \"%s\")" "(format \"%q\")"]]
+    (testing source (is (empty? (matching source :format)))))
+  ;; These calls deliberately differ from Java Formatter: no args is identity,
+  ;; Python accepts mapping placeholders and a dynamic width/precision pair.
+  (is (= "%s" (format "%s")))
+  (is (= "%q" (format "%q")))
+  (is (= "Ada" (format "%(name)s" {"name" "Ada"})))
+  (is (= " 1.20" (format "%*.*f" 5 2 1.2)))
+  (is (= "% ok" (format "%% %s" "ok"))))
+
+(deftest missing-assertion-test
+  (let [prefix "(ns sample (:require [basilisp.test :refer [deftest is testing]])) "]
+    (doseq [body ["(deftest example (odd? 1))"
+                  "(deftest example (testing \"odd\" (odd? 1)))"
+                  "(deftest example (let [value 1] (odd? value)))"]]
+      (is (= 1 (count (matching (str prefix body) :missing-test-assertion)))))
+    (doseq [body ["(deftest example (is (odd? 1)))"
+                  "(deftest example (let [value (odd? 1)] (is value)))"
+                  "(deftest example (testing (str \"odd \" 1) (is (odd? 1))))"
+                  "(deftest example (println :done))"]]
+      (testing body
+        (is (empty? (matching (str prefix body) :missing-test-assertion)))))))
+
+(deftest assertion-message-and-coercion-test
+  (let [prefix "(ns sample (:require [basilisp.test :refer [is]])) "]
+    (doseq [body ["(is true 42)" "(is true [:unexpected])"
+                  "(let [message 42] (is true message))"]]
+      (is (= 1 (count (matching (str prefix body) :is-message-not-string)))))
+    (doseq [body ["(is true \"message\")" "(is true (str 42))"
+                  "(let [message \"valid\"] (is true message))"]]
+      (is (empty? (matching (str prefix body) :is-message-not-string)))))
+  (is (= 1 (count (matching "(boolean true)" :redundant-primitive-coercion))))
+  (is (empty? (matching "(boolean 1)" :redundant-primitive-coercion)))
+  (is (= true (boolean true)))
+  (is (= true (boolean 1))))
+
+(deftest valid-core-type-flow-test
+  ;; These fixtures execute in Basilisp as an independent check on inference.
+  (doseq [[source expected]
+          [["(apply + [1 2 3])" 6]
+           ["(mapv inc [1 2])" [2 3]]
+           ["(transduce (map inc) + 0 [1 2])" 5]
+           ["(reduce-kv (fn [sum _ value] (+ sum value)) 0 {:a 1 :b 2})" 3]
+           ["(let [f (fn [value] (str value))] [(f 1) (f :a)])" ["1" ":a"]]
+           ["(let [f (fn [value] (if (number? value) (inc value) (str value)))] [(f 1) (f :a)])" [2 ":a"]]
+           ["(let [value 1] (let [value \"ok\"] (str value)))" "ok"]
+           ["(loop [value 0] (if (number? value) (recur \"ok\") (str value)))" "ok"]
+           ["(loop [value nil] (if (nil? value) (recur [1]) (first value)))" 1]
+           ["(let [values (if true [1] nil)] (count values))" 1]
+           ["(some-> {:a [1 2]} :a first inc)" 2]
+           ["(cond-> {} true (assoc :a 1) false (assoc :b 2))" {:a 1}]
+           ["(->> [1 2] (map inc) (reduce +))" 5]
+           ["(into {} (map (fn [value] [value (inc value)])) [1 2])" {1 2 2 3}]
+           ["(let [value (atom 1)] (swap! value inc) @value)" 2]
+           ["(letfn [(visit [xs] (if (seq xs) (recur (rest xs)) :done))] (visit [1]))" :done]
+           ["(if-some [value false] (str value) :missing)" "false"]
+           ["(let [[first-value & values] [1 2 3]] (+ first-value (count values)))" 3]
+           ["(let [{:keys [value] :or {value 1}} {}] (inc value))" 2]
+           ["(try (inc 1) (catch python/Exception error (str error)))" 2]]]
+    (testing source
+      (is (= expected (eval (read-string source))))
+      (is (empty? (matching source :type-mismatch))))))

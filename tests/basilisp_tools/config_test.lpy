@@ -152,24 +152,59 @@
      (doseq [[config expected] [["(load-settings)" "literal"]
                                 ["~(load-settings)" "unsupported"]
                                 ["{:extra-indents (make-indents)}" "must be a map"]
-                                ["{:extra-indents #unsafe {}}" "unsupported"]
-                                ["^:replace {:indentation? false}" "unsupported"]]]
+                                ["{:extra-indents #unsafe {}}" "unsupported"]]]
        (testing config
          (project! root (str ":cljfmt " config))
          (let [message (error-message #(fmt/load-config root))]
            (is (some? message))
            (is (and message (>= (.find (.lower message) expected) 0)))))))))
 
-(deftest formatter-profile-overrides-are-rejected-test
+(deftest literal-lein-profiles-test
   (in-project
    (fn [root]
-     (project! root ":profiles {:dev {:dependencies [[some/library \"1.0\"]]}}")
-     (is (map? (fmt/load-config root)))
-     (doseq [profile ["{:dev {:cljfmt {:indentation? false}}}"
-                      "{:dev {:source-paths [\"generated\"]}}"
-                      "{:dev {:test-paths [\"integration\"]}}"]]
-       (project! root (str ":profiles " profile))
-       (is (thrown? python/Exception (fmt/load-config root)))))))
+     (doseq [path ["src" "test" "generated" "integration"]]
+       (.mkdir (.joinpath root path)))
+     (project! root ":profiles {:dev {:dependencies ~(load-dependencies)
+                                     :cljfmt {:indentation? false}
+                                     :source-paths [\"generated\"]
+                                     :test-paths [\"integration\"]}}")
+     (let [options (fmt/load-config root)]
+       (is (false? (:indentation? options)))
+       (is (= ["generated" "src" "integration" "test"] (:paths options))))
+     (project! root ":source-paths [\"src\"] :test-paths [\"test\"]
+                    :cljfmt {:extra-indents {a [[:inner 0]]}}
+                    :profiles {:dev {:source-paths [\"generated\"]
+                                     :test-paths ^:replace [\"integration\"]
+                                     :cljfmt {:extra-indents {b [[:block 1]]}}}}")
+     (let [options (fmt/load-config root)]
+       (is (= ["generated" "src" "integration"] (:paths options)))
+       (is (= {'a [[:inner 0]] 'b [[:block 1]]} (:extra-indents options))))
+     (project! root ":cljfmt {:indentation? true}
+                    :profiles {:formatting {:cljfmt {:indentation? false}}
+                               :default [:formatting]
+                               :unused {:cljfmt {:indentation? true}}}")
+     (is (false? (:indentation? (fmt/load-config root))))
+     (is (true? (:indentation? (fmt/load-config root {:lein-profiles [:unused]}))))
+     (put! root "profiles.clj" "{:formatting {:cljfmt {:indentation? true}}}")
+     (is (true? (:indentation? (fmt/load-config root))))
+     (project! root ":profiles {:default [:a] :a [:b] :b [:a]}")
+     (is (thrown? python/Exception (fmt/load-config root))))))
+
+(deftest literal-lein-profile-merge-priority-test
+  (in-project
+   (fn [root]
+     (doseq [[left right expected]
+             [["{:extra-indents {a [[:inner 0]]}}"
+               "{:extra-indents ^:replace {b [[:block 1]]}}"
+               {'b [[:block 1]]}]
+              ["{:extra-indents ^:replace {a [[:inner 0]]}}"
+               "{:extra-indents {b [[:block 1]]}}"
+               {'a [[:inner 0]]}]
+              ["{:extra-indents {a [[:inner 0]]}}"
+               "{:extra-indents ^:displace {b [[:block 1]]}}"
+               {'a [[:inner 0]]}]]]
+       (project! root (str ":cljfmt " left " :profiles {:dev {:cljfmt " right "}}"))
+       (is (= expected (:extra-indents (fmt/load-config root))))))))
 
 (deftest project-relative-paths-and-cli-overrides-test
   (in-project
@@ -276,3 +311,74 @@
     (is (= "true" (get (fmt/resolve-options {key "true"}) key))))
   (is (= "src" (:project-root (fmt/resolve-options {:project-root "src"}))))
   (is (thrown? python/Exception (fmt/resolve-options {:project-root 4}))))
+
+(deftest external-lein-profile-discovery-test
+  (in-project
+   (fn [root]
+     (let [home (.joinpath root "lein-home")]
+       (with-open [patch (.dict mock/patch os/environ #py {"LEIN_HOME" (str home)} ** :clear true)]
+         (project! root "")
+         (put! home "profiles.clj" "{:user {:cljfmt {:indentation? false}}}")
+         (is (false? (:indentation? (fmt/load-config root))))
+         (put! home "profiles.d/dev.clj" "{:cljfmt {:indent-line-comments? true}}")
+         (is (true? (:indent-line-comments? (fmt/load-config root))))
+         (project! root ":profiles {:user {:cljfmt {:indentation? true}}}")
+         (is (true? (:indentation? (fmt/load-config root))))
+         (put! root "profiles.clj" "{:user {:cljfmt {:indentation? false}}}")
+         (is (false? (:indentation? (fmt/load-config root))))
+         (put! home "profiles.d/user.clj" "{:cljfmt {:indentation? true}}")
+         (is (thrown? python/Exception (fmt/load-config root)))
+         (with-open [disabled (.dict mock/patch os/environ #py {"LEIN_NO_USER_PROFILES" ""})]
+           (is (false? (:indentation? (fmt/load-config root))))
+           (is (nil? (:indent-line-comments? (fmt/load-config root))))))))))
+
+(deftest xdg-lein-profile-discovery-test
+  (in-project
+   (fn [root]
+     (let [home (.joinpath root "home")
+           config (.joinpath root "config")]
+       (with-open [patch (.dict mock/patch os/environ #py {"XDG_CONFIG_HOME" (str config)}
+                                ** :clear true)
+                   home-patch (mock/patch "pathlib.Path.home" ** :return_value home)]
+         (project! root "")
+         (put! config "leiningen/profiles.clj" "{:user {:cljfmt {:indentation? false}}}")
+         (is (false? (:indentation? (fmt/load-config root))))
+         (put! home ".lein/profiles.clj" "{:user {:cljfmt {:indentation? true}}}")
+         (is (true? (:indentation? (fmt/load-config root)))))))))
+
+(deftest composite-lein-profile-metadata-test
+  (in-project
+   (fn [root]
+     (project! root ":cljfmt {:indentation? true}
+                    :profiles {:default ^:displace [:one]
+                               :one {:cljfmt {:indentation? false}}}")
+     (is (true? (:indentation? (fmt/load-config root))))
+     (project! root ":profiles {:default ^:displace [:one]
+                               :one {:cljfmt {:indentation? false}}}")
+     (is (nil? (:indentation? (fmt/load-config root)))))))
+
+(deftest clojure-octal-configuration-data-test
+  (in-project
+   (fn [root]
+     (let [file (put! root "chosen.clj" "{:custom [\\o141 \"\\123\" \"\\\\123\"]}")
+           options (fmt/load-config file)]
+       (is (= ["a" "S" "\\123"] (:custom options)))))))
+
+(deftest literal-string-escape-configuration-test
+  (in-project
+   (fn [root]
+     (let [file (put! root "strings.edn"
+                      "{\"unicode\" \"\\u0041B\" \"emoji\" \"\\uD83D\\uDE00\" \"basilisp\" \"\\a\\v\\U0001f600\"}")
+           options (fmt/load-config file)]
+       (is (= "AB" (get options "unicode")))
+       (is (= "😀" (get options "emoji")))
+       (is (= "\a\v😀" (get options "basilisp")))))))
+
+(deftest literal-primitive-configuration-test
+  (in-project
+   (fn [root]
+     (let [file (put! root "primitives.clj"
+                      "{:values [0x10 020 2r10 23N 1.5M 2/3 \\formfeed \\backspace :dotted.name Long/1]}")
+           options (fmt/load-config file)]
+       (is (= [16 16 2 23 1.5M 2/3 "\f" "\b" :dotted.name (symbol "Long/1")]
+              (:values options)))))))

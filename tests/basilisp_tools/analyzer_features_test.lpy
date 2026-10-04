@@ -1,0 +1,250 @@
+(ns basilisp-tools.analyzer-features-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [inspect] [pathlib] [tempfile] [concurrent.futures :as futures]))
+
+(defn- types [source]
+  (mapv :type (:findings (analyzer/analyze source))))
+
+(deftest inferred-core-types-test
+  (is (= [:type-mismatch] (types "(let [x \"bad\"] (inc x))")))
+  (is (= [:type-mismatch] (types "(defn f [x] (inc x)) (f \"bad\")")))
+  (doseq [source ["(let [f #(inc %)] (map f [1 2]))"
+                  "(defn f [x] (if (number? x) (inc x) x)) (f nil)"
+                  "(defn f [x] (cond (nil? x) 0 (number? x) (inc x) :else x)) (f nil)"
+                  "(defn f [x] (and (number? x) (inc x))) (f nil)"
+                  "(defn f [x] (case x :a 1 :b \"text\")) (str (f :a))"
+                  "(let [x (atom [])] (conj @x 1))"
+                  "(cond-> {} true (assoc :a 1))"]]
+    (testing source (is (empty? (:findings (analyzer/analyze source))) (:findings (analyzer/analyze source))))))
+
+(deftest configured-type-signatures-test
+  (let [config {:linters {:type-mismatch {:namespaces {'sample {'f {:arities {1 {:args [:string] :ret :int}}}}}}}}
+        result (analyzer/analyze "(ns sample) (declare f) (inc (f \"ok\")) (f 1)" {:config config})]
+    (is (= [:type-mismatch] (mapv :type (:findings result))))
+    (is (= "Expected: string, received: positive integer." (:message (first (:findings result)))))))
+
+(deftest shallow-and-data-analysis-test
+  (let [result (analyzer/analyze "(defn f [x] absent)" {:config {:analysis {:var-definitions {:shallow true}}}})]
+    (is (= [:unused-binding] (mapv :type (:findings result))))
+    (is (= 1 (count (:locals result))))
+    (is (= "f" (:name (first (:var-definitions result))))))
+  (let [result (analyzer/analyze "{:key missing :key (absent 1)}" {:lang :edn})]
+    (is (= [:duplicate-map-key] (mapv :type (:findings result))))
+    (is (empty? (:var-usages result)))))
+
+(deftest nested-definition-analysis-test
+  (let [result (analyzer/analyze "(comment (def x 1) (let [a 1] (def y a))) (def z 3)")]
+    (is (= #{"x" "y" "z"} (set (map :name (:var-definitions result)))))
+    (is (every? :filename (:var-definitions result)))))
+
+(deftest protocol-implementation-analysis-test
+  (let [result (analyzer/analyze "(defprotocol P (value [this])) (deftype Box [] P (value [_this] 1))")
+        implementation (first (:implementations result))]
+    (is (empty? (:findings result)) (:findings result))
+    (is (= "P" (:protocol-name implementation)))
+    (is (= "Box" (:type-name implementation)))
+    (is (= "value" (:name (:definition implementation))))
+    (is (= 1 (count (:protocol-methods result))))))
+
+(deftest destructuring-and-recursion-test
+  (is (= [:unbound-destructuring-default] (types "(let [{:keys [x] :or {other 1}} {}] x)")))
+  (is (= [:loop-without-recur] (types "(loop [x 1] x)")))
+  (is (empty? (types "(loop [x 1] (if (pos? x) (recur (dec x)) x))"))))
+
+(deftest python-overload-generic-flow-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        file (.joinpath root "typed.py")
+        opts {:python-options {:python-paths [(str root)] :python-cache (py/create-cache)}}]
+    (try
+      (.write_text file
+                   (str "from typing import TypeVar, Generic, overload, TypeGuard, Callable, ParamSpec\n"
+                        "from contextlib import contextmanager\n"
+                        "from collections.abc import Iterator\n"
+                        "T = TypeVar('T')\n"
+                        "P = ParamSpec('P')\n"
+                        "R = TypeVar('R')\n"
+                        "def passthrough(fn: Callable[P, R]) -> Callable[P, R]: ...\n"
+                        "def call_int(fn: Callable[[int], R], value: int) -> R: ...\n"
+                        "class Box(Generic[T]):\n"
+                        "    def get(self) -> T: ...\n"
+                        "def box() -> Box[str]: ...\n"
+                        "def identity(value: T) -> T: ...\n"
+                        "@overload\n"
+                        "def convert(value: int) -> str: ...\n"
+                        "@overload\n"
+                        "def convert(value: str) -> int: ...\n"
+                        "def convert(value): ...\n"
+                        "def maybe() -> str | None: ...\n"
+                        "async def fetch() -> str: ...\n"
+                        "@contextmanager\n"
+                        "def opened() -> Iterator[str]: ...\n"
+                        "def accepts(value: int) -> str: ...\n"
+                        "def is_text(value: object) -> TypeGuard[str]: ...\n"
+                        "async def async_is_text(value: object) -> TypeGuard[str]: ...\n"
+                        "def either() -> str | int: ...\n"
+                        "def sequence_first(value: list[str]) -> str: ...\n")
+                   ** :encoding "utf-8")
+      (doseq [body ["(.upper (typed/convert 1))"
+                    "(.upper (typed/identity \"text\"))"
+                    "(let [f (typed/passthrough typed/accepts)] (.upper (f 1)))"
+                    "(.upper (typed/call-int (fn [x] (str x)) 1))"
+                    "(.upper (typed/call-int #(str %) 1))"
+                    "(let [f (typed/passthrough (fn [^python/int x] (str x)))] (.upper (f 1)))"
+                    "(let [f (typed/passthrough typed/convert)] (.upper (f 1)) (inc (f \"1\")))"
+                    "(.upper (.get (typed/box)))"
+                    "(let [x (typed/maybe)] (when (some? x) (.upper x)))"
+                    "(let [x (typed/maybe)] (if (python/isinstance x python/str) (.upper x) nil))"
+                    "(defasync fetched [] (.upper (await (typed/fetch))))"
+                    "(with-open [x (typed/opened)] (.upper x))"
+                    "(.upper (typed/sequence-first #py [\"text\"]))"
+                    "(let [x (typed/either)] (if (python/isinstance x python/str) (.upper x) (inc x)))"
+                    "(when-some [x (typed/maybe)] (.upper x))"
+                    "(when-first [x [(typed/identity \"text\")]] (.upper x))"
+                    "(defn hinted ^python/str [x] x) (.upper (hinted (typed/identity \"text\")))"
+                    "(fn ^:async fetched [] (await (typed/fetch)))"
+                    "^:async (fn [] (await (typed/fetch)))"
+                    "(do (typed/box) (.upper (nth #py [\"text\"] 0)))"]]
+        (testing body
+          (let [result (analyzer/analyze (str "(ns sample (:import typed)) " body) opts)]
+            (is (empty? (:findings result)) (:findings result))
+            (is (some #(= ["str"] (get-in % [:python-type :path])) (:python-expressions result))))))
+      (doseq [body ["(typed/accepts \"bad\")"
+                    "(let [f (typed/passthrough typed/accepts)] (f \"bad\"))"
+                    "(typed/call-int (fn [^python/str x] (.upper x)) 1)"
+                    "(inc (typed/convert 1))"
+                    "(defn f [^python/str value] value) (f (typed/convert \"1\"))"
+                    "(defn f [value] (if (typed/is-text value) (inc value) nil))"]]
+        (let [result (analyzer/analyze (str "(ns sample (:import typed)) " body) opts)]
+          (testing body (is (= [:type-mismatch] (mapv :type (:findings result))) (:findings result)))))
+      (let [result (analyzer/analyze "(ns sample (:import typed)) (defn f [value] (if (typed/async-is-text value) (inc value) nil))" opts)]
+        (is (empty? (:findings result)) (:findings result)))
+      (finally (.cleanup temporary)))))
+
+(deftest evaluated-map-key-inference-test
+  (let [config {:linters {:type-mismatch {:namespaces {'sample {'f {:arities {1 {:args [{:op :keys :req {:a :number}}]}}}}}}}}]
+    (doseq [body ["(let [key :a] (f {key 1}))"
+                  "(f {(keyword \"a\") 1})"
+                  "(let [key :a] (f (assoc {} key 1)))"]]
+      (let [result (analyzer/analyze (str "(ns sample) (declare f) " body) {:config config})]
+        (testing body (is (empty? (:findings result)) (:findings result)))))
+    (is (= 1 (count (:findings (analyzer/analyze "(ns sample) (declare f) (f {})" {:config config}))))))
+  (doseq [body ["(let [key :b] (inc (:b {:a \"old\" key 1})))"
+                "(inc (:a (update {:a \"old\"} :a count)))"
+                "(let [key nil] (inc (get {nil 1} key)))"]]
+    (testing body
+      (is (empty? (filter #(= :type-mismatch (:type %)) (:findings (analyzer/analyze body)))))
+      (is (number? (eval (read-string body)))))))
+
+(deftest precise-destructuring-and-reader-conditions-test
+  (is (= [:type-mismatch] (types "(let [[a b] [1 \"text\"]] (+ a b))")))
+  (is (empty? (types "(let [[a & more :as all] [1 2]] (+ a (count more) (count all)))")))
+  (let [result (analyzer/analyze "#?(:default (def chosen 1) :lpy (def wrong 2))")]
+    (is (= #{"chosen"} (set (map :name (:var-definitions result)))))
+    (is (= [:unreachable-code] (mapv :type (:findings result)))))
+  (doseq [body ["(let [{:keys [a b] :or {b (let [a 1] a)}} {}] [a b])"
+                "(let [{:keys [a b] :or {b (fn [a] a)}} {}] [a b])"]]
+    (is (empty? (types body)))))
+
+(deftest basilisp-function-metadata-test
+  (is (= [:non-arg-vec-return-type-hint]
+         (types "(defn ^python/str value [x] x)")))
+  (is (= [:misplaced-async-metadata]
+         (types "(fn ^:async [] 1)")))
+  (is (empty? (types "(fn ^:async f [] 1)"))))
+
+(deftest parallel-analysis-record-isolation-test
+  (let [pool (futures/ThreadPoolExecutor ** :max_workers 2)]
+    (try
+      (let [jobs (mapv (fn [index]
+                         (.submit pool analyzer/analyze
+                                  (str "(ns concurrent.n" index ") (defn value [x] (let [y x] y))")))
+                       (range 8))]
+        (doseq [[index job] (map-indexed vector jobs)]
+          (let [result (.result job)]
+            (is (= (str "concurrent.n" index) (:namespace result)))
+            (is (= ["value"] (mapv :name (:var-definitions result))))
+            (is (= 2 (count (:locals result))))
+            (is (= 2 (count (:local-usages result))))
+            (is (every? vector? (map result [:locals :local-usages :var-usages :calls :findings])))
+            (is (empty? (:findings result))))))
+      (finally (.shutdown pool ** :wait true)))))
+
+(deftest literal-numeric-and-quoted-key-types-test
+  (doseq [source ["(inc (get {''a \"old\" 'a 1} 'a))"
+                  "(inc (get {[''a] \"old\" ['a] 1} ['a]))"
+                  "(python/chr (+ 64 1))"
+                  "(python/chr (- 66 1))"
+                  "(python/chr 0x4E)"
+                  "(+ 1/2 2.5 1M)"]]
+    (testing source
+      (is (empty? (types source)))))
+  (let [result (analyzer/analyze "(defn f ^python/str [x] x)" {:config {:analysis {:var-definitions {:shallow true}}}})]
+    (is (= ["str"] (get-in result [:definitions "f" :return-info :python-type :path])))))
+
+(deftest definition-metadata-and-reader-use-test
+  (let [source "(defn ^{:style/indent 1 :added \"name\"} f {:style/indent 2 :added \"attrs\"} [x] x)"
+        result (analyzer/declarations source)]
+    (is (= {:style/indent 2 :added "attrs"} (get-in result [:definitions "f" :meta])))
+    (is (= "attrs" (get-in result [:definitions "f" :added]))))
+  (doseq [source ["(ns sample (:require [basilisp.string :as s])) `s/join"
+                  "(ns sample (:require [basilisp.string :refer [join]])) `join"
+                  "(ns sample (:require [basilisp.string :as s])) `(s/join ~unknown)"]]
+    (let [found (types source)]
+      (is (not-any? #{:unused-namespace :unused-referred-var} found))
+      (when (.endswith source "~unknown)") (is (= [:unresolved-symbol] found))))))
+
+(deftest implicit-cond-fallthrough-test
+  (doseq [source ["(defn f [value] (let [result (cond (number? value) [value] (= :defn value) [0])] (when result (count result))))"
+                  "(defn f [value] (let [result (cond (number? value) [value])] (if result (count result) 0)))"]]
+    (is (empty? (types source)))))
+
+(deftest overload-and-variadic-basilisp-types-test
+  (is (= [:type-mismatch] (types "(defn f ([x] (str x)) ([x y] (+ x y))) (inc (f 1))")))
+  (is (empty? (types "(defn f ([x] (str x)) ([x y] (+ x y))) (.upper (f 1)) (inc (f 1 2))")))
+  (is (= [:type-mismatch] (types "(defn f [^python/str x & more] (str x more)) (f 1 2 3)")))
+  (is (empty? (types "(defn f [^python/str x & more] (str x more)) (.upper (f \"text\" 2 3))"))))
+
+(deftest destructuring-default-lexical-scopes-test
+  (doseq [source ["(let [{:keys [a b] :or {b (for [a [1]] a)}} {}] [a b])"
+                  "(let [{:keys [a b] :or {b (for [x [1] :let [a x] :when a] a)}} {}] [a b])"
+                  "(let [{:keys [a b] :or {b (letfn [(a [] 1)] (a))}} {}] [a b])"
+                  "(let [{:keys [a b] :or {b (try 1 (catch python/Exception a (str a)))}} {}] [a b])"]]
+    (is (empty? (types source)))))
+
+(deftest python-class-callable-test
+  (is (empty? (types "(map python/str [1 2])")))
+  (is (= ["1" "2"] (vec (eval (read-string "(map python/str [1 2])"))))))
+
+(deftest refer-all-resolves-exported-vars-test
+  (let [result (analyzer/analyze "(ns sample (:require [basilisp.string :refer :all])) (join \" \" [\"a\" \"b\"])")]
+    (is (= "basilisp.string" (:ns (first (filter #(= "join" (:name %)) (:var-usages result))))))
+    (is (= ["str"] (get-in (last (:python-expressions result)) [:python-type :path])))))
+
+(deftest async-anonymous-return-type-test
+  (is (inspect/iscoroutinefunction (eval (read-string "^:async #(str %)"))))
+  (let [result (analyzer/analyze "(let [f ^:async #(str %)] (f 1))")]
+    (is (empty? (:findings result)))
+    (is (= ["Coroutine"] (get-in (last (:python-expressions result)) [:python-type :path])))))
+
+(deftest nullable-core-contracts-test
+  (is (nil? (namespace 'plain)))
+  (is (= "sample" (namespace 'sample/name)))
+  (is (nil? (keyword nil)))
+  (is (nil? (not-empty [])))
+  (is (= [1] (not-empty [1])))
+  (doseq [source ["(defn optional-prefix [name] (when (namespace name) 1))"
+                  "(defn require-qualified [value] (when-not (namespace value) :unqualified))"
+                  "(when (namespace 'sample/name) :qualified)"
+                  "(when-not (namespace 'plain) :unqualified)"
+                  "(keyword nil)"
+                  "(defn maybe-values [values] (when (not-empty values) :present))"
+                  "(let [values []] (when (not-empty values) :present))"
+                  "(defn maybe-key [value] (when (keyword value) :present))"]]
+    (testing source (is (empty? (types source)))))
+  (let [result (analyzer/analyze "(defn upper-prefix [value] (when-some [prefix (namespace value)] (.upper prefix)))")
+        usage (first (filter #(= "upper" (:name %)) (:python-usages result)))]
+    (is (empty? (:findings result)))
+    (is (= :function (get-in usage [:definition :kind])))))

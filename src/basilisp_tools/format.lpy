@@ -2,8 +2,14 @@
   "Pure, lossless formatting with cljfmt-compatible EDN options."
   (:require [basilisp.edn :as edn]
             [basilisp.string :as str]
-            [basilisp-tools.syntax :as syntax])
-  (:import [pathlib] [re] [sys] [operator :as op]))
+            [basilisp-tools.syntax :as syntax]
+            [basilisp-tools.regex :as regex])
+  (:import [pathlib] [re] [sys] [os] [operator :as op]))
+
+(defn- parse-source [source]
+  ;; Formatting is syntactic: recognize shared Clojure source and configs
+  ;; without evaluating reader forms or changing Basilisp analysis semantics.
+  (syntax/parse source {:dialect :clojure}))
 
 (def ^:private containers
   #{:root :list :vector :map :set :anonymous-function
@@ -81,9 +87,46 @@
    :blank-lines-separate-alignment? false
    :max-column-alignment-gap nil :max-column-alignment-width nil})
 
+(defn- style-argument-rule [index specification]
+  (loop [value specification depth 0]
+    (cond
+      (vector? value) (recur (first value) (inc depth))
+      (or (number? value) (= :defn value)) [:inner depth index]
+      :else nil)))
+
+(defn style-indent-rules
+  "Convert Cider :style/indent metadata to cljfmt rules, matching clojure-lsp."
+  [specification]
+  (let [[head & arguments] (if (vector? specification) specification [specification])
+        head-rule (cond (number? head) [:block head]
+                        (= :defn head) [:inner 0])
+        arguments-rules (keep-indexed style-argument-rule arguments)
+        [kind depth index :as tail] (last arguments-rules)]
+    (not-empty
+     (vec (concat (when head-rule [head-rule])
+                  (butlast arguments-rules)
+                  (cond
+                    (and (= :inner kind) (= index (dec (count arguments))))
+                    [[:inner depth]]
+                    tail [tail]
+                    :else nil))))))
+
+(defn with-analysis-indents
+  "Add :style/indent from a sequence of analyzed var definitions.
+  Definition names are qualified by :ns. Explicit user :indents and
+  :extra-indents take precedence; standard indentation remains available."
+  [options definitions]
+  (let [metadata-indents
+        (into {} (keep (fn [definition]
+                         (when-let [rules (style-indent-rules (get-in definition [:meta :style/indent]))]
+                           (when (and (:ns definition) (:name definition))
+                             [(symbol (str (:ns definition)) (name (:name definition))) rules]))))
+              definitions)]
+    (assoc options :indents (merge default-indents metadata-indents (:indents options)))))
+
 (defn- invalid [message data] (throw (ex-info message data)))
 
-(defn- regex? [x] (instance? re/Pattern x))
+(defn- regex? [x] (regex/pattern? x))
 (defn- matcher? [x] (or (symbol? x) (string? x) (regex? x)))
 (defn- rule-key? [k]
   (or (matcher? k)
@@ -152,6 +195,20 @@
             (assoc result k v))
           {} pairs))
 
+(defn- clojure-string [text]
+  ;; The syntax reader already validates escapes. Decode literal data directly:
+  ;; Basilisp EDN does not implement Clojure Unicode or octal string escapes.
+  (let [decoded (re/sub "\\\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|.)"
+                        (fn [match]
+                          (let [value (.group match 1)]
+                            (cond
+                              (contains? #{"u" "U"} (subs value 0 1)) (python/chr (python/int (subs value 1) 16))
+                              (re/fullmatch "[0-7]{1,3}" value) (python/chr (python/int value 8))
+                              :else (get {"t" "\t" "b" "\b" "n" "\n" "r" "\r" "f" "\f" "a" "\a" "v" "\v"
+                                          "\\" "\\" "\"" "\""} value))))
+                        (subs text 1 (dec (count text))))]
+    (.decode (.encode decoded "utf-16-le" "surrogatepass") "utf-16-le" "surrogatepass")))
+
 (defn- config-value [node file clj?]
   ;; Decode data from our syntax tree. Never invoke the compiler, project code,
   ;; reader evaluation, or user-defined tagged-literal readers.
@@ -163,17 +220,41 @@
         (keyword (str "user/" (subs (:text node) 2)))
         (config-error file "Auto-resolved keyword aliases require a Clojure namespace"))
 
-      (#{:nil :boolean :number :symbolic-number :character :keyword :symbol :string} kind)
-      (edn/read-string (syntax/text node))
+      (and (op/eq :character kind) (.startswith (:text node) "\\o"))
+      (python/chr (python/int (subs (:text node) 2) 8))
 
-      (and (true? clj?) (op/eq :metadata kind))
+      (op/eq :string kind) (clojure-string (syntax/text node))
+
+      (op/eq :character kind)
+      (let [value (subs (:text node) 1)]
+        (cond
+          (contains? #{"newline" "space" "tab" "formfeed" "backspace" "return"} value)
+          (get {"newline" "\n" "space" " " "tab" "\t" "formfeed" "\f" "backspace" "\b" "return" "\r"} value)
+          (and (> (count value) 1) (.startswith value "u")) (python/chr (python/int (subs value 1) 16))
+          :else value))
+
+      (op/eq :keyword kind) (keyword (subs (:text node) 1))
+      (op/eq :symbol kind) (symbol (:text node))
+      ;; The full reader is used only for a validated primitive leaf, which
+      ;; cannot contain reader dispatch, evaluation, or tagged-literal readers.
+      (#{:nil :boolean :number :symbolic-number} kind) (read-string (:text node))
+
+      (and clj? (op/eq :metadata kind))
       (let [metadata (config-value (first forms) file clj?)
             target (second forms)]
         (when-not (and (or (map? metadata) (keyword? metadata)
                            (symbol? metadata) (string? metadata))
                        (#{:symbol :map :vector :set :list :namespaced-map :metadata} (:kind target)))
           (config-error file "Invalid configuration metadata"))
-        (config-value target file clj?))
+        (let [value (config-value target file clj?)]
+          (if (op/eq :project clj?)
+            (with-meta value
+              (merge (meta value)
+                     (cond
+                       (map? metadata) metadata
+                       (keyword? metadata) {metadata true}
+                       :else {:tag metadata})))
+            value)))
 
       (#{:map :vector :set :list} kind)
       (let [values (mapv #(config-value % file clj?) forms)]
@@ -206,12 +287,12 @@
 
       (and clj? (op/eq :regex kind) (.startswith (syntax/text node) "#\""))
       (let [source (syntax/text node)]
-        (re/compile (subs source 2 (dec (count source)))))
+        (regex/compile (subs source 2 (dec (count source)))))
 
       (and (not clj?) (op/eq :tagged kind)
            (op/eq "#re" (:text (first (:children node))))
            (op/eq :string (:kind (first forms))))
-      (re/compile (config-value (first forms) file false))
+      (regex/compile (config-value (first forms) file false))
 
       (and (op/eq :tagged kind)
            (#{"#inst" "#uuid"} (:text (first (:children node)))))
@@ -222,7 +303,7 @@
                                "; use literal data (computed values and reader macros are not evaluated)")))))
 
 (defn- config-tree [file]
-  (let [parsed (syntax/parse (.read_text file ** :encoding "utf-8"))]
+  (let [parsed (parse-source (.read_text file ** :encoding "utf-8"))]
     (when (seq (:diagnostics parsed))
       (invalid (str file ": Invalid configuration syntax")
                {:path (str file) :diagnostics (:diagnostics parsed)}))
@@ -232,11 +313,11 @@
   (when-not (#{".edn" ".clj"} (.-suffix file))
     (config-error file "Configuration filename must end in .edn or .clj"))
   (let [clj? (op/eq ".clj" (.-suffix file))
-        parsed (syntax/parse (.read_text file ** :encoding "utf-8"))
+        parsed (parse-source (.read_text file ** :encoding "utf-8"))
         node (first (node-forms (:root parsed)))
         ;; Both upstream readers consume just the first form. A malformed
         ;; later form must not invalidate the selected configuration map.
-        prefix (if node (syntax/parse (subs (:source parsed) 0 (:end node))) parsed)
+        prefix (if node (parse-source (subs (:source parsed) 0 (:end node))) parsed)
         diagnostics (:diagnostics prefix)]
     (when (seq diagnostics)
       (invalid (str file ": Invalid configuration syntax")
@@ -289,36 +370,182 @@
         (config-error file "Expected literal defproject keyword/value pairs"))
       (config-map (map (fn [[k v]] [(:text k) v]) (partition 2 fields)) file))))
 
-(defn- project-paths [fields options root file]
+(defn- merge-meta [value metadata]
+  (if (or (coll? value) (symbol? value)) (with-meta value metadata) value))
+
+(defn- profile-merge
+  ;; Leiningen's meta-merge for the literal values used by formatting:
+  ;; recursive maps, set union, ordered collections and priority metadata.
+  [left right]
+  (let [lm (meta left) rm (meta right)]
+    (cond
+      (nil? left) right
+      (nil? right) (merge-meta left (dissoc lm :top-displace))
+      (:top-displace lm) right
+      (and (:displace lm) (:top-displace rm)) left
+      (or (and (:displace lm) (:displace rm))
+          (and (:replace lm) (:replace rm)))
+      (merge-meta right (merge lm rm))
+      (or (:displace lm) (:replace rm))
+      (merge-meta right (merge (dissoc lm :displace) (dissoc rm :replace)))
+      (or (:replace lm) (:displace rm))
+      (merge-meta left (merge (dissoc rm :displace) (dissoc lm :replace)))
+      (and (map? left) (map? right))
+      (reduce (fn [result [key value]]
+                (assoc result key (if (contains? result key)
+                                    (profile-merge (get result key) value) value)))
+              left right)
+      (and (set? left) (set? right)) (into left right)
+      (and (coll? left) (coll? right))
+      (if (or (:prepend lm) (:prepend rm))
+        (with-meta (vec (concat right left)) (merge rm lm))
+        (with-meta (vec (concat left right)) (merge lm rm)))
+      :else right)))
+
+(def ^:private project-format-keys #{":cljfmt" ":source-paths" ":test-paths"})
+
+(defn- project-values [pairs file]
+  ;; Ignore unrelated project expressions; reading formatter configuration
+  ;; must never execute dependency declarations, middleware or plugins.
+  (reduce (fn [result [key node]]
+            (if (contains? project-format-keys key)
+              (let [value (config-value node file :project)
+                    value (if (and (not (op/eq key ":cljfmt")) (sequential? value))
+                            (with-meta value (assoc (meta value) :prepend true)) value)]
+                (assoc result (keyword (subs key 1)) value))
+              result))
+          {} pairs))
+
+(declare profile-value)
+(defn- profile-value [node file]
+  (let [kind (:kind node) forms (node-forms node)]
+    (case kind
+      :nil nil
+      :keyword (config-value node file :project)
+      :map (project-values (map (fn [[key value]] [(syntax/text key) value])
+                                (partition 2 forms)) file)
+      :vector (mapv #(profile-value % file) forms)
+      :metadata
+      (let [value (profile-value (second forms) file)
+            metadata (config-value (first forms) file :project)]
+        (merge-meta value (merge (meta value)
+                                 (if (keyword? metadata) {metadata true} metadata))))
+      (config-error file "Lein profiles must contain literal maps, keywords or vectors"))))
+
+(defn- profile-definitions [node file]
+  (when-not (or (nil? node) (op/eq :map (:kind node)))
+    (config-error file "Expected a literal map of Lein profiles"))
+  (reduce (fn [profiles [key value]]
+            (when-not (op/eq :keyword (:kind key))
+              (config-error file "Lein profile names must be keywords"))
+            (when (op/eq :keyword (:kind value))
+              (config-error file "Use a vector for a composite Lein profile"))
+            (assoc profiles (config-value key file :project)
+                   (profile-value value file)))
+          {} (partition 2 (node-forms node))))
+
+(defn- read-profile-file [file]
+  (when (.is_file file)
+    (let [node (first (node-forms (config-tree file)))]
+      (when-not (op/eq :nil (:kind node))
+        (profile-definitions node file)))))
+
+(defn- lein-home []
+  (let [home (.home pathlib/Path)
+        classic (.joinpath home ".lein")
+        xdg (.joinpath (pathlib/Path (os/getenv "XDG_CONFIG_HOME"
+                                                (str (.joinpath home ".config"))))
+                       "leiningen")]
+    (if-let [explicit (os/getenv "LEIN_HOME")]
+      (pathlib/Path explicit)
+      (cond (.exists classic) classic (.exists xdg) xdg :else classic))))
+
+(defn- external-profiles [file]
+  (let [system (if (op/eq os/name "nt")
+                 (.joinpath (pathlib/Path (os/getenv "AllUsersProfile" "")) "Leiningen")
+                 (pathlib/Path "/etc/leiningen"))
+        user
+        (when (nil? (os/getenv "LEIN_NO_USER_PROFILES"))
+          (let [home (lein-home)
+                base (or (read-profile-file (.joinpath home "profiles.clj")) {})
+                directory (.joinpath home "profiles.d")]
+            (reduce
+             (fn [profiles path]
+               (let [key (keyword (.-stem path))]
+                 (when (contains? profiles key)
+                   (config-error file (str "Multiple profiles defined in Lein home: " key)))
+                 (assoc profiles key
+                        (profile-value (first (node-forms (config-tree path))) path))))
+             base (if (.is_dir directory)
+                    (sort-by str (filter #(.is_file %) (iterator-seq (.glob directory "*.clj")))) []))))]
+    (merge (read-profile-file (.joinpath system "profiles.clj")) user)))
+
+(defn- apply-project-profiles [project fields root file options]
+  (let [project (reduce (fn [value [key fallback]]
+                          (if (some? (get value key)) value
+                              (assoc value key fallback)))
+                        project [[:source-paths ^:prepend ["src"]]
+                                 [:test-paths ^:prepend ["test"]]])
+        local-file (.joinpath root "profiles.clj")
+        profiles (merge {:default [:leiningen/default]
+                         :leiningen/default [:base :system :user :provided :dev]}
+                        (external-profiles file)
+                        (profile-definitions (get fields ":profiles") file)
+                        (when (.is_file local-file)
+                          (profile-definitions (first (node-forms (config-tree local-file)))
+                                               local-file)))
+        selected (:lein-profiles options [:default])]
+    (when-not (and (sequential? selected) (every? keyword? selected))
+      (config-error file ":lein-profiles must be a vector of profile keywords"))
+    (letfn [(expand [entry seen]
+              (cond
+                (keyword? entry)
+                (do
+                  (when (contains? seen entry)
+                    (config-error file (str "Cyclic Lein profile: " entry)))
+                  (let [value (get profiles entry)]
+                    (when (and (op/eq :provided entry) (sequential? value))
+                      (config-error file "Composite profiles are incompatible with :provided"))
+                    (if (or (keyword? value) (sequential? value))
+                      (map (fn [[name profile]]
+                             [name (merge-meta profile (merge (meta profile) (meta value)))])
+                           (expand value (conj seen entry)))
+                      [[entry (or value {})]])))
+                (sequential? entry) (mapcat #(expand % seen) entry)
+                (map? entry) [[nil entry]]
+                (nil? entry) []
+                :else (config-error file "Invalid Lein profile")))]
+      ;; Lein applies the last occurrence of each named atomic profile.
+      (let [expanded (vec (expand selected #{}))
+            unique (reduce (fn [entries [name _value :as entry]]
+                             (conj (if name (filterv #(not (op/eq name (first %))) entries) entries)
+                                   entry))
+                           [] expanded)]
+        (reduce (fn [result [_ profile]] (profile-merge result profile)) project unique)))))
+
+(defn- project-paths [project options root file]
   (if (some? (:paths options))
     (:paths options)
     (let [paths (mapcat (fn [[key fallback]]
-                          (let [value (if-let [node (get fields key)]
-                                        (config-value node file :project) fallback)
+                          (let [value (get project key)
                                 value (if (nil? value) fallback value)]
-                            (when-not (or (nil? value)
-                                          (and (sequential? value) (every? string? value)))
+                            (when-not (and (sequential? value) (every? string? value))
                               (config-error file (str key " must contain literal paths")))
                             value))
-                        [[":source-paths" ["src"]] [":test-paths" ["test"]]])]
+                        [[:source-paths ["src"]] [:test-paths ["test"]]])]
       (when (empty? paths)
         (config-error file "No source or test paths defined in project map"))
       (filterv #(.is_dir (.joinpath root %)) paths))))
 
-(defn- read-project-config [file]
+(defn- read-project-config [file options]
   (let [fields (project-fields file)
         root (.-parent file)
-        profiles (get fields ":profiles")
-        _ (when (and profiles
-                     (some #(and (op/eq :keyword (:kind %))
-                                 (#{":cljfmt" ":source-paths" ":test-paths"} (:text %)))
-                           (syntax/nodes profiles)))
-            (config-error file "Leiningen profiles affecting formatter settings are unsupported; use top-level configuration or --config"))
-        project (if-let [node (get fields ":cljfmt")] (config-value node file :project) {})
+        values (apply-project-profiles (project-values fields file) fields root file options)
+        project (:cljfmt values {})
         project (if (nil? project) {} project)
         _ (when-not (map? project) (config-error file ":cljfmt must be a literal map"))
         ;; Lein selects paths before loading the optional config file.
-        project (assoc project :paths (project-paths fields project root file)
+        project (assoc project :paths (project-paths values project root file)
                        :project-root (str root))
         config-file (when (:load-config-file? project)
                       (find-formatter-config root {}))
@@ -332,7 +559,9 @@
   "Load literal project.clj settings with Leiningen precedence, or discover
   cljfmt configuration upward when there is no project. Clojure files require
   :read-clj-config-files? for discovery; explicit files always load. No project
-  code, reader evaluation or custom tagged-literal reader is executed."
+  code, reader evaluation or custom tagged-literal reader is executed.
+  Literal project, system and user profiles use Lein's discovery, default
+  selection and merge metadata. :lein-profiles may select a vector of profile keywords."
   ([] (load-config (.cwd pathlib/Path) {}))
   ([path] (load-config path {}))
   ([path options]
@@ -344,7 +573,7 @@
                 :else (config-error p "Configuration path does not exist"))
          value (cond
                  (nil? file) {}
-                 (op/eq "project.clj" (.-name file)) (read-project-config file)
+                 (op/eq "project.clj" (.-name file)) (read-project-config file options)
                  :else (read-file-config file))]
      (resolve-options value)
      value)))
@@ -386,6 +615,14 @@
 
       :else ctx)))
 
+(defn- index-rules [rules]
+  (reduce (fn [index [key _value :as entry]]
+            (update index
+                    (when-not (or (regex? key) (vector? key))
+                      (last (.rsplit (str key) "/" 1)))
+                    (fnil conj []) entry))
+          {} rules))
+
 (defn- namespace-context [root opts]
   (let [ns-form (first (filter #(and (op/eq :list (:kind %)) (op/eq "ns" (head %)))
                                (node-forms root)))
@@ -398,7 +635,8 @@
         (reduce (fn [ctx clause]
                   (reduce #(infer-libspec %1 %2 nil)
                           ctx (rest (semantic-forms clause))))
-                {:ns ns-name :aliases {} :refers {} :rule-cache (atom {})} clauses)]
+                {:ns ns-name :aliases {} :refers {} :rule-cache (atom {})
+                 :rule-index (index-rules (:indents opts))} clauses)]
     (-> inferred
         (update :aliases merge (into {} (map (fn [[k v]] [(str k) (str v)]) (:alias-map opts))))
         (update :refers merge (into {} (map (fn [[k v]] [(str k) (str v)]) (:refer-map opts)))))))
@@ -410,7 +648,7 @@
       [(get (:refers ctx) s (:ns ctx)) s])))
 
 (defn- matches? [pattern value]
-  (and value (if (regex? pattern) (boolean (re/search pattern value))
+  (and value (if (regex? pattern) (boolean (regex/search pattern value))
                  (op/eq (str pattern) value))))
 
 (defn- key-matches? [key s ctx]
@@ -430,9 +668,9 @@
    (cond (regex? k) 2
          (or (vector? k) (str/includes? (str k) "/")) 0
          :else 1)
-   (str k)])
+   (if (regex? k) (regex/source k) (str k))])
 
-(defn- matching-rules [node opts ctx]
+(defn- matching-rules [node ctx]
   (when (#{:list :anonymous-function} (:kind node))
     (let [s (head node) cache (:rule-cache ctx)]
       (if (contains? @cache s)
@@ -443,7 +681,9 @@
                 (fn [entry]
                   (map-indexed (fn [i rule] [(conj (rule-priority entry) i) rule])
                                (second entry)))
-                (filter #(key-matches? (first %) s ctx) (:indents opts))))]
+                (filter #(key-matches? (first %) s ctx)
+                        (concat (get (:rule-index ctx) (when s (last (.rsplit s "/" 1))))
+                                (get (:rule-index ctx) nil)))))]
           (swap! cache assoc s rules)
           rules)))))
 
@@ -452,20 +692,30 @@
       (and parent
            (some (fn [[k v]]
                    (and (key-matches? k (head (:node parent)) ctx)
-                        (and (not (op/eq :all v)) (contains? v (dec (:parent-index frame))))))
+                        (not (op/eq :all v)) (contains? v (dec (:parent-index frame)))))
                  rules))))
 
 (defn- combine-gaps [children]
-  (reduce (fn [xs n]
-            (if (gap? n)
-              (if (gap? (peek xs))
-                (conj (pop xs) (update (peek xs) :text str (if (op/eq :newline (:kind n)) "\n" (:text n))))
-                (conj xs (assoc n :kind :gap :text (if (op/eq :newline (:kind n)) "\n" (:text n)))))
-              (conj xs n))) [] children))
+  ;; These buffers belong to one formatting invocation. Public syntax nodes
+  ;; remain immutable; native iteration avoids constructing lazy Lisp sequences
+  ;; for every token in a large source file.
+  (let [result #py [] items (python/iter children)]
+    (loop [node (python/next items nil)]
+      (if node
+        (do
+          (if (gap? node)
+            (let [previous (when (pos? (python/len result)) (op/getitem result -1))
+                  value (if (op/eq :newline (:kind node)) "\n" (:text node))]
+              (if (gap? previous)
+                (op/setitem result -1 (assoc previous :text (str (:text previous) value)))
+                (.append result (assoc node :kind :gap :text value))))
+            (.append result node))
+          (recur (python/next items nil)))
+        (vec result)))))
 
 (declare prepare)
-(defn- normalize-children [node opts]
-  (let [xs (combine-gaps (mapv #(prepare % opts) (:children node)))
+(defn- normalize-content [node opts]
+  (let [xs (combine-gaps (python/map #(prepare % opts) (:children node)))
         bounded? (or (#{:discard :quote :syntax-quote :unquote-splicing :deref :var-quote} (:kind node))
                      (and (op/eq :unquote (:kind node))
                           (not (op/eq :deref (:kind (first (node-forms node))))))
@@ -479,8 +729,8 @@
                (if (op/eq :comment (:kind before))
                  (assoc xs (- n 2) (leaf :gap (or (some-> (re/search "\r\n|\r|\n" (:text gap)) .group) "\n")))
                  (conj (vec (take (- n 2) xs)) (last xs)))) xs)]
-    (loop [result [] remaining xs form-index 0]
-      (if-let [n (first remaining)]
+    (loop [result [] cursor 0 form-index 0]
+      (if-let [n (get xs cursor)]
         (let [previous (peek result)
               split? (and (op/eq :map (:kind node)) (:split-keypairs-over-multiple-lines? opts)
                           (form? n) (pos? form-index) (even? form-index))
@@ -495,8 +745,19 @@
                                 (and (op/eq :discard (:kind previous)) (form? n))))
                        (conj result (leaf :gap " "))
                        :else result)]
-          (recur (conj result n) (rest remaining) (+ form-index (if (form? n) 1 0))))
+          (recur (conj result n) (inc cursor) (+ form-index (if (form? n) 1 0))))
         result))))
+
+(defn- conditional-opening-index [node]
+  (when (and (#{:reader-conditional :reader-splice} (:kind node))
+             (op/eq :prefix (:kind (first (:children node)))))
+    (first (keep-indexed #(when (op/eq :delimiter (:kind %2)) %1) (:children node)))))
+
+(defn- normalize-children [node opts]
+  (if-let [index (conditional-opening-index node)]
+    (into (combine-gaps (python/map #(prepare % opts) (subvec (:children node) 0 index)))
+          (normalize-content (assoc node :children (subvec (:children node) index)) opts))
+    (normalize-content node opts)))
 
 (defn- comment? [node] (op/eq :comment (:kind node)))
 (defn- gap-lines [node]
@@ -597,36 +858,52 @@
       (<= i 1) (+ body (if extra? 1 0))
       :else (or (:col (get pos 1)) body))))
 
+(defn- indentation-candidates [frames]
+  (let [candidates #py [] depth-count (count frames)]
+    (loop [depth 0]
+      (when (< depth depth-count)
+        (let [ancestor (nth frames (- depth-count depth 1))
+              entries (python/iter (or (:rules ancestor) []))]
+          (loop [entry (python/next entries nil)]
+            (when entry
+              (.append candidates [(first entry) depth (second entry)])
+              (recur (python/next entries nil)))))
+        (recur (inc depth))))
+    (python/sorted candidates ** :key first)))
+
 (defn- indentation [frames opts _ctx]
   (let [frame (peek frames)
-        ancestors (vec (reverse frames))
-        candidates
-        (sort-by first
-                 (mapcat (fn [[depth ancestor]]
-                           (map (fn [[priority rule]] [priority depth rule])
-                                (:rules ancestor)))
-                         (map-indexed vector ancestors)))]
-    (or
-     (some
-      (fn [[_ depth [kind n arg]]]
-        (case kind
-          :inner (when (and (pos? (:index frame)) (op/eq n depth)
-                            (or (nil? arg)
-                                (and (pos? depth)
-                                     (op/eq arg (dec (:parent-index (get ancestors (dec depth))))))))
-                   (inc (:body frame)))
-          :block (when (zero? depth)
-                   (if (<= (:index frame) n)
-                     (ordinary-indent frame opts)
-                     (let [p (get (:positions frame) (inc n))
-                           before (get (:positions frame) n)]
-                       (if (or (nil? p) (not (op/eq (:line p) (:line before))))
-                         (inc (:body frame))
-                         (ordinary-indent frame opts)))))
-          :default (when (zero? depth) (ordinary-indent frame opts))
-          nil))
-      candidates)
-     (ordinary-indent frame opts))))
+        ;; A collection's ancestors and rules cannot change while rendering it.
+        cache (:indent-cache frame)
+        candidates (or (op/getitem cache 0)
+                       (let [value (indentation-candidates frames)]
+                         (op/setitem cache 0 value)
+                         value))
+        entries (python/iter candidates)]
+    (loop [entry (python/next entries nil)]
+      (if entry
+        (let [[_ depth [kind n arg]] entry
+              result
+              (case kind
+                :inner (when (and (pos? (:index frame)) (op/eq n depth)
+                                  (or (nil? arg)
+                                      (and (pos? depth)
+                                           (op/eq arg
+                                                  (dec (:parent-index
+                                                        (nth frames (- (count frames) depth))))))))
+                         (inc (:body frame)))
+                :block (when (zero? depth)
+                         (if (<= (:index frame) n)
+                           (ordinary-indent frame opts)
+                           (let [p (get (:positions frame) (inc n))
+                                 before (get (:positions frame) n)]
+                             (if (or (nil? p) (not (op/eq (:line p) (:line before))))
+                               (inc (:body frame))
+                               (ordinary-indent frame opts)))))
+                :default (when (zero? depth) (ordinary-indent frame opts))
+                nil)]
+          (if (some? result) result (recur (python/next entries nil))))
+        (ordinary-indent frame opts)))))
 
 (defn- write! [state s]
   ;; Private, invocation-local buffers avoid allocating a persistent map and
@@ -675,17 +952,25 @@
 (defn- render-children! [state node frames opts ctx]
   (let [collection? (contains? containers (:kind node))
         wrapper-indent (when (#{:quote :syntax-quote :unquote :unquote-splicing
-                                :deref :var-quote :tagged :namespaced-map :discard} (:kind node))
+                                :deref :var-quote :tagged :namespaced-map :discard :read-eval} (:kind node))
                          (inc (op/getitem state "col")))
-        body (+ (op/getitem state "col")
-                (if (op/eq :root (:kind node)) 0 (count (:text (first (:children node))))))
+        prefix-index (conditional-opening-index node)
+        prefix-indent (when prefix-index (inc (op/getitem state "col")))
+        opener (if prefix-index
+                 (str/join "" (map syntax/text (take (inc prefix-index) (:children node))))
+                 (:text (first (:children node)) ""))
+        body (cond
+               (op/eq :root (:kind node)) (op/getitem state "col")
+               (and prefix-index (newline? opener) (:indentation? opts)) (inc prefix-indent)
+               (newline? opener) (column-width (last (re/split "\\r\\n|\\r|\\n" opener)))
+               :else (+ (op/getitem state "col") (column-width opener)))
         frame {:node node :body body :positions [] :index 0
-               :rules (when collection? (matching-rules node opts ctx))
+               :rules (when collection? (matching-rules node ctx)) :indent-cache #py [nil]
                :parent-index (:index (peek frames))}
         frames (if collection? (conj frames frame) frames)]
-    (loop [xs (:children node) frames frames previous nil]
-      (when-let [n (first xs)]
-        (let [next (second xs)
+    (loop [cursor 0 frames frames previous nil]
+      (when-let [n (get (:children node) cursor)]
+        (let [next (get (:children node) (inc cursor))
               frame (peek frames)
               current-form? (and collection? (form? n))
               frames (if current-form?
@@ -694,9 +979,11 @@
                        frames)]
           (if (gap? n)
             (write! state (format-gap (:text n) previous next frames
-                                      (cond-> opts wrapper-indent (assoc ::wrapper-indent wrapper-indent)) ctx))
+                                      (cond-> opts
+                                        wrapper-indent (assoc ::wrapper-indent wrapper-indent)
+                                        (and prefix-index (< cursor prefix-index)) (assoc ::wrapper-indent prefix-indent)) ctx))
             (render! state n frames opts ctx))
-          (recur (rest xs)
+          (recur (inc cursor)
                  (if current-form?
                    (conj (pop frames) (update (peek frames) :index inc)) frames)
                  n))))))
@@ -743,7 +1030,7 @@
        (source-shape node)))))
 
 (defn- validate-output [original prepared output options]
-  (let [parsed (syntax/parse output)
+  (let [parsed (parse-source output)
         actual (source-shape (:root parsed))]
     (when (or (seq (:diagnostics parsed))
               (if (:sort-ns-references? options)
@@ -759,7 +1046,7 @@
   ;; multiline value shifts another value on its closing line. Return only
   ;; a stable layout, and fail closed on a cycle or excessive convergence.
   (loop [candidate (align-columns source opts ctx) seen #{source} passes 0]
-    (let [parsed (syntax/parse candidate)
+    (let [parsed (parse-source candidate)
           _ (when (seq (:diagnostics parsed))
               (invalid "Invalid syntax produced during alignment" {:code :unsafe-formatting}))
           rendered (render (prepare (:root parsed) opts) opts ctx)
@@ -777,7 +1064,7 @@
   ([source] (format-string source {}))
   ([source options]
    (let [opts (resolve-options options)
-         parsed (syntax/parse source)
+         parsed (parse-source source)
          _ (when (seq (:diagnostics parsed))
              (invalid "Cannot format invalid syntax" {:diagnostics (:diagnostics parsed)}))
          original (:root parsed)
@@ -872,13 +1159,13 @@
   ;; Resolve one column at a time so padding in earlier columns is included
   ;; in later column widths. Each collection is processed outside-in.
   (loop [source source target-index 0]
-    (let [parsed (syntax/parse source)
+    (let [parsed (parse-source source)
           targets (vec (alignment-targets (:root parsed) opts ctx))]
       (if-let [target (get targets target-index)]
         (let [columns (apply max 0 (map count (column-rows target parsed opts)))
               source
               (reduce (fn [s column]
-                        (let [p (syntax/parse s)
+                        (let [p (parse-source s)
                               n (nth (alignment-targets (:root p) opts ctx) target-index)]
                           (apply-edits s (column-edits s p n column opts))))
                       source (range 1 columns))]

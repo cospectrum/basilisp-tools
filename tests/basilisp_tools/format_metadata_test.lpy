@@ -1,0 +1,49 @@
+(ns basilisp-tools.format-metadata-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(deftest cider-style-indentation-test
+  ;; Pinned clojure-lsp format_test.clj conversion expectations.
+  (doseq [[input expected] [[0 [[:block 0]]] [1 [[:block 1]]] [2 [[:block 2]]]
+                            [:defn [[:inner 0]]] [:form nil] [nil nil]
+                            [[0] [[:block 0]]] [[1] [[:block 1]]] [[2] [[:block 2]]]
+                            [[:defn] [[:inner 0]]] [[:form] nil]
+                            [[1 [[:defn]] :form] [[:block 1] [:inner 2 0]]]
+                            [[2 :form :form [1]] [[:block 2] [:inner 1]]]
+                            [[:form [:defn]] [[:inner 1]]]
+                            [[:form [[[:defn]]] :form] [[:inner 3 0]]]
+                            [[:form :form [[[[:defn]]]] :form] [[:inner 4 1]]]]]
+    (testing (pr-str input)
+      (is (= expected (fmt/style-indent-rules input))))))
+
+(deftest metadata-formatting-test
+  (let [definitions [{:ns "example.macros" :name "custom" :macro true :meta {:style/indent 1}}
+                     {:ns 'example.macros :name 'no-style :macro true :meta {:style/indent :form}}]
+        options (fmt/with-analysis-indents {} definitions)
+        source "(ns sample (:require [example.macros :as m]))\n(m/custom a\nb\nc)"
+        expected "(ns sample (:require [example.macros :as m]))\n(m/custom a\n  b\n  c)"]
+    (is (= [[:block 1]] (get-in options [:indents 'example.macros/custom])))
+    (is (nil? (get-in options [:indents 'custom])))
+    (is (nil? (get-in options [:indents 'example.macros/no-style])))
+    (is (= expected (fmt/format-string source options)))
+    (is (= expected (fmt/format-string expected options)))
+    (is (= [[:block 2]] (get-in (fmt/with-analysis-indents
+                                  {:indents {'example.macros/custom [[:block 2]]}}
+                                  definitions)
+                                [:indents 'example.macros/custom])))
+    (is (= [[:inner 0]] (get-in (fmt/resolve-options
+                                 (fmt/with-analysis-indents
+                                   {:extra-indents {'example.macros/custom [[:inner 0]]}}
+                                   definitions))
+                                [:indents 'example.macros/custom])))
+    (is (= "(let [x 1]\n  x)"
+           (fmt/format-string "(let [x 1]\nx)" (fmt/with-analysis-indents {:indents {}} definitions))))))
+
+(deftest analyzed-macro-metadata-test
+  (let [prefix "(ns sample)\n(defmacro ^{:style/indent :defn} custom {:style/indent 1} [x & body] nil)\n"
+        source (str prefix "(custom a\nb)")
+        definitions (:definitions (analyzer/declarations source))
+        options (fmt/with-analysis-indents {} (vals definitions))]
+    (is (= 1 (get-in definitions ["custom" :meta :style/indent])))
+    (is (= (str prefix "(custom a\n  b)") (fmt/format-string source options)))))

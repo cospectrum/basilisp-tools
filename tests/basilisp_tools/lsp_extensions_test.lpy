@@ -1,0 +1,288 @@
+(ns basilisp-tools.lsp-extensions-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.lsp]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.syntax :as syntax])
+  (:import [json] [pathlib] [queue] [subprocess] [sys] [tempfile] [threading] [zipfile] [lsprotocol.types :as lsp] [pygls.workspace :as workspace] [unittest.mock :as mock]))
+
+(defn- read-messages [process messages]
+  (try
+    (loop []
+      (let [header (.readline (.-stdout process))]
+        (when (seq header)
+          (let [length (python/int (second (.split (.decode header "ascii") ":")))]
+            (loop []
+              (when-not (= "\r\n" (.decode (.readline (.-stdout process)) "ascii"))
+                (recur)))
+            (.put messages (py->lisp (json/loads (.read (.-stdout process) length))))
+            (recur)))))
+    (catch python/Exception e (.put messages {:reader-error (str e)}))))
+
+(defn- client [root & [environment]]
+  (let [process (subprocess/Popen
+                 [(str (.joinpath (.-parent (pathlib/Path sys/executable)) "blt")) "lsp"]
+                 ** :stdin subprocess/PIPE :stdout subprocess/PIPE :stderr subprocess/PIPE
+                 :cwd (str root) :env environment)
+        messages (queue/Queue)
+        reader (threading/Thread ** :target #(read-messages process messages) :daemon true)]
+    (.start reader)
+    {:process process :messages messages :id (atom 0) :notifications (atom [])}))
+
+(defn- send! [client message]
+  (let [body (.encode (json/dumps (lisp->py (assoc message :jsonrpc "2.0"))
+                                  ** :ensure_ascii false) "utf-8")
+        stream (.-stdin (:process client))]
+    (.write stream (.encode (str "Content-Length: " (count body) "\r\n\r\n") "ascii"))
+    (.write stream body)
+    (.flush stream)))
+
+(defn- response! [client id]
+  (loop []
+    (let [message (.get (:messages client) ** :timeout 20)]
+      (when (:reader-error message) (throw (python/RuntimeError (:reader-error message))))
+      (if (= id (:id message)) message
+          (do (swap! (:notifications client) conj message)
+              (when (and (:id message) (:method message))
+                (send! client {:id (:id message)
+                               :result (case (:method message)
+                                         "workspace/applyEdit" {:applied true}
+                                         "window/showDocument" {:success true}
+                                         nil)}))
+              (recur))))))
+
+(defn- request! [client method params]
+  (let [id (swap! (:id client) inc)]
+    (send! client {:id id :method method :params params})
+    (response! client id)))
+
+(defn- result! [client method params]
+  (let [response (request! client method params)]
+    (when-let [error (:error response)] (throw (python/RuntimeError (str error))))
+    (:result response)))
+
+(defn- notification! [client method params]
+  (send! client {:method method :params params}))
+
+(defn- diagnostics! [client version]
+  (let [match? #(and (= "textDocument/publishDiagnostics" (:method %))
+                     (= version (get-in % [:params :version])))]
+    (or (some #(when (match? %) (:params %)) @(:notifications client))
+        (loop []
+          (let [message (.get (:messages client) ** :timeout 20)]
+            (if (match? message) (:params message)
+                (do (swap! (:notifications client) conj message) (recur))))))))
+
+(defn- initialize! [client root]
+  (let [result (result! client "initialize"
+                        {:processId nil :rootUri (.as_uri root)
+                         :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"}
+                         :capabilities {:general {:positionEncodings ["utf-16"]}
+                                        :workspace {:workspaceEdit {:documentChanges true}}}})]
+    (notification! client "initialized" {})
+    result))
+
+(defn- open! [client uri source]
+  (notification! client "textDocument/didOpen"
+                 {:textDocument {:uri uri :languageId "basilisp" :version 1 :text source}})
+  (diagnostics! client 1))
+
+(defn- at [uri line character]
+  {:textDocument {:uri uri} :position {:line line :character character}})
+
+(defn- stop! [client]
+  (let [process (:process client)]
+    (try
+      (when (nil? (.poll process))
+        (result! client "shutdown" nil)
+        (notification! client "exit" nil))
+      (is (= 0 (.wait process ** :timeout 10)))
+      (finally
+        (when (nil? (.poll process)) (.kill process))
+        (.wait process)
+        (let [stderr (.read (.-stderr process))]
+          (is (= 0 (.-returncode process)) (.decode stderr "utf-8")))
+        (try (.close (.-stdin process)) (catch python/BrokenPipeError _ nil))
+        (.close (.-stdout process))
+        (.close (.-stderr process))))))
+
+(defn- internal [name] (deref (ns-resolve 'basilisp-tools.lsp name)))
+
+(deftest dependency-source-archive-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        file (.joinpath root "plain source.lpy")
+        archive (.joinpath root "package name.whl")
+        source "(ns dependency.core)\n(def value 1)\n"
+        read-source (internal 'dependency-contents)
+        state (atom {:documents {}})]
+    (try
+      (.write_text file source ** :encoding "utf-8")
+      (with-open [output (zipfile/ZipFile archive "w")]
+        (.writestr output "dependency/core.lpy" source)
+        (.writestr output "dependency/é.lpy" source))
+      (is (= source (read-source state (.as_uri file))))
+      (is (= source (read-source state (str "zipfile:" (subs (.as_uri archive) 5) "::dependency/core.lpy"))))
+      (is (= source (read-source state (str "jar:" (.as_uri archive) "!/dependency/core.lpy"))))
+      (is (= source (read-source state (str "zipfile:" (subs (.as_uri archive) 5) "::dependency/%C3%A9.lpy"))))
+      (is (thrown? python/Exception (read-source state (str "zipfile:" (subs (.as_uri archive) 5) "::../plain source.lpy"))))
+      (is (thrown? python/Exception (read-source state "https://example.com/source.lpy")))
+      (is (thrown? python/Exception (read-source state (str "jar:" (.as_uri archive) "!/missing.lpy"))))
+      (swap! state assoc-in [:documents (.as_uri file)] (workspace/TextDocument (.as_uri file) ** :source "unsaved"))
+      (is (= "unsaved" (read-source state (.as_uri file))))
+      (finally (.cleanup temp)))))
+
+(deftest create-test-edit-plan-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        file (.joinpath root "src/app/core.lpy") destination (.joinpath root "test")
+        uri (.as_uri file) source "(ns app.core)\n(defn hello [x] x)\n"
+        analysis (analyzer/analyze source {:filename (str file) :python-inspection? false})
+        state (atom {:documents {}}) plan-test (internal 'source-test-plan)]
+    (try
+      (let [plan (plan-test state uri analysis (.index source "hello") (str destination))
+            changes (:changes plan)
+            text (.-new_text (first (.-edits (second changes))))
+            target (.joinpath destination "app/core_test.lpy")]
+        (is (:created? plan))
+        (is (= (.as_uri target) (:uri plan)))
+        (is (= 2 (count changes)))
+        (is (= "create" (.-kind (first changes))))
+        (is (not (.exists target)))
+        (is (empty? (:diagnostics (syntax/parse text))))
+        (is (.startswith text "(ns app.core-test"))
+        (is (>= (.find text "(deftest hello-test") 0))
+        (.mkdir (.-parent target) ** :parents true :exist_ok true)
+        (.write_text target text ** :encoding "utf-8")
+        (let [existing (plan-test state uri analysis (.index source "hello") (str destination))]
+          (is (not (:created? existing)))
+          (is (empty? (:changes existing))))
+        (.write_text target "(ns app.core-test (:require [basilisp.test]))\n" ** :encoding "utf-8")
+        (let [existing (plan-test state uri analysis (.index source "hello") (str destination))]
+          (is (= 1 (count (:changes existing))))
+          (is (.startswith (.-new_text (first (.-edits (first (:changes existing))))) "\n(basilisp.test/deftest"))))
+      (let [target (.joinpath destination "app/core_test.lpy")]
+        (.write_text target "(ns app.core-test)\n" ** :encoding "utf-8")
+        (let [plan (plan-test state uri analysis (.index source "hello") (str destination))
+              edits (.-edits (first (:changes plan)))]
+          (is (= 2 (count edits)))
+          (is (= "\n  (:require [basilisp.test])" (.-new_text (first edits))))))
+      (finally (.cleanup temp)))))
+
+(deftest extension-requests-and-test-navigation-protocol-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        source-file (.joinpath root "app.lpy") test-file (.joinpath root "app_test.lpy")
+        source "(ns app)\n(defn hello \"Return its argument.\" [x] x)\n"
+        test-source "(ns app-test (:require [basilisp.test :refer [deftest is]]))\n(deftest hello-test (is true))\n"
+        _ (.write_text source-file source ** :encoding "utf-8")
+        _ (.write_text test-file test-source ** :encoding "utf-8")
+        c (client root) uri (.as_uri source-file)]
+    (try
+      (let [initialized (initialize! c root)]
+        (is (some #{"create-test"} (get-in initialized [:capabilities :executeCommandProvider :commands])))
+        (is (some #{"go-to-test"} (get-in initialized [:capabilities :executeCommandProvider :commands]))))
+      (open! c uri source)
+      (is (= source (result! c "clojure/dependencyContents" {:uri uri})))
+      (is (= "app" (:ns (result! c "clojure/clojuredocs/raw" {:sym-ns "app" :sym-name "hello"}))))
+      (is (= "Return its argument." (:doc (result! c "basilisp/documentation/raw" {:sym-ns "app" :sym-name "hello"}))))
+      (is (nil? (result! c "basilisp/documentation/raw" {:sym-ns "app" :sym-name "missing"})))
+      (notification! c "clojure/serverInfo/log" {})
+      (notification! c "clojure/cursorInfo/log" (at uri 1 7))
+      (result! c "clojure/serverInfo/raw" {})
+      (is (some #(and (= "window/showMessage" (:method %))
+                      (>= (.find (str (get-in % [:params :message])) "server-version") 0)) @(:notifications c)))
+      (result! c "workspace/executeCommand" {:command "go-to-test" :arguments [uri 1 7]})
+      (result! c "clojure/serverInfo/raw" {})
+      (is (some #(and (= "window/showDocument" (:method %))
+                      (= (.as_uri test-file) (get-in % [:params :uri]))) @(:notifications c)))
+      (open! c (.as_uri test-file) test-source)
+      (result! c "workspace/executeCommand" {:command "go-to-test" :arguments [(.as_uri test-file) 1 10]})
+      (result! c "clojure/serverInfo/raw" {})
+      (is (some #(and (= "window/showDocument" (:method %))
+                      (= uri (get-in % [:params :uri]))) @(:notifications c)))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest create-test-protocol-edit-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        file (.joinpath root "src/app/core.lpy") target (.joinpath root "test/app/core_test.lpy")
+        source "(ns app.core)\n(defn hello [x] x)\n"
+        _ (.mkdir (.-parent file) ** :parents true :exist_ok true)
+        _ (.write_text file source ** :encoding "utf-8")
+        c (client root) uri (.as_uri file)]
+    (try
+      (result! c "initialize" {:processId nil :rootUri (.as_uri root)
+                               :initializationOptions {:source-paths ["src" "test"]}
+                               :capabilities {:workspace {:workspaceEdit {:documentChanges true}}}})
+      (notification! c "initialized" {})
+      (open! c uri source)
+      (result! c "workspace/executeCommand" {:command "create-test" :arguments [uri 1 7]})
+      (result! c "clojure/serverInfo/raw" {})
+      (let [request (first (filter #(= "workspace/applyEdit" (:method %)) @(:notifications c)))
+            changes (get-in request [:params :edit :documentChanges])]
+        (is (= "create" (:kind (first changes))))
+        (is (= (.as_uri target) (:uri (first changes))))
+        (is (= (.as_uri target) (get-in (second changes) [:textDocument :uri])))
+        (is (>= (.find (get-in (second changes) [:edits 0 :newText]) "(deftest hello-test") 0))
+        (is (not (.exists target)))
+        (is (some #(and (= "window/showDocument" (:method %))
+                        (= (.as_uri target) (get-in % [:params :uri]))) @(:notifications c))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest checker-config-path-and-copy-settings-test
+  (let [temp (tempfile/TemporaryDirectory) root (.resolve (pathlib/Path (.-name temp)))
+        dependencies (.joinpath root "dependency")
+        exported (.joinpath dependencies "clj-kondo.exports/acme/demo")
+        custom (.joinpath root "lint-rules")
+        settings {:kondo-config-dir "lint-rules"}
+        options {:workspace-root (str root)}
+        config-options (internal 'kondo-options)
+        copy-configs! (internal 'copy-workspace-kondo-configs!)]
+    (try
+      (.mkdir exported ** :parents true)
+      (.write_text (.joinpath exported "config.edn") "{:linters {:unresolved-symbol {:level :off}}}" ** :encoding "utf-8")
+      (is (= (str custom) (:config-dir (config-options (str (.joinpath root "sample.lpy")) options settings))))
+      (is (= (str custom) (:config-dir (config-options "<stdin>" options {:kondo-config-dir (str custom)}))))
+      (is (not (contains? (config-options "<stdin>" options {}) :config-dir)))
+      (let [patch (mock/patch "sys.path" (python/list [(str dependencies)]))]
+        (.start patch)
+        (try
+          (copy-configs! (str root) (assoc settings :copy-kondo-configs? false) options)
+          (is (not (.exists custom)))
+          (let [result (copy-configs! (str root) settings options)]
+            (is (= [(str (.joinpath custom "imports/acme/demo"))] (:copied-configs result)))
+            (is (.is_file (.joinpath custom "imports/acme/demo/config.edn"))))
+          (finally (.stop patch))))
+      (finally (.cleanup temp)))))
+
+(deftest watched-file-change-setting-test
+  (let [observed? (internal 'observed-file-change?)
+        root "/project"
+        state (atom {:roots [root] :settings {}
+                     :settings-by-root {root {:compute-external-file-changes false}}})]
+    (doseq [[type expected] [[(.-Created lsp/FileChangeType) true]
+                             [(.-Changed lsp/FileChangeType) false]
+                             [(.-Deleted lsp/FileChangeType) true]]]
+      (is (= expected (boolean (observed? state (lsp/FileEvent "file:///project/sample.lpy" type))))))
+    (swap! state assoc-in [:settings-by-root root] {})
+    (is (observed? state (lsp/FileEvent "file:///project/sample.lpy" (.-Changed lsp/FileChangeType))))))
+
+;; Uses extension-test client/diagnostics! helpers. The true case asserts an
+;; unopened file receives findings. False still indexes names for navigation.
+(deftest startup-diagnostics-setting-protocol-test
+  (doseq [enabled? [true false]]
+    (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+          file (.joinpath root "sample.lpy")
+          _ (.write_text file "(ns sample)\n(def value missing)\n" ** :encoding "utf-8")
+          c (client root) uri (.as_uri file)]
+      (try
+        (result! c "initialize" {:processId nil :rootUri (.as_uri root)
+                                 :initializationOptions {:source-paths ["."]
+                                                         :lint-project-files-after-startup? enabled?}
+                                 :capabilities {}})
+        (notification! c "initialized" {})
+        (if enabled?
+          (let [published (diagnostics! c nil)]
+            (is (= uri (:uri published)))
+            (is (some #(= "unresolved-symbol" (:code %)) (:diagnostics published))))
+          (do
+            (is (seq (result! c "workspace/symbol" {:query "value"})))
+            (is (not-any? #(and (= "textDocument/publishDiagnostics" (:method %))
+                                (= uri (get-in % [:params :uri]))) @(:notifications c)))))
+        (finally (stop! c) (.cleanup temp))))))

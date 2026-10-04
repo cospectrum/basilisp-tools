@@ -1,0 +1,1183 @@
+(ns basilisp-tools.hooks
+  "Restricted, data-oriented execution of clj-kondo analyze-call and macroexpand hooks.
+
+  Hook source is interpreted as syntax. Python interop, imports, arbitrary
+  namespace loading and runtime evaluation are unavailable."
+  (:refer-basilisp :exclude [resolve])
+  (:require [basilisp.edn :as edn]
+            [basilisp.string :as string]
+            [basilisp.set :as sets]
+            [basilisp.walk :as walk]
+            [basilisp-tools.syntax :as syntax]
+            [basilisp-tools.regex :as regex])
+  (:import [json] [pathlib] [urllib.parse :as url]))
+
+(def ^:dynamic *context* nil)
+(def ^:dynamic *budget* nil)
+
+(defn create-cache [] (atom {}))
+
+(defn- fail [message] (throw (ex-info message {})))
+
+(defn- tick! []
+  (when (and *budget* (neg? (swap! *budget* dec)))
+    (fail "Hook evaluation exceeded its expression limit")))
+
+(defn- location [parsed node]
+  (let [start (syntax/offset->position parsed (:start node))
+        end (syntax/offset->position parsed (:end node))]
+    {:row (inc (:line start)) :col (inc (:character start))
+     :end-row (inc (:line end)) :end-col (inc (:character end))
+     :blt/start (:start node) :blt/end (:end node)}))
+
+(declare sexpr coerce eval-node eval-body bind-pattern load-namespace! to-syntax)
+
+(defn- literal [node]
+  (case (:kind node)
+    :symbol (symbol (:text node))
+    :regex (regex/compile (subs (syntax/text node) 2 (dec (count (syntax/text node)))))
+    :keyword (let [text (:text node)] (keyword (subs text (if (.startswith text "::") 2 1))))
+    (edn/read-string (syntax/text node))))
+
+(defn- from-syntax [parsed node]
+  (let [kind (:kind node) children (syntax/forms node)
+        tag (case kind
+              (:symbol :number :boolean :nil :character :symbolic-number) :token
+              :string :string
+              kind)
+        value (if (#{:token :string :keyword :regex} tag)
+                {:tag tag :value (literal node) :string-value (syntax/text node)}
+                {:tag tag :children (mapv #(from-syntax parsed %) children)})]
+    (if (= :metadata kind)
+      (let [[m target] (:children value)]
+        (with-meta (update target :meta (fnil conj []) m) (if parsed (location parsed node) {})))
+      (with-meta value (if parsed (location parsed node) {})))))
+
+(defn token-node [value] {:tag :token :value value :string-value (pr-str value)})
+(defn keyword-node
+  ([value] (keyword-node value false))
+  ([value auto?] {:tag :keyword :value value
+                  :string-value (str (when auto? ":") value)}))
+(defn string-node [value]
+  (let [value (if (string? value) value (string/join "\n" value))]
+    {:tag :string :value value :string-value (pr-str value)}))
+(defn list-node [children] {:tag :list :children (vec children)})
+(defn vector-node [children] {:tag :vector :children (vec children)})
+(defn map-node [children] {:tag :map :children (vec children)})
+(defn set-node [children] {:tag :set :children (vec children)})
+(defn quote-node [child] {:tag :quote :children [child]})
+(defn tag [node] (:tag node))
+(defn node? [value] (and (map? value) (keyword? (:tag value))))
+(defn token-node? [value] (= :token (tag value)))
+(defn keyword-node? [value] (= :keyword (tag value)))
+(defn string-node? [value] (= :string (tag value)))
+(defn list-node? [value] (= :list (tag value)))
+(defn vector-node? [value] (= :vector (tag value)))
+(defn map-node? [value] (= :map (tag value)))
+(defn set-node? [value] (= :set (tag value)))
+(defn quote-node? [value] (= :quote (tag value)))
+(defn generated-node? [node] (not (:row (meta node))))
+
+(defn sexpr [node]
+  (let [value (case (:tag node)
+                (:token :keyword :string) (:value node)
+                :regex (list 're-pattern (regex/source (:value node)))
+                :list (apply list (map sexpr (:children node)))
+                :vector (mapv sexpr (:children node))
+                :map (into {} (map (fn [[k v]] [(sexpr k) (sexpr v)])
+                                   (partition 2 (:children node))))
+                :set (set (map sexpr (:children node)))
+                :quote (list 'quote (sexpr (first (:children node))))
+                :deref (list 'deref (sexpr (first (:children node))))
+                (fail (str "Unsupported hook node tag " (:tag node))))]
+    (if (and (some? value) (or (symbol? value) (coll? value)))
+      (with-meta value (meta node)) value)))
+
+(defn coerce [value]
+  (let [node (cond
+               (node? value) value
+               (keyword? value) (keyword-node value)
+               (string? value) (string-node value)
+               (vector? value) (vector-node (map coerce value))
+               (map? value) (map-node (mapcat (fn [[k v]] [(coerce k) (coerce v)]) value))
+               (set? value) (set-node (map coerce value))
+               (sequential? value) (list-node (map coerce value))
+               :else (token-node value))]
+    (if-let [m (meta value)] (with-meta node m) node)))
+
+(defn parse-string [source]
+  (let [parsed (syntax/parse source {:dialect :clojure})]
+    (when (seq (:diagnostics parsed)) (fail "Invalid hook syntax"))
+    (some->> (first (syntax/forms (:root parsed))) (from-syntax parsed))))
+
+(defn reg-finding! [finding]
+  (when-not (and (map? finding) (keyword? (:type finding)) (string? (:message finding)))
+    (fail "Hook finding requires :type keyword and :message string"))
+  (when-let [parsed (:parsed *context*)]
+    (let [start {:line (dec (:row finding 1)) :character (dec (:col finding 1))}
+          end {:line (dec (:end-row finding (:row finding 1)))
+               :character (dec (:end-col finding (:col finding 1)))}]
+      (try
+        (when (> (syntax/position->offset parsed start) (syntax/position->offset parsed end))
+          (fail "Hook finding range is reversed"))
+        (catch python/Exception _
+          (fail "Hook finding has an invalid source range")))))
+  (swap! (:findings *context*) conj finding)
+  nil)
+
+(defn reg-keyword! [node registered-by] (assoc node :reg registered-by))
+(defn env [] (zipmap (map symbol (keys (:locals *context*))) (repeat {})))
+(defn callstack []
+  (mapv (fn [call]
+          (if (map? call) call
+              (let [call (if (string? call) (symbol call) call)]
+                (if (symbol? call)
+                  {:ns (some-> (namespace call) symbol) :name (symbol (name call))}
+                  {:ns (first call) :name (second call)}))))
+        (rest (:callstack *context*))))
+(defn resolve [options]
+  (when-let [resolver (:resolve *context*)] (resolver options)))
+(defn ns-analysis
+  ([name] (ns-analysis name {}))
+  ([name options]
+   (if-let [lookup (:ns-analysis *context*)] (lookup name options) {})))
+
+(def ^:private api
+  {'token-node token-node 'keyword-node keyword-node 'string-node string-node
+   'list-node list-node 'vector-node vector-node 'map-node map-node
+   'set-node set-node 'quote-node quote-node 'tag tag 'sexpr sexpr 'coerce coerce
+   'token-node? token-node? 'keyword-node? keyword-node? 'string-node? string-node?
+   'list-node? list-node? 'vector-node? vector-node? 'map-node? map-node?
+   'set-node? set-node? 'quote-node? quote-node? 'node? node?
+   'generated-node? generated-node? 'parse-string parse-string
+   'reg-finding! reg-finding! 'reg-keyword! reg-keyword!
+   'env env 'callstack callstack 'resolve resolve 'ns-analysis ns-analysis})
+
+(defn- match-value [match]
+  (when match
+    (let [groups (.groups match)]
+      (if (zero? (count groups)) (.group match 0)
+          (into [(.group match 0)] groups)))))
+
+(defn- hook-re-matcher [pattern text]
+  (atom {:matches (regex/finditer pattern text) :minimum 0 :last nil}))
+
+(defn- next-match! [matcher]
+  (loop []
+    (let [match (python/next (:matches @matcher) nil)]
+      (if (and match (< (.start match) (:minimum @matcher))) (recur)
+          (do (swap! matcher assoc :last match
+                     :minimum (if match
+                                (+ (.end match) (if (= (.start match) (.end match)) 1 0)) 0))
+              match)))))
+
+(defn- hook-re-find
+  ([matcher] (match-value (next-match! matcher)))
+  ([pattern text] (match-value (regex/search pattern text))))
+
+(defn- hook-re-seq [pattern text]
+  (let [matcher (hook-re-matcher pattern text)]
+    (letfn [(step []
+              (lazy-seq (when-let [match (next-match! matcher)]
+                          (cons (match-value match) (step)))))]
+      (seq (step)))))
+
+(defn- quote-replacement [text]
+  (-> text (string/replace "\\" "\\\\") (string/replace "$" "\\$")))
+
+(defn- expand-replacement [replacement match]
+  (let [size (count replacement) groups (count (.groups match))]
+    (loop [index 0 result []]
+      (if (>= index size) (apply str result)
+          (let [c (subs replacement index (inc index))]
+            (cond
+              (= c "\\")
+              (if (< (inc index) size)
+                (recur (+ index 2) (conj result (subs replacement (inc index) (+ index 2))))
+                (fail "Character to be escaped is missing"))
+              (= c "$")
+              (let [start (inc index)]
+                (when (>= start size) (fail "Illegal group reference"))
+                (if (= "{" (subs replacement start (inc start)))
+                  (let [end (.find replacement "}" (inc start))]
+                    (when (neg? end) (fail "Named capturing group is missing closing brace"))
+                    (recur (inc end) (conj result (or (.group match (subs replacement (inc start) end)) ""))))
+                  (let [digit (subs replacement start (inc start))]
+                    (when-not (contains? #{"0" "1" "2" "3" "4" "5" "6" "7" "8" "9"} digit)
+                      (fail "Illegal group reference"))
+                    (let [[end group]
+                          (loop [end (inc start) group (python/int digit)]
+                            (if (and (< end size) (.isdigit (subs replacement end (inc end)))
+                                     (<= (+ (* group 10) (python/int (subs replacement end (inc end)))) groups))
+                              (recur (inc end) (+ (* group 10) (python/int (subs replacement end (inc end)))))
+                              [end group]))]
+                      (recur end (conj result (or (.group match group) "")))))))
+              :else (recur (inc index) (conj result c))))))))
+
+(defn- hook-replace [text pattern replacement first?]
+  (if (string? pattern)
+    ((if first? string/replace-first string/replace) text pattern replacement)
+    (let [seen? (atom false)]
+      (regex/sub pattern
+                 (fn [match]
+                   (if (and first? @seen?) (.group match 0)
+                       (do (reset! seen? true)
+                           (if (string? replacement) (expand-replacement replacement match)
+                               (replacement (match-value match))))))
+                 text))))
+
+(defn- hook-split
+  ([text pattern] (hook-split text pattern 0))
+  ([text pattern limit]
+   (if (= 1 limit) [text]
+       (let [matcher (hook-re-matcher pattern text)]
+         (loop [start 0 parts []]
+           (let [match (when (or (<= limit 0) (< (count parts) (dec limit))) (next-match! matcher))]
+             (if match
+               (if (and (zero? start) (zero? (.start match)) (zero? (.end match)))
+                 (recur start parts)
+                 (recur (.end match) (conj parts (subs text start (.start match)))))
+               (let [result (conj parts (subs text start))]
+                 (if (and (zero? limit) (seq text))
+                   (vec (reverse (drop-while empty? (reverse result)))) result)))))))))
+
+(defn- hook-pr-str [& values]
+  (letfn [(printed [value]
+            (cond
+              (string? value) (json/dumps value ** :ensure_ascii false)
+              (vector? value) (str "[" (string/join " " (map printed value)) "]")
+              (map? value) (str "{" (string/join ", " (map (fn [[k v]] (str (printed k) " " (printed v))) value)) "}")
+              (set? value) (str "#{" (string/join " " (map printed value)) "}")
+              (seq? value) (str "(" (string/join " " (map printed value)) ")")
+              :else (pr-str value)))]
+    (string/join " " (map printed values))))
+
+(def ^:private core-names
+  '[+ - * / inc dec quot rem mod max min abs = not= < <= > >= compare
+    identity constantly complement comp partial juxt fnil apply some-fn every-pred completing unreduced reduced reduced? ensure-reduced
+    list list* vector vec hash-map array-map hash-set set sorted-set sorted-map
+    conj cons concat into empty not-empty seq first second last rest next ffirst nfirst
+    fnext nnext nth nthnext nthrest peek pop count bounded-count empty? seq?
+    get get-in assoc assoc-in dissoc update update-in merge merge-with select-keys
+    contains? find keys vals key val zipmap
+    map mapv mapcat filter filterv remove keep keep-indexed map-indexed
+    reduce reduce-kv reductions transduce sequence eduction
+    every? not-every? some not-any? take take-last take-while take-nth drop drop-last
+    drop-while split-at split-with partition partition-all partition-by interleave
+    interpose distinct dedupe flatten reverse sort sort-by group-by frequencies
+    range repeat repeatedly iterate cycle dorun doall trampoline rand-int
+    str pr-str print-str format subs name namespace symbol keyword gensym
+    not boolean true? false? nil? some? number? integer? float? string?
+    keyword? symbol? qualified-keyword? simple-keyword? qualified-symbol? simple-symbol?
+    vector? list? map? set? coll? sequential? associative? fn? ifn?
+    pos? neg? zero? even? odd? boolean? char? int long float double
+    meta with-meta vary-meta atom deref reset! swap! compare-and-set!
+    transient persistent! assoc! dissoc! conj! disj! pop! volatile! volatile? vreset! vswap!
+    memoize run! parse-long parse-double parse-boolean parse-uuid
+    force delay? realized? bit-and bit-or bit-xor bit-not bit-shift-left bit-shift-right bit-test bit-set bit-clear bit-flip
+    numerator denominator rational? ratio? decimal? rationalize integer? nat-int? pos-int? neg-int?
+    ex-info ex-data ex-message re-pattern re-find re-matches re-seq re-groups
+    re-matcher re-quote-replacement])
+(def ^:private built-in-macros
+  '#{if-not when when-not if-let if-some when-let when-some when-first and or cond case
+     let letfn as-> cond-> cond->> loop fn defn defn- defmacro defonce defmulti defmethod
+     declare -> ->> some-> some->> for doseq assert condp dotimes doto comment lazy-seq lazy-cat delay binding with-redefs})
+(def ^:private pure-core
+  (merge
+   (into {} (map (fn [name]
+                   [name (with-meta (fn [& _] (fail (str "Cannot take value of macro " name)))
+                           {:blt/builtin-macro (str name)})]) built-in-macros))
+   (let [publics (ns-publics 'basilisp.core)]
+     (into {} (keep (fn [name]
+                      (when-let [value (get publics name)] [name @value])))
+           core-names))
+   {'pr-str hook-pr-str
+    're-pattern regex/compile
+    're-find hook-re-find 're-seq hook-re-seq 're-matcher hook-re-matcher
+    're-matches (fn [pattern text] (match-value (regex/fullmatch pattern text)))
+    're-groups (fn [matcher] (or (match-value (:last @matcher)) (fail "No match found")))
+    're-quote-replacement quote-replacement
+    'list* (fn [& values]
+             (when (empty? values) (fail "list* requires an argument"))
+             (apply list (concat (butlast values) (last values))))
+    'read-string (fn [source] (sexpr (parse-string source)))
+    'println (fn [& values] (binding [*out* *err*] (apply println values)))
+    'prn (fn [& values] (binding [*out* *err*] (apply prn values)))}))
+
+(defn- public-functions [namespace]
+  (let [allowed (when (= 'basilisp.walk namespace)
+                  '#{walk prewalk postwalk prewalk-replace postwalk-replace
+                     keywordize-keys stringify-keys})]
+    (merge
+     (into {} (keep (fn [[name value]]
+                      (when (or (nil? allowed) (contains? allowed name))
+                        [name @value]))) (ns-publics namespace))
+     (when (= 'basilisp.string namespace)
+       {'replace (fn [text pattern replacement] (hook-replace text pattern replacement false))
+        'replace-first (fn [text pattern replacement] (hook-replace text pattern replacement true))
+        'split hook-split 're-quote-replacement quote-replacement}))))
+
+(defn- analysis-elements [db bucket]
+  (mapcat (fn [[uri analysis]]
+            (map #(assoc % :uri uri :bucket bucket) (get analysis bucket)))
+          (:analysis db)))
+
+(defn- internal-uri? [db uri]
+  (if-let [uris (:internal-uris db)]
+    (contains? (set uris) uri)
+    (and (.startswith uri "file:")
+         (not (contains? (set (:external-uris db)) uri)))))
+
+(defn- internal-analysis [db]
+  (into {} (filter (fn [[uri _]] (internal-uri? db uri))) (:analysis db)))
+
+(defn- external-analysis [db]
+  (into {} (remove (fn [[uri _]] (internal-uri? db uri))) (:analysis db)))
+
+(defn- all-definitions [db include-private?]
+  (filter #(or include-private? (not (:private %))) (analysis-elements db :var-definitions)))
+
+(defn- element-identity [element]
+  (case (:bucket element)
+    (:locals :local-usages) [:local (:uri element) (:id element)]
+    (:namespace-definitions :namespace-usages) [:namespace (or (:to element) (:name element))]
+    :keywords [:keyword (:ns element) (:name element)]
+    [:var (or (:to element) (:ns element) (:from element)) (:name element)]))
+
+(defn- find-definition [db element]
+  (let [identity (element-identity element)
+        buckets (case (first identity)
+                  :local [:locals] :namespace [:namespace-definitions]
+                  :keyword [:keywords] [:var-definitions])]
+    (first (filter #(and (= identity (element-identity %))
+                         (if (= :keywords (:bucket %)) (:reg %) true))
+                   (mapcat #(analysis-elements db %) buckets)))))
+
+(defn- find-references [db element include-definition?]
+  (let [identity (element-identity element)
+        buckets (case (first identity)
+                  :local [:local-usages] :namespace [:namespace-usages]
+                  :keyword [:keywords] [:var-usages])
+        usages (filter #(= identity (element-identity %)) (mapcat #(analysis-elements db %) buckets))]
+    (vec (concat (when include-definition? (some-> (find-definition db element) vector)) usages))))
+
+(defn- position-inside? [row col element]
+  (let [start [(or (:name-row element) (:row element) 1) (or (:name-col element) (:col element) 1)]
+        end [(or (:name-end-row element) (:end-row element) (first start))
+             (or (:name-end-col element) (:end-col element) (second start))]]
+    (and (not (neg? (compare [row col] start))) (neg? (compare [row col] end)))))
+
+(defn- find-element [db uri row col]
+  (first (for [[bucket entries] (get-in db [:analysis uri])
+               element entries :when (position-inside? row col element)]
+           (assoc element :uri uri :bucket bucket))))
+
+(defn- find-implementations [db element]
+  (filter #(and (= (or (:protocol-ns %) (:ns %)) (or (:to element) (:ns element)))
+                (or (= (:protocol-name %) (:name element)) (= (:method-name %) (:name element))))
+          (analysis-elements db :protocol-impls)))
+
+(defn- inside? [a b]
+  (let [start (juxt #(or (:row %) (:name-row %) 1) #(or (:col %) (:name-col %) 1))
+        end (juxt #(or (:end-row %) (:name-end-row %) (:row %) 1)
+                  #(or (:end-col %) (:name-end-col %) (:col %) 1))]
+    (and (not (neg? (compare (start a) (start b))))
+         (not (pos? (compare (end a) (end b)))))))
+
+(defn- zipper [node] {:node node :parents [] :left [] :right []})
+(defn- zipper-down [location]
+  (when-let [child (first (:children (:node location)))]
+    {:node child :parents (conj (:parents location) (dissoc location :parents))
+     :left [] :right (vec (rest (:children (:node location))))}))
+(defn- zipper-up [location]
+  (when-let [parent (peek (:parents location))]
+    (assoc parent :parents (pop (:parents location)))))
+(defn- zipper-right [location]
+  (when-let [node (first (:right location))]
+    (assoc location :node node :left (conj (:left location) (:node location))
+           :right (vec (rest (:right location))))))
+(defn- zipper-left [location]
+  (when-let [node (peek (:left location))]
+    (assoc location :node node :left (pop (:left location))
+           :right (into [(:node location)] (:right location)))))
+(defn- zipper-root [location]
+  (if-let [parent (zipper-up location)] (recur parent) location))
+(defn- zipper-next [location]
+  (or (zipper-down location) (zipper-right location)
+      (loop [parent (zipper-up location)]
+        (if parent (or (zipper-right parent) (recur (zipper-up parent)))
+            (assoc location :end? true)))))
+
+(defn- element-node [db element]
+  (let [source (get-in db [:documents (:uri element) :text])
+        parsed (when source (syntax/parse source))
+        offset (when parsed (syntax/position->offset
+                             parsed {:line (dec (or (:row element) (:name-row element) 1))
+                                     :character (dec (or (:col element) (:name-col element) 1))}))
+        node (when offset (syntax/node-at (:root parsed) offset))
+        ;; Prefer the encompassing list for definition elements.
+        enclosing (when parsed
+                    (last (filter #(and (= :list (:kind %))
+                                        (<= (:start %) offset) (< offset (:end %)))
+                                  (syntax/nodes (:root parsed)))))]
+    (when node (zipper (from-syntax parsed (or enclosing node))))))
+
+(defn- find-nodes [db elements predicate]
+  (vec (keep #(when (predicate %) (element-node db %)) elements)))
+
+(def ^:private zipper-api
+  {'node :node 'sexpr #(sexpr (:node %)) 'tag #(tag (:node %))
+   'of-node zipper 'down zipper-down 'up zipper-up 'right zipper-right 'left zipper-left
+   'root #(-> % zipper-root :node) 'next zipper-next 'end? #(boolean (:end? %))
+   'rightmost #(last (take-while some? (iterate zipper-right %)))
+   'leftmost #(last (take-while some? (iterate zipper-left %)))
+   'find-value (fn [location direction value]
+                 (first (filter #(= value (sexpr (:node %)))
+                                (take-while some? (iterate direction location)))))
+   'find-tag (fn [location direction value]
+               (first (filter #(= value (tag (:node %)))
+                              (take-while some? (iterate direction location)))))})
+
+(def ^:private custom-linters-api
+  {'internal-analysis internal-analysis 'external-analysis external-analysis
+   'db-with-internal-analysis #(assoc % :analysis (internal-analysis %))
+   'db-with-uris-analysis #(update %1 :analysis select-keys %2)
+   'find-definition find-definition
+   'find-declaration (fn [db element]
+                       (or (first (filter #(and (= (:uri element) (:uri %))
+                                                (= (element-identity element) (element-identity %))
+                                                (:refer %))
+                                          (analysis-elements db :var-usages)))
+                           (find-definition db element)))
+   'find-implementations find-implementations 'find-references find-references
+   'find-element find-element 'find-all-var-definitions all-definitions
+   'find-var-definitions (fn [db uri include-private?]
+                           (all-definitions (update db :analysis select-keys [uri]) include-private?))
+   'find-element-from-sym (fn [db namespace name]
+                            (first (filter #(and (= namespace (:ns %)) (= name (:name %)))
+                                           (all-definitions db true))))
+   'find-nodes find-nodes
+   'find-nodes-from-sym (fn [db namespace name]
+                          (find-nodes db (filter #(and (= namespace (:ns %)) (= name (:name %)))
+                                                 (all-definitions db true)) identity))
+   'find-nodes-from-defined-bys (fn [db defined-bys]
+                                  (find-nodes db (all-definitions db true)
+                                              #(contains? (set defined-bys) (:defined-by %))))
+   'filename->uri (fn [filename _] (.as_uri (.absolute (pathlib/Path filename))))
+   'uri->filename (fn [uri] (url/unquote (.-path (url/urlparse uri))))
+   'dir-uris->file-uris (fn [uris db]
+                          (filter (fn [uri]
+                                    (some (fn [directory]
+                                            (or (= directory uri)
+                                                (.startswith uri (str directory "/"))))
+                                          uris))
+                                  (keys (:analysis db))))
+   'inside? inside? 'fast= =})
+
+(def ^:private builtin-namespaces
+  {"clj-kondo.hooks-api" api "basilisp-tools.hooks" api
+   "clojure-lsp.custom-linters-api" custom-linters-api
+   "rewrite-clj.zip" zipper-api
+   "clojure.core" pure-core "basilisp.core" pure-core
+   "clojure.string" (public-functions 'basilisp.string)
+   "basilisp.string" (public-functions 'basilisp.string)
+   "clojure.set" (assoc (public-functions 'basilisp.set) 'union sets/union)
+   "basilisp.set" (public-functions 'basilisp.set)
+   "clojure.walk" (assoc (public-functions 'basilisp.walk) 'walk walk/walk)
+   "basilisp.walk" (public-functions 'basilisp.walk)})
+
+(defn- lookup [environment name]
+  (let [text (str name) prefix (namespace name) short (symbol (basilisp.core/name name))
+        namespace (when prefix (get @(:aliases environment) prefix prefix))
+        globals @(:globals environment)]
+    (cond
+      (and (:local-functions environment) (contains? @(:local-functions environment) name))
+      (get @(:local-functions environment) name)
+      (contains? (:locals environment) name) (get (:locals environment) name)
+      (contains? (:dynamic-bindings *context*) (symbol (or namespace (:namespace environment)) (str short)))
+      (get (:dynamic-bindings *context*) (symbol (or namespace (:namespace environment)) (str short)))
+      (and (nil? prefix) (contains? globals name)) (get globals name)
+      (and (nil? prefix) (contains? @(:refers environment) name)) (get @(:refers environment) name)
+      (and (nil? prefix) (contains? pure-core name) (not (contains? @(:core-excluded environment) name))) (get pure-core name)
+      (#{"Exception." "java.lang.Exception." "IllegalArgumentException."} text)
+      (fn [message] (python/ValueError message))
+      (and prefix (= namespace (:namespace environment)) (contains? globals short)) (get globals short)
+      (and prefix (contains? (get builtin-namespaces namespace) short))
+      (get-in builtin-namespaces [namespace short])
+      prefix (let [loaded (get @(:modules environment) namespace)]
+               (if (and loaded (contains? @(:globals loaded) short))
+                 (get @(:globals loaded) short)
+                 (fail (str "Unsupported hook function " name))))
+      :else (fail (str "Unresolved hook symbol " name)))))
+
+(defn- bind-pattern [environment pattern value]
+  (let [kind (:kind pattern) xs (syntax/forms pattern)]
+    (case kind
+      :metadata (bind-pattern environment (last xs) value)
+      :symbol (assoc-in environment [:locals (symbol (:text pattern))] value)
+      :vector
+      (loop [environment environment patterns xs values (seq value)]
+        (if-let [pattern (first patterns)]
+          (case (:text pattern)
+            "&" (let [scope (bind-pattern environment (second patterns) values)
+                      remaining (drop 2 patterns)]
+                  (if (= ":as" (:text (first remaining)))
+                    (bind-pattern scope (second remaining) value) scope))
+            ":as" (bind-pattern environment (second patterns) value)
+            (recur (bind-pattern environment pattern (first values)) (rest patterns) (next values)))
+          environment))
+      :map
+      (let [pairs (partition 2 xs)
+            defaults (some (fn [[k v]]
+                             (when (= ":or" (:text k))
+                               (into {} (map (fn [[name expression]]
+                                               [(symbol (:text name)) (eval-node environment expression)]))
+                                     (partition 2 (syntax/forms v))))) pairs)]
+        (reduce
+         (fn [environment [binding key-node]]
+           (let [key-text (:text binding)]
+             (cond
+               (= ":or" key-text) environment
+               (= ":as" key-text) (bind-pattern environment key-node value)
+               (#{"keys" "syms" "strs"} (some-> key-text (subs 1) (string/split #"/") last))
+               (reduce (fn [environment symbol-node]
+                         (let [sym (literal symbol-node)
+                               local (symbol (name sym))
+                               prefix (or (namespace sym)
+                                          (some-> key-text (subs 1) (string/split #"/") butlast first))
+                               key (case (last (string/split key-text #"/"))
+                                     (":keys" "keys") (keyword prefix (name sym))
+                                     (":syms" "syms") sym
+                                     (":strs" "strs") (name sym))]
+                           (assoc-in environment [:locals local] (get value key (get defaults local)))))
+                       environment (syntax/forms key-node))
+               :else (bind-pattern environment binding
+                                   (get value (eval-node environment key-node)
+                                        (get defaults (some-> (:text binding) symbol)))))))
+         environment pairs))
+      (fail "Unsupported hook binding pattern"))))
+
+(defn- bindings [environment node]
+  (reduce (fn [environment [pattern expression]]
+            (bind-pattern environment pattern (eval-node environment expression)))
+          environment (partition 2 (syntax/forms node))))
+
+(defn- quote-data
+  ([node] (sexpr (from-syntax nil node)))
+  ([environment node]
+   (quote-data
+    (walk/postwalk
+     (fn [value]
+       (if (and (map? value) (= :keyword (:kind value))
+                (.startswith (:text value) "::"))
+         (assoc value :text (str (eval-node environment value))) value))
+     node))))
+
+(defn- quoted-symbol [environment value]
+  (let [prefix (namespace value) short (name value)]
+    (cond
+      prefix (symbol (get @(:aliases environment) prefix prefix) short)
+      (contains? '#{& if do quote var def fn* let* loop* recur throw try catch finally new set! .} value) value
+      (or (.startswith short ".") (.endswith short ".")) value
+      (contains? @(:globals environment) value) (symbol (:namespace environment) short)
+      (contains? @(:refers environment) value)
+      (get @(:refer-sources environment) value (symbol (:namespace environment) short))
+      (and (contains? pure-core value) (not (contains? @(:core-excluded environment) value)))
+      (symbol "clojure.core" short)
+      :else (symbol (:namespace environment) short))))
+
+(defn- quote-environment [environment node]
+  (let [cache (or (:quote-cache environment) (:gensyms environment))
+        key (python/id node)
+        entry (or (get @cache key)
+                  (get (swap! cache assoc key {:node node :symbols (atom {})}) key))]
+    (assoc environment :quote-cache cache :gensyms (:symbols entry))))
+
+(defn- quote-symbol-value [environment value]
+  (if (.endswith (str value) "#")
+    (let [key (str value)]
+      (or (get @(:gensyms environment) key)
+          (get (swap! (:gensyms environment) assoc key (gensym key)) key)))
+    (quoted-symbol environment value)))
+
+(defn- quote-expansion [environment node]
+  (letfn [(sym [value] {:kind :symbol :text (str value)})
+          (call [name & children] {:kind :list :children (into [(sym name)] children)})
+          (expand [child]
+            (case (:kind child)
+              :syntax-quote (quote-expansion environment
+                                             (quote-expansion (quote-environment environment child)
+                                                              (first (syntax/forms child))))
+              :unquote (first (syntax/forms child))
+              :symbol (call 'quote (sym (quote-symbol-value environment (literal child))))
+              (:quote :deref)
+              (expand {:kind :list :children [(sym (if (= :quote (:kind child)) 'quote 'clojure.core/deref))
+                                              (first (syntax/forms child))]})
+              (:list :vector :map :set)
+              (let [forms (syntax/forms child)
+                    parts (map (fn [part]
+                                 (if (= :unquote-splicing (:kind part)) (first (syntax/forms part))
+                                     (call 'clojure.core/list (expand part)))) forms)
+                    sequence (call 'clojure.core/sequence
+                                   (call 'clojure.core/seq
+                                         {:kind :list :children (into [(sym 'clojure.core/concat)] parts)}))]
+                (case (:kind child)
+                  :list (if (seq forms) sequence (call 'clojure.core/list))
+                  :vector (call 'clojure.core/vec sequence)
+                  :set (call 'clojure.core/apply (sym 'clojure.core/hash-set) sequence)
+                  :map (call 'clojure.core/apply (sym 'clojure.core/hash-map) sequence)))
+              :metadata (let [[metadata target] (syntax/forms child)]
+                          (call 'clojure.core/with-meta (expand target) (expand metadata)))
+              child))]
+    (expand node)))
+
+(defn- syntax-quote-data [environment node]
+  (case (:kind node)
+    :unquote (eval-node environment (first (syntax/forms node)))
+    (:list :vector :map :set)
+    (let [values (mapcat (fn [child]
+                           (if (= :unquote-splicing (:kind child))
+                             (eval-node environment (first (syntax/forms child)))
+                             [(syntax-quote-data environment child)]))
+                         (syntax/forms node))]
+      (case (:kind node)
+        :list (apply list values) :vector (vec values)
+        :map (apply hash-map values) :set (set values)))
+    :symbol (quote-symbol-value environment (literal node))
+    :quote (list 'quote (syntax-quote-data environment (first (syntax/forms node))))
+    :deref (list 'clojure.core/deref (syntax-quote-data environment (first (syntax/forms node))))
+    :syntax-quote (syntax-quote-data environment
+                                     (quote-expansion (quote-environment environment node) (first (syntax/forms node))))
+    (literal node)))
+
+(defn- function-value [environment forms macro?]
+  (let [[name forms] (if (= :symbol (:kind (first forms)))
+                       [(symbol (:text (first forms))) (rest forms)] [nil forms])
+        first-form (first forms)
+        first-form (if (= :metadata (:kind first-form)) (last (syntax/forms first-form)) first-form)
+        forms (cons first-form (rest forms))
+        arities (if (= :vector (:kind first-form)) [forms]
+                    (map (fn [arity]
+                           (let [[params & body] (syntax/forms arity)
+                                 params (if (= :metadata (:kind params)) (last (syntax/forms params)) params)]
+                             (cons params body))) forms))
+        self (atom nil)
+        function (fn [& args]
+                   (tick!)
+                   (let [arity (some (fn [arity]
+                                       (let [params (syntax/forms (first arity))
+                                             variadic? (some #(= "&" (:text %)) params)]
+                                         (when (if variadic? (>= (count args) (- (count params) 2))
+                                                   (= (count args) (count params))) arity))) arities)]
+                     (when-not arity (fail (str "Wrong number of arguments (" (count args) ") in hook function")))
+                     (loop [arguments args]
+                       (let [scope (cond-> (bind-pattern environment (first arity) arguments)
+                                     name (assoc-in [:locals name] @self)
+                                     macro? (assoc-in [:locals '&form] (:macro-form *context*))
+                                     macro? (assoc-in [:locals '&env] (:macro-env *context*)))
+                             body (rest arity)
+                             contracts (when (and (next body) (= :map (:kind (first body))))
+                                         (into {} (map (fn [[k v]] [(:text k) v])
+                                                       (partition 2 (syntax/forms (first body))))))
+                             body (if contracts (rest body) body)
+                             _ (doseq [condition (syntax/forms (get contracts ":pre"))]
+                                 (when-not (eval-node scope condition)
+                                   (throw (python/AssertionError (str "Assert failed: " (syntax/text condition))))))
+                             result (eval-body scope body)]
+                         (if (and (map? result) (:blt/recur result))
+                           (recur (:blt/recur result))
+                           (do (doseq [condition (syntax/forms (get contracts ":post"))]
+                                 (when-not (eval-node (assoc-in scope [:locals '%] result) condition)
+                                   (throw (python/AssertionError (str "Assert failed: " (syntax/text condition))))))
+                               result))))))]
+    (reset! self function)
+    (with-meta function {:blt/macro macro?})))
+
+(defn- eval-body [environment forms]
+  (reduce (fn [_ form] (eval-node environment form)) nil forms))
+
+(defn- comprehension [environment binding-forms body]
+  (if (empty? binding-forms)
+    [(eval-body environment body)]
+    (let [[pattern expression & remaining] binding-forms]
+      (case (:text pattern)
+        ":let" (comprehension (bindings environment expression) remaining body)
+        ":when" (when (eval-node environment expression) (comprehension environment remaining body))
+        ":while" (if (eval-node environment expression)
+                   (comprehension environment remaining body) [::stop-comprehension])
+        (take-while #(not= ::stop-comprehension %)
+                    (mapcat #(comprehension (bind-pattern environment pattern %) remaining body)
+                            (eval-node environment expression)))))))
+
+(defn- thread-node [first? value step]
+  (if (= :list (:kind step))
+    (let [[head & args] (syntax/forms step)]
+      {:kind :list :children (if first? (concat [head value] args) (concat [head] args [value]))})
+    {:kind :list :children [step value]}))
+
+(defn- hook-catches? [class-name error]
+  (let [name (last (string/split class-name #"[.]"))]
+    (case name
+      "Throwable" true
+      ("AssertionError" "Error") (python/isinstance error python/AssertionError)
+      ("Exception" "RuntimeException") (not (python/isinstance error python/AssertionError))
+      "ArithmeticException" (python/isinstance error python/ArithmeticError)
+      ("IllegalArgumentException" "NumberFormatException") (python/isinstance error python/ValueError)
+      "IndexOutOfBoundsException" (python/isinstance error python/IndexError)
+      "ExceptionInfo" (some? (ex-data error))
+      (fail (str "Unsupported hook catch class " class-name)))))
+
+(defn- eval-call [environment node]
+  (let [[head & args] (syntax/forms node)
+        raw (:text head)
+        special? (contains? #{"quote" "do" "if" "let*" "loop*" "recur" "fn*" "def" "throw" "try"} raw)
+        function (when (and (= :symbol (:kind head)) (not special?))
+                   (lookup environment (symbol raw)))
+        word (if special? raw (:blt/builtin-macro (meta function)))]
+    (case word
+      "quote" (quote-data environment (first args))
+      "do" (eval-body environment args)
+      "if" (eval-node environment (if (eval-node environment (first args)) (second args) (nth args 2 nil)))
+      "if-not" (eval-node environment (if (eval-node environment (first args)) (nth args 2 nil) (second args)))
+      "when" (when (eval-node environment (first args)) (eval-body environment (rest args)))
+      "when-not" (when-not (eval-node environment (first args)) (eval-body environment (rest args)))
+      ("if-let" "if-some" "when-let" "when-some" "when-first")
+      (let [[pattern expression] (syntax/forms (first args))
+            value (eval-node environment expression)
+            value (if (= "when-first" word) (first value) value)
+            selected? (if (#{"if-some" "when-some"} word) (some? value) (boolean value))
+            scope (bind-pattern environment pattern value)]
+        (if selected?
+          (if (.startswith word "when") (eval-body scope (rest args)) (eval-node scope (second args)))
+          (when (.startswith word "if") (eval-node environment (nth args 2 nil)))))
+      "and" (loop [forms args result true]
+              (if (and result (seq forms)) (recur (rest forms) (eval-node environment (first forms))) result))
+      "or" (loop [forms args result nil]
+             (if (and (not result) (seq forms))
+               (recur (rest forms) (eval-node environment (first forms))) result))
+      "cond" (second (some (fn [[test value]] (when (eval-node environment test) [true (eval-node environment value)]))
+                           (partition 2 args)))
+      "case" (let [value (eval-node environment (first args))
+                   clauses (rest args)
+                   matched (some (fn [[test result]]
+                                   (let [test (quote-data environment test)]
+                                     (when (if (seq? test) (contains? (set test) value) (= value test))
+                                       [true (eval-node environment result)])))
+                                 (partition 2 clauses))]
+               (if matched (second matched)
+                   (if (odd? (count clauses)) (eval-node environment (last clauses))
+                       (fail (str "No matching clause: " value)))))
+      ("let" "let*") (eval-body (bindings environment (first args)) (rest args))
+      "letfn" (let [scope (assoc environment :local-functions (atom {}))]
+                (doseq [declaration (syntax/forms (first args))
+                        :let [[name & function-forms] (syntax/forms declaration)]]
+                  (swap! (:local-functions scope) assoc (symbol (:text name))
+                         (function-value scope function-forms false)))
+                (eval-body scope (rest args)))
+      "as->" (reduce (fn [value expression]
+                       (eval-node (bind-pattern environment (second args) value) expression))
+                     (eval-node environment (first args)) (drop 2 args))
+      ("cond->" "cond->>")
+      (reduce (fn [value [condition step]]
+                (if (eval-node environment condition)
+                  (eval-node (assoc-in environment [:locals 'blt-thread-value] value)
+                             (thread-node (= "cond->" word)
+                                          {:kind :symbol :text "blt-thread-value"} step))
+                  value))
+              (eval-node environment (first args)) (partition 2 (rest args)))
+      ("loop" "loop*")
+      (loop [scope (bindings environment (first args))]
+        (let [result (eval-body scope (rest args))]
+          (if (and (map? result) (:blt/recur result))
+            (recur (reduce (fn [scope [pattern value]] (bind-pattern scope pattern value))
+                           scope (map vector (take-nth 2 (syntax/forms (first args))) (:blt/recur result))))
+            result)))
+      "recur" {:blt/recur (mapv #(eval-node environment %) args)}
+      ("fn" "fn*") (function-value environment args false)
+      ("defn" "defn-" "defmacro")
+      (let [name-node (first args)
+            name-node (if (= :metadata (:kind name-node)) (last (syntax/forms name-node)) name-node)
+            name (symbol (:text name-node))
+            body (drop-while #(#{:string :map} (:kind %)) (rest args))
+            function (function-value environment body (= "defmacro" word))]
+        (swap! (:globals environment) assoc name function) function)
+      ("def" "defonce")
+      (let [name-node (first args)
+            name-node (if (= :metadata (:kind name-node)) (last (syntax/forms name-node)) name-node)
+            name (symbol (:text name-node))
+            defined? (and (= "defonce" word) (contains? @(:globals environment) name))
+            value (if defined? (get @(:globals environment) name) (eval-node environment (last args)))]
+        (when-not defined? (swap! (:globals environment) assoc name value)) value)
+      "defmulti"
+      (let [name (symbol (:text (first args)))
+            dispatch (eval-node environment (second args))
+            methods (atom {})
+            function (with-meta
+                       (fn [& values]
+                         (let [value (apply dispatch values)
+                               method (or (get @methods value) (get @methods :default))]
+                           (when-not method (fail (str "No hook method for " value)))
+                           (apply method values)))
+                       {:blt/methods methods})]
+        (swap! (:globals environment) assoc name function) function)
+      "defmethod"
+      (let [function (eval-node environment (first args))
+            dispatch-value (eval-node environment (second args))
+            method (function-value environment (drop 2 args) false)
+            methods (:blt/methods (meta function))]
+        (when-not methods (fail "defmethod target is not a hook multimethod"))
+        (swap! methods assoc dispatch-value method) function)
+      "declare" (doseq [name args] (swap! (:globals environment) assoc (symbol (:text name)) nil))
+      ("->" "->>") (eval-node environment (reduce #(thread-node (= "->" word) %1 %2) (first args) (rest args)))
+      ("some->" "some->>")
+      (loop [value (eval-node environment (first args)) steps (rest args)]
+        (if (and (some? value) (seq steps))
+          (let [scope (assoc-in environment [:locals 'blt-thread-value] value)
+                value-node {:kind :symbol :text "blt-thread-value"}]
+            (recur (eval-node scope (thread-node (= "some->" word) value-node (first steps))) (rest steps)))
+          value))
+      ("for" "doseq") (let [results (vec (comprehension environment (syntax/forms (first args)) (rest args)))]
+                        (when (= "for" word) results))
+      "comment" nil
+      "lazy-seq" (lazy-seq (eval-body environment args))
+      "delay" (delay (eval-body environment args))
+      "lazy-cat" (apply concat (map #(lazy-seq (eval-node environment %)) args))
+      "dotimes" (let [[pattern expression] (syntax/forms (first args))
+                      n (eval-node environment expression)]
+                  (doseq [value (range n)]
+                    (eval-body (bind-pattern environment pattern value) (rest args))))
+      "doto" (let [value (eval-node environment (first args))
+                   scope (assoc-in environment [:locals 'blt-thread-value] value)
+                   value-node {:kind :symbol :text "blt-thread-value"}]
+               (doseq [step (rest args)] (eval-node scope (thread-node true value-node step))) value)
+      "condp" (let [predicate (eval-node environment (first args))
+                    expression (eval-node environment (second args))]
+                (loop [clauses (drop 2 args)]
+                  (cond
+                    (empty? clauses) (fail (str "No matching clause: " expression))
+                    (= 1 (count clauses)) (eval-node environment (first clauses))
+                    :else (let [matched (predicate (eval-node environment (first clauses)) expression)
+                                indirect? (= ":>>" (:text (second clauses)))]
+                            (if matched
+                              (if indirect? ((eval-node environment (nth clauses 2)) matched)
+                                  (eval-node environment (second clauses)))
+                              (recur (drop (if indirect? 3 2) clauses)))))))
+      "binding" (let [values (into {} (map (fn [[name value]]
+                                             [(quoted-symbol environment (symbol (:text name)))
+                                              (eval-node environment value)]))
+                                   (partition 2 (syntax/forms (first args))))]
+                  (binding [*context* (update *context* :dynamic-bindings merge values)]
+                    (eval-body environment (rest args))))
+      "with-redefs"
+      (let [entries (mapv (fn [[name expression]]
+                            (let [name (symbol (:text name))
+                                  qualified (quoted-symbol environment name)
+                                  target (if (= (namespace qualified) (:namespace environment))
+                                           environment (get @(:modules environment) (namespace qualified)))]
+                              (when-not target (fail "with-redefs supports hook-defined vars"))
+                              [(:globals target) (symbol (basilisp.core/name qualified))
+                               (eval-node environment expression)]))
+                          (partition 2 (syntax/forms (first args))))
+            previous (mapv (fn [[globals name _]] [globals name (get @globals name)]) entries)]
+        (try
+          (doseq [[globals name value] entries] (swap! globals assoc name value))
+          (eval-body environment (rest args))
+          (finally (doseq [[globals name value] previous] (swap! globals assoc name value)))))
+      "throw" (throw (eval-node environment (first args)))
+      "try" (let [body (take-while #(not (#{"catch" "finally"} (:text (first (syntax/forms %))))) args)
+                  handlers (drop (count body) args)
+                  catchers (filter #(= "catch" (:text (first (syntax/forms %)))) handlers)
+                  finalizer (first (filter #(= "finally" (:text (first (syntax/forms %)))) handlers))]
+              (try (eval-body environment body)
+                   (catch python/Exception error
+                     (if-let [catcher (first (filter #(hook-catches? (:text (second (syntax/forms %))) error) catchers))]
+                       (let [[_ _ binding & forms] (syntax/forms catcher)]
+                         (eval-body (bind-pattern environment binding error) forms))
+                       (throw error)))
+                   (finally (when finalizer (eval-body environment (rest (syntax/forms finalizer)))))))
+      "assert" (when-not (eval-node environment (first args))
+                 (throw (python/AssertionError (str "Assert failed: " (if (second args) (eval-node environment (second args)) (syntax/text (first args)))))))
+      (let [function (eval-node environment head)]
+        (if (:blt/macro (meta function))
+          (let [form (quote-data environment node)
+                expanded (binding [*context* (assoc *context* :macro-form form
+                                                    :macro-env (zipmap (keys (:locals environment)) (repeat {})))]
+                           (apply function (rest form)))]
+            (eval-node environment (to-syntax (coerce expanded) {})))
+          (apply function (mapv #(eval-node environment %) args)))))))
+
+(defn- eval-node [environment node]
+  (tick!)
+  (when node
+    (case (:kind node)
+      :symbol (lookup environment (symbol (:text node)))
+      :keyword (let [text (:text node)]
+                 (if (.startswith text "::")
+                   (let [sym (symbol (subs text 2))
+                         namespace (if-let [prefix (namespace sym)]
+                                     (get @(:aliases environment) prefix prefix)
+                                     (:namespace environment))]
+                     (keyword namespace (name sym)))
+                   (literal node)))
+      (:number :nil :boolean :string :character :symbolic-number) (literal node)
+      :list (eval-call environment node)
+      :vector (mapv #(eval-node environment %) (syntax/forms node))
+      :set (set (map #(eval-node environment %) (syntax/forms node)))
+      :map (into {} (map (fn [[k v]] [(eval-node environment k) (eval-node environment v)])
+                         (partition 2 (syntax/forms node))))
+      :quote (quote-data environment (first (syntax/forms node)))
+      :syntax-quote (syntax-quote-data (quote-environment environment node) (first (syntax/forms node)))
+      :deref (deref (eval-node environment (first (syntax/forms node))))
+      :metadata (eval-node environment (last (syntax/forms node)))
+      :regex (literal node)
+      :anonymous-function (let [body {:kind :list :children (:children node)}
+                                placeholders (keep #(when (= :symbol (:kind %)) (:text %)) (syntax/nodes node))
+                                required (reduce max 0 (keep #(cond (= "%" %) 1
+                                                                    (regex/fullmatch "%[1-9][0-9]*" %) (python/int (subs % 1))) placeholders))
+                                variadic? (some #{"%&"} placeholders)
+                                function (fn [& args]
+                                           (tick!)
+                                           (when-not (if variadic? (>= (count args) required) (= (count args) required))
+                                             (fail (str "Wrong number of arguments (" (count args) ") in anonymous hook function")))
+                                           (let [scope (reduce (fn [scope [index value]]
+                                                                 (assoc-in scope [:locals (symbol (str "%" (inc index)))] value))
+                                                               (-> environment
+                                                                   (assoc-in [:locals '%] (first args))
+                                                                   (assoc-in [:locals '%&] (seq (drop required args))))
+                                                               (map-indexed vector (take required args)))]
+                                             (eval-node scope body)))]
+                            function)
+      :reader-conditional (let [pairs (partition 2 (syntax/forms node))
+                                selected (or (some (fn [[k v]] (when (= ":clj" (:text k)) v)) pairs)
+                                             (some (fn [[k v]] (when (= ":lpy" (:text k)) v)) pairs)
+                                             (some (fn [[k v]] (when (= ":default" (:text k)) v)) pairs))]
+                            (eval-node environment selected))
+      (fail (str "Unsupported hook expression " (:kind node))))))
+
+(defn- resolve-hook-readers [node feature]
+  (letfn [(selected [conditional]
+            (some (fn [[key value]] (when (contains? #{feature ":default"} (:text key)) value))
+                  (partition 2 (syntax/forms conditional))))
+          (children [parent]
+            (mapcat
+             (fn [child]
+               (case (:kind child)
+                 :reader-conditional (when-let [value (selected child)] [(resolve-hook-readers value feature)])
+                 :reader-splice (when-let [value (selected child)]
+                                  (when-not (contains? #{:list :vector} (:kind value))
+                                    (fail "Reader conditional splice requires a sequential form"))
+                                  (map #(resolve-hook-readers % feature) (:children value)))
+                 [(resolve-hook-readers child feature)]))
+             (:children parent)))]
+    (if (:children node) (assoc node :children (vec (children node))) node)))
+
+(defn- namespace-file [directories namespace]
+  (let [relative (-> namespace (.replace "-" "_") (.replace "." "/"))]
+    (some (fn [directory]
+            (some (fn [extension]
+                    (let [path (.joinpath (pathlib/Path directory) (str relative extension))]
+                      (when (.is_file path) path)))
+                  [".clj_kondo" ".clj" ".cljc" ".lpy"]))
+          directories)))
+
+(defn- install-refers! [environment target namespace names renames]
+  (doseq [name names
+          :let [renamed (get renames name name)]]
+    (when-not (contains? target name) (fail (str "Unknown hook refer " namespace "/" name)))
+    (swap! (:refers environment) assoc renamed (get target name))
+    (swap! (:refer-sources environment) assoc renamed (symbol namespace (str name)))))
+
+(defn- require-spec! [environment spec]
+  (let [parts (syntax/forms spec)
+        namespace (if (= :symbol (:kind spec)) (:text spec) (:text (first parts)))
+        target (or (get builtin-namespaces namespace)
+                   (let [loaded (load-namespace! environment namespace)] @(:globals loaded)))
+        options (into {} (map (fn [[k v]] [(:text k) v]) (partition 2 (rest parts))))
+        referred (get options ":refer")
+        renames (when-let [node (get options ":rename")] (quote-data node))]
+    (doseq [option (keys options)]
+      (when-not (contains? #{":as" ":as-alias" ":refer" ":rename"} option)
+        (fail (str "Unsupported hook require option " option))))
+    (when-let [alias (or (get options ":as") (get options ":as-alias"))]
+      (swap! (:aliases environment) assoc (:text alias) namespace))
+    (install-refers! environment target namespace
+                     (if (= ":all" (:text referred)) (keys target)
+                         (map #(symbol (:text %)) (syntax/forms referred)))
+                     renames)))
+
+(defn- refer-core! [environment args]
+  (let [options (into {} (map (fn [[k v]] [(:text k) (quote-data v)]) (partition 2 args)))
+        excluded (set (get options ":exclude"))
+        renamed (get options ":rename")
+        only (get options ":only")]
+    (doseq [option (keys options)]
+      (when-not (contains? #{":exclude" ":only" ":rename"} option)
+        (fail (str "Unsupported hook refer-clojure option " option))))
+    (swap! (:core-excluded environment) into
+           (concat excluded (keys renamed) (when only (remove (set only) (keys pure-core)))))
+    (install-refers! environment pure-core "clojure.core" (keys renamed) renamed)))
+
+(defn- load-namespace! [parent namespace]
+  (or (get @(:modules parent) namespace)
+      (let [path (namespace-file (:directories parent) namespace)]
+        (when-not path (fail (str "Hook namespace file not found: " namespace)))
+        (let [source (.read_text path ** :encoding "utf-8")
+              parsed (syntax/parse source {:dialect :clojure})
+              environment {:namespace namespace :directories (:directories parent)
+                           :modules (:modules parent) :files (:files parent)
+                           :globals (atom {}) :aliases (atom {})
+                           :refers (atom {}) :refer-sources (atom {}) :core-excluded (atom #{}) :gensyms (atom {}) :locals {}}]
+          (swap! (:files parent) assoc (str path) source)
+          (when (seq (:diagnostics parsed)) (fail (str "Invalid hook syntax in " path)))
+          (swap! (:modules parent) assoc namespace environment)
+          (doseq [form (syntax/forms (resolve-hook-readers (:root parsed) (when (.endswith (str path) ".lpy") ":lpy")))]
+            (if (= "ns" (:text (first (syntax/forms form))))
+              (doseq [clause (drop 2 (syntax/forms form))]
+                (let [[head & args] (syntax/forms clause)]
+                  (case (:text head)
+                    ":require" (doseq [spec args] (require-spec! environment spec))
+                    (":refer-clojure" ":refer-basilisp") (refer-core! environment args)
+                    (fail (str "Unsupported hook namespace clause " (:text head))))))
+              (eval-node environment form)))
+          environment))))
+
+(defn- cache-current? [entry]
+  (and entry
+       (every? (fn [[path source]]
+                 (try (= source (.read_text (pathlib/Path path) ** :encoding "utf-8"))
+                      (catch python/OSError _ false)))
+               (:files entry))))
+
+(defn- hook-function [context specification]
+  (when (and (string? specification) (not (:allow-string-hooks context)))
+    (fail "String hooks require :hooks {:__dangerously-allow-string-hooks__ true}"))
+  (let [directories (filterv some? (distinct (concat (:config-directories (:config context))
+                                                     [(:cfg-dir (:config context))] (:hook-paths context))))
+        cache (:hook-cache context)
+        cache-key [directories specification]
+        cached (when cache (get @cache cache-key))]
+    (if (cache-current? cached)
+      (:function cached)
+      (let [environment {:directories directories :modules (atom {}) :files (atom {})
+                         :namespace "user" :globals (atom {}) :aliases (atom {})
+                         :refers (atom {}) :refer-sources (atom {}) :core-excluded (atom #{}) :gensyms (atom {}) :locals {}}
+            function
+            (cond
+              (symbol? specification)
+              (let [namespace (namespace specification)]
+                (when-not namespace (fail "Hook function must be a qualified symbol"))
+                (let [module (load-namespace! environment namespace)
+                      function (get @(:globals module) (symbol (name specification)))]
+                  (when-not (ifn? function) (fail (str "Hook function not found: " specification)))
+                  function))
+              (string? specification)
+              (when (:allow-string-hooks context)
+                (let [parsed (syntax/parse specification {:dialect :clojure})]
+                  (when (seq (:diagnostics parsed)) (fail "Invalid string hook syntax"))
+                  (eval-body environment (syntax/forms (resolve-hook-readers (:root parsed) nil)))))
+              :else (fail "Hook must be a qualified symbol or an enabled string hook"))]
+        (when (and cache function)
+          (swap! cache (fn [entries]
+                         (assoc (if (>= (count entries) 256) {} entries)
+                                cache-key {:function function :files @(:files environment)}))))
+        function))))
+
+(defn- to-syntax [node fallback]
+  (when-not (node? node) (fail "Hook :node must be a hook API node"))
+  (let [metadata (merge (meta fallback) (meta node))
+        start (or (:blt/start metadata) 0) end (or (:blt/end metadata) start)
+        generated? (generated-node? node)
+        kind (if (= :token (:tag node))
+               (cond (symbol? (:value node)) :symbol (nil? (:value node)) :nil
+                     (boolean? (:value node)) :boolean (number? (:value node)) :number
+                     :else :character)
+               (:tag node))
+        result (if (#{:token :keyword :string :regex} (:tag node))
+                 {:kind kind :text (let [text (or (:string-value node) (pr-str (:value node)))]
+                                     (if (and (= :symbol kind) (.startswith text "clojure.core/"))
+                                       (str "basilisp.core/" (subs text 13)) text))}
+                 {:kind kind :children (mapv #(to-syntax % (with-meta node metadata)) (:children node))})]
+    (cond-> (assoc result :start start :end end)
+      generated? (assoc :generated true :derived-location true)
+      (:reg node) (assoc :reg (:reg node)))))
+
+(defn- hook-setting [context kind]
+  (let [identity (:call-identity context) config (:config context)
+        mapping (get-in config [:hooks kind])
+        namespace (str (:ns identity)) name (str (:name identity))]
+    (or (get mapping (symbol namespace name))
+        (some (fn [group]
+                (when (or (and (string? (:pattern group))
+                               (re-find (re-pattern (:pattern group)) namespace))
+                          (and (string? (:filename-pattern group))
+                               (re-find (re-pattern (:filename-pattern group)) (or (:filename context) ""))))
+                  (get mapping (symbol (str (:name group)) name))))
+              (:ns-groups config)))))
+
+(defn apply-call
+  "Run a configured hook and return {:node CST-or-nil :findings [...]}. An absent
+  hook returns nil. Context supplies :config, :call-identity, :parsed, :locals,
+  :callstack and optional :resolve/:ns-analysis callbacks."
+  [context node]
+  (when (seq (get-in context [:config :hooks]))
+    (let [config (:config context)
+          analyze (hook-setting context :analyze-call)
+          macro (hook-setting context :macroexpand)
+          specification (or analyze macro)
+          allowed? (if (contains? context :allow-string-hooks) (:allow-string-hooks context)
+                       (get-in config [:hooks :__dangerously-allow-string-hooks__]))
+          context (assoc context :allow-string-hooks allowed?)]
+      (when (and specification (not (and (string? specification) (not allowed?))))
+        (let [findings (atom [])
+              original (from-syntax (:parsed context) node)
+              context (assoc context :findings findings
+                             :macro-env (zipmap (map symbol (keys (:locals context))) (repeat {})))]
+          (binding [*context* context *budget* (atom 100000)]
+            (try
+              (let [function (hook-function context specification)
+                    result (if analyze
+                             (function {:node original :cljc false :lang :clj :filename (:filename context)
+                                        :ns (some-> (:namespace context) symbol)
+                                        :config config :context (:context context)})
+                             (let [form (sexpr original)]
+                               (binding [*context* (assoc context :macro-form form)]
+                                 {:node (coerce (apply function (rest form)))})))
+                    transformed (:node result)]
+                {:node (when transformed (to-syntax transformed original))
+                 :findings @findings :context (:context result)})
+              (catch python/Exception error
+                {:findings (conj @findings (assoc (meta original) :type :hook :level :error
+                                                  :message (or (ex-message error) (str error))))}))))))))
+
+(defn invoke
+  "Invoke a restricted hook function with data. Context supports :hook-paths,
+  :config and :hook-cache. Throws a descriptive exception on unsupported code."
+  [context specification argument]
+  (binding [*context* (assoc context :findings (atom [])) *budget* (atom 100000)]
+    ((hook-function context specification) argument)))
+
+(defn run-custom-linters
+  "Run clojure-lsp :linters/:custom against an analysis database. Returns
+  diagnostics registered with :reg-diagnostic!, plus linter failure diagnostics.
+  Context is {:db db :uris [...] :settings config :hook-paths [...]}; each db
+  :analysis URI maps to clj-kondo analysis buckets and :documents URI to :text."
+  [{:keys [db uris settings] :as context}]
+  (let [diagnostics (atom [])
+        context (assoc context :config settings)]
+    (doseq [[function parameters] (get-in settings [:linters :custom])
+            :when (not= :off (:level parameters))]
+      (try
+        (invoke context function
+                {:db db :uris (vec uris) :params parameters
+                 :reg-diagnostic! (fn [diagnostic]
+                                    (swap! diagnostics conj
+                                           (merge {:level (or (:level parameters) :warning)
+                                                   :source "blt" :code (str function)}
+                                                  diagnostic))
+                                    nil)})
+        (catch python/Exception error
+          (doseq [uri uris]
+            (swap! diagnostics conj {:uri uri :level :error :source "blt"
+                                     :code "hook" :message (str "Custom linter " function ": " error)
+                                     :range {:row 1 :col 1 :end-row 1 :end-col 1}})))))
+    @diagnostics))

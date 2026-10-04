@@ -1,6 +1,9 @@
 (ns basilisp-tools.lsp-test
   (:require [basilisp.test :refer [deftest is testing]]
-            [basilisp-tools.lsp :as lsp])
+            [basilisp.string :as str]
+            [basilisp-tools.lsp :as lsp]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.syntax :as syntax])
   (:import [json] [os] [pathlib] [queue] [subprocess] [sys] [tempfile] [threading]))
 
 (defn- read-messages [process messages]
@@ -27,7 +30,7 @@
     {:process process :messages messages :id (atom 0) :notifications (atom [])}))
 
 (defn- send! [client message]
-  (let [body (.encode (json/dumps (lisp->py (assoc message :jsonrpc "2.0"))
+  (let [body (.encode (json/dumps (lisp->py (assoc message :jsonrpc "2.0") :keyword-fn #(subs (str %) 1))
                                   ** :ensure_ascii false) "utf-8")
         stream (.-stdin (:process client))]
     (.write stream (.encode (str "Content-Length: " (count body) "\r\n\r\n") "ascii"))
@@ -66,7 +69,8 @@
 (defn- initialize! [client root]
   (let [result (result! client "initialize"
                         {:processId nil :rootUri (.as_uri root)
-                         :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"}
+                         :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"
+                                                 :linters {:clojure-lsp/unused-public-var {:level "off"}}}
                          :capabilities {:general {:positionEncodings ["utf-16"]}
                                         :workspace {:workspaceEdit {:documentChanges true}}}})]
     (notification! client "initialized" {})
@@ -111,7 +115,8 @@
                         :contentChanges [{:range {:start {:line 2 :character 17}
                                                   :end {:line 2 :character 24}}
                                           :text "x"}]})
-        (is (empty? (:diagnostics (diagnostics! c 2)))))
+        (let [findings (:diagnostics (diagnostics! c 2))]
+          (is (empty? findings) (pr-str findings))))
       (testing "Only the latest document version receives asynchronous diagnostics"
         (notification! c "textDocument/didChange"
                        {:textDocument {:uri uri :version 3} :contentChanges [{:text "("}]})
@@ -372,7 +377,8 @@
     (try
       (result! c "initialize"
                {:processId nil :rootUri (.as_uri root)
-                :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"}
+                :initializationOptions {:source-paths ["."] :text-document-sync-kind "incremental"
+                                        :linters {:clojure-lsp/unused-public-var {:level "off"}}}
                 :capabilities {:workspace {:didChangeWatchedFiles {:dynamicRegistration true}}}})
       (notification! c "initialized" {})
       (let [registration (.get (:messages c) ** :timeout 20)]
@@ -461,34 +467,34 @@
   (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
         config (.joinpath root ".lsp" "config.edn")
         _ (.mkdir (.-parent config) ** :parents true)
-        _ (.write_text config "{:linters {:clj-kondo {:ns-exclude-regex \"quiet.*\"}}}" ** :encoding "utf-8")
+        _ (.write_text config "{:linters {:clj-kondo {:ns-exclude-regex \"silent.*\"}}}" ** :encoding "utf-8")
         c (client root) uri (.as_uri (.joinpath root "quiet.lpy"))]
     (try
       (initialize! c root)
-      (is (empty? (:diagnostics (open! c uri "(ns quiet.example) missing"))))
+      (is (empty? (:diagnostics (open! c uri "(ns silent.example) missing"))))
       (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 2}
-                                                 :contentChanges [{:text "(ns loud) missing"}]})
+                                                 :contentChanges [{:text "(ns quiet) missing"}]})
       (is (= "unresolved-symbol" (:code (first (:diagnostics (diagnostics! c 2))))))
       (notification! c "workspace/didChangeConfiguration" {:settings {:linters {:clj-kondo {:level "off"}}}})
       (next-diagnostics! c uri empty?)
       (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 3}
-                                                 :contentChanges [{:text "(ns loud) still-missing"}]})
+                                                 :contentChanges [{:text "(ns quiet) still-missing"}]})
       (is (empty? (:diagnostics (diagnostics! c 3))))
       (notification! c "workspace/didChangeConfiguration"
                      {:settings {:linters {:clj-kondo {:level "on" :report-duplicates false}}
                                  :diagnostics {:range-type "simple"}}})
       (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 4}
-                                                 :contentChanges [{:text "(ns loud) (inc 1 2)"}]})
+                                                 :contentChanges [{:text "(ns quiet) (inc 1 2)"}]})
       (let [diagnostic (first (:diagnostics (diagnostics! c 4)))]
         (is (= "invalid-arity" (:code diagnostic)))
         (is (= (get-in diagnostic [:range :start]) (get-in diagnostic [:range :end]))))
       (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 5}
-                                                 :contentChanges [{:text "(ns loud) missing missing"}]})
+                                                 :contentChanges [{:text "(ns quiet) missing missing"}]})
       (is (= 1 (count (:diagnostics (diagnostics! c 5)))))
       (notification! c "workspace/didChangeConfiguration"
                      {:settings {:linters {:clj-kondo {:report-duplicates true}}}})
       (notification! c "textDocument/didChange" {:textDocument {:uri uri :version 6}
-                                                 :contentChanges [{:text "(ns loud) missing missing"}]})
+                                                 :contentChanges [{:text "(ns quiet) missing missing"}]})
       (is (= 2 (count (:diagnostics (diagnostics! c 6)))))
       (finally (stop! c) (.cleanup temp)))))
 
@@ -619,7 +625,7 @@
       (is (empty? (result! c "textDocument/codeAction"
                            {:textDocument {:uri uri}
                             :range {:start {:line 0 :character 26} :end {:line 0 :character 27}}
-                            :context {:diagnostics []}})))
+                            :context {:diagnostics [] :only ["quickfix"]}})))
       (finally (stop! c) (.cleanup temp)))))
 
 (deftest multiworkspace-resolution-python-and-rename-isolation-test
@@ -747,4 +753,476 @@
       (is (<= 0 (.find (get-in (result! c "textDocument/hover" (at uri 1 5)) [:contents :value])
                        "Correct project directory.")))
       (is (.is_file marker))
+      (finally (stop! c) (.cleanup temp)))))
+
+(defn- transformed [source command offset & args]
+  (let [analysis (analyzer/analyze source {:filename "/tmp/blt-refactor-test.lpy"})
+        edits (lsp/refactor-edits source analysis command offset args)]
+    (reduce (fn [text [start end replacement]] (str (subs text 0 start) replacement (subs text end)))
+            source (sort-by first > edits))))
+
+(deftest source-refactor-semantics-test
+  (doseq [[source command offset]
+          [["(+ (* 2 3) 4)" "thread-first-all" 0]
+           ["(+ 4 (* 2 3))" "thread-last-all" 0]
+           ["(-> 2 (* 3) (+ 4))" "unwind-all" 0]
+           ["(->> 2 (* 3) (+ 4))" "unwind-thread" 0]
+           ["(get (get {:a {:b 3}} :a) :b)" "get-in-all" 0]
+           ["(get-in {:a {:b 3}} [:a :b])" "get-in-none" 0]
+           ["(get-in {:a {:b 3}} [:a :b])" "get-in-less" 0]
+           ["(if true 1 2)" "if->cond-refactor" 0]
+           ["(cond false 1 :else 2)" "cond->if-refactor" 0]
+           ["(let [x 2] (+ x x))" "inline-symbol" 6]
+           ["(+ 2 3)" "introduce-let" 3]]]
+    (let [result (transformed source command offset)]
+      (is (not= source result) (str command " should produce an edit"))
+      (is (empty? (:diagnostics (syntax/parse result))))
+      (is (= (load-string source) (load-string result)) (str command " must preserve evaluation"))))
+  (let [source "(defn calc [x y] (+ x (* y 2)))"
+        result (transformed source "extract-function" 21 "double-y")]
+    (is (not= source result))
+    (is (empty? (:diagnostics (syntax/parse result))))
+    (is (empty? (:findings (analyzer/analyze result)))))
+  (is (= "(let [x (println 1)] [x x])"
+         (transformed "(let [x (println 1)] [x x])" "inline-symbol" 6)))
+  (is (= "'(+ 1 2)" (transformed "'(+ 1 2)" "extract-function" 2 "unsafe")))
+  (is (= "(let [x 1] x)" (transformed "(let [x 1] x)" "introduce-let" 6 "x")))
+  (is (= "(+ ; keep\n 1 2)" (transformed "(+ ; keep\n 1 2)" "thread-first-all" 0))))
+
+(deftest structural-editor-transformations-test
+  (doseq [[source command offset expected]
+          [["[1 2] 3" "forward-slurp" 1 "[1 2 3]"]
+           ["1 [2 3]" "backward-slurp" 3 "[1 2 3]"]
+           ["[1 2 3]" "forward-barf" 1 "[1 2] 3"]
+           ["[1 2 3]" "backward-barf" 1 "1 [2 3]"]
+           ["[1 2 3]" "drag-forward" 1 "[2 1 3]"]
+           ["[1 2 3]" "drag-backward" 3 "[2 1 3]"]
+           ["{:b 2 :a 1}" "sort-map" 0 "{:a 1 :b 2}"]
+           ["[1 2]" "cycle-coll" 0 "#{1 2}"]
+           ["(defn x [] 1)" "cycle-privacy" 7 "(defn- x [] 1)"]]]
+    (let [result (transformed source command offset)]
+      (is (= expected result))
+      (is (empty? (:diagnostics (syntax/parse result))))))
+  (is (= [3 7] (let [source "#(+ %1 %2)"
+                     result (transformed source "promote-fn" 0)]
+                 [((load-string source) 1 2) ((load-string result) 3 4)])))
+  (is (= "(ns foo) ::key" (transformed "(ns foo) :foo/key" "cycle-keyword-auto-resolve" 10))))
+
+(deftest standard-editor-protocol-features-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        uri (.as_uri (.joinpath root "features.lpy")) c (client root)
+        source "(ns features)\n;; https://example.com/help\n(defn add [first second]\n  (+ first second))\n(let [amount 1]\n  (add amount 2))"]
+    (try
+      (let [initialized (initialize! c root)]
+        (doseq [capability [:selectionRangeProvider :foldingRangeProvider :documentHighlightProvider
+                            :linkedEditingRangeProvider :inlayHintProvider :typeDefinitionProvider :implementationProvider]]
+          (is (get-in initialized [:capabilities capability]))))
+      (open! c uri source)
+      (let [ranges (result! c "textDocument/selectionRange"
+                            {:textDocument {:uri uri} :positions [{:line 5 :character 8} {:line 2 :character 8}]})]
+        (is (= 2 (count ranges)))
+        (is (= {:line 5 :character 7} (get-in ranges [0 :range :start])))
+        (is (:parent (first ranges))))
+      (is (= 2 (count (result! c "textDocument/foldingRange" {:textDocument {:uri uri}}))))
+      (is (= "https://example.com/help"
+             (:target (first (result! c "textDocument/documentLink" {:textDocument {:uri uri}})))))
+      (let [highlights (result! c "textDocument/documentHighlight" (at uri 5 8))
+            linked (result! c "textDocument/linkedEditingRange" (at uri 5 8))]
+        (is (= 2 (count highlights)))
+        (is (= #{2 3} (set (map :kind highlights))))
+        (is (= 2 (count (:ranges linked)))))
+      (let [hints (result! c "textDocument/inlayHint"
+                           {:textDocument {:uri uri} :range {:start {:line 0 :character 0}
+                                                             :end {:line 5 :character 17}}})]
+        (is (some #(= "first:" (:label %)) hints))
+        (is (some #(= "second:" (:label %)) hints)))
+      (let [actions (result! c "textDocument/codeAction"
+                             {:textDocument {:uri uri} :range {:start {:line 5 :character 2} :end {:line 5 :character 16}}
+                              :context {:diagnostics [] :only ["refactor"]}})]
+        (is (some #(= "Thread first" (:title %)) actions))
+        (is (every? :edit actions)))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest file-rename-updates-namespace-and-consumers-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        provider (.joinpath root "old.lpy") consumer (.joinpath root "consumer.lpy")
+        _ (.write_text provider "(ns old) (defn value [] 1)")
+        _ (.write_text consumer "(ns consumer (:require [old :as o])) (old/value) (o/value)")
+        c (client root)]
+    (try
+      (initialize! c root)
+      (let [edit (result! c "workspace/willRenameFiles"
+                          {:files [{:oldUri (.as_uri provider) :newUri (.as_uri (.joinpath root "renamed.lpy"))}]})
+            changes (:documentChanges edit)]
+        (is (= 2 (count changes)))
+        (is (= ["renamed" "renamed" "renamed"]
+               (mapv :newText (mapcat :edits changes)))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest dependency-exported-lsp-settings-and-custom-linter-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        exported (.joinpath root "deps" "clojure-lsp.exports" "example" "lint")
+        project (.joinpath root ".lsp") home (.joinpath root "home")]
+    (try
+      (.mkdir exported ** :parents true)
+      (.mkdir project)
+      (.mkdir home)
+      (.write_text (.joinpath exported "config.edn")
+                   "{:hover {:hide-file-location? true} :classpath-config-paths [\"example/lint\"]}")
+      (.write_text (.joinpath project "config.edn")
+                   "{:classpath-config-paths [\"example/lint\"] :hover {:arity-on-same-line? true}}")
+      (let [settings (lsp/load-settings {:root (str root) :home (str home)
+                                         :xdg-config-home (str (.joinpath home "xdg"))
+                                         :classpath-paths [(str (.joinpath root "deps"))]})]
+        (is (true? (get-in settings [:hover :hide-file-location?])))
+        (is (true? (get-in settings [:hover :arity-on-same-line?]))))
+      (.write_text (.joinpath project "config.edn")
+                   "{:source-paths [\".\"] :linters {:custom {rules/lint {:level :info}}}}")
+      (.write_text (.joinpath root "rules.clj")
+                   "(ns rules) (defn lint [{:keys [uris reg-diagnostic!]}] (doseq [uri uris] (reg-diagnostic! {:uri uri :range {:row 1 :col 1 :end-row 1 :end-col 2} :message \"Custom rule\"})))")
+      (let [c (client root) uri (.as_uri (.joinpath root "app.lpy"))]
+        (try
+          (initialize! c root)
+          (let [diagnostics (:diagnostics (open! c uri "(ns app)"))
+                custom (first (filter #(= "Custom rule" (:message %)) diagnostics))]
+            (is custom)
+            (is (= 3 (:severity custom))))
+          (finally (stop! c))))
+      (finally (.cleanup temp)))))
+
+(defn- apply-wire-edits [source edits]
+  (let [lines (.splitlines source ** :keepends true)
+        offset (fn [position] (+ (reduce + 0 (map count (take (:line position) lines))) (:character position)))
+        edits (map (fn [edit] [(offset (get-in edit [:range :start])) (offset (get-in edit [:range :end])) (:newText edit)]) edits)]
+    (reduce (fn [text [start end replacement]] (str (subs text 0 start) replacement (subs text end)))
+            source (sort-by first > edits))))
+
+(deftest parameter-movement-preserves-evaluation-order-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        uri (.as_uri (.joinpath root "params.lpy"))
+        source "(ns params)\n(defn pair [a b] [a b])\n(def events (atom []))\n(pair (do (swap! events conj :a) 1) (do (swap! events conj :b) 2))\n@events"]
+    (try
+      (initialize! c root) (open! c uri source)
+      (doseq [[command character] [["drag-param-forward" 12] ["drag-param-backward" 14]]]
+        (result! c "workspace/executeCommand" {:command command :arguments [uri 1 character]})
+        (let [request (last (filter #(= "workspace/applyEdit" (:method %)) @(:notifications c)))
+              edits (get-in request [:params :edit :documentChanges 0 :edits])
+              result (apply-wire-edits source edits)]
+          (is (seq edits))
+          (is (>= (.find result "[b a]") 0))
+          (is (= (load-string source) (load-string result)))
+          (send! c {:id (:id request) :result {:applied true}})))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest inline-functions-and-binding-context-safety-test
+  (let [source "(defn blt-inline-sample [x y] (+ x y)) (let [x 10] (blt-inline-sample 2 x))"
+        result (transformed source "inline-function" (.rfind source "(blt-inline-sample"))]
+    (is (not= source result))
+    (is (= (load-string source) (load-string result))))
+  (doseq [source ["(defn f [x] x)" "(fn f [x] x)" "(for [x [1]] x)" "(doseq [x [1]] x)"]
+          command ["extract-function" "introduce-let"]]
+    (is (= source (transformed source command (.find source "[") "new-name"))))
+  (is (= "(fn [x y] (+ x 1))" (transformed "(fn [x y] (+ x 1))" "demote-fn" 0)))
+  (is (= "(get-in {:a 1} (list :a))" (transformed "(get-in {:a 1} (list :a))" "get-in-none" 0)))
+  (let [source "(fn [x y] (+ x y))" result (transformed source "demote-fn" 0)]
+    (is (= 3 ((load-string result) 1 2)))))
+
+(deftest snippets-project-tree-and-test-tree-protocol-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        uri (.as_uri (.joinpath root "features_test.lpy"))
+        source "(ns features-test (:require [basilisp.test :refer [deftest testing is]]))\n(deftest example (testing \"group\" (is true)))\ndefn"]
+    (try
+      (result! c "initialize"
+               {:processId nil :rootUri (.as_uri root)
+                :initializationOptions {:source-paths ["."]}
+                :capabilities {:textDocument {:completion {:completionItem {:snippetSupport true}}}
+                               :experimental {:testTree true}}})
+      (notification! c "initialized" {})
+      (open! c uri source)
+      (let [items (:items (result! c "textDocument/completion" (at uri 2 4)))
+            snippet (first (filter #(and (= "defn" (:label %)) (= 2 (:insertTextFormat %))) items))]
+        (is snippet)
+        (is (>= (.find (get-in snippet [:textEdit :newText]) "${1:name}") 0)))
+      (let [tree (result! c "clojure/workspace/projectTree/nodes" nil)]
+        (is (= 1 (:type tree)))
+        (is (= 2 (:type (first (:nodes tree))))))
+      (let [tree (result! c "clojure/workspace/projectTree/nodes" {:name "." :type 2 :final false})]
+        (is (some #(= "features-test" (:name %)) (:nodes tree))))
+      (let [info (result! c "clojure/serverInfo/raw" {})]
+        (is (:server-version info)))
+      (let [info (result! c "clojure/cursorInfo/raw" (at uri 2 2))]
+        (is (:node info)))
+      (let [notification (first (filter #(= "clojure/textDocument/testTree" (:method %)) @(:notifications c)))
+            tree (get-in notification [:params :tree])]
+        (is (= 1 (:kind tree)))
+        (is (= "example" (get-in tree [:children 0 :name])))
+        (is (= "group" (get-in tree [:children 0 :children 0 :name]))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest python-and-keyword-references-across-aliases-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        first-file (.joinpath root "first.lpy") second-file (.joinpath root "second.lpy")
+        first-source "(ns first (:import [math :as m])) (m/sin 1) :shared/key"
+        _ (.write_text first-file first-source)
+        _ (.write_text second-file "(ns second (:import [math])) (math/sin 2) :shared/key")
+        uri (.as_uri first-file)]
+    (try
+      (initialize! c root) (open! c uri first-source)
+      (let [refs (result! c "textDocument/references"
+                          (assoc (at uri 0 38) :context {:includeDeclaration false}))]
+        (is (= 2 (count refs))))
+      (let [refs (result! c "textDocument/references"
+                          (assoc (at uri 0 47) :context {:includeDeclaration true}))]
+        (is (= 2 (count refs))))
+      (is (nil? (result! c "textDocument/prepareRename" (at uri 0 38))))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest batch-analysis-depth-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        entry (str (.joinpath root "entry.lpy")) dep (.joinpath root "dependency.lpy")
+        source "(ns entry (:require [dependency :as d])) (d/value)"
+        _ (.write_text dep "(ns dependency) (defn value [] 1)")
+        documents {entry source} options {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (let [shallow (lsp/workspace-analysis documents options)
+            namespaces (lsp/workspace-analysis documents (assoc options :analysis :project-namespaces-only))
+            full (lsp/workspace-analysis documents (assoc options :analysis :project-and-full-dependencies))]
+        (is (= 1 (count shallow)))
+        (is (empty? (:var-usages (get namespaces entry))))
+        (is (= #{entry (str dep)} (set (keys full)))))
+      (finally (.cleanup temp)))))
+
+(deftest binding-and-namespace-refactors-test
+  (doseq [[source command needle]
+          [["(let [m {:a 1 :b 2}] (+ (:a m) (get m :b)))" "destructure-keys" "m {"]
+           ["(let [{:keys [a b]} {:a 1 :b 2}] (+ a b))" "restructure-keys" "{:keys"]
+           ["(let [x 1] (let [y 2] (+ x y)))" "expand-let" "let [y"]
+           ["(let [x 1] (+ x 2))" "move-to-let" "(+"]
+           ["(vec (for [x [1 2]] (+ x 3)))" "move-to-for-let" "(+"]
+           ["{:group/a 1 :b 2 :other/c 3}" "cycle-namespaced-map" "{"]
+           ["#:group{:a 1 :_/b 2 :other/c 3}" "cycle-namespaced-map" "{"]
+           ["(:b (:a {:a {:b 3}}))" "get-in-all" "(:b"]
+           ["(get {:a 1} :a 0)" "get-in-none" "(get"]]]
+    (let [result (transformed source command (.index source needle))]
+      (is (not= source result) (str command " must be offered"))
+      (is (empty? (:diagnostics (syntax/parse result))))
+      (is (= (load-string source) (load-string result)) (str command " preserves value"))))
+  (let [source "(ns x (:require [basilisp.string :as s :refer [join]]))\n(join \", \" [\"a\" \"b\"])"
+        result (transformed source "refer-to-as" (.index source ":refer"))]
+    (is (str/includes? result "(s/join"))
+    (is (not (str/includes? result ":refer")))
+    (is (empty? (:findings (analyzer/analyze result)))))
+  (let [source "(ns x (:require [basilisp.string :as s]))\n(s/join \", \" [\"a\" \"b\"])"
+        result (transformed source "as-to-refer" (.index source ":as"))]
+    (is (str/includes? result ":refer [join]"))
+    (is (str/includes? result "(join"))
+    (is (not (str/includes? result ":as")))
+    (is (empty? (:findings (analyzer/analyze result)))))
+  (let [source "(ns x (:require [basilisp.string :as s]))\n(let [join identity] (s/join []))"]
+    (is (= source (transformed source "as-to-refer" (.index source ":as")))))
+  (let [source "(defn f [m] (:a m))"]
+    (is (= source (transformed source "destructure-keys" (.index source "m]")))))
+  (let [source "(let [m (python/dict)] (:a m))"]
+    (is (= source (transformed source "destructure-keys" (.index source "m ")))))
+  (is (= "#{1 2 3}" (transformed "#{3 1 2}" "sort-clauses" 0)))
+  (let [source "(missing 1 2)" result (transformed source "create-function" 1)]
+    (is (str/includes? result "(basilisp.core/defn- missing [arg1 arg2]"))
+    (is (empty? (:diagnostics (syntax/parse result))))))
+
+(deftest automatic-require-completion-and-command-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        uri (.as_uri (.joinpath root "consumer.lpy")) source "(ns consumer)\n(val)"]
+    (try
+      (.write_text (.joinpath root "provider.lpy") "(ns provider) (defn value [] 42)" ** :encoding "utf-8")
+      (initialize! c root) (open! c uri source)
+      (let [items (:items (result! c "textDocument/completion" (at uri 1 4)))
+            item (first (filter #(= "provider/value" (:label %)) items))
+            result (apply-wire-edits source (cons (:textEdit item) (:additionalTextEdits item)))]
+        (is item)
+        (is (seq (:additionalTextEdits item)))
+        (is (str/includes? result "(:require [provider])"))
+        (is (str/includes? result "(provider/value)")))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2} :contentChanges [{:text "(ns consumer)\n(value)"}]})
+      (diagnostics! c 2)
+      (result! c "workspace/executeCommand" {:command "add-missing-libspec" :arguments [uri 1 2]})
+      (let [request (last (filter #(= "workspace/applyEdit" (:method %)) @(:notifications c)))
+            edits (get-in request [:params :edit :documentChanges 0 :edits])]
+        (is (seq edits))
+        (is (str/includes? (apply-wire-edits "(ns consumer)\n(value)" edits) "[provider :refer [value]]"))
+        (send! c {:id (:id request) :result {:applied true}}))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest selection-extraction-and-presentation-settings-test
+  (let [source "(defn blt-selected [x] (inc x) (+ x 2)) (blt-selected 4)"
+        start (.index source "(inc") end (.index source ") (blt")
+        analysis (assoc (analyzer/analyze source) :selection-end end
+                        :settings {:private-by-default-on-extract? false})
+        edits (lsp/refactor-edits source analysis "extract-function" start ["selected-part"])
+        result (reduce (fn [text [start end replacement]] (str (subs text 0 start) replacement (subs text end)))
+                       source (sort-by first > edits))]
+    (is (seq edits))
+    (is (str/includes? result "(basilisp.core/defn selected-part [x]"))
+    (is (= (load-string source) (load-string result))))
+  (let [source "(inc 1)" analysis (assoc (analyzer/analyze source) :settings {:keep-parens-when-threading? true})]
+    (is (= "(basilisp.core/-> 1 (inc))" (nth (first (lsp/refactor-edits source analysis "thread-first" 0 [])) 2))))
+  (let [source "(defn allocation [] [1])"]
+    (is (= source (transformed source "extract-to-def" (.index source "[1]") "shared")))))
+
+(deftest new-namespace-and-hover-call-settings-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        uri (.as_uri (.joinpath root "blank.lpy"))]
+    (try
+      (let [init (initialize! c root)]
+        (is (get-in init [:capabilities :experimental :testTree]))
+        (is (get-in init [:capabilities :experimental :projectTree])))
+      (open! c uri "")
+      (result! c "workspace/symbol" {:query ""})
+      (let [request (first (filter #(= "workspace/applyEdit" (:method %)) @(:notifications c)))]
+        (is (= "(ns blank)\n" (get-in request [:params :edit :documentChanges 0 :edits 0 :newText])))
+        (send! c {:id (:id request) :result {:applied true}}))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2} :contentChanges [{:text "(ns blank) (let [x 1] (inc x))"}]})
+      (diagnostics! c 2)
+      (is (str/includes? (get-in (result! c "textDocument/hover" (at uri 0 27)) [:contents :value]) "calling: inc"))
+      (notification! c "workspace/didChangeConfiguration" {:settings {:hover {:hide-signature-call? true}}})
+      (is (not (str/includes? (get-in (result! c "textDocument/hover" (at uri 0 27)) [:contents :value]) "calling:")))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest comment-dependency-placement-test
+  (let [source "(ns app)\n(comment (s/join []))" offset (.index source "s/join")]
+    (doseq [[mode expected] [[:always "(basilisp.core/require '[basilisp.string :as s])"]
+                             [:never "(:require [basilisp.string :as s])"]]]
+      (let [analysis (assoc (analyzer/analyze source) :settings {:add-missing {:add-to-rcf mode}})
+            edits (lsp/refactor-edits source analysis "add-require-suggestion" offset ["basilisp.string" "s"])
+            result (reduce (fn [text [start end replacement]] (str (subs text 0 start) replacement (subs text end)))
+                           source (sort-by first > edits))]
+        (is (str/includes? result expected))
+        (is (empty? (:diagnostics (syntax/parse result))))))))
+
+(deftest workspace-move-form-protocol-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        source-file (.joinpath root "move_source.lpy")
+        target-file (.joinpath root "move_target.lpy")
+        source "(ns move-source)\n(defn greet [x] (str \"Hi \" x))\n(greet \"Ada\")\n"
+        target "(ns move-target)\n"
+        uri (.as_uri source-file)]
+    (try
+      (.write_text source-file source)
+      (.write_text target-file target)
+      (initialize! c root)
+      (open! c uri source)
+      (result! c "workspace/executeCommand"
+               {:command "move-form" :arguments [uri 1 7 "move_target.lpy"]})
+      (let [request (first (filter #(= "workspace/applyEdit" (:method %)) @(:notifications c)))
+            changes (get-in request [:params :edit :documentChanges])
+            results (into {} (for [change changes
+                                   :let [changed-uri (get-in change [:textDocument :uri])
+                                         before (if (= uri changed-uri) source target)]]
+                               [changed-uri (apply-wire-edits before (:edits change))]))]
+        (is (= #{uri (.as_uri target-file)} (set (keys results))))
+        (is (str/includes? (get results (.as_uri target-file) "") "defn greet"))
+        (is (not (str/includes? (get results uri "") "(defn greet")))
+        (is (str/includes? (get results uri "") "move-target/greet"))
+        (send! c {:id (:id request) :result {:applied true}}))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest batch-rename-scope-and-dependency-safety-test
+  (let [file "/tmp/rename-scope.lpy"
+        source "(ns rename-scope) (defn left [x] x) (defn right [other] other)"
+        docs {file source}
+        options {:python-inspection? false}
+        result (lsp/batch-query docs options "rename"
+                                {:filename file :row 1 :col (+ 2 (.index source "[x")) :to "other"})]
+    (is (= 2 (:occurrences (:result result)))))
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        entry (str (.joinpath root "entry.lpy")) dep (.joinpath root "dependency.lpy")
+        source "(ns entry (:require [dependency :as d])) (d/value)"
+        _ (.write_text dep "(ns dependency) (defn value [] 1)")
+        documents {entry source}
+        options {:python-paths [(str root)] :python-inspection? false
+                 :analysis {:type :project-and-full-dependencies}}]
+    (try
+      (let [refs (lsp/batch-query documents options "references" {:from "dependency/value" :include-declaration? true})]
+        (is (= #{entry (str dep)} (set (map :filename (:result refs))))))
+      (doseq [from ["dependency/value" "dependency"]]
+        (is (thrown? Exception (lsp/batch-query documents options "rename" {:from from :to "renamed"}))))
+      (finally (.cleanup temp)))))
+
+(deftest editor-formatting-honors-macro-metadata-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        uri (.as_uri (.joinpath root "format_meta.lpy"))
+        source "(ns format-meta)\n(defmacro ^{:style/indent 1} custom [x & body] nil)\n(custom 1\n2\n3)"]
+    (try
+      (initialize! c root) (open! c uri source)
+      (let [edits (result! c "textDocument/formatting"
+                           {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})]
+        (is (str/includes? (apply-wire-edits source edits) "(custom 1\n  2\n  3)")))
+      (let [edits (result! c "textDocument/rangeFormatting"
+                           {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}
+                            :range {:start {:line 2 :character 0} :end {:line 4 :character 2}}})]
+        (is (str/includes? (apply-wire-edits source edits) "(custom 1\n  2\n  3)")))
+      (finally (stop! c) (.cleanup temp)))))
+
+(deftest workspace-logging-lifecycle-protocol-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        first-log (.joinpath root "first.log") second-log (.joinpath root "second.log")
+        uri (.as_uri (.joinpath root "logging_example.lpy"))]
+    (try
+      (result! c "initialize"
+               {:processId nil :rootUri (.as_uri root)
+                :initializationOptions {:source-paths ["."] :log-path "first.log"}
+                :capabilities {}})
+      (notification! c "initialized" {})
+      (open! c uri "(ns logging-example) (def value 1)")
+      (is (.is_file first-log))
+      (notification! c "workspace/didChangeConfiguration" {:settings {:log-path "second.log"}})
+      (result! c "clojure/serverInfo/raw" {})
+      (stop! c)
+      (is (.is_file second-log))
+      (finally
+        (when (nil? (.poll (:process c))) (stop! c))
+        (.cleanup temp)))))
+
+(deftest remaining-refactor-command-output-test
+  (is (= "1" (transformed "(+ 1 2)" "raise-sexp" 3)))
+  (is (= "(+  2)" (transformed "(+ 1 2)" "kill-sexp" 3)))
+  (let [source "(ns imports)\n(datetime/date 2020 1 1)"
+        result (transformed source "add-missing-import" (.index source "datetime") "datetime")]
+    (is (str/includes? result "(:import [datetime])"))
+    (is (str/includes? result "(datetime/date 2020 1 1)")))
+  (let [source "(ns sample (:require [basilisp.string]))\n(basilisp.string/join \" \" [\"a\" \"b\"])"
+        result (transformed source "swap-namespace-with-alias" (.rfind source "basilisp.string") "basilisp.string" "s")]
+    (is (str/includes? result "[basilisp.string :as s]"))
+    (is (str/includes? result "(s/join")))
+  (let [source "(ns sample (:require [basilisp.string :refer :all]))\n(join \" \" [\"a\" \"b\"])"
+        offset (.index source ":refer")
+        referred (transformed source "replace-refer-all-with-refer" offset)
+        aliased (transformed source "replace-refer-all-with-alias" offset)]
+    (is (str/includes? referred ":refer [join]") referred)
+    (is (str/includes? aliased "[basilisp.string :as string]"))
+    (is (str/includes? aliased "(string/join") aliased)))
+
+(deftest cursor-and-macro-configuration-command-protocol-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp)) c (client root)
+        uri (.as_uri (.joinpath root "command_demo.lpy"))]
+    (try
+      (initialize! c root)
+      (open! c uri "(ns command-demo)\n(+ 1 2)\n(custom [x 1] x)")
+      (doseq [[command character start end]
+              [["forward" 0 7 7] ["forward-select" 0 0 7]
+               ["backward" 7 0 0] ["backward-select" 7 0 7]]]
+        (result! c "workspace/executeCommand" {:command command :arguments [uri 1 character]})
+        (let [request (last (filter #(= "window/showDocument" (:method %)) @(:notifications c)))]
+          (is (= uri (get-in request [:params :uri])))
+          (is (= {:line 1 :character start} (get-in request [:params :selection :start])))
+          (is (= {:line 1 :character end} (get-in request [:params :selection :end])))
+          (send! c {:id (:id request) :result {:success true}})))
+      (result! c "workspace/executeCommand" {:command "resolve-macro-as" :arguments [uri 2 1 "clojure.core/let"]})
+      (let [request (last (filter #(= "workspace/applyEdit" (:method %)) @(:notifications c)))
+            changes (get-in request [:params :edit :documentChanges])]
+        (is (= "create" (:kind (first changes))))
+        (is (str/includes? (get-in (second changes) [:edits 0 :newText])
+                           "command-demo/custom basilisp.core/let") (pr-str changes))
+        (send! c {:id (:id request) :result {:applied true}}))
       (finally (stop! c) (.cleanup temp)))))

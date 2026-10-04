@@ -1,0 +1,41 @@
+(ns basilisp-tools.lsp-logging-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp.string :as str]
+            [basilisp-tools.lsp])
+  (:import [subprocess] [sys] [logging] [pathlib] [tempfile]))
+
+(defn- start-logging [root settings options]
+  ((deref (ns-resolve 'basilisp-tools.lsp 'start-workspace-logging!)) root settings options))
+
+(defn- stop-logging [current]
+  ((deref (ns-resolve 'basilisp-tools.lsp 'stop-workspace-logging!)) current))
+
+(deftest configured-log-path-and-cli-precedence-test
+  (with-open [directory (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path directory)
+          current (start-logging directory {:log-path "settings.log"} {:log-path "cli.log"})
+          original-level (:previous-level current)]
+      (try
+        (.warning (logging/getLogger "blt.logging.fixture") "configured file")
+        (finally (stop-logging current)))
+      (is (= original-level (.-level (logging/getLogger))))
+      (is (.exists (.joinpath root "cli.log")))
+      (is (not (.exists (.joinpath root "settings.log")))))
+    (let [current (start-logging directory {:log-path "unused.log"} {:log-configured? true :log-path "already-open.log"})]
+      (try
+        (is (empty? (:handlers current)))
+        (finally (stop-logging current))))))
+
+(deftest invalid-telemetry-configuration-does-not-leak-handlers-test
+  (let [logger (logging/getLogger) handlers (vec (.-handlers logger))]
+    (is (thrown? python/Exception
+                 (start-logging nil {:otlp {:enable true :config {"otel.exporter.otlp.logs.protocol" "unknown"}}} {})))
+    (is (= handlers (vec (.-handlers logger))))))
+
+(deftest otlp-wire-protocols-and-disabled-logging-test
+  (let [result (subprocess/run [sys/executable "scripts/check_lsp_logging.py"]
+                               ** :capture_output true :text true :timeout 90)]
+    (is (= 0 (.-returncode result)) (str (.-stdout result) "\n" (.-stderr result)))
+    (doseq [message ["File logging and disabled telemetry passed"
+                     "http/protobuf transport passed" "http/json transport passed" "gRPC transport passed"]]
+      (is (str/includes? (.-stdout result) message)))))

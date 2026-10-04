@@ -1,0 +1,63 @@
+
+(ns basilisp-tools.analyzer-linter-evidence-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private project
+  {"support" (:definitions (analyzer/declarations
+                            "(ns ^{:deprecated \"1.0\"} support) (defn- hidden [] 1) (defn public [] 1)"))})
+
+(def ^:private cases
+  [[:private-call "(ns sample (:require support)) (support/hidden)"
+    "(ns sample (:require support)) (support/public)"]
+   [:missing-map-value "{:a 1 :b}" "{:a 1 :b 2}"]
+   [:duplicate-require "(ns sample (:require support support))"
+    "(ns sample (:require support))"]
+   [:unsorted-imports "(ns sample (:import zlib math))" "(ns sample (:import math zlib))"]
+   [:unresolved-var "(ns sample (:require support)) (support/absent)"
+    "(ns sample (:require support)) (support/public)"]
+   [:reduce-without-init "(reduce conj [1 2])" "(reduce conj [] [1 2])"]
+   [:if-x-x-y "(let [x 1] (if x x 2))" "(let [x 1] (if x 2 3))"]
+   [:deprecated-namespace "(ns sample (:require support))" "(ns sample)"]
+   [:aliased-referred-var "(ns sample (:require [basilisp.string :as s :refer [join]])) (s/join [\"a\"])"
+    "(ns sample (:require [basilisp.string :as s :refer [join]])) (join [\"a\"])"]
+   [:missing-else-branch "(if (identity true) 1)" "(if (identity true) 1 2)"]
+   [:if-nil-return "(if (identity true) 1 nil)" "(if (identity true) 1 2)"]
+   [:unused-import "(ns sample (:import math))" "(ns sample (:import math)) (math/sqrt 4)"]
+   [:use "(ns sample (:use support))" "(ns sample (:require support))"]
+   [:redundant-call "(+ 1)" "(+ 1 2)"]
+   [:aliased-namespace-symbol "(ns sample (:require [basilisp.string :as s])) (basilisp.string/join [\"a\"])"
+    "(ns sample (:require [basilisp.string :as s])) (s/join [\"a\"])"]
+   [:line-length "(def long-name 1)" "(def x 1)" {:max-line-length 12}]
+   [:alias-same-as-ns "(ns sample (:require [support :as support]))" "(ns sample (:require [support :as s]))"]
+   [:equals-expected-position "(let [x 1] (= x 1))" "(let [x 1] (= 1 x))"]
+   [:missing-protocol-method-arity "(defprotocol P (method [this] [this x])) (deftype T [] P (method [_this] 1))"
+    "(defprotocol P (method [this])) (deftype T [] P (method [_this] 1))"]
+   [:destructured-or-always-evaluates "(let [{:keys [x] :or {x (println \"side effect\")}} {}] x)"
+    "(let [{:keys [x] :or {x 1}} {}] x)"]
+   [:unquote-not-syntax-quoted "~x" "`(~x)"]
+   [:await-without-async-fn "(defn f [x] (await x))" "(defasync f [x] (await x))"]
+   [:unexpected-recur "(recur 1)" "(loop [x 1] (if (pos? x) (recur (dec x)) x))"]
+   [:keyword-binding "(let [{:keys [:x]} {:x 1}] x)" "(let [{:keys [x]} {:x 1}] x)"]
+   [:discouraged-tag "#old 1" "#new 1" {'old {:message "Avoid old"}}]
+   [:discouraged-var "(inc 1)" "(dec 1)" {'basilisp.core/inc {:message "Avoid inc"}}]
+   [:discouraged-namespace "(ns sample (:require support))" "(ns sample)"
+    {'support {:message "Avoid support"}}]])
+
+(defn- findings [source type settings level]
+  (filterv #(= type (:type %))
+           (:findings (analyzer/analyze source
+                                        {:project project :filename "sample.lpy"
+                                         :config {:linters {type (assoc settings :level level)}}}))))
+
+(deftest applicable-linter-positive-negative-and-disable-test
+  (doseq [[type positive negative settings] cases]
+    (testing (str type)
+      (let [reported (findings positive type settings :warning)]
+        (is (seq reported) (str type " was not reported for " positive))
+        (is (every? #(and (= :warning (:level %)) (string? (:message %))
+                          (pos? (:row %)) (pos? (:col %))) reported)))
+      (is (empty? (findings negative type settings :warning))
+          (str type " reported a clean counterpart: " negative))
+      (is (empty? (findings positive type settings :off))
+          (str type " ignored its disabled level")))))

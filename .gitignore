@@ -73,3 +73,6 @@ TODO
 *.lpyc
 .ruff_cache/
 .DS_Store
+
+# Language server workspace cache
+.lsp/.cache/

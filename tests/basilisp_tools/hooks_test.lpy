@@ -1,0 +1,294 @@
+(ns basilisp-tools.hooks-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.hooks :as hooks]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.syntax :as syntax])
+  (:import [pathlib] [tempfile]))
+
+(defn run-hook [source body & [options]]
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        parsed (syntax/parse source)
+        config (merge {:cfg-dir (str root)
+                       :hooks {:analyze-call {'demo/macro 'sample.hooks/transform}}} (:config options))
+        context (merge {:config config :call-identity {:ns "demo" :name "macro"}
+                        :parsed parsed :filename "sample.lpy"} (dissoc options :config))]
+    (try
+      (.mkdir (.joinpath root "sample"))
+      (.write_text (.joinpath root "sample" "hooks.clj") body ** :encoding "utf-8")
+      (hooks/apply-call context (first (syntax/forms (:root parsed))))
+      (finally (.cleanup temporary)))))
+
+(deftest hook-node-api-test
+  (let [node (hooks/parse-string "(f [a 2] {:x true})")]
+    (is (= '(f [a 2] {:x true}) (hooks/sexpr node)))
+    (is (= :list (hooks/tag node)))
+    (is (= {:row 1 :col 1 :end-row 1 :end-col 20 :blt/start 0 :blt/end 19} (meta node)))
+    (is (not (hooks/generated-node? node)))
+    (is (hooks/generated-node? (hooks/token-node 'hello)))
+    (is (= '(a "x" #{1} [:k]) (hooks/sexpr (hooks/coerce '(a "x" #{1} [:k])))))))
+
+(deftest upstream-with-bound-hook-test
+  (let [result (run-hook "(demo/macro [a 1 {:setting true}] (inc a))"
+                         "(ns sample.hooks (:require [clj-kondo.hooks-api :as api]))
+                          (defn transform [{:keys [node]}]
+                            (let [[binding-vec & body] (rest (:children node))
+                                  [sym val opts] (:children binding-vec)]
+                              (when-not (and sym val)
+                                (throw (ex-info \"No sym and val provided\" {})))
+                              {:node (api/list-node
+                                      (list* (api/token-node 'let)
+                                             (api/vector-node [sym val])
+                                             opts body))}))")]
+    (is (empty? (:findings result)) (:findings result))
+    (is (= "let" (:text (first (syntax/forms (:node result))))))
+    (is (= ["a" "1"] (mapv :text (syntax/forms (second (syntax/forms (:node result)))))))
+    (is (= 13 (:start (first (syntax/forms (second (syntax/forms (:node result))))))))))
+
+(deftest custom-findings-and-restricted-execution-test
+  (let [result (run-hook "(demo/macro [:event])"
+                         "(ns sample.hooks (:require [clj-kondo.hooks-api :as api]))
+                          (defn transform [{:keys [node]}]
+                            (let [event (-> node :children second :children first)
+                                  value (api/sexpr event)]
+                              (when-not (qualified-keyword? value)
+                                (api/reg-finding! (assoc (meta event) :type :event/name
+                                                         :message \"Use qualified keyword\")))))")]
+    (is (= :event/name (:type (first (:findings result)))))
+    (is (= 14 (:col (first (:findings result)))))
+    (is (nil? (:node result))))
+  (doseq [body ["(ns sample.hooks (:import [os])) (defn transform [_] nil)"
+                "(ns sample.hooks) (defn transform [_] (eval '(+ 1 2)))"
+                "(ns sample.hooks) (defn transform [_] (python/__import__ \"os\"))"
+                "(ns sample.hooks) (defn transform [_] (slurp \"/etc/passwd\"))"]]
+    (testing body
+      (is (= :hook (:type (first (:findings (run-hook "(demo/macro)" body)))))))))
+
+(deftest macroexpand-and-language-test
+  (let [body "(ns sample.hooks (:require [clj-kondo.hooks-api :as api]
+                                         [clojure.string :as str]))
+              (defmacro transform [bindings & body]
+                `(let ~bindings ~@body))"
+        result (run-hook "(demo/macro [a 1] (inc a))" body
+                         {:config {:hooks {:macroexpand {'demo/macro 'sample.hooks/transform}}}})]
+    (is (empty? (:findings result)) (:findings result))
+    (is (= "basilisp.core/let" (:text (first (syntax/forms (:node result))))))))
+
+(deftest analyzer-hook-integration-test
+  (let [temporary (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temporary))
+        file (.joinpath root "hook.clj")
+        config {:cfg-dir (str root)
+                :hooks {:analyze-call {'user/with-bound 'hook/with-bound}}}]
+    (try
+      (.write_text file
+                   "(ns hook (:require [clj-kondo.hooks-api :as api]))
+                    (defn with-bound [{:keys [node]}]
+                      (let [[_ bindings & body] (:children node)]
+                        {:node (api/list-node (list* (api/token-node 'let) bindings body))}))"
+                   ** :encoding "utf-8")
+      (let [result (analyzer/analyze "(with-bound [value 1] (inc value))" {:config config})]
+        (is (empty? (:findings result)) (:findings result))
+        (is (= ["value"] (mapv :name (:locals result))))
+        (is (= [13] (mapv :start (:locals result)))))
+      (is (= [:unused-binding]
+             (mapv :type (:findings (analyzer/analyze "(with-bound [value 1] 2)" {:config config})))))
+      (finally (.cleanup temporary)))))
+
+(deftest string-hook-control-test
+  (let [source "(custom x)"
+        hook "(fn [{:keys [node]}] {:node (clj-kondo.hooks-api/token-node nil)})"
+        config {:hooks {:analyze-call {'user/custom hook}}}]
+    (is (some #(= :unresolved-symbol (:type %))
+              (:findings (analyzer/analyze source {:config config}))))
+    (is (empty? (:findings
+                 (analyzer/analyze source
+                                   {:config (assoc-in config [:hooks :__dangerously-allow-string-hooks__] true)}))))))
+
+(deftest custom-lsp-linter-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        uri "file:///project/src/demo.lpy"
+        definition {:name 'f :ns 'demo :row 1 :col 1 :end-row 1 :end-col 14
+                    :name-row 1 :name-col 7 :name-end-row 1 :name-end-col 8
+                    :defined-by 'basilisp.core/defn}
+        db {:analysis {uri {:var-definitions [definition] :var-usages []}}
+            :documents {uri {:text "(defn f [] 1)"}} :internal-uris #{uri}}
+        settings {:linters {:custom {'lint/check {:level :info}}}}
+        context {:db db :uris [uri] :settings settings :hook-paths [(str root)]}]
+    (try
+      (.write_text (.joinpath root "lint.clj")
+                   "(ns lint (:require [clojure-lsp.custom-linters-api :as api]
+                                      [rewrite-clj.zip :as z]))
+                    (defn check [{:keys [db uris params reg-diagnostic!]}]
+                      (doseq [definition (api/find-all-var-definitions db false)
+                              :when (empty? (api/find-references db definition false))]
+                        (let [node (first (api/find-nodes db [definition] identity))]
+                          (reg-diagnostic! {:uri (:uri definition)
+                                            :code \"custom/unused\"
+                                            :level (:level params)
+                                            :message (str \"Unused \" (-> node z/down z/right z/sexpr))
+                                            :range (select-keys definition [:row :col :end-row :end-col])}))))"
+                   ** :encoding "utf-8")
+      (let [diagnostics (hooks/run-custom-linters context)]
+        (is (= 1 (count diagnostics)))
+        (is (= "Unused f" (:message (first diagnostics))))
+        (is (= :info (:level (first diagnostics))))
+        (is (= "custom/unused" (:code (first diagnostics)))))
+      (is (empty? (hooks/run-custom-linters
+                   (assoc-in context [:settings :linters :custom 'lint/check :level] :off))))
+      (finally (.cleanup temporary)))))
+
+(deftest common-hook-language-test
+  (doseq [[expression expected]
+          [["(loop [n 3 out []] (if (zero? n) out (recur (dec n) (conj out n))))" [3 2 1]]
+           ["(letfn [(even [n] (if (zero? n) true (odd (dec n)))) (odd [n] (if (zero? n) false (even (dec n))))] (even 6))" true]
+           ["(let [{:keys [a] :or {a 10}} {}] a)" 10]
+           ["(let [{:person/keys [name]} {:person/name \"Alex\"}] name)" "Alex"]
+           ["(for [x [1 2 3] :when (odd? x) :let [y (* x x)]] y)" [1 9]]
+           ["((fn ([x] x) ([x y] (+ x y))) 1 2)" 3]
+           ["(as-> 1 x (+ x 2) (* x x))" 9]
+           ["(cond-> 1 true inc false dec)" 2]
+           ["(or false false)" false]
+           ["(try (throw (Exception. \"bad\")) (catch Exception e :caught))" :caught]]]
+    (testing expression
+      (is (= expected
+             (hooks/invoke {:allow-string-hooks true} (str "(fn [_] " expression ")") nil))))))
+
+(deftest hook-cache-reload-and-isolation-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (hooks/create-cache)
+        file (.joinpath root "counter.clj")
+        helper (.joinpath root "helper.clj")
+        context {:hook-cache cache :hook-paths [(str root)]}]
+    (try
+      (.write_text file "(ns counter (:require [helper :as h])) (def n (atom 0)) (defn value [_] [(swap! n inc) h/value])" ** :encoding "utf-8")
+      (.write_text helper "(ns helper) (def value 1)" ** :encoding "utf-8")
+      (is (= [1 1] (hooks/invoke context 'counter/value nil)))
+      (is (= [2 1] (hooks/invoke context 'counter/value nil)))
+      (.write_text helper "(ns helper) (def value 2)" ** :encoding "utf-8")
+      (is (= [1 2] (hooks/invoke context 'counter/value nil)))
+      (is (= [1 2] (hooks/invoke (assoc context :hook-cache (hooks/create-cache)) 'counter/value nil)))
+      (is (= 1 (count @cache)))
+      (finally (.cleanup temporary)))))
+
+(deftest hook-multimethod-and-while-test
+  (let [source "(demo/macro [1 2 3])"
+        body "(ns sample.hooks (:require [clj-kondo.hooks-api :as api]))
+              (defmulti inspect api/tag)
+              (defmethod inspect :vector [node] (api/sexpr node))
+              (defmethod inspect :default [_] [])
+              (defn transform [{:keys [node]}]
+                {:node (api/coerce (for [x (inspect (second (:children node)))
+                                       :while (< x 3)] x))})"
+        result (run-hook source body)]
+    (is (empty? (:findings result)) (:findings result))
+    (is (= ["1" "2"] (mapv :text (syntax/forms (:node result)))))))
+
+(deftest local-macro-and-destructuring-test
+  (let [result (run-hook "(demo/macro :x)"
+                         "(ns sample.hooks (:require [clj-kondo.hooks-api :as api]))
+                          (defmacro unless [test & body] `(if-not ~test (do ~@body)))
+                          (defn transform [{:keys [node]}]
+                            (let [[a & more :as all] [1 2 3]
+                                  {[x y] :pair} {:pair [4 5]}]
+                              (unless false
+                                {:node (api/coerce [a (vec more) all x y ::keyword])})))")]
+    (is (empty? (:findings result)) (:findings result))
+    (is (= ":sample.hooks/keyword" (:text (last (syntax/forms (:node result))))))))
+
+(deftest custom-linter-query-contract-test
+  (let [uri "file:///project/a.lpy" dependency "zipfile:///lib/a.lpy"
+        definition {:name 'f :ns 'a :row 1 :col 1 :end-row 1 :end-col 15
+                    :name-row 1 :name-col 7 :name-end-row 1 :name-end-col 8}
+        usage {:name 'f :to 'a :from 'b :row 2 :col 2 :end-row 2 :end-col 3}
+        db {:internal-uris #{uri}
+            :analysis {uri {:var-definitions [definition] :var-usages [usage]
+                            :protocol-impls [{:protocol-ns 'a :protocol-name 'P :method-name 'f}]}
+                       dependency {:var-definitions [{:name 'external :ns 'lib}]}}}
+        invoke (fn [expression data]
+                 (hooks/invoke {:allow-string-hooks true}
+                               (str "(fn [db] " expression ")") data))]
+    (is (= [uri] (vec (keys (invoke "(clojure-lsp.custom-linters-api/internal-analysis db)" db)))))
+    (is (= [dependency] (vec (keys (invoke "(clojure-lsp.custom-linters-api/external-analysis db)" db)))))
+    (is (= 'f (:name (invoke "(clojure-lsp.custom-linters-api/find-element db \"file:///project/a.lpy\" 1 7)" db))))
+    (is (= 1 (count (invoke "(clojure-lsp.custom-linters-api/find-implementations db {:ns 'a :name 'f})" db))))
+    (is (= 'f (:name (invoke "(clojure-lsp.custom-linters-api/find-definition db {:to 'a :name 'f :bucket :var-usages})" db))))
+    (is (= 2 (count (invoke "(clojure-lsp.custom-linters-api/find-references db {:ns 'a :name 'f} true)" db))))
+    (is (= "/project/a b.lpy" (invoke "(clojure-lsp.custom-linters-api/uri->filename \"file:///project/a%20b.lpy\")" db)))))
+
+(deftest hook-keyword-registration-test
+  (let [config {:hooks {:__dangerously-allow-string-hooks__ true
+                        :analyze-call {'user/register
+                                       "(fn [{:keys [node]}]
+                                          {:node (clj-kondo.hooks-api/reg-keyword!
+                                                   (second (:children node)) 'user/register)})"}}}
+        result (analyzer/analyze "(declare register) (register :sample/event)" {:config config})]
+    (is (empty? (:findings result)) (:findings result))
+    (is (= 'user/register (:reg (first (filter :reg (:keywords result))))))))
+
+(deftest java-regex-hook-functions-test
+  (let [invoke (fn [expression]
+                 (hooks/invoke {:allow-string-hooks true}
+                               (str "(fn [_] " expression ")") nil))]
+    (is (= ["ABC" "DEF"] (invoke "(vec (re-seq #\"\\p{Lu}+\" \"ABC dé DEF\"))")))
+    (is (= ["a" "a" nil] (invoke "(re-matches #\"(a)(b)?\" \"a\")")))
+    (is (= [false true] (invoke "[(boolean (re-find #\"(?i)k\" \"K\")) (boolean (re-find #\"(?iu)k\" \"K\"))]")))
+    (is (= [["12" "12"] ["12" "12"] ["34" "34"] nil]
+           (invoke "(let [m (re-matcher #\"([0-9]+)\" \"a12b34\")] [(re-find m) (re-groups m) (re-find m) (re-find m)])")))
+    (is (= ["a" "" "b" ""] (invoke "(clojure.string/split \"a,,b,\" #\"(,)\" -1)")))
+    (is (= "1-a 2-b" (invoke "(clojure.string/replace \"a1 b2\" #\"([a-z])([0-9])\" \"$2-$1\")")))
+    (is (= "a-b" (invoke "(clojure.string/replace \"ab\" #\"(?<part>a)(b)\" \"${part}-$2\")")))
+    (is (= "1a b2" (invoke "(clojure.string/replace-first \"a1 b2\" #\"([a-z])([0-9])\" \"$2$1\")")))
+    (is (= "$1\\" (invoke "(clojure.string/replace \"a\" #\"a\" (clojure.string/re-quote-replacement \"$1\\\\\"))")))))
+
+(deftest reader-and-macro-hygiene-test
+  (doseq [[expression expected]
+          [["(#(vector % %2 %&) 1 2 3 4)" [1 2 '(3 4)]]
+           ["(#(vec %&) 1 2)" [1 2]]
+           ["(try (#(+ % %2) 1) (catch Exception _ :arity))" :arity]
+           ["(let [a `x# b `x#] (not= a b))" true]
+           ["(let [[a b] `[x# x#]] (= a b))" true]
+           ["(let [f (fn [] `x#)] (= (f) (f)))" true]
+           ["(let [when inc] (when 1))" 2]
+           ["(let [when inc] (clojure.core/when true 1))" 1]
+           ["(let [cond inc] (cond 1))" 2]
+           ["[0 #?@(:default [1 2]) 3]" [0 1 2 3]]
+           ["[0 #?(:clj 1) 2]" [0 2]]
+           ["`inc" 'clojure.core/inc]]]
+    (testing expression
+      (is (= expected (hooks/invoke {:allow-string-hooks true} (str "(fn [_] " expression ")") nil))))))
+
+(deftest immediate-namespace-analysis-extension-test
+  ;; ns-analysis normally exposes cached information upstream. Basilisp also
+  ;; exposes definitions already analyzed in this invocation.
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        file (.joinpath root "current.clj")
+        config {:cfg-dir (str root)
+                :hooks {:analyze-call {'user/define 'current/define 'user/probe 'current/probe}}
+                :linters {:example/current {:level :info}}}]
+    (try
+      (.write_text file
+                   "(ns current (:require [clj-kondo.hooks-api :as api]))
+                    (defn define [{:keys [node]}]
+                      {:node (api/list-node (cons (api/token-node 'def) (rest (:children node))))})
+                    (defn probe [{:keys [node]}]
+                      (api/reg-finding! (assoc (meta node) :type :example/current
+                         :message (pr-str [(get-in (api/ns-analysis 'user {:lang :lpy}) [:lpy 'value :name])
+                                           (api/resolve {:name 'inc :call true})]))))"
+                   ** :encoding "utf-8")
+      (let [result (analyzer/analyze
+                    "(define value 1) (let [inc 2] (probe) inc)" {:config config})]
+        (is (= ["[value nil]"]
+               (mapv :message (filter #(= :example/current (:type %)) (:findings result)))))
+        (is (not-any? #(= :hook (:type %)) (:findings result))))
+      (finally (.cleanup temporary)))))
+
+(deftest delayed-hook-evaluation-test
+  ;; The pinned native clj-kondo image cannot construct clojure.lang.Delay.
+  ;; Check the pure language contract directly rather than copying that host error.
+  (is (= [false 1 1 1 true]
+         (hooks/invoke {:allow-string-hooks true}
+                       "(fn [_] (let [calls (atom 0) d (delay (swap! calls inc))]
+                                  [(realized? d) (force d) (force d) @calls (realized? d)]))" nil))))

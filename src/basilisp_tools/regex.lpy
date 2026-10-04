@@ -1,0 +1,262 @@
+(ns basilisp-tools.regex
+  "Java-style configuration patterns, without requiring a JVM at runtime."
+  (:require [basilisp.string :as str])
+  (:import [re] [regex :as engine] [operator :as op] [basilisp.lang.obj :as obj] [unicodedata]))
+
+(defrecord Pattern [pattern compiled])
+
+(defn ^{:kwargs :collect} print-pattern [value _options]
+  (str "#re " (pr-str (:pattern value))))
+
+(.register obj/lrepr Pattern print-pattern)
+
+(defn pattern? [value]
+  (or (instance? Pattern value)
+      (instance? re/Pattern value) (instance? engine/Pattern value)))
+
+(defn source
+  "Original pattern spelling, including Java quoting and flags."
+  [value]
+  (if (instance? Pattern value) (:pattern value)
+      (if (pattern? value) (.-pattern value) value)))
+
+(def ^:private ascii-classes
+  {"d" "0-9" "s" " \\t\\n\\x0b\\f\\r" "w" "a-zA-Z_0-9"})
+(def ^:private posix-classes
+  {"Lower" "a-z" "Upper" "A-Z" "ASCII" "\\x00-\\x7f"
+   "Alpha" "a-zA-Z" "Digit" "0-9" "Alnum" "a-zA-Z0-9"
+   "Punct" "!-/:-@\\[-\\x60{-~" "Graph" "\\x21-\\x7e"
+   "Print" "\\x20-\\x7e" "Blank" " \\t" "Cntrl" "\\x00-\\x1f\\x7f"
+   "XDigit" "a-fA-F0-9" "Space" " \\t\\n\\x0b\\f\\r"})
+(def ^:private java-properties
+  {"javaLowerCase" "Lowercase" "javaUpperCase" "Uppercase"
+   "javaTitleCase" "Lt" "javaAlphabetic" "Alphabetic"
+   "javaIdeographic" "Ideographic" "javaDigit" "Nd"
+   "javaDefined" "Assigned" "javaLetter" "L"
+   "javaMirrored" "Bidi_Mirrored"
+   "javaUnicodeIdentifierStart" "ID_Start"
+   "javaUnicodeIdentifierPart" "ID_Continue"})
+(def ^:private java-property-classes
+  {"javaLetterOrDigit" "\\p{L}\\p{Nd}"
+   "javaJavaIdentifierStart" "\\p{L}\\p{Nl}\\p{Sc}\\p{Pc}"
+   "javaJavaIdentifierPart" "\\p{L}\\p{Nl}\\p{Sc}\\p{Pc}\\p{Mn}\\p{Mc}\\p{Nd}\\p{Cf}\\x00-\\x08\\x0e-\\x1b\\x7f-\\x9f"
+   "javaIdentifierIgnorable" "\\p{Cf}\\x00-\\x08\\x0e-\\x1b\\x7f-\\x9f"
+   "javaSpaceChar" "\\p{Zs}\\p{Zl}\\p{Zp}"
+   "javaWhitespace" "\\t\\n\\x0b\\f\\r\\x1c-\\x1f \\u1680\\u2000-\\u2006\\u2008-\\u200a\\u2028\\u2029\\u205f\\u3000"})
+(def ^:private horizontal "\\t \\u00a0\\u1680\\u180e\\u2000-\\u200a\\u202f\\u205f\\u3000")
+(def ^:private vertical "\\n\\x0b\\f\\r\\x85\\u2028\\u2029")
+(def ^:private final-boundary "(?=\\r\\n\\Z|[\\n\\r\\x85\\u2028\\u2029]?\\Z)")
+
+(defn- character-class [body negate?]
+  (str "[" (when negate? "^") body "]"))
+
+(defn- property-text [name negate? unicode? ignore-case?]
+  (if-let [body (or (get java-property-classes name)
+                    (when (not unicode?)
+                      (get posix-classes (if (and ignore-case? (#{"Lower" "Upper"} name))
+                                           "Alpha" name))))]
+    (character-class body negate?)
+    (str "\\" (if negate? "P" "p") "{" (get java-properties name name) "}")))
+
+(defn- flag-state [state enabled disabled]
+  (reduce (fn [value [flag key]]
+            (cond
+              (str/includes? enabled flag) (assoc value key true)
+              (str/includes? disabled flag) (assoc value key false)
+              :else value))
+          state [["U" :unicode?] ["i" :ignore-case?] ["u" :unicode-case?] ["U" :unicode-case?] ["s" :dotall?] ["m" :multiline?] ["d" :unix?] ["x" :verbose?]]))
+
+(defn- literal-text [value classes state]
+  (if (and (:ignore-case? state) (not (:unicode-case? state)))
+    (if (pos? classes)
+      (.join "" (python/map #(if (and (.isascii %) (.isalpha %))
+                               (str (.lower %) (.upper %)) (re/escape %)) value))
+      (str "(?ai:" (re/escape value) ")"))
+    (re/escape value)))
+
+(defn- translate [source]
+  (let [size (count source) result #py []]
+    (loop [index 0 classes 0 state {} stack []]
+      (if (>= index size)
+        (.join "" result)
+        (let [c (op/getitem source index)
+              following (when (< (inc index) size) (op/getitem source (inc index)))]
+          (cond
+            (and (:verbose? state) (contains? #{" " "\t" "\n" "\r" "\f" "\v"} c))
+            (recur (inc index) classes state stack)
+
+            (and (:verbose? state) (= c "#"))
+            (let [end (or (some-> (re/search "[\\r\\n]" (subs source index)) .start
+                                  (+ index)) size)]
+              (recur end classes state stack))
+
+            (= c "\\")
+            (cond
+              (= following "Q")
+              (let [end (.find source "\\E" (+ index 2))
+                    end (if (neg? end) size end)]
+                (.append result (literal-text (subs source (+ index 2) end) classes state))
+                (recur (min size (+ end 2)) classes state stack))
+
+              (and (= following "x") (.startswith source "{" (+ index 2)))
+              (let [end (.find source "}" (+ index 3))]
+                (when (neg? end) (throw (python/ValueError "Unclosed hexadecimal escape")))
+                (.append result (literal-text (python/chr (python/int (subs source (+ index 3) end) 16))
+                                              classes state))
+                (recur (inc end) classes state stack))
+
+              (#{"u" "x"} following)
+              (let [length (if (= following "u") 4 2)
+                    end (+ index length 2)
+                    digits (subs source (+ index 2) end)
+                    _ (when-not (and (= length (count digits)) (re/fullmatch "[0-9A-Fa-f]+" digits))
+                        (throw (python/ValueError "Invalid hexadecimal escape")))
+                    value (python/chr (python/int digits 16))]
+                (.append result (literal-text value classes state))
+                (recur end classes state stack))
+
+              (and (= following "N") (.startswith source "{" (+ index 2)))
+              (let [end (.find source "}" (+ index 3))]
+                (when (neg? end) (throw (python/ValueError "Unclosed character name")))
+                (.append result (literal-text (unicodedata/lookup (subs source (+ index 3) end))
+                                              classes state))
+                (recur (inc end) classes state stack))
+
+              (= following "c")
+              (do
+                (.append result (literal-text (python/chr (op/xor (python/ord (op/getitem source (+ index 2))) 64))
+                                              classes state))
+                (recur (+ index 3) classes state stack))
+
+              (= following "e")
+              (do (.append result "\\x1b") (recur (+ index 2) classes state stack))
+
+              (= following "0")
+              (let [match (re/match "0([0-3][0-7]{2}|[0-7]{1,2})" (subs source (inc index)))]
+                (when-not match (throw (python/ValueError "Invalid octal escape")))
+                (.append result (literal-text (python/chr (python/int (.group match 1) 8)) classes state))
+                (recur (+ index 1 (.end match)) classes state stack))
+
+              (and following (#{"p" "P"} following) (.startswith source "{" (+ index 2)))
+              (let [end (.find source "}" (+ index 3))]
+                (if (neg? end)
+                  (do (.append result (subs source index))
+                      (recur size classes state stack))
+                  (let [name (subs source (+ index 3) end)
+                        property (property-text name (= "P" following) (:unicode? state)
+                                                (:ignore-case? state))
+                        property (if (and (:ignore-case? state) (not (:unicode-case? state))
+                                          (zero? classes) (not (contains? posix-classes name)))
+                                   (str "(?i:" property ")") property)]
+                    (.append result property)
+                    (recur (inc end) classes state stack))))
+
+              (and (= following "k") (.startswith source "<" (+ index 2)))
+              (let [end (.find source ">" (+ index 3))]
+                (if (neg? end)
+                  (do (.append result (subs source index)) (recur size classes state stack))
+                  (do (.append result (str "\\g<" (subs source (+ index 3) end) ">"))
+                      (recur (inc end) classes state stack))))
+
+              :else
+              (let [lower (when following (.lower following))
+                    shorthand (when (not (:unicode? state)) (get ascii-classes lower))
+                    replacement
+                    (cond
+                      shorthand (character-class shorthand (not= following lower))
+                      (#{"h" "H"} following) (character-class horizontal (= following "H"))
+                      (#{"v" "V"} following) (character-class vertical (= following "V"))
+                      (= following "z") "\\Z"
+                      (= following "Z") final-boundary
+                      :else (subs source index (min size (+ index 2))))]
+                (.append result replacement)
+                (recur (min size (+ index 2)) classes state stack)))
+
+            (and (= c "(") (zero? classes)
+                 (re/match "\\(\\?([idmsuxU]*)(?:-([idmsuxU]*))?[:)]" (subs source index)))
+            (let [match (re/match "\\(\\?([idmsuxU]*)(?:-([idmsuxU]*))?([:)])" (subs source index))
+                  enabled (.group match 1) disabled (or (.group match 2) "")
+                  scoped? (= ":" (.group match 3))
+                  changed (flag-state state enabled disabled)
+                  flags (if (and (:ignore-case? changed) (:unicode-case? changed)) "i" "-i")]
+              (.append result (if (seq flags)
+                                (str "(?" flags (if scoped? ":" ")"))
+                                (if scoped? "(?:" "")))
+              (recur (+ index (.end match)) classes changed
+                     (if scoped? (conj stack state) stack)))
+
+            (and (= c "(") (zero? classes)
+                 (re/match "\\(\\?<([A-Za-z][A-Za-z0-9]*)>" (subs source index)))
+            (let [match (re/match "\\(\\?<([A-Za-z][A-Za-z0-9]*)>" (subs source index))]
+              (.append result (.group match))
+              (recur (+ index (.end match)) classes state (conj stack state)))
+
+            (and (:ignore-case? state) (not (:unicode-case? state))
+                 (.isascii c) (.isalpha c))
+            (let [range? (and (pos? classes) (= following "-") (< (+ index 2) size)
+                              (let [end (op/getitem source (+ index 2))]
+                                (and (.isascii end) (.isalpha end))))
+                  end (if range? (op/getitem source (+ index 2)) c)
+                  body (if range?
+                         (str c "-" end (.lower c) "-" (.lower end) (.upper c) "-" (.upper end))
+                         (str (.lower c) (.upper c)))]
+              (.append result (if (pos? classes) body (str "[" body "]")))
+              (recur (+ index (if range? 3 1)) classes state stack))
+
+            :else
+            (let [replacement
+                  (cond
+                    (and (zero? classes) (= c "."))
+                    (cond (:dotall? state) "[\\s\\S]"
+                          (:unix? state) "[^\\n]"
+                          :else "[^\\r\\n\\x85\\u2028\\u2029]")
+                    (and (zero? classes) (= c "$"))
+                    (cond
+                      (and (:multiline? state) (not (:unix? state)))
+                      "(?=\\r\\n|(?<!\\r)\\n|[\\r\\x85\\u2028\\u2029]|\\Z)"
+                      (:multiline? state) "(?=\\n|\\Z)"
+                      (:unix? state) "(?=\\n?\\Z)"
+                      :else final-boundary)
+                    (and (zero? classes) (= c "^") (:multiline? state) (not (:unix? state)))
+                    "(?:\\A|(?<=\\n)|(?<=\\r)(?!\\n)|(?<=[\\x85\\u2028\\u2029]))(?!\\Z)"
+                    (and (zero? classes) (= c "^") (:multiline? state))
+                    "(?:\\A|(?<=\\n))(?!\\Z)"
+                    :else c)
+                  opening? (and (zero? classes) (= c "("))
+                  closing? (and (zero? classes) (= c ")"))]
+              (.append result replacement)
+              (recur (inc index)
+                     (cond (= c "[") (inc classes) (= c "]") (max 0 (dec classes)) :else classes)
+                     (if (and closing? (seq stack)) (peek stack) state)
+                     (cond opening? (conj stack state)
+                           (and closing? (seq stack)) (pop stack)
+                           :else stack)))))))))
+
+(defn compile
+  "Compile a Java-style pattern. Existing Python compiled patterns pass through."
+  [value]
+  (if (pattern? value) value
+      (->Pattern value (engine/compile (str "(?-f)" (translate value)) engine/VERSION1))))
+
+(defn- native-pattern [value]
+  (let [compiled (compile value)]
+    (if (instance? Pattern compiled) (:compiled compiled) compiled)))
+
+(defn search [pattern text]
+  (.search (native-pattern pattern) text))
+
+(defn fullmatch [pattern text]
+  (.fullmatch (native-pattern pattern) text))
+
+(defn finditer
+  "Return the native match iterator; use iterator-seq from Basilisp."
+  [pattern text]
+  (.finditer (native-pattern pattern) text))
+
+(defn split [pattern text]
+  (.split (native-pattern pattern) text))
+
+(defn sub
+  "Replace matches with a native replacement string or callable."
+  [pattern replacement text]
+  (.sub (native-pattern pattern) replacement text))

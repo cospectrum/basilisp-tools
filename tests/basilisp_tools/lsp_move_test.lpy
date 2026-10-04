@@ -1,0 +1,174 @@
+(ns basilisp-tools.lsp-move-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp.string :as str]
+            [basilisp-tools.lsp :as lsp]
+            [basilisp-tools.syntax :as syntax])
+  (:import [pathlib] [subprocess] [sys] [tempfile]))
+
+(defn- apply-edits [source edits]
+  (reduce (fn [text [start end value]] (str (subs text 0 start) value (subs text end)))
+          source (sort-by first > edits)))
+
+(defn- move [documents source-file target-file]
+  (let [analyses (lsp/workspace-analysis documents {:settings {:linters {:clojure-lsp/unused-public-var {:level :off}}}})
+        offset (let [function-offset (.find (get documents source-file) "(defn")]
+                 (if (neg? function-offset) (.find (get documents source-file) "(def ") function-offset))
+        edits (lsp/move-form-edits documents analyses source-file offset target-file)]
+    (when edits
+      (reduce (fn [out [file changes]] (assoc out file (apply-edits (get documents file) changes)))
+              documents edits))))
+
+(deftest move-updates-consumers-dependencies-and-comment-envelope
+  (let [documents {"/tmp/source.lpy" (str "(ns source (:require [basilisp.string :as s]))\n"
+                                          ";; Shared greeting.\n(defn greet [x] {:message (s/upper-case x) :kind ::greeting})\n")
+                   "/tmp/target.lpy" "(ns target)\n"
+                   "/tmp/client.lpy" "(ns client (:require [source :refer [greet]]))\n(greet \"hi\")\n"}
+        moved (move documents "/tmp/source.lpy" "/tmp/target.lpy")
+        target (get moved "/tmp/target.lpy")
+        client (get moved "/tmp/client.lpy")]
+    (is (some? moved))
+    (is (str/includes? target ";; Shared greeting."))
+    (is (.startswith (get moved "/tmp/source.lpy") "(ns source"))
+    (is (not (str/includes? target "::greeting")))
+    (is (str/includes? target ":source/greeting"))
+    (is (str/includes? target "basilisp.string/upper-case"))
+    (is (str/includes? client "target/greet"))
+    (is (not (str/includes? client ":refer [greet]")))
+    (is (every? #(empty? (:diagnostics (syntax/parse %))) (vals moved)))))
+
+(deftest move-preserves-recursive-self-calls
+  (let [moved (move {"/tmp/source.lpy" "(ns source)\n(defn countdown [x] (if (pos? x) (countdown (dec x)) x))\n"
+                     "/tmp/target.lpy" "(ns target)\n"} "/tmp/source.lpy" "/tmp/target.lpy")]
+    (is (some? moved))
+    (is (str/includes? (get moved "/tmp/target.lpy") "target/countdown"))))
+
+(deftest move-imports-python-hints-and-body-references
+  (let [documents {"/tmp/source.lpy" (str "(ns source (:import [pathlib :as p]))\n"
+                                          "(defn ^p/PurePath make-path [^python/str x] (p/PurePath x))\n")
+                   "/tmp/target.lpy" "(ns target)\n"}
+        moved (move documents "/tmp/source.lpy" "/tmp/target.lpy")
+        target (get moved "/tmp/target.lpy")]
+    (is (some? moved))
+    (is (str/includes? target ":import"))
+    (is (str/includes? target "pathlib/PurePath"))
+    (is (str/includes? target "^python/str"))
+    (is (not (str/includes? target "p/PurePath")))
+    (with-open [directory (tempfile/TemporaryDirectory)]
+      (let [file (.joinpath (pathlib/Path directory) "target.lpy")]
+        (.write_text file (str target "\n(prn (str (make-path \".\")))\n") ** :encoding "utf-8")
+        (let [result (subprocess/run [sys/executable "-c" "from basilisp.cli import invoke_cli; invoke_cli()" "run" "--include-unsafe-path=false" (str file)]
+                                     ** :capture_output true :text true :timeout 20)]
+          (is (= 0 (.-returncode result)) (.-stderr result))
+          (is (str/includes? (.-stdout result) "\".\"")))))))
+
+(deftest move-reuses-target-python-alias-and-preserves-member-access
+  (let [moved (move {"/tmp/source.lpy" (str "(ns source (:import [pathlib :as p]))\n"
+                                            "(defn inspect-path [^{:tag p/PurePath} x] (.as_posix x))\n")
+                     "/tmp/target.lpy" "(ns target (:import [pathlib :as paths]))\n"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")
+        target (get moved "/tmp/target.lpy")]
+    (is (some? moved))
+    (is (str/includes? target ":tag paths/PurePath"))
+    (is (str/includes? target "(.as_posix x)"))
+    (is (not (str/includes? target "pathlib/PurePath")))))
+
+(deftest move-rewrites-attribute-map-return-hints
+  (let [moved (move {"/tmp/source.lpy" (str "(ns source (:import [decimal :as d]))\n"
+                                            "(defn amount \"Money.\" {:tag d/Decimal} [x] (d/Decimal x))\n")
+                     "/tmp/target.lpy" "(ns target (:import [decimal :as money]))\n"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")]
+    (is (some? moved))
+    (is (str/includes? (get moved "/tmp/target.lpy") ":tag money/Decimal"))
+    (is (str/includes? (get moved "/tmp/target.lpy") "(money/Decimal x)"))))
+
+(deftest move-declines-unsafe-hints-decorators-and-private-captures
+  (doseq [source ["(ns source) (defn ^Unknown f [] 1)"
+                  "(ns source) (defn ^\"Forward\" f [] 1)"
+                  "(ns source) (defn f {:decorators [identity]} [] 1)"
+                  "(ns source) (def ^:private hidden 1) (defn f [] hidden)"
+                  "(ns source) (defn- f [] 1)"]]
+    (is (nil? (move {"/tmp/source.lpy" source "/tmp/target.lpy" "(ns target)"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")))))
+
+(deftest move-declines-name-collisions-and-new-dependency-cycles
+  (is (nil? (move {"/tmp/source.lpy" "(ns source) (defn f [] 1)"
+                   "/tmp/target.lpy" "(ns target) (defn f [] 2)"}
+                  "/tmp/source.lpy" "/tmp/target.lpy")))
+  (is (nil? (move {"/tmp/source.lpy" "(ns source) (def helper 1) (defn f [] helper) (f)"
+                   "/tmp/target.lpy" "(ns target)"}
+                  "/tmp/source.lpy" "/tmp/target.lpy"))))
+
+(deftest move-bare-python-modules-without-capturing-locals
+  (is (some? (move {"/tmp/source.lpy" "(ns source (:import [pathlib :as p])) (defn module [] p)"
+                    "/tmp/target.lpy" "(ns target)"}
+                   "/tmp/source.lpy" "/tmp/target.lpy")))
+  (is (nil? (move {"/tmp/source.lpy" "(ns source (:import [pathlib :as p])) (defn module [paths] [paths p])"
+                   "/tmp/target.lpy" "(ns target (:import [pathlib :as paths]))"}
+                  "/tmp/source.lpy" "/tmp/target.lpy"))))
+
+(deftest move-precedes-target-consumers-and-preserves-auto-namespaced-maps
+  (with-open [directory (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path directory) source-file (str (.joinpath root "source.lpy"))
+          target-file (str (.joinpath root "target.lpy"))
+          documents {source-file "(ns source)\n(defn build [] #::{:answer 42})\n"
+                     target-file "(ns target (:require [source :as s]))\n(def answer (s/build))\n"}
+          moved (move documents source-file target-file)
+          target (get moved target-file)]
+      (is (some? moved))
+      (is (str/includes? target "#:source{:answer 42}"))
+      (is (< (.find target "(basilisp.core/defn") (.find target "(def answer")))
+      (doseq [[filename text] moved] (.write_text (pathlib/Path filename) text ** :encoding "utf-8"))
+      (let [script (str "import sys; sys.path.insert(0, " (pr-str directory) "); "
+                        "from basilisp.cli import invoke_cli; invoke_cli()")
+            result (do (.write_text (pathlib/Path target-file) (str target "\n(prn (:source/answer answer))\n") ** :encoding "utf-8")
+                       (subprocess/run [sys/executable "-c" script "run" "--include-unsafe-path=false" target-file]
+                                       ** :capture_output true :text true :timeout 20))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (str/includes? (.-stdout result) "42"))))))
+
+(deftest move-literal-constant-definitions
+  (let [moved (move {"/tmp/source.lpy" "(ns source)\n(def options {:name \"blt\" :kind ::tool :versions [1 2]})\n"
+                     "/tmp/target.lpy" "(ns target)\n"
+                     "/tmp/client.lpy" "(ns client (:require [source :as s]))\n(:name s/options)\n"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")]
+    (is (some? moved))
+    (is (str/includes? (get moved "/tmp/target.lpy") "(def options"))
+    (is (str/includes? (get moved "/tmp/target.lpy") ":source/tool"))
+    (is (str/includes? (get moved "/tmp/client.lpy") "target/options")))
+  (is (nil? (move {"/tmp/source.lpy" "(ns source) (def value (python/object))"
+                   "/tmp/target.lpy" "(ns target)"}
+                  "/tmp/source.lpy" "/tmp/target.lpy"))))
+
+(deftest move-constant-data-does-not-treat-map-keys-as-function-metadata
+  (let [moved (move {"/tmp/source.lpy" "(ns source) (def config {:tag \"literal\" :decorators []})"
+                     "/tmp/target.lpy" "(ns target)"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")
+        target (get moved "/tmp/target.lpy")]
+    (is (some? moved))
+    (with-open [directory (tempfile/TemporaryDirectory)]
+      (let [file (.joinpath (pathlib/Path directory) "target.lpy")]
+        (.write_text file (str target "\n(prn (:tag config))\n") ** :encoding "utf-8")
+        (let [result (subprocess/run [sys/executable "-c" "from basilisp.cli import invoke_cli; invoke_cli()"
+                                      "run" "--include-unsafe-path=false" (str file)]
+                                     ** :capture_output true :text true :timeout 20)]
+          (is (= 0 (.-returncode result)) (.-stderr result))
+          (is (str/includes? (.-stdout result) "\"literal\"")))))))
+
+(deftest move-preserves-quoted-symbol-metadata-as-data
+  (let [moved (move {"/tmp/source.lpy" "(ns source (:import [pathlib :as p])) (defn quoted [] '^p/PurePath x)"
+                     "/tmp/target.lpy" "(ns target)"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")]
+    (is (some? moved))
+    (is (str/includes? (get moved "/tmp/target.lpy") "'^p/PurePath x"))))
+
+(deftest move-declines-python-scope-dependent-evaluation-and-frame-inspection
+  (doseq [source ["(ns source) (defn f [] (python/eval \"__name__\"))"
+                  "(ns source) (defn f [] (python/exec \"x = 1\"))"
+                  "(ns source) (defn f [] (python/globals))"
+                  "(ns source) (defn f [] (python/locals))"
+                  "(ns source (:import [builtins :as b])) (defn f [] (b/eval \"__name__\"))"
+                  "(ns source (:import [builtins :refer [globals]])) (defn f [] (globals))"
+                  "(ns source (:import [inspect :as i])) (defn f [] (i/currentframe))"
+                  "(ns source (:import [sys :as s])) (defn f [] (s/_getframe))"]]
+    (is (nil? (move {"/tmp/source.lpy" source "/tmp/target.lpy" "(ns target)"}
+                    "/tmp/source.lpy" "/tmp/target.lpy")) source)))

@@ -1,0 +1,50 @@
+(ns basilisp-tools.analyzer-shared-types-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp.string :as str]
+            [basilisp.set :as sets]))
+
+(defn- mismatches [source]
+  (filterv #(= :type-mismatch (:type %))
+           (:findings (analyzer/analyze source {:python-inspection false}))))
+
+(deftest string-arguments-and-return-values
+  (let [source (str "(ns typed (:require [basilisp.string :as s])) "
+                    "(s/lower-case 1) (s/starts-with? \"abc\" :a) "
+                    "(s/lpad \"a\" \"3\") (inc (s/join [1 2])) "
+                    "(s/split 1 #\",\")")]
+    (is (= 5 (count (mismatches source)))))
+  (is (empty? (mismatches
+               (str "(ns typed (:require [basilisp.string :as s])) "
+                    "(s/blank? nil) (s/split \"a,b\" \",\" nil) "
+                    "(s/split \"a,b\" #\",\" 2) (s/join nil) "
+                    "(s/replace \"abc\" #\"a\" (fn [x] x)) "
+                    "(s/index-of \"abc\" \"a\" nil) (s/rpad \"a\" 3 \"_\")")))))
+
+(deftest set-arguments-and-result-types
+  (is (= 5 (count (mismatches
+                   (str "(ns typed (:require [basilisp.set :as s])) "
+                        "(s/difference 1 #{}) (s/subset? #{} []) "
+                        "(s/rename-keys [] {}) (inc (s/map-invert {:a 1})) "
+                        "(inc (s/select even? [1 2]))")))))
+  (is (empty? (mismatches
+               (str "(ns typed (:require [basilisp.set :as s])) "
+                    "(s/difference #{1 2} [2]) (s/intersection #{1 2} [1]) "
+                    "(s/disjoint? #{1} [2]) (s/union #{1} #{2}) "
+                    "(s/map-invert nil) (s/select even? nil) "
+                    "(s/project [{:a 1}] [:a]) (s/index nil nil) "
+                    "(s/rename [] nil) (s/rename-keys {} nil)")))))
+
+(deftest runtime-fixtures-confirm-basilisp-specific-contracts
+  (is (= ["a" "b"] (str/split "a,b" "," nil)))
+  (is (= ["a" "b"] (str/split "a,b" #"," 2)))
+  (is (= 0 (str/index-of "abc" "a" nil)))
+  (is (= "A Title" (str/title-case "a title")))
+  (is (= "__a" (str/lpad "a" 3 "_")))
+  (is (= #{1} (sets/difference #{1 2} [2])))
+  (is (= #{1} (sets/intersection #{1 2} [1])))
+  (is (sets/disjoint? #{1} [2]))
+  (is (= #{1 2} (sets/union #{1} #{2})))
+  (is (= {} (sets/map-invert nil)))
+  (is (= #{} (sets/select even? nil)))
+  (is (= {} (sets/rename-keys {} nil))))

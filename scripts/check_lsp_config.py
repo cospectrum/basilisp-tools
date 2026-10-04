@@ -11,10 +11,11 @@ import argparse
 import importlib
 import json
 import os
-import re
 import subprocess
 import tempfile
 from pathlib import Path
+from collections.abc import Mapping, Set
+from dataclasses import dataclass
 from unittest.mock import patch
 
 CLOJURE_LSP_REVISION = "8ad65c1d681d2fc9022b3854f6dcaf1677d29631"
@@ -22,6 +23,60 @@ CLOJURE_LSP_REVISION = "8ad65c1d681d2fc9022b3854f6dcaf1677d29631"
 # Java indexing, LSP transport, analyzers, or the rest of that application's deps.
 ORACLE_DEPS = '{:deps {org.clojure/clojure {:mvn/version "1.12.5"} medley/medley {:mvn/version "1.4.0"}}}'
 
+
+
+@dataclass(frozen=True)
+class RegexValue:
+    """Cross-runtime identity, distinct from strings and user collection data."""
+    source: str
+    java_flags: int
+
+
+def canonical(value, regex_module, flags_by_source):
+    # The adapter retains the original spelling and accepts no separate flags.
+    # Ask Java for those spelling-derived flags, rather than treating Python
+    # engine flags (with different values/Unicode defaults) as Java flags.
+    if isinstance(value, RegexValue):
+        return value
+    if isinstance(value, regex_module.Pattern):
+        source = regex_module.source(value)
+        return RegexValue(source, flags_by_source[source])
+    if isinstance(value, Mapping):
+        return ("map", len(value), frozenset(
+            (canonical(k, regex_module, flags_by_source),
+             canonical(v, regex_module, flags_by_source)) for k, v in value.items()))
+    if isinstance(value, Set):
+        return ("set", len(value), frozenset(canonical(x, regex_module, flags_by_source) for x in value))
+    if not isinstance(value, (str, bytes)) and hasattr(value, "__iter__"):
+        return ("sequence", tuple(canonical(x, regex_module, flags_by_source) for x in value))
+    return value
+
+
+def regex_sources(value, regex_module):
+    if isinstance(value, regex_module.Pattern):
+        yield regex_module.source(value)
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            yield from regex_sources(key, regex_module)
+            yield from regex_sources(item, regex_module)
+    elif not isinstance(value, (str, bytes)) and hasattr(value, "__iter__"):
+        for item in value:
+            yield from regex_sources(item, regex_module)
+
+
+def normalization_guards(regex_module, flags_by_source):
+    plain, flagged = regex_module.compile_("^value$"), regex_module.compile_("(?im)^value$")
+    norm = lambda value: canonical(value, regex_module, flags_by_source)
+    assert norm(plain) == RegexValue("^value$", 0)
+    assert norm(flagged) == RegexValue("(?im)^value$", 10)
+    assert norm(plain) != "^value$"
+    assert norm(plain) != norm(flagged)
+    assert norm({"nested": {plain: [flagged]}}) == norm(
+        {"nested": {RegexValue("^value$", 0): [RegexValue("(?im)^value$", 10)]}})
+    assert norm({"nested": {plain: [flagged]}}) != norm({"nested": {"^value$": [flagged]}})
+    assert norm(flagged) != RegexValue("(?im)^value$", 0)
+    assert regex_module.search(plain, "other\nVALUE\nother") is None
+    assert regex_module.search(flagged, "other\nVALUE\nother") is not None
 
 def cases():
     for name, a, b in [
@@ -101,6 +156,13 @@ def cases():
         "project/.lsp/config.edn": '{"document-formatting?" false "nested" {"key" "value"}}'}}
     yield {"name": "file-regex-reader", "mode": "load", "files": {
         "project/.lsp/config.edn": '{:custom-regex #re "^generated/"}'}}
+    yield {"name": "file-flagged-regex-reader", "mode": "load", "files": {
+        "project/.lsp/config.edn": '{:custom-regex #re "(?im)^value$"}'}}
+    # Clean mode avoids the documented upstream repeated-root collection bug.
+    yield {"name": "client-nested-regex-keys", "mode": "clean",
+           "client": '{:custom {#re "^value$" [#re "(?im)^value$"] "^value$" :plain-string}}'}
+    yield {"name": "client-regex-flags-distinct", "mode": "clean",
+           "client": '{:custom [#re "^value$" #re "(?im)^value$" "^value$"]}'}
     yield {"name": "malformed-project-config-ignored", "mode": "load", "files": {
         "project/.lsp/config.edn": "{:broken"}}
     yield {"name": "malformed-global-keeps-project", "mode": "load", "files": {
@@ -127,10 +189,40 @@ def main() -> int:
 
     settings = importlib.import_module("basilisp_tools.lsp")
     edn = importlib.import_module("basilisp.edn")
-    reader_options = lmap({kw("default"): lambda tag, value: re.compile(value)})
+    regex_module = importlib.import_module("basilisp_tools.regex")
+
+    def tagged(tag, value):
+        if str(tag) == "re":
+            return regex_module.compile_(value)
+        if str(tag) == "blt-oracle/regex":
+            return RegexValue(value[0], value[1])
+        raise ValueError(f"Unexpected oracle tag: {tag}")
+
+    reader_options = lmap({kw("default"): tagged})
 
     def read(text):
         return edn.read_string(text, reader_options)
+
+    def evaluate(case, directory):
+        if case["mode"] == "deep-merge":
+            actual = settings.deep_merge_settings(read(case["a"]), read(case["b"]))
+        elif case["mode"] == "merge":
+            actual = settings.merge_settings(read(case["a"]), read(case["b"]))
+        elif case["mode"] == "clean":
+            actual = settings.clean_client_settings(read(case["client"]))
+        else:
+            # Match the upstream environment stub. A nil override means
+            # normal environment lookup, not an explicitly unset XDG.
+            with patch.dict(os.environ):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                actual = settings.load_settings(lmap({
+                    kw("root"): str(directory / "project"),
+                    kw("home"): str(directory / "home"),
+                    kw("xdg-config-home"): None if case.get("xdg_unset") else str(directory / "xdg"),
+                    kw("client-settings"): read(case.get("client", "{}")),
+                    kw("force-settings"): read(case.get("force", "{}")),
+                }))
+        return actual
 
     results = []
     with tempfile.TemporaryDirectory(prefix="blt-lsp-config-") as temporary:
@@ -153,40 +245,38 @@ def main() -> int:
             specifications.append("{" + " ".join(f":{key} {value}" for key, value in values.items()) + "}")
             prepared.append((case, directory))
         input_file, output_file = base / "input.edn", base / "output.edn"
-        input_file.write_text("[" + "\n".join(specifications) + "]", encoding="utf-8")
+        actual_values = []
+        sources = {"^value$", "(?im)^value$"}
+        for case, directory in prepared:
+            try:
+                actual = evaluate(case, directory)
+                actual_values.append((actual, None))
+                sources.update(regex_sources(actual, regex_module))
+            except Exception as error:
+                actual_values.append((None, error))
+        input_file.write_text("{:cases [" + "\n".join(specifications) +
+                              "] :actual-regex-sources " + json.dumps(sorted(sources)) + "}", encoding="utf-8")
         subprocess.run(["clojure", "-Srepro", "-Sdeps", ORACLE_DEPS, "-M",
                         str(Path(__file__).with_suffix(".clj").resolve()), str(checkout),
                         str(input_file), str(output_file)], cwd=base, check=True)
-        expected = read(output_file.read_text(encoding="utf-8"))
+        output = read(output_file.read_text(encoding="utf-8"))
+        expected = output.val_at(kw("cases"))
+        flags_by_source = dict(output.val_at(kw("regex-flags")).items())
+        normalization_guards(regex_module, flags_by_source)
         if len(expected) != len(prepared):
             raise RuntimeError("The LSP configuration oracle returned incomplete results.")
-        for (case, directory), oracle in zip(prepared, expected):
+        for ((case, directory), oracle, (actual, actual_error)) in zip(prepared, expected, actual_values):
             expected_settings = oracle.val_at(kw("settings"))
             expected_error = oracle.val_at(kw("error"))
             try:
-                if case["mode"] == "deep-merge":
-                    actual = settings.deep_merge_settings(read(case["a"]), read(case["b"]))
-                elif case["mode"] == "merge":
-                    actual = settings.merge_settings(read(case["a"]), read(case["b"]))
-                elif case["mode"] == "clean":
-                    actual = settings.clean_client_settings(read(case["client"]))
-                else:
-                    # Match the upstream environment stub. A nil override means
-                    # normal environment lookup, not an explicitly unset XDG.
-                    with patch.dict(os.environ):
-                        os.environ.pop("XDG_CONFIG_HOME", None)
-                        actual = settings.load_settings(lmap({
-                            kw("root"): str(directory / "project"),
-                            kw("home"): str(directory / "home"),
-                            kw("xdg-config-home"): None if case.get("xdg_unset") else str(directory / "xdg"),
-                            kw("client-settings"): read(case.get("client", "{}")),
-                            kw("force-settings"): read(case.get("force", "{}")),
-                        }))
-                matched = expected_error is None and actual == expected_settings
+                if actual_error is not None:
+                    raise actual_error
+                matched = expected_error is None and (
+                    canonical(actual, regex_module, flags_by_source) ==
+                    canonical(expected_settings, regex_module, flags_by_source))
                 actual_text = str(actual)
             except Exception as error:
-                # No fixture expects an error; matching unrelated exceptions
-                # must never count as configuration compatibility.
+                # Matching unrelated exceptions never proves compatibility.
                 matched = False
                 actual_text = repr(error)
             results.append({"name": case["name"], "matched": matched,
@@ -196,6 +286,7 @@ def main() -> int:
     for result in failures:
         print(f"{result['name']}:\n  clojure-lsp: {result['expected']}\n  blt:         {result['actual']}")
     print(f"clojure-lsp configuration: {len(results) - len(failures)}/{len(results)} matched.")
+    print("Regex normalization: typed source/Java-flags and nested-key behavior guards passed.")
     print("Intentional deviation: blt reads ancestor .lsp/config.edn files; pinned upstream repeats the root file.")
     if args.report:
         args.report.write_text(json.dumps({"upstream_revision": revision, "cases": results}, indent=2) + "\n",

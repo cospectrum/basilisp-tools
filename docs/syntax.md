@@ -38,7 +38,10 @@ without inserting synthetic characters.
 - Reader conditionals and splicing conditionals, with all branches preserved.
 - Line comments, shebang comments, whitespace, and commas.
 
-A lone colon or backslash is reported as an error.
+A lone colon or backslash is reported as an error. The default dialect validates
+Basilisp syntax. `(parse source {:dialect :clojure})` additionally accepts
+read-eval text, legacy metadata, aliased namespaced maps, and array-class symbols
+for lossless tooling; it still never evaluates source.
 
 ## Traversal
 
@@ -69,7 +72,7 @@ Mismatched delimiters recover at an enclosing delimiter where possible;
 unexpected closers remain error leaves. Unterminated strings retain the
 remaining input, so later forms may become part of the string.
 
-Recursive depth is limited to 64. Lower it with `(parse source {:max-depth n})`;
+Form nesting is limited to 128 levels. Lower it with `(parse source {:max-depth n})`;
 excess nesting becomes error tokens. Each parse processes the full document.
 
 The parser checks token spelling, escapes, delimiters, reader operands, map form

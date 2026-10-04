@@ -1,8 +1,9 @@
 (ns basilisp-tools.check-test
   (:require [basilisp.edn :as edn]
-            [basilisp.test :refer [deftest is testing]]
-            [basilisp-tools.check :as check])
-  (:import [json] [os] [pathlib] [re] [tempfile] [unittest.mock :as mock]))
+            [basilisp.test :refer [deftest is]]
+            [basilisp-tools.check :as check]
+            [basilisp-tools.regex :as regex])
+  (:import [json] [os] [pathlib] [tempfile] [unittest.mock :as mock]))
 
 (defn- write! [root name content]
   (let [path (.joinpath root name)]
@@ -11,12 +12,12 @@
     path))
 
 (deftest literal-configuration-test
-  (let [config (check/read-config "{:linters #:demo{:test {:level :off}} :config-paths ^:replace [] :lint-as {app/let basilisp.core/let} :pattern #\"a.*\"}")]
+  (let [config (check/read-config "{:linters #:demo{:test {:level :off}} :config-paths ^:replace [] :lint-as {app/let basilisp.core/let} :pattern \"a.*\"}")]
     (is (= :off (get-in config [:linters :demo/test :level])))
     (is (:replace (meta (:config-paths config))))
     (is (= 'basilisp.core/let (get-in config [:lint-as 'app/let])))
-    (is (some? (re/fullmatch (:pattern config) "abc"))))
-  (doseq [source ["{} {}" "[]" "{:x 1 :x 2}" "{:x #=(python/print 1)}" "{:x #evil 1}" "{:x #::alias{:k 1}}"]]
+    (is (some? (regex/fullmatch (:pattern config) "abc"))))
+  (doseq [source ["{:x #\"a.*\"}" "{} {}" "[]" "{:x 1 :x 2}" "{:x #=(python/print 1)}" "{:x #evil 1}" "{:x #::alias{:k 1}}"]]
     (is (thrown? python/Exception (check/read-config source)))))
 
 (deftest config-merging-test
@@ -50,9 +51,10 @@
       (write! project ".clj-kondo/config.edn" "{:config-paths [\"loop\"]}")
       (write! project ".clj-kondo/loop/config.edn" "{:config-paths [\"..\"]}")
       (is (thrown? python/ValueError (check/load-config {:cwd (str project)})))
-      (is (thrown? python/ValueError
-                   (check/load-config {:config-dir (str extra) :repro true
-                                       :config "{:hooks {:analyze-call {app/macro app.hook/expand}}}"})))
+      (is (= 'app.hook/expand
+             (get-in (check/load-config {:config-dir (str extra) :repro true
+                                         :config "{:hooks {:analyze-call {app/macro app.hook/expand}}}"})
+                     [:hooks :analyze-call 'app/macro])))
       (finally (.stop env) (.cleanup temp)))))
 
 (deftest runner-project-and-input-test
@@ -80,7 +82,8 @@
       (let [result (check/run (assoc opts :paths ["-"] :stdin "unresolved-name" :filename "virtual.lpy"))]
         (is (= "virtual.lpy" (:filename (first (:findings result)))))
         (is (= :unresolved-symbol (:type (first (:findings result))))))
-      (is (thrown? python/ValueError (check/run (assoc opts :paths ["-" "."] :stdin ""))))
+      (is (= 2 (get-in (check/run (assoc opts :paths ["-" (str (.joinpath root "src/lib.lpy"))] :stdin ""))
+                       [:summary :files])))
       (finally (.cleanup temp)))))
 
 (deftest output-and-exit-code-test

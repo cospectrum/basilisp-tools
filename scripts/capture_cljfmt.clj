@@ -42,7 +42,18 @@
      :options {:align-binding-columns? true :align-form-columns? false}}
     {:name "deprecated-binding-alignment-does-not-disable-form-alignment"
      :source "(let [a 1\nlonger 2]\n(+ a longer))"
-     :options {:align-binding-columns? false :align-form-columns? true}}]))
+     :options {:align-binding-columns? false :align-form-columns? true}}
+    {:name "octal-characters" :source "(f \\o141\n\\o377)" :options {}}
+    {:name "octal-strings" :source "(f \"\\123\"\n\"\\377\")" :options {}}
+    {:name "spaced-reader-conditional" :source "#? (:clj (a\nb)\n:cljs (c\nd))" :options {}}
+    {:name "spaced-reader-splice" :source "#?@ (:clj [a\nb])" :options {}}
+    {:name "commented-reader-conditional" :source "#? ; platform\n(:clj (a\nb)\n:cljs (c\nd))" :options {}}
+    {:name "java-quoted-indent-pattern" :source "(my-fn value\n(body))"
+     :options {:extra-indents {(re-pattern "^\\Qmy-fn\\E$") [[:block 1]]}}}
+    {:name "java-unicode-indent-pattern" :source "(συνάρτηση value\n(body))"
+     :options {:extra-indents {(re-pattern "^\\p{L}+$") [[:block 1]]}}}
+    {:name "java-intersection-indent-pattern" :source "(macro-bcd value\n(body))"
+     :options {:extra-indents {(re-pattern "^macro-[a-z&&[^aeiou]]+$") [[:block 1]]}}}]))
 
 (let [[destination corpus] *command-line-args*
       result

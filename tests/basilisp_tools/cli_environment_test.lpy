@@ -1,0 +1,51 @@
+(ns basilisp-tools.cli-environment-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.cli :as cli])
+  (:import [io] [json] [os] [pathlib] [subprocess] [sys] [tempfile]
+           [unittest.mock :as mock]))
+
+(defn- invoke [args]
+  (let [out (io/StringIO) err (io/StringIO)
+        patches [(mock/patch "sys.stdout" out) (mock/patch "sys.stderr" err)]]
+    (doseq [patch patches] (.start patch))
+    (try
+      {:code (cli/main args) :out (.getvalue out) :err (.getvalue err)}
+      (finally (doseq [patch (reverse patches)] (.stop patch))))))
+
+(deftest selected-interpreter-exported-settings-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (.resolve (pathlib/Path (.-name temporary)))
+        environment (.joinpath root "env")
+        python (.joinpath environment (if (= "nt" os/name) "Scripts/python.exe" "bin/python"))
+        _ (subprocess/run [sys/executable "-m" "venv" "--without-pip" (str environment)] ** :check true :capture_output true)
+        site (pathlib/Path (.strip (subprocess/check_output
+                                    [(str python) "-c" "import sysconfig; print(sysconfig.get_path('purelib'))"]
+                                    ** :text true)))
+        exported (.joinpath site "clojure-lsp.exports/vendor/library/config.edn")
+        config (.joinpath root ".lsp/config.edn")
+        source (.joinpath root "lib/sample.lpy")
+        args ["lsp" "dump" "--project-root" (str root) "--python" (str python)
+              "--no-python-inspection" "--raw"
+              "--output" "{:format :json :filter-keys [:settings :analysis]}"]
+        home-patch (.dict mock/patch os/environ
+                          #py {"HOME" (str (.joinpath root "home"))
+                               "XDG_CONFIG_HOME" (str (.joinpath root "home/.config"))})]
+    (.start home-patch)
+    (try
+      (.mkdir (.-parent exported) ** :parents true)
+      (.write_text exported "{:source-paths [\"lib\"] :clean {:sort {:refer false}}}" ** :encoding "utf-8")
+      (.mkdir (.-parent source) ** :parents true)
+      (.write_text source "(ns sample) (def value 1)\n" ** :encoding "utf-8")
+      (doseq [from-file? [true false]]
+        (if from-file?
+          (do (.mkdir (.-parent config) ** :parents true :exist_ok true)
+              (.write_text config "{:classpath-config-paths [\"vendor/library\"]}" ** :encoding "utf-8"))
+          (.unlink config))
+        (let [result (invoke (if from-file? args
+                                 (into args ["--settings" "{:classpath-config-paths [\"vendor/library\"]}"])))
+              data (when (= 0 (:code result)) (py->lisp (json/loads (:out result))))]
+          (is (= 0 (:code result)) (:err result))
+          (is (= ["lib"] (get-in data [:settings :source-paths])))
+          (is (= false (get-in data [:settings :clean :sort :refer])))
+          (is (= ["sample"] (mapv :name (get-in data [:analysis :namespace-definitions]))))))
+      (finally (.stop home-patch) (.cleanup temporary)))))

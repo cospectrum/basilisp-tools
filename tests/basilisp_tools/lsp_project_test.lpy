@@ -1,0 +1,191 @@
+(ns basilisp-tools.lsp-project-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.lsp :as lsp]
+            [basilisp-tools.analyzer :as analyzer])
+  (:import [pathlib] [tempfile]))
+
+(defn- analyze-documents [documents]
+  (let [declarations (mapcat (fn [[filename source]]
+                               (:var-definitions (analyzer/declarations source {:filename filename})))
+                             documents)]
+    (into {} (map (fn [[filename source]]
+                    [filename (analyzer/analyze source {:filename filename :python-inspection false
+                                                        :known-definitions declarations})])
+                  documents))))
+
+(defn- findings [documents settings & [root]]
+  (lsp/project-findings documents (analyze-documents documents) settings root))
+
+(defn- of-type [result code]
+  (filterv #(= code (:type %)) (mapcat val result)))
+
+(def ^:private no-unused {:linters {:clojure-lsp/unused-public-var {:level :off}}})
+
+(deftest unused-public-vars-use-project-references
+  (let [documents {"/tmp/one.lpy" "(ns one) (defn used [] 1) (defn recursive [] (recursive)) (defn- private [] 1)"
+                   "/tmp/two.lpy" "(ns two (:require [one :as o])) (o/used)"}
+        actual (of-type (findings documents {}) :clojure-lsp/unused-public-var)]
+    (is (= 1 (count actual)))
+    (is (= "Unused public var 'one/recursive'" (:message (first actual))))
+    (is (= :info (:level (first actual))))
+    (is (= [1] (:tags (first actual))))))
+
+(deftest public-var-exclusions-include-metadata-and-definers
+  (let [documents {"/tmp/exclusions.lpy"
+                   (str "(ns exclusions (:require [basilisp.test :refer [deftest]])) "
+                        "(defn ^:export exported [] 1) (defn ^:api api [] 1) "
+                        "(defn -main [] 1) (deftest test-thing 1) (defn named [] 1) "
+                        "(defn regex-match [] 1) (defn kept [] 1) (comment (defn scratch [] 1))")}
+        settings {:linters {:clojure-lsp/unused-public-var
+                            {:exclude '#{named} :exclude-regex #{"exclusions/regex-.*"}
+                             :exclude-when-contains-meta #{:api}}}}
+        actual (of-type (findings documents settings) :clojure-lsp/unused-public-var)]
+    (is (= ["Unused public var 'exclusions/kept'"] (mapv :message actual)))
+    (is (empty? (of-type (findings documents {:linters {:clojure-lsp/unused-public-var
+                                                        {:exclude-when-defined-by '#{basilisp.core/defn}}}})
+                         :clojure-lsp/unused-public-var)))))
+
+(deftest namespace-config-and-groups-control-public-linter
+  (let [documents {"/tmp/one.lpy" "(ns one) (defn one-f [] 1)"
+                   "/tmp/two.lpy" "(ns two) (defn two-f [] 1)"}
+        settings {:ns-groups [{:name 'ignored :filename-pattern "/one\\.lpy$"}]
+                  :config-in-ns {'ignored {:linters {:clojure-lsp/unused-public-var {:level :off}}}
+                                 'two {:linters {:clojure-lsp/unused-public-var {:level :warning}}}}}
+        actual (of-type (findings documents settings) :clojure-lsp/unused-public-var)]
+    (is (= ["Unused public var 'two/two-f'"] (mapv :message actual)))
+    (is (= [:warning] (mapv :level actual)))))
+
+(deftest test-references-can-be-ignored
+  (let [documents {"/tmp/lib.lpy" "(ns lib) (defn tested [] 1)"
+                   "/tmp/lib_test.lpy" "(ns lib-test (:require [lib :as l])) (l/tested)"}
+        settings {:linters {:clojure-lsp/unused-public-var {:ignore-test-references? true}}}]
+    (is (empty? (of-type (findings documents {}) :clojure-lsp/unused-public-var)))
+    (is (= ["Unused public var 'lib/tested'"]
+           (mapv :message (of-type (findings documents settings) :clojure-lsp/unused-public-var))))))
+
+(deftest source-discard-suppression-honors-codes-and-target-ranges
+  (let [documents {"/tmp/ignored.lpy"
+                   (str "(ns ignored) #_:clojure-lsp/ignore (defn one [] 1) "
+                        "#_{:clj-kondo/ignore [:clojure-lsp/unused-public-var]} (defn two [] 2) "
+                        "#_{:clojure-lsp/ignore [:other/code]} (defn three [] 3) "
+                        "(defn four [] 4)")}
+        actual (of-type (findings documents {}) :clojure-lsp/unused-public-var)]
+    (is (= ["Unused public var 'ignored/three'" "Unused public var 'ignored/four'"]
+           (mapv :message actual)))))
+
+(deftest inconsistent-aliases-point-to-alias-tokens
+  (let [documents {"/tmp/a.lpy" "(ns a (:require [shared :as s]))"
+                   "/tmp/b.lpy" "(ns b (:require [shared :as shared]))"}
+        settings {:linters {:clojure-lsp/different-aliases {:level :warning}}}
+        result (findings documents settings)
+        actual (of-type result :clojure-lsp/different-aliases)]
+    (is (= 2 (count actual)))
+    (is (= #{"s" "shared"}
+           (set (for [[file entries] result
+                      entry entries :when (= :clojure-lsp/different-aliases (:type entry))]
+                  (subs (get documents file) (:start entry) (:end entry))))))
+    (is (empty? (of-type (findings documents {}) :clojure-lsp/different-aliases)))
+    (is (empty? (of-type (findings documents {:linters {:clojure-lsp/different-aliases
+                                                        {:level :error :exclude-aliases '#{s}}}})
+                         :clojure-lsp/different-aliases)))))
+
+(deftest cycles-report-closed-paths-on-namespace-names
+  (let [documents {"/tmp/a.lpy" "(ns a (:require [b :as b]))"
+                   "/tmp/b.lpy" "(ns b (:require [c :as c]))"
+                   "/tmp/c.lpy" "(ns c (:require [a :as a]))"}
+        settings {:linters {:clojure-lsp/cyclic-dependencies {:level :error}}}
+        result (findings documents settings)
+        actual (of-type result :clojure-lsp/cyclic-dependencies)]
+    (is (= 3 (count actual)))
+    (is (every? #(= "Cyclic dependency detected: a -> b -> c -> a" (:message %)) actual))
+    (is (= #{"a" "b" "c"}
+           (set (for [[file entries] result entry entries
+                      :when (= :clojure-lsp/cyclic-dependencies (:type entry))]
+                  (subs (get documents file) (:start entry) (:end entry))))))
+    (is (empty? (of-type (findings documents {}) :clojure-lsp/cyclic-dependencies)))
+    (is (= 2 (count (of-type (findings documents {:linters {:clojure-lsp/cyclic-dependencies
+                                                            {:level :error :exclude-namespaces '#{b}}}})
+                             :clojure-lsp/cyclic-dependencies))))))
+
+(deftest non-loading-and-comment-requires-do-not-create-cycles
+  (let [settings {:linters {:clojure-lsp/cyclic-dependencies {:level :error}}}]
+    (is (empty? (of-type
+                 (findings {"/tmp/a.lpy" "(ns a (:require [b :as-alias b]))"
+                            "/tmp/b.lpy" "(ns b (:require [a :as a]))"} settings)
+                 :clojure-lsp/cyclic-dependencies)))
+    (is (empty? (of-type
+                 (findings {"/tmp/a.lpy" "(ns a) (comment (require '[b :as b]))"
+                            "/tmp/b.lpy" "(ns b (:require [a :as a]))"} settings)
+                 :clojure-lsp/cyclic-dependencies)))))
+
+(deftest clj-depend-layer-access-and-custom-rules
+  (let [documents {"/tmp/controller.lpy" "(ns app.controller (:require [app.model :as m]))"
+                   "/tmp/model.lpy" "(ns app.model)"}
+        settings {:linters {:clojure-lsp/unused-public-var {:level :off}}
+                  :clj-depend {:config {:layers {:controller {:defined-by "controller$" :accesses-layers #{}}
+                                                 :model {:namespaces '#{app.model}}}
+                                        :rules [{:namespaces '#{app.controller}
+                                                 :should-not-depend-on '#{app.model}
+                                                 :message "Keep the model behind the service."}]}}}
+        actual (of-type (findings documents settings) :clj-depend)]
+    (is (= 2 (count actual)))
+    (is (some #(= "Keep the model behind the service." (:message %)) actual))
+    (is (some #(.startswith (:message %) "\"app.controller\" should not depend on \"app.model\"") actual))
+    (is (every? #(= :info (:level %)) actual))))
+
+(deftest clj-depend-accessed-by-and-peer-restrictions
+  (let [documents {"/tmp/a.lpy" "(ns app.a (:require [app.b :as b] [external.core :as e]))"
+                   "/tmp/b.lpy" "(ns app.b)"}
+        config {:layers {:app {:defined-by "^app\\." :access-peer-ns false}
+                         :external {:defined-by "^external\\." :accessed-by-layers #{}}}}
+        actual (of-type (findings documents (assoc no-unused :clj-depend {:config config})) :clj-depend)]
+    (is (= 2 (count actual)))))
+
+(deftest clj-depend-file-config-source-paths-and-snapshots
+  (with-open [directory (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path directory) src (.joinpath root "src") tests (.joinpath root "tests")
+          config-dir (.joinpath root ".clj-depend")]
+      (.mkdir src) (.mkdir tests) (.mkdir config-dir)
+      (.write_text (.joinpath config-dir "config.edn")
+                   "{:rules [{:defined-by \"^app\\\\.\" :should-not-depend-on #{\"^db\\\\.\"}}]}" ** :encoding "utf-8")
+      (let [filename (str (.joinpath src "a.lpy"))
+            documents {filename "(ns app.a (:require [db.core :as db]))"
+                       (str (.joinpath tests "test.lpy")) "(ns app.test (:require [db.core :as db]))"}
+            actual (of-type (findings documents no-unused directory) :clj-depend)]
+        (is (= 1 (count actual)))
+        (.write_text (.joinpath config-dir "snapshot.edn")
+                     "{:violations [{:namespace app.a :dependency-namespace db.core}]}" ** :encoding "utf-8")
+        (is (empty? (of-type (findings documents no-unused directory) :clj-depend)))))))
+
+(deftest clj-depend-legacy-configuration-and-circular-rules
+  (let [documents {"/tmp/a.lpy" "(ns a (:require [b :as b]))"
+                   "/tmp/b.lpy" "(ns b (:require [a :as a]))"}
+        config {:rules [{:defined-by "^a$" :should-not-depend-on '#{b}}]}
+        legacy (assoc no-unused :clj-depend config)
+        nested (assoc no-unused :clj-depend {:config config})
+        actual (of-type (findings documents legacy) :clj-depend)]
+    (is (= (findings documents nested) (findings documents legacy)))
+    (is (= 3 (count actual)))
+    (is (= 2 (count (filter #(.startswith (:message %) "Circular dependency") actual))))))
+
+(deftest cycle-analysis-handles-a-long-acyclic-chain
+  (let [analyses (into {} (for [i (range 1400)
+                                :let [ns-name (str "chain" i) target (str "chain" (inc i))]]
+                            [ns-name {:namespace ns-name
+                                      :namespace-usages (if (< i 1399) [{:name target :start 0 :end 0}] [])}]))]
+    (is (every? empty? (vals (lsp/project-findings {} analyses
+                                                   {:linters {:clojure-lsp/unused-public-var {:level :off}
+                                                              :clojure-lsp/cyclic-dependencies {:level :error}}} nil))))))
+
+(deftest registered-keywords-share-public-unused-diagnostics
+  (let [documents {"/tmp/register.lpy" "(ns register) :events/used :events/unused"
+                   "/tmp/use.lpy" "(ns use) :events/used"}
+        analyses (analyze-documents documents)
+        analyses (update-in analyses ["/tmp/register.lpy" :keywords]
+                            #(mapv (fn [entry] (assoc entry :reg 'event.core/register)) %))
+        actual (of-type (lsp/project-findings documents analyses {} nil) :clojure-lsp/unused-public-var)]
+    (is (= ["Unused public keyword ':events/unused'"] (mapv :message actual)))
+    (is (empty? (of-type (lsp/project-findings documents analyses
+                                               {:linters {:clojure-lsp/unused-public-var
+                                                          {:exclude-when-defined-by '#{event.core/register}}}} nil)
+                         :clojure-lsp/unused-public-var)))))

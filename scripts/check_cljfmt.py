@@ -48,11 +48,12 @@ def main() -> int:
     edn = importlib.import_module("basilisp.edn")
     formatter = importlib.import_module("basilisp_tools.format")
     syntax = importlib.import_module("basilisp_tools.syntax")
+    regex_adapter = importlib.import_module("basilisp_tools.regex")
 
     def tagged_reader(tag, value):
         if str(tag) != "re":
             raise ValueError(f"Unexpected oracle EDN tag: {tag}")
-        return re.compile(value)
+        return regex_adapter.compile_(value)
 
     with tempfile.TemporaryDirectory(prefix="blt-cljfmt-") as temporary:
         output = Path(temporary) / "oracle.edn"
@@ -88,22 +89,6 @@ def main() -> int:
     def field(value, name, default=None):
         return value.val_at(kw(name), default)
 
-    def unsupported_reason(source, diagnostics):
-        """Only skip reader features that Basilisp deliberately does not support."""
-        reasons = set()
-        for diagnostic in diagnostics:
-            token = source[field(diagnostic, "start"):field(diagnostic, "end")]
-            code = field(diagnostic, "code")
-            if code == kw("invalid-dispatch") and source.startswith(("#^", "#="), field(diagnostic, "start")):
-                reasons.add("Clojure legacy metadata/read-eval dispatch")
-            elif code == kw("invalid-map-namespace") and token.startswith("#::"):
-                reasons.add("Clojure aliased namespaced map")
-            elif code == kw("invalid-token") and re.fullmatch(r"[\w.$]+/[1-9]", token):
-                reasons.add("Clojure 1.12 array class symbol")
-            else:
-                return None
-        return "; ".join(sorted(reasons)) if reasons else None
-
     def compare(case, name=None, options=None):
         source = field(case, "source")
         name = name or field(case, "name")
@@ -114,18 +99,11 @@ def main() -> int:
         if oracle_error:
             counts["oracle-unsupported"] += 1
             findings.append({**details, "kind": "oracle-unsupported", "reason": oracle_error})
-        diagnostics = field(syntax.parse(source), "diagnostics")
+        diagnostics = field(syntax.parse(source, lmap({kw("dialect"): kw("clojure")})), "diagnostics")
         if len(diagnostics):
-            reason = unsupported_reason(source, diagnostics)
-            parts = field(case, "fragments")
-            if reason and parts:
-                for index, part in enumerate(parts):
-                    compare(part, f"{name}/form-{index + 1}", options)
-                return
-            kind = "unsupported-syntax" if reason else "unexpected-parser-error"
-            counts[kind] += 1
+            counts["unexpected-parser-error"] += 1
             findings.append({
-                **details, "kind": kind, "reason": reason or str(diagnostics)
+                **details, "kind": "unexpected-parser-error", "reason": str(diagnostics)
             })
             return
         started = time.perf_counter()

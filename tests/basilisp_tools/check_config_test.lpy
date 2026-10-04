@@ -1,7 +1,8 @@
 (ns basilisp-tools.check-config-test
   (:require [basilisp.test :refer [deftest is]]
-            [basilisp-tools.check :as check])
-  (:import [io] [os] [pathlib] [re] [tempfile] [unittest.mock :as mock]))
+            [basilisp-tools.check :as check]
+            [basilisp-tools.regex :as regex])
+  (:import [io] [os] [pathlib] [tempfile] [unittest.mock :as mock]))
 
 (defn- write! [root name content]
   (let [path (.joinpath root name)]
@@ -32,8 +33,8 @@
 
 (deftest tagged-regex-is-opt-in-test
   (is (thrown? python/ValueError (check/read-config "{:x #re \"pattern\"}")))
-  (is (some? (re/fullmatch (:x (check/read-config "{:x #re \"p.*\"}" "settings" {:readers #{'re}}))
-                           "pattern")))
+  (is (some? (regex/fullmatch (:x (check/read-config "{:x #re \"p.*\"}" "settings" {:readers #{'re}}))
+                              "pattern")))
   (is (thrown? python/ValueError
                (check/read-config "{:x #unknown \"pattern\"}" "settings" {:readers #{'re}}))))
 
@@ -95,3 +96,29 @@
       (doseq [source ["nil" "; empty" "{} {}"]]
         (is (thrown? python/ValueError (check/read-config source))))
       (finally (.stop env) (.cleanup temp)))))
+
+(deftest configuration-document-linters-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        file (write! root ".clj-kondo/config.edn" "{}")
+        options {:filename (str file) :repro true :cache false :python-inspection? false
+                 :config-dir (str (.-parent file))}
+        lint #(check/run (assoc options :stdin %))]
+    (try
+      (let [findings (:findings (lint "{:linters {:typo {} :unused-binding 1} :unresolved-symbol {}}"))]
+        (is (= 3 (count findings)))
+        (is (= #{:clj-kondo-config} (set (map :type findings))))
+        (is (= #{"Unexpected linter name: :typo" "Expected a map, but got: int"
+                 "Linter config should go under :linters"} (set (map :message findings)))))
+      (is (empty? (:findings (lint "{:linters {:custom/rule {} :python-inspection {:level :off}}}"))))
+      (is (empty? (:findings (lint "#_{:clj-kondo/ignore [:clj-kondo-config]} {:linters {:typo {}}}"))))
+      (is (= 1 (count (:findings (lint "^:replace {:linters ^:replace {:typo {}}}")))))
+      (let [result (check/run (assoc options :stdin "{:min-clj-kondo-version \"2099.01.01\"}"
+                                     :config "{:min-clj-kondo-version \"2099.01.01\"}"))
+            finding (first (:findings result))]
+        (is (= :min-clj-kondo-version (:type finding)))
+        (is (= 25 (:col finding)))
+        (is (= (str "Version " check/compatibility-version " below configured minimum 2099.01.01")
+               (:message finding))))
+      (is (empty? (:findings (check/run (assoc options :stdin "{:linters {:typo {}}}"
+                                               :config "{:linters {:clj-kondo-config {:level :off}}}")))))
+      (finally (.cleanup temp)))))

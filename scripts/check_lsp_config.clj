@@ -93,9 +93,10 @@
 
 (let [[checkout input output] *command-line-args*]
   (install-oracle checkout)
-  (let [cases (edn/read-string {:readers {'re re-pattern}} (slurp input))
+  (let [{:keys [cases actual-regex-sources]} (edn/read-string {:readers {'re re-pattern}} (slurp input))
         results (mapv capture cases)
         printable (walk/postwalk #(if (instance? java.util.regex.Pattern %)
-                                    (tagged-literal 're (str %)) %) results)]
+                                    (tagged-literal 'blt-oracle/regex [(.pattern %) (.flags %)]) %) results)
+        regex-flags (into {} (map (fn [source] [source (.flags (re-pattern source))]) actual-regex-sources))]
     (binding [*print-namespace-maps* false]
-      (spit output (pr-str printable)))))
+      (spit output (pr-str {:cases printable :regex-flags regex-flags})))))

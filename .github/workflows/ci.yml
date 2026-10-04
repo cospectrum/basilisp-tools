@@ -103,11 +103,19 @@ jobs:
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference --corpus .basilisp-reference
       - name: Compare configuration precedence with Leiningen plugin
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt .cljfmt-reference
+      - name: Compare literal Leiningen profile merging
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lein_profiles.py
+      - name: Compare configuration regexes with Java Pattern
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_regex.py
       - name: Compare checker diagnostics with clj-kondo
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo.py
       - name: Compare checker configuration with clj-kondo
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_config.py
       - name: Compare checker analysis and SARIF with clj-kondo
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_output.py
+      - name: Compare restricted hooks with clj-kondo
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_hooks.py
+      - name: Compare refactorings with clojure-lsp
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lsp_refactors.py --clojure-lsp .clojure-lsp-reference
       - name: Compare language server configuration with clojure-lsp
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lsp_config.py --clojure-lsp .clojure-lsp-reference

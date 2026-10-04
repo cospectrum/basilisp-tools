@@ -35,7 +35,12 @@ For existing projects, literal `:cljfmt` settings in `project.clj` are also
 supported. During discovery, the nearest `project.clj` takes precedence over
 formatter files; `:load-config-file? true` loads EDN settings before applying
 project overrides with a shallow merge. Configured project paths are relative
-to the project root. Use `--config .cljfmt.edn` to bypass this compatibility behavior.
+to the project root. Literal profiles from the project, `profiles.clj`,
+user `$LEIN_HOME/profiles.d`, and user/system profiles are merged with Leiningen
+metadata rules.
+Use `--lein-profile release` to select profiles explicitly; repeat the flag to
+combine them, including `default` when desired. Executable profile expressions
+are never run. Use `--config .cljfmt.edn` to bypass this compatibility behavior.
 
 ## Indentation
 
@@ -58,7 +63,8 @@ Argument indexes start at zero after the function or macro name.
 ```
 
 Rule keys can be symbols, regexes, or `[namespace-pattern name-pattern]` pairs.
-Regexes use Python syntax and match the symbol's name. The formatter reads
+Regexes support Java-style quoting, named groups, Unicode properties, and
+character-class intersections, and match the symbol's name. The formatter reads
 namespace names, aliases, and refers from the `ns` form; `:alias-map` and
 `:refer-map` override those values.
 
@@ -119,11 +125,11 @@ and prepares the whole selection before writing any files.
 
 Namespace sorting and column alignment are optional. Sorting keeps attached and
 dangling comments. Formatting does not wrap lines to a maximum length. Inputs
-nested more than 64 levels deep are rejected.
+nested more than 128 levels deep are rejected.
 
-The supported options follow cljfmt, with some differences in reader support
-and validation. See [Compatibility](compatibility.md) for details and development
-checks.
+The supported options follow cljfmt. The formatter also preserves Clojure
+reader forms such as read-eval text and legacy metadata without executing them.
+See [Compatibility](compatibility.md) for details and development checks.
 
 ## Library API
 

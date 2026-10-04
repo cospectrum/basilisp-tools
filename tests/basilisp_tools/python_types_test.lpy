@@ -1,0 +1,518 @@
+(ns basilisp-tools.python-types-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.python :as bridge])
+  (:import [pathlib] [tempfile] [subprocess] [sys]))
+
+(def int-type {:module "builtins" :path ["int"]})
+(def str-type {:module "builtins" :path ["str"]})
+(def bool-type {:module "builtins" :path ["bool"]})
+(def none-type {:module "builtins" :path ["NoneType"]})
+
+(def models
+  (str "from typing import TypeVar, Generic, Union, Optional, Literal, overload, TypedDict, Protocol, NamedTuple, NewType\n"
+       "from dataclasses import dataclass, field, InitVar\n"
+       "from functools import lru_cache\n"
+       "T = TypeVar('T')\n"
+       "B = TypeVar('B', bound=str)\n"
+       "S = TypeVar('S', str, bytes)\n"
+       "class Box(Generic[T]):\n"
+       "    value: T\n"
+       "    def __init__(self, value: T): ...\n"
+       "    def get(self) -> T: ...\n"
+       "    def pair(self) -> tuple[T, T]: ...\n"
+       "class TextBox(Box[str]): pass\n"
+       "def identity(value: T) -> T: ...\n"
+       "def first(values: list[T]) -> T: ...\n"
+       "def bounded(value: B) -> B: ...\n"
+       "def constrained(value: S) -> S: ...\n"
+       "@overload\n"
+       "def choose(value: int) -> str: ...\n"
+       "@overload\n"
+       "def choose(value: str) -> int: ...\n"
+       "def choose(value): ...\n"
+       "@overload\n"
+       "def parse(value: str, *, binary: Literal[True]) -> bytes: ...\n"
+       "@overload\n"
+       "def parse(value: str, *, binary: Literal[False] = False) -> str: ...\n"
+       "def parse(*args, **kwargs): ...\n"
+       "def optional() -> Optional[Box[str]]: ...\n"
+       "def union() -> Union[int, str]: ...\n"
+       "def modern() -> int | str | None: ...\n"
+       "def forwarding() -> 'list[Box[str]]': ...\n"
+       "class Record(TypedDict):\n"
+       "    name: str\n"
+       "    count: int\n"
+       "class Extra(Record, total=False):\n"
+       "    label: str\n"
+       "class Reader(Protocol):\n"
+       "    def read(self) -> str: ...\n"
+       "class Point(NamedTuple):\n"
+       "    x: int\n"
+       "    name: str = 'point'\n"
+       "UserId = NewType('UserId', int)\n"
+       "def user(value: UserId) -> UserId: ...\n"
+       "@lru_cache(maxsize=20)\n"
+       "def cached(value: int) -> str: ...\n"
+       "@dataclass\n"
+       "class GenericRecord(Generic[T]):\n"
+       "    value: T\n"
+       "    context: InitVar[str]\n"))
+
+(defn with-models [f]
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false
+              :python-cache (bridge/create-cache)}]
+    (try
+      (.write_text (.joinpath root "models.pyi") models ** :encoding "utf-8")
+      (f opts)
+      (finally (.cleanup temp)))))
+
+(deftest generic-functions-and-overloads-test
+  (with-models
+    (fn [opts]
+      (let [identity (bridge/inspect-path "models" ["identity"] opts)
+            first (bridge/inspect-path "models" ["first"] opts)
+            choose (bridge/inspect-path "models" ["choose"] opts)
+            parse (bridge/inspect-path "models" ["parse"] opts)
+            union {:union [int-type str-type]}]
+        (is (= {:typevar "T"} (bridge/return-type identity)))
+        (is (= int-type (bridge/call-result identity [int-type] {})))
+        (is (= str-type (bridge/call-result first [{:module "builtins" :path ["list"] :arguments [str-type]}] {})))
+        (is (= str-type (bridge/call-result choose [int-type] {})))
+        (is (= int-type (bridge/call-result choose [str-type] {})))
+        (is (= {:union [str-type int-type]} (bridge/call-result choose [union] {})))
+        (is (nil? (bridge/call-result choose [nil] {}))))
+      (let [parse (bridge/inspect-path "models" ["parse"] opts)]
+        (is (= {:module "builtins" :path ["bytes"]}
+               (bridge/call-result parse [str-type] {"binary" (assoc bool-type :literal-values [true])})))
+        (is (= str-type (bridge/call-result parse [str-type] {"binary" (assoc bool-type :literal-values [false])})))
+        (is (= str-type (bridge/call-result parse [str-type] {}))))
+      (let [bounded (bridge/inspect-path "models" ["bounded"] opts)
+            constrained (bridge/inspect-path "models" ["constrained"] opts)]
+        (is (= str-type (bridge/call-result bounded [str-type] {})))
+        (is (empty? (bridge/call-signatures bounded [int-type] {})))
+        (is (= str-type (bridge/call-result constrained [str-type] {})))
+        (is (empty? (bridge/call-signatures constrained [int-type] {})))))))
+
+(deftest generic-receivers-and-inheritance-test
+  (with-models
+    (fn [opts]
+      (let [box (bridge/inspect-path "models" ["Box"] opts)
+            type {:module "models" :path ["Box"] :arguments [str-type]}
+            get (bridge/inspect-member type "get" opts)
+            inherited (bridge/inspect-path "models" ["TextBox" "get"] (assoc opts :instance? true))]
+        (is (= type (bridge/call-result box [str-type] {})))
+        (is (= [] (bridge/check-call get 0 [])))
+        (is (= str-type (bridge/call-result get [] {})))
+        (is (= str-type (bridge/return-type inherited)))
+        (is (= str-type (bridge/return-type (bridge/inspect-member type "value" opts))))
+        (is (= {:module "builtins" :path ["tuple"] :arguments [str-type str-type]}
+               (bridge/return-type (bridge/inspect-member type "pair" opts))))))))
+
+(deftest unions-literals-and-forward-references-test
+  (with-models
+    (fn [opts]
+      (is (= {:module "models" :path ["Box"] :arguments [str-type] :nullable? true}
+             (bridge/return-type (bridge/inspect-path "models" ["optional"] opts))))
+      (is (= {:union [int-type str-type]}
+             (bridge/return-type (bridge/inspect-path "models" ["union"] opts))))
+      (is (= {:union [int-type str-type] :nullable? true}
+             (bridge/return-type (bridge/inspect-path "models" ["modern"] opts))))
+      (is (= {:module "builtins" :path ["list"]
+              :arguments [{:module "models" :path ["Box"] :arguments [str-type]}]}
+             (bridge/return-type (bridge/inspect-path "models" ["forwarding"] opts))))
+      (is (= int-type (bridge/return-type (bridge/inspect-path "models" ["user"] opts))))
+      (is (= str-type (bridge/call-result (bridge/inspect-path "models" ["cached"] opts) [int-type] {})))
+      (let [union {:union [{:module "models" :path ["Box"] :arguments [str-type]}
+                           {:module "models" :path ["Box"] :arguments [int-type]}]}]
+        (is (= {:union [str-type int-type]} (bridge/return-type (bridge/inspect-member union "value" opts))))
+        (is (= :unknown (:status (bridge/inspect-member union "missing" opts))))))))
+
+(deftest structured-records-and-element-types-test
+  (with-models
+    (fn [opts]
+      (let [record (bridge/inspect-path "models" ["Extra"] opts)
+            type {:module "models" :path ["Extra"]}
+            point (bridge/inspect-path "models" ["Point"] opts)
+            protocol (bridge/inspect-path "models" ["Reader"] opts)]
+        (is (:typed-dict? record))
+        (is (= [] (bridge/check-call record 0 ["name" "count"])))
+        (is (seq (bridge/check-call record 0 ["name"])))
+        (is (= str-type (bridge/element-type type "label" opts)))
+        (is (= int-type (bridge/element-type type "count" opts)))
+        (is (nil? (bridge/element-type type "missing" opts)))
+        (is (:protocol? protocol))
+        (is (= str-type (bridge/return-type (bridge/inspect-member {:module "models" :path ["Reader"]} "read" opts))))
+        (is (:named-tuple? point))
+        (is (= [] (bridge/check-call point 1 [])))
+        (is (= str-type (bridge/element-type {:module "models" :path ["Point"]} 1 opts)))
+        (is (= int-type (bridge/element-type {:module "builtins" :path ["tuple"] :arguments [int-type str-type]} 0)))
+        (is (= str-type (bridge/element-type {:module "builtins" :path ["dict"] :arguments [int-type str-type]})))
+        (is (= {:module "models" :path ["GenericRecord"] :arguments [int-type]}
+               (bridge/call-result (bridge/inspect-path "models" ["GenericRecord"] opts) [int-type str-type] {})))))))
+
+(deftest conservative-type-compatibility-test
+  (is (true? (bridge/type-compatible? bool-type int-type)))
+  (is (true? (bridge/type-compatible? int-type {:module "builtins" :path ["float"]})))
+  (is (false? (bridge/type-compatible? str-type int-type)))
+  (is (nil? (bridge/type-compatible? nil int-type)))
+  (is (nil? (bridge/type-compatible? {:any? true} int-type)))
+  (is (true? (bridge/type-compatible? none-type (assoc int-type :nullable? true))))
+  (is (false? (bridge/type-compatible? (assoc int-type :nullable? true) int-type)))
+  (is (true? (bridge/type-compatible? (assoc str-type :literal-values ["a"])
+                                      (assoc str-type :literal-values ["a" "b"]))))
+  (is (false? (bridge/type-compatible? (assoc str-type :literal-values ["c"])
+                                       (assoc str-type :literal-values ["a" "b"])))))
+
+(deftest async-context-and-iteration-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "async_types.py")
+                   (str "from typing import Iterator, AsyncIterator, Callable, TypeVar, Self\n"
+                        "from contextlib import contextmanager, asynccontextmanager\n"
+                        "T = TypeVar('T')\n"
+                        "def preserve(fn: Callable[[T], T]) -> Callable[[T], T]: return fn\n"
+                        "@preserve\n"
+                        "def preserved(value: int) -> int: return value\n"
+                        "async def fetch(value: str) -> int: return 1\n"
+                        "@contextmanager\n"
+                        "def opened() -> Iterator[str]: yield ''\n"
+                        "@asynccontextmanager\n"
+                        "async def async_opened() -> AsyncIterator[int]: yield 1\n"
+                        "def stream() -> Iterator[str]: yield ''\n"
+                        "class Parent:\n"
+                        "    def again(self) -> Self: return self\n"
+                        "class Child(Parent): pass\n"
+                        "def commented(value): # type: (str) -> int\n"
+                        "    return 1\n")
+                   ** :encoding "utf-8")
+      (let [fetch (bridge/call-result (bridge/inspect-path "async_types" ["fetch"] opts) [str-type] {})
+            opened (bridge/call-result (bridge/inspect-path "async_types" ["opened"] opts) [] {})
+            async-opened (bridge/call-result (bridge/inspect-path "async_types" ["async_opened"] opts) [] {})]
+        (is (= int-type (bridge/awaited-type fetch opts)))
+        (is (= str-type (bridge/context-type opened opts)))
+        (is (= int-type (bridge/context-type async-opened opts))))
+      (is (= str-type (bridge/iterated-type
+                       (bridge/call-result (bridge/inspect-path "async_types" ["stream"] opts) [] {}) opts)))
+      (is (= int-type (bridge/call-result (bridge/inspect-path "async_types" ["preserved"] opts) [int-type] {})))
+      (is (= int-type (bridge/call-result (bridge/inspect-path "async_types" ["commented"] opts) [str-type] {})))
+      (is (= {:module "async_types" :path ["Child"]}
+             (bridge/return-type (bridge/inspect-member {:module "async_types" :path ["Child"]} "again" opts))))
+      (finally (.cleanup temp)))))
+
+(deftest aliases-and-functional-records-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "aliases.pyi")
+                   (str "from typing import TypeVar, TypedDict, NamedTuple\n"
+                        "T = TypeVar('T')\n"
+                        "Pair = tuple[T, T]\n"
+                        "def pair() -> Pair[str]: ...\n"
+                        "Record = TypedDict('Record', {'name': str, 'count': int}, total=False)\n"
+                        "Point = NamedTuple('Point', [('x', int), ('name', str)])\n")
+                   ** :encoding "utf-8")
+      (is (= {:module "builtins" :path ["tuple"] :arguments [str-type str-type]}
+             (bridge/return-type (bridge/inspect-path "aliases" ["pair"] opts))))
+      (let [record (bridge/inspect-path "aliases" ["Record"] opts)]
+        (is (:typed-dict? record))
+        (is (= [] (bridge/check-call record 0 []))))
+      (is (= str-type (bridge/element-type {:module "aliases" :path ["Point"]} 1 opts)))
+      (when (>= (.-minor sys/version_info) 12)
+        (.write_text (.joinpath root "modern_aliases.pyi")
+                     "type Pair[T] = tuple[T, T]\ndef pair() -> Pair[str]: ...\nclass Box[T]:\n    def __init__(self, value: T): ...\n    def get(self) -> T: ...\n"
+                     ** :encoding "utf-8")
+        (is (= {:module "builtins" :path ["tuple"] :arguments [str-type str-type]}
+               (bridge/return-type (bridge/inspect-path "modern_aliases" ["pair"] opts))))
+        (is (= {:module "modern_aliases" :path ["Box"] :arguments [int-type]}
+               (bridge/call-result (bridge/inspect-path "modern_aliases" ["Box"] opts) [int-type] {}))))
+      (finally (.cleanup temp)))))
+
+(deftest runtime-annotations-generics-and-wrappers-test
+  (let [script (str
+                "import importlib.util, sys, typing, functools\n"
+                "spec = importlib.util.spec_from_file_location('worker', sys.argv[1])\n"
+                "worker = importlib.util.module_from_spec(spec); spec.loader.exec_module(worker)\n"
+                "T = typing.TypeVar('T')\n"
+                "class Base(typing.Generic[T]):\n"
+                "    def get(self) -> T: raise AssertionError('executed')\n"
+                "class Child(Base[str]): pass\n"
+                "def target(value: 'list[str]') -> 'str | int | None': raise AssertionError('executed')\n"
+                "@functools.wraps(target)\n"
+                "def wrapped(*args, **kwargs): raise AssertionError('executed')\n"
+                "info = worker.runtime_member('Child', Child)\n"
+                "assert info['members']['get']['type-path'] == ['str'], info\n"
+                "signature = worker.runtime_member('wrapped', wrapped)\n"
+                "assert signature['parameters'][0]['name'] == 'value', signature\n"
+                "assert signature['parameters'][0]['type-arguments'][0]['type-path'] == ['str'], signature\n"
+                "assert signature['nullable?'] and len(signature['type-union']) == 2, signature\n"
+                "class Record(typing.TypedDict):\n"
+                "    name: str\n"
+                "info = worker.runtime_member('Record', Record)\n"
+                "assert info['typed-dict?'] and info['parameters'][0]['required?'], info\n"
+                "print('safe')\n")
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])
+                               ** :text true :capture_output true :timeout 10)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "safe\n" (.-stdout result)))))
+
+(deftest structural-protocols-inheritance-and-union-calls-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "structural.pyi")
+                   (str "from typing import Protocol, TypeVar\n"
+                        "S = TypeVar('S', str, bytes)\n"
+                        "class Reader(Protocol):\n"
+                        "    def read(self) -> str: ...\n"
+                        "class Good:\n"
+                        "    def read(self) -> str: ...\n"
+                        "class Bad:\n"
+                        "    def read(self) -> int: ...\n"
+                        "class Parent: pass\n"
+                        "class Child(Parent): pass\n"
+                        "class First:\n"
+                        "    def run(self, value: int) -> str: ...\n"
+                        "class Second:\n"
+                        "    def run(self, value: str, extra: int) -> int: ...\n"
+                        "def constrained(first: S, second: S) -> S: ...\n")
+                   ** :encoding "utf-8")
+      (is (true? (bridge/type-compatible?
+                  {:module "structural" :path ["Good"]} {:module "structural" :path ["Reader"]} opts)))
+      (is (false? (bridge/type-compatible?
+                   {:module "structural" :path ["Bad"]} {:module "structural" :path ["Reader"]} opts)))
+      (is (true? (bridge/type-compatible?
+                  {:module "structural" :path ["Child"]} {:module "structural" :path ["Parent"]} opts)))
+      (let [type {:union [{:module "structural" :path ["First"]}
+                          {:module "structural" :path ["Second"]}]}
+            method (bridge/inspect-member type "run" opts)]
+        (is (seq (bridge/check-call method 1 [])))
+        (is (nil? (bridge/call-result method [int-type] {} opts))))
+      (is (empty? (bridge/call-signatures (bridge/inspect-path "structural" ["constrained"] opts)
+                                          [str-type {:module "builtins" :path ["bytes"]}] {} opts)))
+      (finally (.cleanup temp)))))
+
+(deftest pydantic-fields-and-dataclass-transform-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "frameworks.pyi")
+                   (str "from pydantic import BaseModel, Field, ConfigDict\n"
+                        "from typing_extensions import dataclass_transform\n"
+                        "class User(BaseModel):\n"
+                        "    model_config = ConfigDict(extra='forbid')\n"
+                        "    name: str\n"
+                        "    age: int = 0\n"
+                        "    external: str = Field(alias='externalName')\n"
+                        "    values: list[str] = Field(default_factory=list)\n"
+                        "def custom_field(*, default=None, init=True, alias=None): ...\n"
+                        "@dataclass_transform(kw_only_default=True, field_specifiers=(custom_field,))\n"
+                        "def model(cls): return cls\n"
+                        "@model\n"
+                        "class Record:\n"
+                        "    name: str\n"
+                        "    age: int = custom_field(default=1)\n"
+                        "    hidden: int = custom_field(init=False)\n"
+                        "    external: str = custom_field(alias='externalName')\n"
+                        "@dataclass_transform(kw_only_default=True)\n"
+                        "class ModelBase: pass\n"
+                        "class Child(ModelBase):\n"
+                        "    name: str\n")
+                   ** :encoding "utf-8")
+      (let [user (bridge/inspect-path "frameworks" ["User"] opts)]
+        (is (:pydantic-model? user))
+        (is (= ["name" "age" "externalName" "values"] (mapv :name (:parameters user))))
+        (is (= [] (bridge/check-call user 0 ["name" "externalName"])))
+        (is (seq (bridge/check-call user 1 ["externalName"])))
+        (is (seq (bridge/check-call user 0 ["name" "externalName" "extra"]))))
+      (let [record (bridge/inspect-path "frameworks" ["Record"] opts)]
+        (is (= ["name" "age" "externalName"] (mapv :name (:parameters record))))
+        (is (= [] (bridge/check-call record 0 ["name" "externalName"])))
+        (is (seq (bridge/check-call record 1 ["externalName"]))))
+      (is (= [] (bridge/check-call (bridge/inspect-path "frameworks" ["Child"] opts) 0 ["name"])))
+      (is (seq (bridge/check-call (bridge/inspect-path "frameworks" ["Child"] opts) 0 [])))
+      (finally (.cleanup temp)))))
+
+(deftest imported-generic-alias-and-recursive-runtime-type-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "aliases_origin.pyi")
+                   "from typing import TypeVar, TypeAlias\nT = TypeVar('T')\nPair: TypeAlias = tuple[T, T]\n"
+                   ** :encoding "utf-8")
+      (.write_text (.joinpath root "aliases_user.pyi")
+                   "from aliases_origin import Pair, T\ndef pair() -> Pair[str]: ...\ndef identity(value: T) -> T: ...\n"
+                   ** :encoding "utf-8")
+      (is (= {:module "builtins" :path ["tuple"] :arguments [str-type str-type]}
+             (bridge/return-type (bridge/inspect-path "aliases_user" ["pair"] opts))))
+      (is (= int-type (bridge/call-result (bridge/inspect-path "aliases_user" ["identity"] opts) [int-type] {} opts)))
+      (finally (.cleanup temp))))
+  (let [script (str "import importlib.util, sys, typing, json\n"
+                    "s=importlib.util.spec_from_file_location('worker',sys.argv[1]);w=importlib.util.module_from_spec(s);s.loader.exec_module(w)\n"
+                    "Tree = typing.Union[int, typing.List['Tree']]\n"
+                    "value=w.runtime_type('Tree', '__main__')\n"
+                    "assert len(json.dumps(value)) < 1000, value\n"
+                    "print('bounded')\n")
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])
+                               ** :text true :capture_output true :timeout 10)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "bounded\n" (.-stdout result)))))
+
+(deftest type-guards-and-enums-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "guards.pyi")
+                   (str "from typing import TypeGuard\n"
+                        "from typing_extensions import TypeIs\n"
+                        "from enum import Enum\n"
+                        "def string(value: object) -> TypeGuard[str]: ...\n"
+                        "def integer(value: object) -> TypeIs[int]: ...\n"
+                        "class Color(Enum):\n"
+                        "    RED = 1\n"
+                        "    GREEN = 2\n"
+                        "def outer() -> int:\n"
+                        "    def inner(): yield 1\n"
+                        "    return 1\n")
+                   ** :encoding "utf-8")
+      (let [string (bridge/inspect-path "guards" ["string"] opts)
+            integer (bridge/inspect-path "guards" ["integer"] opts)]
+        (is (= bool-type (bridge/return-type string)))
+        (is (= str-type (bridge/return-type (:type-guard string))))
+        (is (false? (:type-is? string)))
+        (is (= int-type (bridge/return-type (:type-guard integer))))
+        (is (:type-is? integer)))
+      (is (= {:module "guards" :path ["Color"]}
+             (bridge/return-type (bridge/inspect-path "guards" ["Color" "RED"] opts))))
+      (is (false? (:generator? (bridge/inspect-path "guards" ["outer"] opts))))
+      (finally (.cleanup temp)))))
+
+(deftest conservative-variance-literals-and-protocol-shapes-test
+  (is (false? (bridge/type-compatible?
+               {:module "builtins" :path ["list"] :arguments [int-type]}
+               {:module "builtins" :path ["list"] :arguments [{:module "builtins" :path ["float"]}]})))
+  (is (nil? (bridge/type-compatible? str-type {:module "mine" :path ["object"]})))
+  (is (false? (bridge/type-compatible? (assoc int-type :literal-values [1])
+                                       (assoc bool-type :literal-values [true]))))
+  (is (true? (bridge/type-compatible? (assoc bool-type :literal-values [false])
+                                      (assoc bool-type :literal-values [true false]))))
+  (is (= {:never? true} (bridge/union-type [{:never? true}])))
+  (is (= none-type (bridge/union-type [none-type {:never? true}])))
+  (is (nil? (bridge/awaited-type {:module "mine" :path ["Future"] :arguments [str-type]})))
+  (is (nil? (bridge/context-type {:module "mine" :path ["ContextManager"] :arguments [str-type]})))
+  (is (nil? (bridge/iterated-type {:module "mine" :path ["Iterator"] :arguments [str-type]})))
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}
+        type #(hash-map :module "protocol_shapes" :path [%])]
+    (try
+      (.write_text (.joinpath root "protocol_shapes.pyi")
+                   (str "from typing import Protocol\n"
+                        "class Named(Protocol):\n    def read(self, path: str) -> str: ...\n"
+                        "class Renamed:\n    def read(self, other: str) -> str: ...\n"
+                        "class Optional(Protocol):\n    def read(self, path: str = '') -> str: ...\n"
+                        "class Required:\n    def read(self, path: str) -> str: ...\n"
+                        "class Private(Protocol):\n    def _required(self) -> str: ...\n"
+                        "class Missing: pass\n")
+                   ** :encoding "utf-8")
+      (is (false? (bridge/type-compatible? (type "Renamed") (type "Named") opts)))
+      (is (false? (bridge/type-compatible? (type "Required") (type "Optional") opts)))
+      (is (not (true? (bridge/type-compatible? (type "Missing") (type "Private") opts))))
+      (finally (.cleanup temp)))))
+
+(deftest lazy-type-parameters-and-metaclass-safety-test
+  (let [script (str
+                "import importlib.util, sys\n"
+                "s=importlib.util.spec_from_file_location('worker',sys.argv[1]);w=importlib.util.module_from_spec(s);s.loader.exec_module(w)\n"
+                "calls=[]\n"
+                "class Meta(type):\n"
+                "    def __eq__(cls, other): calls.append('equality'); return False\n"
+                "    def __hash__(cls): calls.append('hash'); return 1\n"
+                "class Trap(metaclass=Meta): pass\n"
+                "for f in [w.annotation,w.runtime_type]: f(Trap())\n"
+                "w.safe_member('value', Trap())\n"
+                "w.safe_member('class', Trap)\n"
+                "assert not calls, calls\n"
+                "def effect(): calls.append('deferred'); return str\n"
+                "if sys.version_info >= (3, 12):\n"
+                "    exec('class Bound[T: effect()]: pass\\nclass Constrained[T: (effect(), int)]: pass')\n"
+                "    w.runtime_type(Bound.__type_params__[0]); w.runtime_type(Constrained.__type_params__[0])\n"
+                "if sys.version_info >= (3, 13):\n"
+                "    exec('class Default[T = effect()]: pass')\n"
+                "    w.runtime_type(Default.__type_params__[0])\n"
+                "if sys.version_info >= (3, 14):\n"
+                "    exec('def deferred(value: effect()) -> effect(): pass\\nclass Deferred:\\n    def __init__(self, value: effect()): pass')\n"
+                "    w.runtime_member('deferred', deferred); w.runtime_member('Deferred', Deferred)\n"
+                "assert not calls, calls\n"
+                "assert w.union_type([{'type-never?': True}]) == {'type-never?': True}\n"
+                "print('safe')\n")
+        worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
+        result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])
+                               ** :text true :capture_output true :timeout 10)]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (= "safe\n" (.-stdout result)))))
+
+(deftest inferred-mutable-literals-widen-without-weakening-declared-invariance
+  (let [one (assoc int-type :literal-values [1])
+        two (assoc int-type :literal-values [2])
+        literal-union (bridge/union-type [one two])
+        inferred (bridge/widen-literals literal-union)]
+    (is (= int-type inferred))
+    (is (true? (bridge/type-compatible? {:module "builtins" :path ["list"] :arguments [inferred]}
+                                        {:module "builtins" :path ["list"] :arguments [int-type]})))
+    (is (false? (bridge/type-compatible? {:module "builtins" :path ["list"] :arguments [one]}
+                                         {:module "builtins" :path ["list"] :arguments [int-type]})))
+    (is (false? (bridge/type-compatible? {:module "builtins" :path ["list"] :arguments [int-type]}
+                                         {:module "builtins" :path ["list"] :arguments [{:module "builtins" :path ["float"]}]})))))
+
+(deftest persistent-collections-follow-real-python-abc-contracts
+  (let [vector-type {:module "basilisp.lang.vector" :path ["PersistentVector"] :arguments [str-type]}
+        map-type {:module "basilisp.lang.map" :path ["PersistentMap"] :arguments [str-type int-type]}
+        list-type {:module "basilisp.lang.list" :path ["PersistentList"] :arguments [str-type]}]
+    (is (true? (bridge/type-compatible? vector-type {:module "collections.abc" :path ["Sequence"] :arguments [str-type]})))
+    (is (true? (bridge/type-compatible? map-type {:module "collections.abc" :path ["Mapping"] :arguments [str-type int-type]})))
+    (is (true? (bridge/type-compatible? list-type {:module "collections.abc" :path ["Iterable"] :arguments [str-type]})))
+    (is (false? (bridge/type-compatible? list-type {:module "collections.abc" :path ["Sequence"] :arguments [str-type]})))
+    (is (false? (bridge/type-compatible? vector-type {:module "builtins" :path ["list"] :arguments [str-type]})))
+    (is (false? (bridge/type-compatible? vector-type {:module "builtins" :path ["tuple"] :arguments [str-type]})))
+    (is (false? (bridge/type-compatible? map-type {:module "collections.abc" :path ["MutableMapping"] :arguments [str-type int-type]})))
+    (is (false? (bridge/type-compatible? str-type {:module "collections.abc" :path ["Sequence"] :arguments [int-type]})))
+    (is (false? (bridge/type-compatible? {:module "builtins" :path ["tuple"] :arguments [str-type int-type]}
+                                         {:module "collections.abc" :path ["Iterable"] :arguments [str-type]})))
+    (is (false? (bridge/type-compatible? {:module "builtins" :path ["list"] :arguments [int-type]}
+                                         {:module "collections.abc" :path ["MutableSequence"] :arguments [{:module "builtins" :path ["float"]}]})))))
+
+(deftest installed-slot-fields-and-typechecking-only-forward-references
+  (let [opts {:cache (bridge/create-cache)}
+        range-type {:module "lsprotocol.types" :path ["Range"]}
+        start (bridge/inspect-member range-type "start" opts)
+        position (bridge/return-type start)
+        line (bridge/inspect-member position "line" opts)
+        documentation (bridge/return-type (bridge/inspect-member {:module "lsprotocol.types" :path ["CompletionItem"]} "documentation" opts))
+        workspace (bridge/return-type (bridge/inspect-member {:module "pygls.lsp.server" :path ["LanguageServer"]} "workspace" opts))]
+    (is (= {:module "lsprotocol.types" :path ["Position"]} position))
+    (is (= int-type (bridge/return-type line)))
+    (is (some? (:union documentation)))
+    (is (= "pygls.workspace.workspace" (:module workspace)))
+    (is (some? (bridge/inspect-member workspace "position_codec" opts)))
+    (is (= :unknown (:status (bridge/inspect-member {:typevar "Unbound"} "unknown" opts))))))
+
+(deftest signature-candidates-distinguish-proven-and-unknown-matches
+  (let [signature {:status :known :kind :function
+                   :parameters [{:name "value" :kind :positional-or-keyword :required? true
+                                 :type-module "builtins" :type-path ["str"]}]
+                   :type-module "builtins" :type-path ["int"]}]
+    (is (true? (:type-match? (first (bridge/call-signatures signature [str-type] {})))))
+    (is (nil? (:type-match? (first (bridge/call-signatures signature [nil] {})))))
+    (is (= 1 (count (bridge/call-signatures signature [nil] {}))))
+    (is (empty? (bridge/call-signatures signature [int-type] {})))))

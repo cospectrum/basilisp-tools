@@ -17,6 +17,25 @@ import tempfile
 from check_kondo import KONDO_VERSION, normalize
 
 CASES = [
+    ("quoted-qualified-symbols", "'x '(a example/x)", "{:symbols true}"),
+    ("quoted-symbol-aliases", "(ns sample (:require [example :as e])) '(e/f example/g)", "{:symbols true}"),
+    ("discarded-quoted-symbols", "#_'example/ignored 'example/used", "{:symbols true}"),
+    ("quote-call-symbols", "(quote [example/a example/b])", "{:symbols true}"),
+    ("definition-callstack", "(comment (def x 1) (let [a 1] (def y a))) (def z 3)", "{:var-definitions {:callstack true}}"),
+    ("referred-declarations", "(ns sample (:require [example :refer [f g] :rename {g h}])) (f) (h)", "true"),
+    ("context-selector", "(ns sample) (def x :foo) x", "{:context [:app] :keywords true}"),
+    ("context-true", "(ns sample) (def x :foo) x", "{:context true :keywords true}"),
+    ("instance-methods", '(let [x "abc"] (.upper x) (. x lower) (. x (replace "a" "b")))', "{:instance-invocations true :var-usages false}"),
+    ("instance-quoted-ignore", "'(.upper x) '( . x lower)", "{:instance-invocations true}"),
+    ("destructuring-keywords", "(defn f [{:keys [a abc/b] :abc/keys [c] :as m :or {a :x}}] [a b c m])", "{:keywords true :var-usages false}"),
+    ("empty-optional-analysis", "", "{:symbols true :instance-invocations true :protocol-impls true}"),
+    ("protocol-record-implementation", "(ns sample) (defprotocol P (f [x])) (defrecord R [] P (f [x] x))", "{:protocol-impls true :var-usages false}"),
+    ("protocol-reify-implementation", "(ns sample) (defprotocol P (f [x])) (reify P (f [x] x))", "{:protocol-impls true :var-usages false}"),
+    ("protocol-type-implementation", "(ns sample) (defprotocol P (f [x])) (deftype T [] P (f [x] x))", "{:protocol-impls true :var-usages false}"),
+    ("protocol-extend-type", "(ns sample) (defprotocol P (f [x])) (deftype T []) (extend-type T P (f [x] x))", "{:protocol-impls true :var-usages false}"),
+    ("protocol-extend-protocol", "(ns sample) (defprotocol P (f [x])) (deftype T []) (extend-protocol P T (f [x] x))", "{:protocol-impls true :var-usages false}"),
+    ("shallow-definitions", "(def x (missing)) (def y x)", "{:var-definitions {:shallow true}}"),
+    ("shallow-body-metadata", "(defn f [x] [:body 'example/x (.upper x)])", "{:var-definitions {:shallow true} :var-usages false :keywords true :symbols true :instance-invocations true :locals true}"),
     ("empty-analysis", "", "true"),
     ("unresolved-variable", "missing", "true"),
     ("unresolved-call", "(missing 1)", "true"),
@@ -39,6 +58,11 @@ CASES = [
      "{:var-usages false :arglists true :locals true}"),
     ("var-metadata", '(ns sample)\n(def ^{:private true :added "1" :custom 42} x 1)',
      "{:var-definitions {:meta true}}"),
+    ("namespaced-var-metadata", '(def ^{:custom/flag true} x 1)', "{:var-definitions {:meta true}}"),
+    ("tagged-uuid-metadata", '(def ^{:custom #uuid "12345678-1234-1234-1234-123456789abc"} x 1)', "{:var-definitions {:meta true}}"),
+    ("tagged-instant-metadata", '(def ^{:custom #inst "2020-01-01"} x 1)', "{:var-definitions {:meta true}}"),
+    ("ratio-metadata", '(def ^{:custom 1/2} x 1)', "{:var-definitions {:meta true}}"),
+    ("decimal-metadata", '(def ^{:custom 1.5M} x 1)', "{:var-definitions {:meta true}}"),
     ("selected-var-metadata", '(ns sample)\n(def ^{:private true :added "1" :custom 42} x 1)',
      "{:var-definitions {:meta [:custom]}}"),
     ("namespace-metadata", '(ns ^{:deprecated "1" :custom 42} sample)',
@@ -84,15 +108,15 @@ def main():
     checker = importlib.import_module("basilisp_tools.check")
     comparisons = []
     with tempfile.TemporaryDirectory(prefix="blt-kondo-output-") as temporary:
-        def compare(name, source, config, extra=(), options=None, sarif=False):
-            command = [args.clj_kondo, "--lint", "-", "--filename", "sample.clj",
+        def compare(name, source, config, extra=(), options=None, sarif=False, filename="sample.clj"):
+            command = [args.clj_kondo, "--lint", "-", "--filename", filename,
                        "--repro", "--cache", "false", "--config-dir", temporary,
                        "--config", config, *extra]
             oracle = subprocess.run(command, input=source, text=True, capture_output=True)
             if oracle.returncode not in (0, 2, 3):
                 raise RuntimeError(f"{name}: clj-kondo failed: {oracle.stderr}")
             result = checker.run(lmap({
-                kw("stdin"): source, kw("filename"): "sample.clj",
+                kw("stdin"): source, kw("filename"): filename,
                 kw("config-dir"): temporary, kw("repro"): True,
                 kw("config"): config, kw("python-inspection?"): False,
                 **(options or {}),
@@ -122,6 +146,10 @@ def main():
             config = ("{:analysis " + analysis + " :output {:analysis true :format :json}}"
                       if location else "{:output {:format :json :analysis " + analysis + "}}")
             compare(name, source, config)
+        hook = "(fn [{:keys [node]}] {:node (with-meta (clj-kondo.hooks-api/list-node (cons (clj-kondo.hooks-api/token-node 'def) (rest (:children node)))) (meta node))})"
+        compare("hook-definition-origin", "(declare define-value) (define-value answer 42)",
+                "{:hooks {:__dangerously-allow-string-hooks__ true :analyze-call {user/define-value "
+                + json.dumps(hook) + "}} :analysis {:var-usages false} :output {:format :json}}")
         for name, source, config in [
             ("sarif-clean", "(ns sample)", "{}"),
             ("sarif-error", "(ns sample)\nmissing", "{}"),
@@ -132,6 +160,19 @@ def main():
         compare("sarif-report-level", "(ns sample)\n(let [unused 1] nil)",
                 "{:output {:format :sarif}}",
                 ("--report-level", "error"), {kw("report-level"): kw("error")}, sarif=True)
+        for name, source in [
+            ("edn-symbol-data", "{plain external/value :keyword [foo bar]}"),
+            ("edn-duplicate-map", "{:a 1 :a 2}"),
+            ("edn-duplicate-set", "#{:a :a}"),
+            ("edn-structural-error", "{:a"),
+        ]:
+            compare(name, source, "{:output {:format :json}}", filename="data.edn")
+        compare("edn-symbol-analysis", "{plain external/value}", "{:analysis {:symbols true} :output {:format :json}}", filename="data.edn")
+        compare("skip-lint-output", "missing", "{:output {:format :json}}",
+                ("--skip-lint",), {kw("skip-lint"): True})
+        compare("skip-lint-analysis", "(ns sample) (def x missing)",
+                "{:analysis true :output {:format :json}}",
+                ("--skip-lint",), {kw("skip-lint"): True})
         source = "(ns sample)\n(def x missing)"
         oracle = subprocess.run([args.clj_kondo, "--lint", "-", "--filename", "sample.clj",
                                  "--config-dir", temporary, "--repro", "--dependencies"],

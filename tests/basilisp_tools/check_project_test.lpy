@@ -1,0 +1,131 @@
+(ns basilisp-tools.check-project-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.check :as check])
+  (:import [contextlib] [io] [os] [pathlib] [tempfile] [zipfile]))
+
+(defn- write! [root name source]
+  (let [file (.joinpath root name)]
+    (.mkdir (.-parent file) ** :parents true :exist_ok true)
+    (.write_text file source ** :encoding "utf-8")
+    file))
+
+(defn- options [root]
+  {:config-dir (str (.joinpath root ".clj-kondo"))
+   :cwd (str root) :repro true :python-inspection? false})
+
+(deftest dependency-exported-configs-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        library (.joinpath root "library")
+        opts (assoc (options root) :paths [(str library)] :copy-configs true)]
+    (try
+      (write! library "clj-kondo.exports/vendor/library/config.edn"
+              "{:linters {:unresolved-symbol {:level :off}}}")
+      (write! library "clj-kondo.exports/vendor/library/hooks.lpy" "do-not-lint-this")
+      (write! library "source.lpy" "(ns library)\nmissing")
+      (let [result (check/run (assoc opts :skip-lint true))]
+        (is (zero? (get-in result [:summary :files])))
+        (is (empty? (:findings result)))
+        (is (= 1 (count (:copied-configs result)))))
+      (let [copied (.joinpath root ".clj-kondo/imports/vendor/library/config.edn")
+            hooks (.joinpath root ".clj-kondo/imports/vendor/library/hooks.lpy")]
+        (is (.is_file copied))
+        (is (.is_file hooks))
+        (is (= :off (get-in (check/load-config (options root)) [:linters :unresolved-symbol :level]))))
+      (let [result (check/run (assoc opts :dependencies true))]
+        (is (= 1 (get-in result [:summary :files])))
+        (is (empty? (:findings result)))
+        (is (empty? (:copied-configs result))))
+      (finally (.cleanup temp)))))
+
+(deftest legacy-export-location-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))]
+    (try
+      (write! root ".clj-kondo/old/package/config.edn" "{}")
+      (write! root "lib/clj-kondo.exports/new/package/config.edn" "{:lint-as {custom/macro basilisp.core/let}}")
+      (check/run (assoc (options root) :paths [(str (.joinpath root "lib"))]
+                        :copy-configs true :skip-lint true))
+      (is (.is_file (.joinpath root ".clj-kondo/new/package/config.edn")))
+      (is (not (.exists (.joinpath root ".clj-kondo/imports"))))
+      (finally (.cleanup temp)))))
+
+(deftest archive-input-and-safe-export-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        wheel (.joinpath root "library.whl")
+        archive (zipfile/ZipFile wheel "w")]
+    (try
+      (.writestr archive "library/core.lpy" "(ns library.core)\n(defn f [x] x)")
+      (.writestr archive "library/unused.py" "not basilisp")
+      (.writestr archive "clj-kondo.exports/vendor/library/config.edn" "{}")
+      (.writestr archive "clj-kondo.exports/vendor/library/hooks.lpy" "not-linted")
+      (.writestr archive "clj-kondo.exports/../../outside/config.edn" "malicious")
+      (.close archive)
+      (let [result (check/run (assoc (options root) :paths [(str wheel)] :copy-configs true
+                                     :config "{:analysis true :output {:canonical-paths true}}"))]
+        (is (empty? (:findings result)))
+        (is (= 1 (get-in result [:summary :files])))
+        (is (= (str (.resolve wheel) ":library/core.lpy") (:filename (first (:sources result)))))
+        (is (= 'library.core (:name (first (:namespace-definitions (check/analysis-output result))))))
+        (is (.is_file (.joinpath root ".clj-kondo/imports/vendor/library/config.edn")))
+        (is (not (.exists (.joinpath root "outside/config.edn")))))
+      (finally (.close archive) (.cleanup temp)))))
+
+(deftest persistent-declarations-cache-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        dependency (write! root "external/library.lpy" "(ns external.library)\n(defn public [x] x)")
+        opts (options root)
+        consumer "(ns consumer (:require [external.library :as e]))\n(e/public)"
+        cache-dir (.joinpath root ".clj-kondo/.cache/blt-v2")]
+    (try
+      (check/run (assoc opts :paths [(str dependency)] :dependencies true))
+      (is (.is_dir cache-dir))
+      (let [errors (:findings (check/run (assoc opts :stdin consumer)))]
+        (is (= [:invalid-arity] (mapv :type errors))))
+      (let [log (io/StringIO) redirect (contextlib/redirect_stderr log)]
+        (.__enter__ redirect)
+        (try (check/run (assoc opts :paths [(str dependency)] :dependencies true :debug true))
+             (finally (.__exit__ redirect nil nil nil)))
+        (is (>= (.find (.getvalue log) "Cached declarations:") 0)))
+      ;; Source changes invalidate the cache and then update the shared namespace index.
+      (.write_text dependency "(ns external.library)\n(defn public [] nil)" ** :encoding "utf-8")
+      (check/run (assoc opts :paths [(str dependency)] :dependencies true))
+      (is (empty? (:findings (check/run (assoc opts :stdin consumer)))))
+      ;; Damaged cache entries are harmless and get rebuilt from source.
+      (doseq [file (iterator-seq (.glob cache-dir "*.edn"))] (.write_text file "not an edn map"))
+      (is (empty? (:findings (check/run (assoc opts :paths [(str dependency)])))))
+      (.unlink dependency)
+      (is (empty? (:findings (check/run (assoc opts :stdin consumer)))))
+      (finally (.cleanup temp)))))
+
+(deftest cache-disabled-and-custom-location-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        source (write! root "sample.lpy" "(ns sample)")
+        opts (assoc (options root) :paths [(str source)])]
+    (try
+      (check/run (assoc opts :cache false))
+      (is (not (.exists (.joinpath root ".clj-kondo/.cache"))))
+      (check/run (assoc opts :cache-dir (str (.joinpath root "custom"))))
+      (is (.is_dir (.joinpath root "custom/blt-v2")))
+      (finally (.cleanup temp)))))
+
+(deftest input-lists-stdin-progress-and-skip-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        first-file (write! root "a.lpy" "(ns a)")
+        second-file (write! root "b.lpy" "(ns b)")
+        callbacks (atom [])
+        opts (assoc (options root) :paths [(str first-file os/pathsep second-file) "-"]
+                    :stdin "(ns virtual)" :filename "virtual.lpy"
+                    :file-analyzed-fn #(swap! callbacks conj %))]
+    (try
+      (let [result (check/run opts)]
+        (is (= 3 (get-in result [:summary :files])))
+        (is (empty? (:findings result)))
+        (is (= [1 2 3] (mapv :files-done @callbacks)))
+        (is (every? #(= 3 (:total-files %)) @callbacks)))
+      (let [result (check/run (assoc opts :skip-lint true :stdin "unresolved"))]
+        (is (zero? (get-in result [:summary :files])))
+        (is (zero? (check/exit-status result))))
+      (let [result (check/run (assoc opts :skip-lint true :stdin "unresolved" :config "{:analysis true}"))]
+        (is (= 3 (get-in result [:summary :files])))
+        (is (empty? (:findings result)))
+        (is (= 2 (count (:namespace-definitions (check/analysis-output result))))))
+      (finally (.cleanup temp)))))

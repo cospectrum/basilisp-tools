@@ -11,6 +11,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -203,12 +204,251 @@ CONFIG_CASES.extend(
 )
 
 
-def normalize(findings):
-    # The core namespace is the only intentional language-specific difference.
+CONFIG_CASES.extend(
+    [('one-logical', '(and true)'),
+     ('one-comparison', '(= 1)'),
+     ('try-without-handler', '(try 1)'),
+     ('when-without-body', '(when true)'),
+     ('earmuffed-nondynamic', '(def *value* 1)'),
+     ('dynamic-not-earmuffed',
+      '(def ^:dynamic value 1)',
+      '{:linters {:dynamic-var-not-earmuffed {:level :warning}}}'),
+     ('uninitialized', '(def value)'),
+     ('conflicting-fixed-arity', '(fn ([x] x) ([y] y))'),
+     ('case-duplicate', '(case 1 1 :a 1 :b)'),
+     ('case-quoted', "(case 1 'x :a)"),
+     ('case-symbol', '(case 1 x :a)', '{:linters {:case-symbol-test {:level :warning}}}'),
+     ('blank-docstring', '(defn f "" [] 1)'),
+     ('misplaced-docstring', '(defn f [] "wrong place" 1)'),
+     ('used-underscore', '(let [_x 1] _x)', '{:linters {:used-underscored-binding {:level :warning}}}'),
+     ('inline-def', '(defn f [] (def x 1))'),
+     ('redundant-string', '(str "x")'),
+     ('redundant-nested', '(and true (and false true))'),
+     ('seq-rest', '(seq (rest [1]))', '{:linters {:seq-rest {:level :warning}}}'),
+     ('not-nil', '(not (nil? 1))', '{:linters {:not-nil? {:level :warning}}}'),
+     ('equals-true', '(= true 1)', '{:linters {:equals-true {:level :warning}}}'),
+     ('equals-false', '(= false 1)', '{:linters {:equals-false {:level :warning}}}'),
+     ('equals-nil', '(= nil 1)', '{:linters {:equals-nil {:level :warning}}}'),
+     ('plus-one', '(+ 1 2)', '{:linters {:plus-one {:level :warning}}}'),
+     ('minus-one', '(- 2 1)', '{:linters {:minus-one {:level :warning}}}'),
+     ('equals-float', '(= 1.0 1)', '{:linters {:equals-float {:level :warning}}}'),
+     ('unknown-ns-option', '(ns sample (:wat foo))'),
+     ('ns-underscore', '(ns sample_name)'),
+     ('redundant-declare', '(def x 1) (declare x)'),
+     ('numeric-type-error', '(inc "x")'),
+     ('variadic-type-error', '(+ 1 :x)'),
+     ('seqable-type-error', '(first 1)'),
+     ('collection-type-error', '(conj 1 2)'),
+     ('string-type-error', '(subs 1 0)'),
+     ('function-type-error', '(map 1 [])'),
+     ('local-call-type-error', '(let [x 1] (x 2))'),
+     ('nil-call-type-error', '(let [x nil] (x 2))'),
+     ('inferred-parameter-type', '(defn f [x] (inc x)) (f "x")'),
+     ('type-flow-binding', '(let [x "x"] (inc x))'),
+     ('not-empty-sequence', '(not (empty? (list 1)))')]
+)
+
+CONFIG_CASES.extend(
+    [('loop-no-recur', '(loop [x 1] x)'),
+     ('destructuring-default-unbound', '(let [{:keys [x] :or {y 1}} {}] x)'),
+     ('deprecated-value', '(def ^:deprecated old 1) old'),
+     ('deprecated-call', '(defn ^:deprecated old [] 1) (old)'),
+     ('deprecated-since', '(def ^{:deprecated "1.0"} old 1) old'),
+     ('deprecated-exclusion',
+      '(def ^:deprecated old 1) old',
+      '{:linters {:deprecated-var {:exclude {sample/old {:namespaces [sample]}}}}}'),
+     ('missing-docstring', '(defn f [] 1)', '{:linters {:missing-docstring {:level :warning}}}'),
+     ('docstring-summary',
+      '(defn f "No period" [] 1)',
+      '{:linters {:docstring-no-summary {:level :warning}}}'),
+     ('docstring-whitespace',
+      '(defn f " extra " [] 1)',
+      '{:linters {:docstring-leading-trailing-whitespace {:level :warning}}}'),
+     ('def-of-fn', '(def f (fn [x] x))', '{:linters {:def-fn {:level :warning}}}'),
+     ('shadowed-core-var', '(let [map 1] map)', '{:linters {:shadowed-var {:level :warning}}}'),
+     ('core-conflicting-alias', '(ns sample (:require [clojure.core :as c] [other :as c]))'),
+     ('unknown-require-option', '(ns sample (:require [clojure.core :wat []]))'),
+     ('self-require', '(ns sample (:require [sample :as self]))'),
+     ('duplicate-refer', '(ns sample (:require [clojure.core :refer [inc inc]]))'),
+     ('consistent-alias',
+      '(ns sample (:require [clojure.core :as core]))',
+      '{:linters {:consistent-alias {:aliases {basilisp.core c clojure.core c}}}}'),
+     ('refer-all-warning', '(ns sample (:require [clojure.core :refer :all]))'),
+     ('refer-warning',
+      '(ns sample (:require [clojure.core :refer [inc]]))',
+      '{:linters {:refer {:level :warning}}}'),
+     ('unused-alias',
+      '(ns sample (:require [clojure.core :as c])) (clojure.core/inc 1)',
+      '{:linters {:unused-alias {:level :warning}}}'),
+     ('unused-core-exclusion', '(ns sample (:refer-clojure :exclude [map]))'),
+     ('unknown-core-exclusion', '(ns sample (:refer-clojure :exclude [not-a-real-core-var]))'),
+     ('unsorted-requires',
+      '(ns sample (:require [z :as z] [a :as a]))',
+      '{:linters {:unsorted-required-namespaces {:level :warning}}}'),
+     ('protocol-missing-method',
+      '(defprotocol P (m [this]) (n [this])) (deftype T [] P (m [this] nil))'),
+     ('protocol-arity', '(defprotocol P (m [this])) (deftype T [] P (m [this x] x))'),
+     ('protocol-unknown-method', '(defprotocol P (m [this])) (deftype T [] P (unknown [this] nil))'),
+     ('protocol-varargs', '(defprotocol P (m [this & xs]))'),
+     ('fn-wrapper', '(fn [x] (println x))', '{:linters {:redundant-fn-wrapper {:level :warning}}}'),
+     ('anonymous-wrapper', '#(println %)', '{:linters {:redundant-fn-wrapper {:level :warning}}}'),
+     ('fn-wrapper-reordered',
+      '(fn [x y] (println y x))',
+      '{:linters {:redundant-fn-wrapper {:level :warning}}}'),
+     ('format-missing-argument', '(format "%s %s" "one")'),
+     ('format-extra-argument', '(format "%s" "one" "two")'),
+     ('redundant-format', '(format "plain")'),
+     ('redundant-boolean', '(boolean true)'),
+     ('missing-test-assertion',
+      '(ns sample (:require [clojure.test :refer [deftest]])) (deftest t (= 1 2))'),
+     ('assertion-message',
+      '(ns sample (:require [clojure.test :refer [deftest is]])) (deftest t (is (= 1 2) :bad))')]
+)
+
+CONFIG_CASES.extend(
+    [('duplicate-field', '(deftype Item [value value])'),
+     ('duplicate-assoc-key', '(assoc {} :a 1 :a 2 :a 3)'),
+     ('duplicate-dissoc-key', '(dissoc {} :a :a :a)'),
+     ('duplicate-symbol-assoc-key', '(let [key :a] (assoc {} key 1 key 2))'),
+     ('alias-only-var', '(ns sample (:require [clojure.core :as-alias c])) (c/inc 1)'),
+     ('case-name-style',
+      '(defn Submit [] 1) (defn submit [] 2)',
+      '{:linters {:var-same-name-except-case {:level :warning}}}'),
+     ('configured-map-missing',
+      '(declare f) (f {})',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {1 {:args [{:op :keys :req {:a '
+      ':number}}]}}}}}}}}'),
+     ('configured-map-wrong-value',
+      '(declare f) (f {:a "bad"})',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {1 {:args [{:op :keys :req {:a '
+      ':number}}]}}}}}}}}'),
+     ('configured-map-correct',
+      '(declare f) (f {:a 1})',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {1 {:args [{:op :keys :req {:a '
+      ':number}}]}}}}}}}}'),
+     ('configured-rest-pairs',
+      '(declare f) (f :a 1 :b "bad")',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {:varargs {:min-arity 0 :args [{:op '
+      ':rest :spec [:keyword :number]}]}}}}}}}}')]
+)
+
+CONFIG_CASES.extend(
+    [('conditional-basic',
+      '(let [m {} m (if true (assoc m :a 1) m) m (if false (assoc m :b 2) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-nonliteral-base',
+      '(let [m (hash-map) m (if true (assoc m :a 1) m) m (if true (assoc m :b 2) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-single',
+      '(let [m {} m (if true (assoc m :a 1) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-predicate-use',
+      '(let [m {} m (if (:x m) (assoc m :a 1) m) m (if (:y m) (assoc m :b 2) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-value-use',
+      '(let [m {} m (if true (assoc m :a (:x m)) m) m (if true (assoc m :b 2) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-shadowed-predicate',
+      '(let [m {} m (if (let [m true] m) (assoc m :a 1) m) m (if (let [m true] m) (assoc m :b 2) m)] '
+      'm)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-shadowed-assoc',
+      '(let [assoc (fn [_ _ _] {}) m {} m (if true (assoc m :a 1) m) m (if true (assoc m :b 2) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('conditional-break',
+      '(let [m {} m (if true (assoc m :a 1) m) m (assoc m :stop 1) m (if true (assoc m :b 2) m)] m)',
+      '{:linters {:conditional-build-up {:level :warning}}}'),
+     ('default-same-map',
+      '(let [{:keys [a b] :or {b a}} {}] [a b])',
+      '{:linters {:destructured-or-binding-of-same-map {:level :warning}}}'),
+     ('default-as-map',
+      '(fn [{value :value :as row :or {value row}}] value)',
+      '{:linters {:destructured-or-binding-of-same-map {:level :warning}}}'),
+     ('default-own-fallback',
+      '(let [a 1 {:keys [a] :or {a a}} {}] a)',
+      '{:linters {:destructured-or-binding-of-same-map {:level :warning}}}'),
+     ('default-quoted',
+      "(let [{:keys [a b] :or {b 'a}} {}] [a b])",
+      '{:linters {:destructured-or-binding-of-same-map {:level :warning}}}')]
+)
+
+CONFIG_CASES.extend(
+    [('redundant-ignore-all', '#_:clj-kondo/ignore (inc 1)'),
+     ('redundant-ignore-selective', '#_{:clj-kondo/ignore [:unused-binding]} (inc 1)'),
+     ('used-ignore', '#_{:clj-kondo/ignore [:unresolved-symbol]} missing'),
+     ('ignored-ignore',
+      '#_{:clj-kondo/ignore [:unused-binding]} (inc 1)',
+      '{:linters {:redundant-ignore {:exclude [:unused-binding]}}}'),
+     ('constant-true-inferred', '(let [x (str 1)] (if x 1 2))'),
+     ('constant-false-inferred', '(if (:x {}) 1 2)'),
+     ('constant-nil-local', '(let [x nil] (if x 1 2))'),
+     ('constant-boolean-intentional', '(if false 1 2)'),
+     ('template-empty-args',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [] (inc 1) 2)'),
+     ('template-empty-values',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [x] (inc x))'),
+     ('template-uneven-values',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [x y] (+ x y) 1 2 '
+      '3)'),
+     ('template-valid-expanded',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [x] (inc x) 1 2)'),
+     ('template-expanded-type',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [x] (inc x) "bad")'),
+     ('template-expanded-unresolved',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [x] (println x) '
+      'missing)'),
+     ('template-data-replacement',
+      '(ns sample (:require [clojure.template :refer [do-template]])) (do-template [:slot] (inc :slot) '
+      '1)')]
+)
+
+CONFIG_CASES.extend(
+    [('shared-string-result', '(ns sample (:require [clojure.string :as s])) (inc (s/join [1 2]))'),
+     ('shared-set-result', '(ns sample (:require [clojure.set :as s])) (inc (s/rename [] {}))'),
+     ('configured-rest-last',
+      '(declare f) (f 1 2 "end")',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {:varargs {:args [{:op :rest :spec '
+      ':number :last :string}]}}}}}}}}'),
+     ('configured-rest-incomplete',
+      '(declare f) (f :a)',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {:varargs {:args [{:op :rest :spec '
+      '[:keyword :number]}]}}}}}}}}'),
+     ('configured-number-widening',
+      '(declare f) (f 1)',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {1 {:args [:double]}}}}}}}}'),
+     ('configured-key-ret',
+      '(declare f) (inc (:a (f)))',
+      '{:linters {:type-mismatch {:namespaces {sample {f {:arities {0 {:ret {:op :keys :req {:a '
+      ':string}}}}}}}}}}'),
+     ('repeated-ignored-param', '(fn [_ _ _] 1)')]
+)
+
+CONFIG_CASES.extend([
+    ("aliased-namespace-symbol", '(ns sample (:require [clojure.string :as s])) (clojure.string/join ["a"])',
+     '{:linters {:aliased-namespace-symbol {:level :warning}}}'),
+    ("aliased-namespace-symbol-excluded", '(ns sample (:require [clojure.string :as s])) (clojure.string/join ["a"])',
+     '{:linters {:aliased-namespace-symbol {:level :warning :exclude [clojure.string basilisp.string]}}}'),
+    ("syntax-quoted-alias", '(ns sample (:require [clojure.string :as s])) `s/join'),
+    ("syntax-quoted-referred", '(ns sample (:require [clojure.string :refer [join]])) `join'),
+])
+
+
+def normalize(findings, source=None):
+    # Normalize equivalent standard-library namespace names and their source widths.
     result = []
     for finding in findings:
         item = {field: finding.get(field) for field in FIELDS}
-        item["message"] = item["message"].replace("clojure.core/", "basilisp.core/")
+        item["message"] = item["message"].replace("clojure.core", "basilisp.core").replace("clojure.test", "basilisp.test").replace("clojure.template", "basilisp.template").replace("clojure.string", "basilisp.string").replace("clojure.set", "basilisp.set")
+        if source is not None:
+            # Replacing the language namespace changes its width by one column.
+            lines = source.splitlines()
+            for row_key, column_key in (("row", "col"), ("end-row", "end-col")):
+                row, column = item[row_key], item[column_key]
+                if row and column and row <= len(lines):
+                    line = lines[row - 1]
+                    delta = sum(1 for match in re.finditer(r"clojure\.(?:core|test|template|string|set)", line)
+                                if len(line[:match.end()].encode("utf-16-le")) // 2 < column)
+                    item[column_key] += delta
         result.append(item)
     return sorted(result, key=lambda item: (
         item["row"] or 0, item["col"] or 0, item["type"], item["message"]
@@ -259,11 +499,11 @@ def main() -> int:
             ], input=source, text=True, capture_output=True, env=environment, cwd=temporary)
             if oracle.returncode not in (0, 2, 3):
                 raise RuntimeError(f"clj-kondo failed for {name}: {oracle.stderr}")
-            expected = normalize(json.loads(oracle.stdout)["findings"])
+            expected = normalize(json.loads(oracle.stdout)["findings"], source)
             try:
                 with patch.dict(os.environ, environment, clear=True):
                     result = checker.run(lmap({
-                        kw("stdin"): source.replace("clojure.core", "basilisp.core"),
+                        kw("stdin"): source.replace("clojure.core", "basilisp.core").replace("clojure.test", "basilisp.test").replace("clojure.template", "basilisp.template").replace("clojure.string", "basilisp.string").replace("clojure.set", "basilisp.set"),
                         kw("filename"): filename, kw("config"): checker.read_config(config),
                         kw("config-dir"): str(config_directory), kw("repro"): True,
                         kw("python-inspection?"): False,

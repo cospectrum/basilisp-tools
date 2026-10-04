@@ -16,7 +16,7 @@
             packages = with pkgs; [ uv actionlint ];
           };
           compatibility = pkgs.mkShellNoCC {
-            packages = with pkgs; [ uv clojure clj-kondo ];
+            packages = with pkgs; [ uv clojure clj-kondo leiningen jdk ];
           };
         });
       packages = forAllSystems (system:

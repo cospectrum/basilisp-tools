@@ -1,8 +1,8 @@
 (ns basilisp-tools.check-output-test
   (:require [basilisp.edn :as edn]
-            [basilisp.test :refer [deftest is testing]]
+            [basilisp.test :refer [deftest is]]
             [basilisp-tools.check :as check])
-  (:import [json] [pathlib] [tempfile]))
+  (:import [datetime] [decimal] [fractions] [json] [pathlib] [tempfile] [uuid]))
 
 (defn- analyze [source config]
   (check/run {:stdin source :filename "sample.lpy" :repro true :python-inspection? false
@@ -94,3 +94,67 @@
         (is (= 0 (check/exit-status result)))
         (is (= 2 (count (:namespace-definitions (check/analysis-output result))))))
       (finally (.cleanup temp)))))
+
+(deftest extended-analysis-records-test
+  (let [result (analysis "(ns sample (:require [external :refer [f]]))\n(comment (def x 'external/value))\n(f)"
+                         "{:analysis {:symbols true :context [:app] :var-definitions {:callstack true}}}")
+        definition (first (:var-definitions result))
+        reference (first (:var-usages result))
+        symbol (first (:symbols result))]
+    (is (= [{:ns 'basilisp.core :name 'def} {:ns 'basilisp.core :name 'comment}]
+           (:callstack definition)))
+    (is (:refer reference))
+    (is (= 'external/value (:symbol symbol)))
+    (is (= {} (:context symbol)))
+    (is (= 'external (:to symbol))))
+  (let [result (analysis "(defmulti dispatch :kind) (defmethod dispatch :a [x] x)"
+                         "{:analysis true}")
+        method (first (filter :defmethod (:var-usages result)))]
+    (is (= 'dispatch (:name method)))
+    (is (= ":a" (:dispatch-val-str method))))
+  (let [result (analysis "(defn f [{:keys [x]}] (.upper x))"
+                         "{:analysis {:keywords true :instance-invocations true}}")]
+    (is (= ["keys" "x"] (mapv :name (:keywords result))))
+    (is (:keys-destructuring (second (:keywords result))))
+    (is (= ["upper"] (mapv :method-name (:instance-invocations result))))))
+
+(deftest public-config-api-test
+  (let [first-config (check/read-config "{:linters {:type-mismatch {:namespaces {app {f {:arities {1 {:args [:string]} 2 {:args [:int :int]}}}}}}}}")
+        second-config (check/read-config "{:linters {:type-mismatch {:namespaces {app {f {:arities {1 {:args [:int]}}}}}}}}")
+        merged (check/merge-configs [first-config second-config])]
+    (is (= [:int] (get-in merged [:linters :type-mismatch :namespaces 'app 'f :arities 1 :args])))
+    (is (= [:int :int] (get-in merged [:linters :type-mismatch :namespaces 'app 'f :arities 2 :args])))
+    (is (= 64 (count (check/config-hash merged))))
+    (is (= (check/config-hash merged) (check/config-hash merged))))
+  (is (= :warning (get-in (check/resolve-config {:repro true :config "{:linters {:file {:level :warning}}}"})
+                          [:linters :file :level]))))
+
+(deftest hook-keyword-analysis-test
+  (let [options {:stdin "(app/reg :id)" :filename "sample.lpy" :repro true
+                 :python-inspection? false :cache false
+                 :config "{:analysis {:keywords true} :hooks {:__dangerously-allow-string-hooks__ true :analyze-call {app/reg \"(fn [{:keys [node]}] {:node (clj-kondo.hooks-api/reg-keyword! (second (:children node)) :app)})\"}}}"}
+        result (check/analysis-output (check/run options))
+        keyword (first (filter #(= "id" (:name %)) (:keywords result)))]
+    (is (= :app (:reg keyword)))
+    (is (= 10 (:col keyword)))))
+
+(deftest json-scalar-compatibility-test
+  (let [instant (.fromisoformat datetime/datetime "2026-08-04T12:34:56.789+02:00")
+        id (uuid/UUID "123e4567-e89b-12d3-a456-426614174000")
+        amount (decimal/Decimal "12345678901234567890.12345678901234567890")
+        encoded (check/json-dumps {:custom/key {:instant instant :uuid id :ratio (fractions/Fraction 1 2)
+                                                :decimal amount :bytes (.encode "hello" "utf-8")
+                                                :nonfinite [(python/float "nan") (python/float "inf")
+                                                            (python/float "-inf")]}})
+        decoded (json/loads encoded ** :parse_float decimal/Decimal)
+        value (get decoded "custom/key")]
+    (is (= "2026-08-04T10:34:56Z" (get value "instant")))
+    (is (= (str id) (get value "uuid")))
+    (is (= (decimal/Decimal "0.5") (get value "ratio")))
+    (is (= amount (get value "decimal")))
+    (is (.__contains__ encoded "12345678901234567890.12345678901234567890"))
+    (is (= "aGVsbG8=" (get value "bytes")))
+    (is (= ["NaN" "Infinity" "-Infinity"] (vec (get value "nonfinite")))))
+  (is (= "[1, 2]" (check/json-dumps (python/tuple [1 2]))))
+  (is (= "{\"custom/flag\": true}" (check/json-dumps (python/dict [[:custom/flag true]]))))
+  (is (= "\"2026-08-04T12:34:56Z\"" (check/json-dumps (datetime/datetime 2026 8 4 12 34 56)))))

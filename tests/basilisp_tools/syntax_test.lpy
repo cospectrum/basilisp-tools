@@ -250,3 +250,29 @@
             :start 2 :end 2}
            diagnostic))
     (is (:incomplete? (first (syntax/forms (:root result)))))))
+
+(deftest clojure-dialect-is-lossless-and-opt-in-test
+  (doseq [[source kind] [["#^:private answer" :metadata]
+                         ["#^{:doc \"value\"} answer" :metadata]
+                         ["#=(java.lang.System/exit 1)" :read-eval]
+                         ["#::alias{:key 1}" :namespaced-map]
+                         ["^Long/1 values" :metadata]]]
+    (testing source
+      (is (seq (:diagnostics (syntax/parse source))))
+      (let [parsed (syntax/parse source {:dialect :clojure})
+            form (first (syntax/forms (:root parsed)))]
+        (is (empty? (:diagnostics parsed)))
+        (is (= kind (:kind form)))
+        (is (= source (syntax/text (:root parsed)))))))
+  (doseq [source ["#=" "#^:private" "#::alias[]" "^Long/0 values"]]
+    (is (seq (:diagnostics (syntax/parse source {:dialect :clojure})))))
+  (is (thrown? python/ValueError (syntax/parse "" {:dialect :unknown}))))
+
+(deftest clojure-octal-and-spaced-reader-prefix-test
+  (doseq [source ["\\o141" "\"\\123\"" "#? (:clj value)" "#?@ (:clj [value])"]]
+    (is (seq (:diagnostics (syntax/parse source))))
+    (let [parsed (syntax/parse source {:dialect :clojure})]
+      (is (empty? (:diagnostics parsed)))
+      (is (= source (syntax/text (:root parsed))))))
+  (doseq [source ["\\o400" "\"\\400\"" "#? (:clj)"]]
+    (is (seq (:diagnostics (syntax/parse source {:dialect :clojure}))))))

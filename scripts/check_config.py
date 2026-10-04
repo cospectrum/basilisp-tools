@@ -172,6 +172,10 @@ def cases():
         "aligned-forms", "extra-aligned-forms", "blank-line-forms", "extra-blank-line-forms", "alias-map", "refer-map"],
            "files": {".cljfmt.edn": '{:aligned-forms {bind #{0}} :extra-aligned-forms {pair #{1}} :blank-line-forms {cond :all} :extra-blank-line-forms {other :all} :alias-map {local external} :refer-map {item external/item}}'}}
 
+    for literal, label in (("0x10", "hex"), ("020", "octal"), ("2r10", "radix")):
+        yield {"name": f"numeric-literal-{label}", "explicit": "chosen.clj",
+               "keys": ["max-column-alignment-gap"],
+               "files": {"chosen.clj": "{:max-column-alignment-gap " + literal + "}"}}
     yield {"name": "unknown-options-survive", "keys": ["future-option", "integration/settings"],
            "files": {".cljfmt.edn": '{:future-option true :integration/settings {:enabled? nil}}'}}
 
@@ -202,6 +206,7 @@ def main() -> int:
     from basilisp.lang.vector import vector
 
     formatter = importlib.import_module("basilisp_tools.format")
+    regex_adapter = importlib.import_module("basilisp_tools.regex")
     edn = importlib.import_module("basilisp.edn")
     failures = []
     with tempfile.TemporaryDirectory(prefix="blt-config-") as temporary:
@@ -248,7 +253,7 @@ def main() -> int:
         ], cwd=checkout, check=True)
         expected = edn.read_string(
             output_file.read_text(encoding="utf-8"),
-            lmap({kw("default"): lambda tag, value: re.compile(value)}),
+            lmap({kw("default"): lambda tag, value: regex_adapter.compile_(value)}),
         )
         if len(expected) != len(prepared):
             raise RuntimeError("The configuration oracle returned an incomplete result.")
