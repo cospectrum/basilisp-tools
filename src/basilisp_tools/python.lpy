@@ -249,36 +249,37 @@
 (defn return-type
   "Return structured inferred type information without evaluating annotations."
   [metadata]
-  (if (or (:module metadata) (:union metadata) (:typevar metadata)
-          (:any? metadata) (:never? metadata) (:ellipsis? metadata)
-          (:parameter-list? metadata) (:type-pack? metadata))
-    (if (:type-module metadata)
-      (return-type (dissoc metadata :typevar))
-      (cond-> (select-keys metadata [:module :path :arguments :union :nullable?
-                                     :typevar :bound :constraints :default :literal-values
-                                     :any? :never? :ellipsis? :parameter-spec? :variadic? :unpack?
-                                     :parameter-part :parameter-list? :type-pack? :callable-overloads])
-        (and (:parameter-list? metadata) (contains? metadata :parameters)) (assoc :parameters (:parameters metadata))
-        (contains? metadata :type-arguments) (assoc :arguments (mapv return-type (:type-arguments metadata)))
-        (:type-bound metadata) (assoc :bound (return-type (:type-bound metadata)))
-        (:type-constraints metadata) (assoc :constraints (mapv return-type (:type-constraints metadata)))
-        (:type-default metadata) (assoc :default (return-type (:type-default metadata)))))
-    (let [result (cond-> {}
-                   (:type-module metadata) (assoc :module (:type-module metadata) :path (:type-path metadata))
-                   (contains? metadata :type-arguments) (assoc :arguments (mapv return-type (:type-arguments metadata)))
-                   (seq (:type-union metadata)) (assoc :union (mapv return-type (:type-union metadata)))
-                   (:nullable? metadata) (assoc :nullable? true)
-                   (contains? metadata :literal-values) (assoc :literal-values (:literal-values metadata))
-                   (:type-any? metadata) (assoc :any? true)
-                   (:type-never? metadata) (assoc :never? true)
-                   (:type-ellipsis? metadata) (assoc :ellipsis? true)
-                   (:parameter-spec? metadata) (assoc :parameter-spec? true)
-                   (:variadic? metadata) (assoc :variadic? true)
-                   (:unpack? metadata) (assoc :unpack? true)
-                   (:parameter-part metadata) (assoc :parameter-part (:parameter-part metadata))
-                   (:parameter-list? metadata) (assoc :parameter-list? true)
-                   (:type-pack? metadata) (assoc :type-pack? true))]
-      (when (seq result) result))))
+  (when (some? metadata)
+    (if (or (:module metadata) (:union metadata) (:typevar metadata)
+            (:any? metadata) (:never? metadata) (:ellipsis? metadata)
+            (:parameter-list? metadata) (:type-pack? metadata))
+      (if (:type-module metadata)
+        (return-type (dissoc metadata :typevar))
+        (cond-> (select-keys metadata [:module :path :arguments :union :nullable?
+                                       :typevar :bound :constraints :default :literal-values
+                                       :any? :never? :ellipsis? :parameter-spec? :variadic? :unpack?
+                                       :parameter-part :parameter-list? :type-pack? :callable-overloads])
+          (and (:parameter-list? metadata) (contains? metadata :parameters)) (assoc :parameters (:parameters metadata))
+          (contains? metadata :type-arguments) (assoc :arguments (mapv return-type (:type-arguments metadata)))
+          (:type-bound metadata) (assoc :bound (return-type (:type-bound metadata)))
+          (:type-constraints metadata) (assoc :constraints (mapv return-type (:type-constraints metadata)))
+          (:type-default metadata) (assoc :default (return-type (:type-default metadata)))))
+      (let [result (cond-> {}
+                     (:type-module metadata) (assoc :module (:type-module metadata) :path (:type-path metadata))
+                     (contains? metadata :type-arguments) (assoc :arguments (mapv return-type (:type-arguments metadata)))
+                     (seq (:type-union metadata)) (assoc :union (mapv return-type (:type-union metadata)))
+                     (:nullable? metadata) (assoc :nullable? true)
+                     (contains? metadata :literal-values) (assoc :literal-values (:literal-values metadata))
+                     (:type-any? metadata) (assoc :any? true)
+                     (:type-never? metadata) (assoc :never? true)
+                     (:type-ellipsis? metadata) (assoc :ellipsis? true)
+                     (:parameter-spec? metadata) (assoc :parameter-spec? true)
+                     (:variadic? metadata) (assoc :variadic? true)
+                     (:unpack? metadata) (assoc :unpack? true)
+                     (:parameter-part metadata) (assoc :parameter-part (:parameter-part metadata))
+                     (:parameter-list? metadata) (assoc :parameter-list? true)
+                     (:type-pack? metadata) (assoc :type-pack? true))]
+        (when (seq result) result)))))
 
 (defn- type-metadata [type]
   (cond-> {}
@@ -1016,24 +1017,29 @@
                       (map #(assoc % :callable-branch? true)
                            (call-signatures metadata positional keyword opts))) branches))
        (vec
-        (keep (fn [signature]
-                (when-not (seq (check-call signature (count positional-types) (keys keyword-types)))
-                  (let [prepared (unpacked-call-signature signature positional-types)
+        (keep (fn [original]
+                (when-not (seq (check-call original (count positional-types) (keys keyword-types)))
+                  (let [prepared (unpacked-call-signature original positional-types)
                         signature (:signature prepared)
                         pairs (vec (argument-pairs signature positional-types keyword-types))
                         bindings (reduce (fn [result [expected actual]]
                                            (infer-bindings result expected actual)) (:bindings prepared) pairs)
                         specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
-                        specialized-pairs (argument-pairs specialized positional-types keyword-types)
+                        unchanged? (identical? specialized signature)
+                        specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types))
                         comparisons (map (fn [[expected actual]]
-                                           (if (false? (type-compatible? actual expected opts))
-                                             false
-                                             (type-compatible? actual (substitute-type expected bindings) opts))) specialized-pairs)]
-                    (when-not (or (some (fn [[expected actual]]
-                                          (and (not (:parameter-part expected))
-                                               (false? (type-compatible? actual expected opts)))) pairs)
+                                           (let [result (type-compatible? actual expected opts)
+                                                 substituted (substitute-type expected bindings)]
+                                             (if (or (false? result) (= expected substituted))
+                                               result
+                                               (type-compatible? actual substituted opts)))) specialized-pairs)]
+                    (when-not (or (and (not unchanged?)
+                                       (some (fn [[expected actual]]
+                                               (and (not (:parameter-part expected))
+                                                    (false? (type-compatible? actual expected opts)))) pairs))
                                   (some false? comparisons)
-                                  (seq (check-call specialized (count positional-types) (keys keyword-types))))
+                                  (and (not (identical? original specialized))
+                                       (seq (check-call specialized (count positional-types) (keys keyword-types)))))
                       (assoc specialized :type-match? (every-compatible comparisons))))))
               signatures))))))
 
@@ -1261,9 +1267,10 @@
      (let [expanded (expand-arguments positional-types keyword-types)]
        (when expanded
          (let [results (mapv (fn [[positional keyword]]
-                               (when-not (seq (check-call metadata (count positional) (keys keyword)))
-                                 (or (builtin-call-result metadata positional keyword opts)
-                                     (signature-result (call-signatures metadata positional keyword opts))))) expanded)]
+                               (or (when (and (:builtin-call metadata)
+                                              (not (seq (check-call metadata (count positional) (keys keyword)))))
+                                     (builtin-call-result metadata positional keyword opts))
+                                   (signature-result (call-signatures metadata positional keyword opts)))) expanded)]
            (if (= 1 (count results)) (first results) (union-type results))))))))
 
 (defn element-type
