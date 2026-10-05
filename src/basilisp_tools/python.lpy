@@ -702,7 +702,9 @@
                child (when owner
                        (or (get (:members owner) part)
                            (package-child owner part opts)
-                           (resolve-member owner part)))]
+                           (resolve-member owner part)))
+               child (if (contains? #{:variable :property} (:kind metadata))
+                       (some-> child bind-member) child)]
            (when child (recur child (next remaining))))
          (if (:instance? opts) (bind-member metadata) metadata))))))
 

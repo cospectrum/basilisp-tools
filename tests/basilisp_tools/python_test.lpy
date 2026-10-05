@@ -450,3 +450,49 @@
         receiver {:module "builtins" :path ["super"]}]
     (is (= :unknown (:status (bridge/inspect-member receiver "write" opts))))
     (is (nil? (bridge/inspect-member {:module "builtins" :path ["str"]} "definitely_missing" opts)))))
+
+(deftest module-instance-paths-bind-methods-once
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        opts {:python-paths [(str root)] :python-inspection? false}]
+    (try
+      (.write_text (.joinpath root "bound_alias.py")
+                   (str "from typing import overload\n"
+                        "raise AssertionError('module must not execute')\n"
+                        "class Bucket:\n"
+                        "    @overload\n"
+                        "    def get(self, key: str) -> str: ...\n"
+                        "    @overload\n"
+                        "    def get(self, key: str, default: str) -> str: ...\n"
+                        "    def get(self, key, default=None): pass\n"
+                        "    @staticmethod\n"
+                        "    def fresh(key: str) -> str: pass\n"
+                        "    @classmethod\n"
+                        "    def make(cls, key: str) -> str: pass\n"
+                        "class State:\n"
+                        "    bucket: Bucket\n"
+                        "    @property\n"
+                        "    def current(self) -> Bucket: raise AssertionError('descriptor must not execute')\n"
+                        "bucket = Bucket()\n"
+                        "state = State()\n")
+                   ** :encoding "utf-8")
+      (doseq [path [["bucket"] ["state" "bucket"] ["state" "current"]]]
+        (let [method (bridge/inspect-path "bound_alias" (conj path "get") opts)]
+          (is (= [1 2] (mapv #(count (:parameters %)) (:overloads method))))
+          (is (= [] (bridge/check-call method 1 [])))
+          (is (= [] (bridge/check-call method 2 [])))
+          (is (seq (bridge/check-call method 0 [])))
+          (is (seq (bridge/check-call method 3 [])))
+          (is (= method (bridge/bind-member method))))
+        (doseq [name ["fresh" "make"]]
+          (let [method (bridge/inspect-path "bound_alias" (conj path name) opts)]
+            (is (= [] (bridge/check-call method 1 [])))
+            (is (seq (bridge/check-call method 0 [])))
+            (is (seq (bridge/check-call method 2 []))))))
+      (let [method (bridge/inspect-path "bound_alias" ["Bucket" "get"] opts)]
+        (is (= [2 3] (mapv #(count (:parameters %)) (:overloads method))))
+        (is (seq (bridge/check-call method 1 [])))
+        (is (= [] (bridge/check-call method 2 []))))
+      (doseq [name ["fresh" "make"]]
+        (is (= [] (bridge/check-call (bridge/inspect-path "bound_alias" ["Bucket" name] opts) 1 []))))
+      (finally (.cleanup temp)))))
