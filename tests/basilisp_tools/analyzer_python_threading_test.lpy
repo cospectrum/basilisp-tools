@@ -1,0 +1,39 @@
+(ns basilisp-tools.analyzer-python-threading-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- errors [source]
+  (filterv #(= :error (:level %)) (:findings (analyzer/analyze source))))
+
+(deftest threaded-python-member-forms-agree-with-runtime-test
+  (doseq [[expression expected]
+          [["(-> (python/complex 1 2) (.- real))" 1.0]
+           ["(-> (python/complex 1 2) .-real)" 1.0]
+           ["(-> \"abc\" (. upper))" "ABC"]
+           ["(-> \"abc\" (. (replace \"a\" \"x\")))" "xbc"]
+           ["(-> \"abc\" (. replace \"a\" \"x\"))" "xbc"]
+           ["(. \"abc\" (replace \"a\" \"x\"))" "xbc"]
+           ["(.- (python/complex 1 2) real)" 1.0]
+           ["(->> \"x\" (.replace \"abc\" \"a\"))" "xbc"]]]
+    (testing expression
+      (is (= expected (load-string expression)))
+      (is (empty? (errors expression))))))
+
+(deftest threaded-python-member-diagnostics-test
+  (doseq [[expression type]
+          [["(-> (python/complex 1 2) (.- missing-member))" :unresolved-symbol]
+           ["(-> \"abc\" (. upper 1))" :invalid-arity]
+           ["(-> (python/complex 1 2) (.- real) (. upper))" :unresolved-symbol]]]
+    (testing expression
+      (is (try (load-string expression) false (catch python/Exception _ true)))
+      (is (= [type] (mapv :type (errors expression))))))
+  (is (empty? (errors "(fn [object] (-> object (.- value)))"))))
+
+(deftest threaded-member-locations-and-receiver-usage-test
+  (let [source "(let [value \"abc\"] (-> value (. upper)))"
+        analysis (analyzer/analyze source)
+        member (first (filter #(= "upper" (:name %)) (:python-usages analysis)))]
+    (is (= 1 (count (:local-usages analysis))))
+    (is (= (.index source "upper") (:start member)))
+    (is (= (+ (.index source "upper") 5) (:end member)))
+    (is (empty? (:findings analysis)))))

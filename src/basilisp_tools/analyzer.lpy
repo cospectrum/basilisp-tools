@@ -1929,14 +1929,16 @@
             node (assoc node :children (vec (cons head args)))]
         (walk-call! ctx env node injected))
       (and (op/eq :symbol (:kind head)) (#{"." ".-"} (token head)))
-      (let [target (first args) specification (second args)
+      (let [receiver-injected? (and (:thread-target env) (not (get-in env [:thread-target :last?])))
+            target (when-not receiver-injected? (first args))
+            specification (if receiver-injected? (first args) (second args))
             nested? (op/eq :list (:kind specification))
             member-node (if nested? (first (forms specification)) specification)
             member-name (token member-node)
             method-head (assoc member-node :text (str (if (op/eq ".-" (token head)) ".-" ".") member-name))
-            arguments (if nested? (rest (forms specification)) (drop 2 args))]
+            arguments (if nested? (rest (forms specification)) (drop (if receiver-injected? 1 2) args))]
         (if member-name
-          (walk-python-method! ctx env node method-head (cons target arguments))
+          (walk-python-method! ctx env node method-head (if receiver-injected? arguments (cons target arguments)))
           (walk-body! ctx env args)))
       (and (op/eq :symbol (:kind head)) (op/eq ".." (token head)))
       (let [initial (walk! ctx env (first args))]
