@@ -6,6 +6,8 @@ import collections
 import json
 import os
 import queue
+import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,18 +24,19 @@ BLT = str(Path(__file__).resolve().parent.parent / ".venv" / "bin" / "blt")
 
 
 class Client:
-    def __init__(self, root, output, blt=BLT):
+    def __init__(self, root, output, blt=BLT, extra_args=()):
         self.output = output
         self.started_at = time.monotonic()
         self.usage_before = child_usage()
         self.process_metrics = {}
         self.stderr = open(str(output) + ".stderr", "w")  # noqa: SIM115 - Owned until stop().
         self.process = subprocess.Popen(
-            [str(blt), "lsp"],
+            [str(blt), "lsp", *extra_args],
             cwd=root,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=self.stderr,
+            start_new_session=os.name == "posix",
         )
         self.messages = queue.Queue()
         self.notifications = []
@@ -175,9 +178,7 @@ class Client:
                 self.process.stdin.close()
                 self.process.wait(timeout=30)
         finally:
-            if self.process.poll() is None:
-                self.process.kill()
-            self.process.wait()
+            kill_process_tree(self.process)
             self.process_metrics = {
                 "lifecycle_seconds": round(time.monotonic() - self.started_at, 4),
                 **child_usage_delta(self.usage_before),
@@ -191,6 +192,54 @@ class Client:
             Path(str(self.output) + ".protocol.json").write_text(
                 json.dumps(self.transcript, indent=2)
             )
+
+
+
+def kill_process_tree(process):
+    """Reap the server and stop any descendants left in its owned process group."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        elif process.poll() is None:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def rename_contains_declaration(edit, uri, selection_range, new_name):
+    if not isinstance(edit, dict):
+        return False
+    edits = list(edit.get("changes", {}).get(uri, []))
+    for change in edit.get("documentChanges", []):
+        if change.get("textDocument", {}).get("uri") == uri:
+            edits.extend(change.get("edits", []))
+    return any(
+        item.get("range") == selection_range and item.get("newText") == new_name
+        for item in edits
+    )
+
+
+def manifest_scope(root, entry, source_paths=None):
+    """Mirror the checker manifest while keeping untracked interop probes visible."""
+    root = root.resolve()
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "-z"], cwd=root, text=True
+    ).split("\0")
+    sources = sorted(path for path in tracked if Path(path).suffix in {".lpy", ".cljc"})
+    selected = sorted(set(entry.get("files") or sources))
+    unknown = set(selected) - set(sources)
+    if unknown:
+        raise ValueError(f"Manifest selects untracked sources: {sorted(unknown)}")
+    excluded = sorted(set(sources) - set(selected))
+    return {
+        "selected_files": selected,
+        "selected_file_count": len(selected),
+        "selected_bytes": sum((root / path).stat().st_size for path in selected),
+        "excluded_files": excluded,
+        "source_paths": source_paths or entry.get("source_paths") or ["."],
+        "paths_ignore_regex": [re.escape(str((root / path).resolve())) for path in excluded],
+    }
 
 
 def at(uri, source, offset):
@@ -231,7 +280,7 @@ def cache_snapshot(path):
 
 def audit(
     root, filename, output, source_paths=None, python_executable=None, blt=BLT,
-    cache_path=None,
+    cache_path=None, python_timeout=None, workspace_scope=None,
 ):
     print(
         json.dumps({"project": root.name, "file": str(filename), "status": "starting"}),
@@ -242,13 +291,15 @@ def audit(
     cache_path = Path(cache_path or (str(output) + ".cache")).resolve()
     cache_before = cache_snapshot(cache_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    client = Client(root, output, blt=blt)
+    extra_args = [] if python_timeout is None else ["--python-timeout", str(python_timeout)]
+    client = Client(root, output, blt=blt, extra_args=extra_args)
     report = {
         "root": str(root),
         "file": str(filename),
         "bytes": len(source.encode()),
         "assertions": [],
         "observations": {},
+        "workspace_scope": workspace_scope,
         "analysis_cache": {
             "path": str(cache_path),
             "before": cache_before,
@@ -269,6 +320,9 @@ def audit(
             settings["source-paths"] = source_paths
         if python_executable:
             settings["python"] = {"executable": python_executable}
+        if workspace_scope and workspace_scope["paths_ignore_regex"]:
+            settings["paths-ignore-regex"] = workspace_scope["paths_ignore_regex"]
+        report["initialization_settings"] = settings
         initialized = client.request(
             "initialize",
             {
@@ -363,8 +417,8 @@ def audit(
             report["observations"]["rename"] = rename
             verify(
                 "rename contains declaration edit",
-                bool(
-                    rename and (rename.get("documentChanges") or rename.get("changes"))
+                rename_contains_declaration(
+                    rename, uri, candidate["selectionRange"], "blt-audit-renamed"
                 ),
             )
         formatted = client.request(
@@ -541,7 +595,7 @@ def successful(report):
 
 def repeated_audit(
     root, filename, output, source_paths, python_executable, blt,
-    repeat=1, isolated_cache=False,
+    repeat=1, isolated_cache=False, python_timeout=None, workspace_scope=None,
 ):
     output.parent.mkdir(parents=True, exist_ok=True)
     cache_path = None
@@ -559,7 +613,8 @@ def repeated_audit(
         )
         report = audit(
             root, filename, destination, source_paths, python_executable,
-            blt, cache_path=cache_path,
+            blt, cache_path=cache_path, python_timeout=python_timeout,
+            workspace_scope=workspace_scope,
         )
         report["process_run"] = index + 1
         report["process_runs"] = repeat
@@ -596,6 +651,7 @@ def main():
     parser.add_argument("--blt", default=BLT)
     parser.add_argument("--source-path", action="append")
     parser.add_argument("--python-executable")
+    parser.add_argument("--python-timeout", type=float, help="Forward inspection timeout to blt lsp")
     parser.add_argument(
         "--repeat", type=int, default=1,
         help="Total fresh LSP processes; repeats share a new isolated analysis cache",
@@ -607,6 +663,8 @@ def main():
     args = parser.parse_args()
     if args.repeat < 1:
         parser.error("--repeat must be positive")
+    if args.python_timeout is not None and args.python_timeout <= 0:
+        parser.error("--python-timeout must be positive")
     if args.corpus and not args.manifest:
         args.manifest = Path(__file__).with_name("public_projects.json")
     if not args.manifest:
@@ -621,6 +679,7 @@ def main():
             args.blt,
             args.repeat,
             args.isolated_cache,
+            args.python_timeout,
         )
         if args.repeat > 1:
             args.report.write_text(json.dumps(reports, indent=2))
@@ -657,15 +716,20 @@ def main():
         if not selected:
             parser.error(f"{name}: manifest requires lsp_file")
         filename = root / selected
+        scope = manifest_scope(root, entry, args.source_path)
+        if selected not in scope["selected_files"]:
+            parser.error(f"{name}: lsp_file is outside the selected manifest scope")
         project_reports = repeated_audit(
             root,
             filename,
             args.output / (name.replace("/", "__") + ".json"),
-            args.source_path or ["."],
+            scope["source_paths"],
             args.python_executable,
             args.blt,
             args.repeat,
             args.isolated_cache,
+            args.python_timeout,
+            scope,
         )
         for report in project_reports:
             report["repo"] = name

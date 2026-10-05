@@ -64,7 +64,8 @@ def test_request_uses_message_arrival_not_queue_consumption(monkeypatch):
 def test_repeated_processes_share_only_their_new_cache(tmp_path, monkeypatch):
     observed = []
 
-    def audit(root, filename, output, source_paths, python_executable, blt, cache_path):
+    def audit(root, filename, output, source_paths, python_executable, blt, cache_path,
+              python_timeout=None, workspace_scope=None):
         before = harness.cache_snapshot(cache_path)
         observed.append((cache_path, before))
         (cache_path / "entry.json").write_text("{}")
@@ -82,3 +83,56 @@ def test_repeated_processes_share_only_their_new_cache(tmp_path, monkeypatch):
     harness.repeated_audit(*args, repeat=1, isolated_cache=True)
     assert observed[2][0] != observed[0][0]
     assert observed[2][1] == {"files": 0, "bytes": 0}
+
+
+def test_manifest_scope_excludes_only_unselected_tracked_sources(tmp_path, monkeypatch):
+    paths = ["src/main.lpy", "ui/example[1].cljc", "templates/test.cljc", "README.md"]
+    for path in paths:
+        file = tmp_path / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("(ns example)")
+    monkeypatch.setattr(harness.subprocess, "check_output", lambda *a, **kw: "\0".join(paths))
+    scope = harness.manifest_scope(tmp_path, {"files": ["src/main.lpy"]})
+    assert scope["selected_file_count"] == 1
+    assert scope["selected_files"] == ["src/main.lpy"]
+    assert scope["source_paths"] == ["."]
+    patterns = scope["paths_ignore_regex"]
+    ignored = lambda path: any(harness.re.fullmatch(pattern, str((tmp_path / path).resolve())) for pattern in patterns)
+    assert ignored("ui/example[1].cljc")
+    assert ignored("templates/test.cljc")
+    assert not ignored("src/main.lpy")
+    assert not ignored("ui/example1.cljc")  # Regex metacharacters are literal.
+    assert not ignored("src/__blt_audit_interop.lpy")
+    assert harness.manifest_scope(tmp_path, {"source_paths": ["src"]})["source_paths"] == ["src"]
+
+
+def test_rename_requires_exact_declaration_edit():
+    uri = "file:///project/main.lpy"
+    selection = {"start": {"line": 1, "character": 6}, "end": {"line": 1, "character": 9}}
+    edit = {"range": selection, "newText": "renamed"}
+    assert harness.rename_contains_declaration({"changes": {uri: [edit]}}, uri, selection, "renamed")
+    assert harness.rename_contains_declaration({"documentChanges": [{"textDocument": {"uri": uri}, "edits": [edit]}]}, uri, selection, "renamed")
+    assert not harness.rename_contains_declaration({"changes": {"file:///other.lpy": [edit]}}, uri, selection, "renamed")
+    assert not harness.rename_contains_declaration({"changes": {uri: [edit]}}, uri, selection, "wrong")
+    assert not harness.rename_contains_declaration({"changes": {uri: [edit]}}, uri, {"start": {}, "end": {}}, "renamed")
+
+
+def test_cleanup_kills_owned_group_even_if_server_has_exited(monkeypatch):
+    if harness.os.name != "posix":
+        return
+    calls = []
+    process = SimpleNamespace(pid=42, poll=lambda: 0, wait=lambda: calls.append("wait"))
+    monkeypatch.setattr(harness.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    harness.kill_process_tree(process)
+    assert calls == [(42, harness.signal.SIGKILL), "wait"]
+
+
+def test_cleanup_reaps_an_already_gone_group(monkeypatch):
+    if harness.os.name != "posix":
+        return
+    calls = []
+    def missing(pid, sig):
+        raise ProcessLookupError
+    monkeypatch.setattr(harness.os, "killpg", missing)
+    harness.kill_process_tree(SimpleNamespace(pid=42, wait=lambda: calls.append("wait")))
+    assert calls == ["wait"]
