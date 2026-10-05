@@ -1,7 +1,8 @@
 (ns basilisp-tools.python-types-test
   (:require [basilisp.test :refer [deftest is testing]]
             [basilisp-tools.python :as bridge])
-  (:import [pathlib] [tempfile] [subprocess] [sys]))
+  (:import [pathlib] [tempfile] [subprocess] [sys]
+           [unittest.mock :as mock]))
 
 (def int-type {:module "builtins" :path ["int"]})
 (def str-type {:module "builtins" :path ["str"]})
@@ -516,3 +517,63 @@
     (is (nil? (:type-match? (first (bridge/call-signatures signature [nil] {})))))
     (is (= 1 (count (bridge/call-signatures signature [nil] {}))))
     (is (empty? (bridge/call-signatures signature [int-type] {})))))
+
+(defn- with-inspection [inspect test]
+  (let [patch (mock/patch "basilisp_tools.python.inspect_path" ** :new inspect)]
+    (.start patch)
+    (try (test) (finally (.stop patch)))))
+
+(deftest structural-comparisons-share-only-the-current-inheritance-walk
+  (let [reference (fn [name] {:module "diamond" :path [name]})
+        metadata (fn [bases]
+                   {:status :known :kind :class
+                    :bases (mapv (fn [name] {:type-module (:module (reference name)) :type-path [name]}) bases)})
+        graph (merge {"Root" (metadata ["A8" "B8"]) "A0" (metadata []) "B0" (metadata []) "Other" (metadata [])}
+                     (into {} (for [depth (range 1 9) prefix ["A" "B"]]
+                                [(str prefix depth) (metadata [(str "A" (dec depth)) (str "B" (dec depth))])])))
+        calls (atom 0)
+        inspect (fn [_ path _] (swap! calls inc) (get graph (first path)))]
+    (with-inspection inspect
+      (fn []
+        (let [result (bridge/type-compatible? (reference "Root") (reference "Other") {})]
+          (is (nil? result)))
+        (is (pos? @calls))
+        (is (<= @calls 80) (str "inspection calls: " @calls))
+        (let [before @calls]
+          ;; No memo survives into a new comparison, even with the same options.
+          (let [result (bridge/type-compatible? (reference "Root") (reference "Other") {})]
+            (is (nil? result)))
+          (is (= (* 2 before) @calls)))))))
+
+(deftest structural-comparison-budget-does-not-hide-shorter-paths
+  (let [reference (fn [name] {:module "budget" :path [name]})
+        metadata (fn [bases]
+                   {:status :known :kind :class
+                    :bases (mapv (fn [name] {:type-module (:module (reference name)) :type-path [name]}) bases)})
+        graph (merge {"Root" (metadata ["Long0" "Leaf"]) "Leaf" (metadata ["Target"]) "Target" (metadata [])
+                      "CycleA" (metadata ["CycleB"]) "CycleB" (metadata ["CycleA"])}
+                     (into {} (for [depth (range 11)]
+                                [(str "Long" depth) (metadata [(if (= 10 depth) "Leaf" (str "Long" (inc depth)))])])))
+        inspect (fn [_ path _] (get graph (first path)))]
+    (with-inspection inspect
+      (fn []
+        (is (true? (bridge/type-compatible? (reference "Root") (reference "Target") {})))
+        (is (nil? (bridge/type-compatible? (reference "CycleA") (reference "Target") {})))))))
+
+(deftest structural-comparison-memo-keeps-generic-bindings-separate
+  (let [ref (fn [name args] {:module "generic_memo" :path [name] :arguments args})
+        parameter {:typevar "T"}
+        int {:module "builtins" :path ["int"]}
+        str {:module "builtins" :path ["str"]}
+        branch {:status :known :kind :class
+                :type-parameters [parameter]
+                :bases [{:type-module "generic_memo" :type-path ["Base"] :type-arguments [parameter]}]}
+        root {:status :known :kind :class
+              :bases [{:type-module "generic_memo" :type-path ["Branch"] :type-arguments [{:type-module "builtins" :type-path ["str"]}]}
+                      {:type-module "generic_memo" :type-path ["Branch"] :type-arguments [{:type-module "builtins" :type-path ["int"]}]}]}
+        inspect (fn [_ path _] (case (first path) "Root" root "Branch" branch
+                                     "Base" {:status :known :kind :class} nil))]
+    (with-inspection inspect
+      (fn []
+        (is (true? (bridge/type-compatible? (ref "Root" []) (ref "Base" [int]) {})))
+        (is (true? (bridge/type-compatible? (ref "Root" []) (ref "Base" [str]) {})))))))

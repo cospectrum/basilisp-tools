@@ -459,7 +459,21 @@
   ([actual expected] (basic-type-compatible? actual expected))
   ([actual expected opts]
    (let [result (basic-type-compatible? actual expected)]
-     (if (nil? result) (structural-compatible? actual expected opts) result))))
+     (if (some? result)
+       result
+       (let [comparisons (or (::type-comparisons opts) (atom {}))
+             opts (assoc opts ::type-comparisons comparisons)
+             ;; Depth is part of the budget: a deep unknown must not hide a
+             ;; later, shallower path through the same inheritance diamond.
+             key [actual expected (get opts :python-type-depth 0)]
+             cached (get @comparisons key ::unseen)]
+         (if (= ::unseen cached)
+           (do
+             (swap! comparisons assoc key ::pending)
+             (let [result (structural-compatible? actual expected opts)]
+               (swap! comparisons assoc key result)
+               result))
+           (when (not= ::pending cached) cached)))))))
 
 (declare type-label substitute-metadata substitute-type)
 
