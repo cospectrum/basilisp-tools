@@ -1843,6 +1843,19 @@ def metadata_decoder(keyword, persistent_map, vector):
         return persistent_map(result)
     return decode
 
+
+def dependencies_fresh(dependencies):
+    """Check every recorded file on each lookup, without caching stat results."""
+    for filename, modified, size in dependencies or ():
+        try:
+            stat = os.stat(filename)
+        except OSError:
+            return False
+        if modified != stat.st_mtime_ns or size != stat.st_size:
+            return False
+    return True
+
+
 class InspectionProcesses:
     """Own inspection children so server shutdown cannot leave workers behind.
 

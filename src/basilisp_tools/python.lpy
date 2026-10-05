@@ -115,13 +115,7 @@
   (and metadata
        (or (not (contains? transient-reasons (:reason metadata)))
            (< (time/monotonic) (get (meta metadata) :retry-at 0)))
-       (every? (fn [dependency]
-                 (try
-                   (let [[file modified size] dependency
-                         stat (.stat (pathlib/Path file))]
-                     (and (= modified (.-st_mtime_ns stat)) (= size (.-st_size stat))))
-                   (catch python/OSError _ false)))
-               (:dependencies metadata))))
+       (.dependencies_fresh worker-runtime (:dependencies metadata))))
 
 (defn- retain-results [entries additions]
   ;; Keep new results and bound retained entries, including old fingerprints.
