@@ -1,0 +1,34 @@
+(ns basilisp-tools.analyzer-shallow-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private shallow-configurations
+  [{:analysis {:var-definitions {:shallow true}}}
+   {:output {:analysis {:var-definitions {:shallow true}}}}])
+
+(defn- analyze [source config]
+  (analyzer/analyze source {:config config :python-options {:python-inspection? false}}))
+
+(defn- errors [analysis]
+  (mapv :type (filter #(= :error (:level %)) (:findings analysis))))
+
+(deftest shallow-vars-keep-their-syntactic-function-signatures-test
+  (doseq [config shallow-configurations]
+    (let [result (analyze "(def f (fn [x] unavailable)) (f)" config)]
+      (is (= [:invalid-arity] (errors result)))
+      (is (= #{1} (get-in result [:definitions "f" :fixed-arities])))
+      (is (= ["[x]"] (get-in result [:definitions "f" :arglists]))))
+    (let [result (analyze "(def f (fn ([x] x) ([x y & rest] rest))) (f)" config)]
+      (is (= [:invalid-arity] (errors result)))
+      (is (= #{1} (get-in result [:definitions "f" :fixed-arities])))
+      (is (= 2 (get-in result [:definitions "f" :varargs-min-arity]))))))
+
+(deftest shallow-redefinitions-use-the-current-initializer-test
+  (doseq [config shallow-configurations]
+    (let [result (analyze "(def f (fn [x] x)) (f) (def f (identity inc)) (f)" config)]
+      (is (= [:invalid-arity] (errors result)))
+      (is (nil? (get-in result [:definitions "f" :fixed-arities]))))
+    (is (= [:invalid-arity]
+           (errors (analyze "(def f (fn [x] x)) (f 1) (def f (fn [] 2)) (f 1)" config))))
+    (is (= [:invalid-arity]
+           (errors (analyze "(def f (fn [x] x)) (def f) (f)" config))))))
