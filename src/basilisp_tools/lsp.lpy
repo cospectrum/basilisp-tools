@@ -1273,19 +1273,24 @@
        result))))
 
 (defn- occurrences [analyses identity declarations?]
-  (for [[uri analysis] analyses
-        item (concat (:local-usages analysis) (:var-usages analysis) (:keyword-usages analysis) (:python-usages analysis)
-                     (map #(assoc % :namespace? true) (remove :python (:namespace-usages analysis)))
-                     (when declarations? (map #(assoc % :namespace? true) (:namespace-definitions analysis)))
-                     (for [[_alias referred] (:refers analysis)
-                           :when (not (:all referred))
-                           node (distinct (remove nil? [(:node referred) (:refer-node referred)
-                                                        (:rename-node referred)]))]
-                       (merge node {:filename (or (some-> uri file-path str) uri)
-                                    :name (:name referred) :ns (:ns referred)}))
-                     (when declarations? (concat (:locals analysis) (:var-definitions analysis))))
-        :when (= identity (identity-of item))]
-    [uri item]))
+  ;; Realize each document before advancing: nested lazy comprehensions retain
+  ;; a stack frame per document when a long run has no matching occurrences.
+  (reduce
+   (fn [result [uri analysis]]
+     (into result
+           (for [item (concat (:local-usages analysis) (:var-usages analysis) (:keyword-usages analysis) (:python-usages analysis)
+                              (map #(assoc % :namespace? true) (remove :python (:namespace-usages analysis)))
+                              (when declarations? (map #(assoc % :namespace? true) (:namespace-definitions analysis)))
+                              (for [[_alias referred] (:refers analysis)
+                                    :when (not (:all referred))
+                                    node (distinct (remove nil? [(:node referred) (:refer-node referred)
+                                                                 (:rename-node referred)]))]
+                                (merge node {:filename (or (some-> uri file-path str) uri)
+                                             :name (:name referred) :ns (:ns referred)}))
+                              (when declarations? (concat (:locals analysis) (:var-definitions analysis))))
+                 :when (= identity (identity-of item))]
+             [uri item])))
+   [] analyses))
 
 (defn- markdown
   ([definition] (markdown definition {}))

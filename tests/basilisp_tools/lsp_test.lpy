@@ -1389,3 +1389,23 @@
                       :contentChanges [{:text source}]})
       (is (empty? (:diagnostics (diagnostics! c 3))))
       (finally (stop! c) (.cleanup temp)))))
+
+(deftest references-across-many-unrelated-documents-test
+  (let [target "/tmp/blt-many-references/target.lpy"
+        documents (assoc (into {} (for [i (range 300)]
+                                    [(str "/tmp/blt-many-references/file" i ".lpy")
+                                     (str "(ns bulk.n" i ")\n(def value " i ")\n")]))
+                         target "(ns bulk.target)\n(def value 1)\n(def other value)\n")
+        analyses (lsp/workspace-analysis documents {:python-inspection? false})
+        options {:analyses analyses}
+        query #(lsp/batch-query documents options "references" %)
+        references (:result (query {:from "bulk.target/value" :include-declaration? true}))
+        usages (:result (query {:from "bulk.target/value" :include-declaration? false}))
+        absent (query {:from "bulk.target/absent" :include-declaration? true})]
+    (is (= 301 (count analyses)))
+    (is (= 2 (count references)))
+    (is (= #{target} (set (map :filename references))))
+    (is (= #{2 3} (set (map :row references))))
+    (is (= [3] (mapv :row usages)))
+    (is (empty? (:result absent)))
+    (is (= 1 (:exit-code absent)))))
