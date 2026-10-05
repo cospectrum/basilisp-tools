@@ -1,0 +1,114 @@
+(ns basilisp-tools.analyzer-defonce-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private cases
+  [{:name "repeated-root" :expected 1
+    :source "(defonce f (fn [x] x)) (defonce f (fn [] 2)) (f 1)"
+    :arity #{1}}
+   {:name "ordinary-def-before-once" :expected 1
+    :source "(def f (fn [x] x)) (defonce f nil) (f 1)" :arity #{1}}
+   {:name "defn-before-once" :expected 1
+    :source "(defn f [x] x) (defonce f nil) (f 1)" :arity #{1}}
+   {:name "bound-nil" :expected true
+    :source "(defonce f nil) (defonce f (fn [x] x)) (nil? f)"
+    :value-path ["NoneType"]}
+   {:name "bound-unknown" :expected 1
+    :source "(defonce f (eval '(fn [x] x))) (defonce f nil) (f 1)"
+    :unknown? true}
+   {:name "unbound-def" :expected 1
+    :source "(def f) (defonce f (fn [x] x)) (f 1)" :arity #{1}}
+   {:name "declare-only" :expected 1
+    :source "(declare f) (defonce f (fn [x] x)) (f 1)" :arity #{1}}
+   {:name "no-init-does-not-unbind" :expected true
+    :source "(defonce f nil) (def f) (defonce f (fn [x] x)) (nil? f)"
+    :value-path ["NoneType"]}
+   {:name "root-do" :expected 1
+    :source "(do (defonce f (fn [x] x)) (do (defonce f nil))) (f 1)"
+    :arity #{1}}
+   {:name "ordinary-def-replaces-once" :expected 2
+    :source "(defonce f (fn [x] x)) (def f (fn [] 2)) (f)" :arity #{0}}
+   {:name "unexecuted-conditional" :expected 1
+    :source "(when false (def f nil)) (defonce f (fn [x] x)) (f 1)"}
+   {:name "unexecuted-function" :expected 1
+    :source "(defn initialize [] (def f nil)) (defonce f (fn [x] x)) (f 1)"}
+   {:name "conditional-after-bound" :expected 1
+    :source "(def f (fn [x] x)) (when false (def f nil)) (defonce f nil) (f 1)"}
+   {:name "called-function-mutates-value" :expected 2
+    :source "(def f nil) (defn initialize [] (def f (fn [] 2))) (initialize) (defonce f nil) (f)"}
+   {:name "function-once-is-not-executed" :expected 1
+    :source "(defn initialize [] (defonce f nil)) (defonce f (fn [x] x)) (f 1)"}])
+
+(defn- errors [analysis]
+  (mapv :type (filter #(= :error (:level %)) (:findings analysis))))
+
+(deftest defonce-retains-the-initialized-root-test
+  (doseq [{:keys [name source expected arity value-path unknown?] :as case} cases]
+    (let [source (str "(ns blt-defonce-" name "-" (gensym) ") " source)
+          analysis (analyzer/analyze source {:python-options {:python-inspection? false}})
+          definition (get-in analysis [:definitions "f"])]
+      (is (= expected (binding [*ns* *ns*] (load-string source))))
+      (is (empty? (errors analysis)))
+      (when (contains? case :arity) (is (= arity (:fixed-arities definition))))
+      (when value-path (is (= value-path (get-in definition [:python-type :path]))))
+      (when unknown? (is (nil? (:python-type definition)))))))
+
+(deftest defonce-declarations-retain-the-effective-function-signature-test
+  (doseq [source ["(defonce f (fn [x] x)) (defonce f (fn [] 2))"
+                  "(def f (fn [x] x)) (defonce f nil)"
+                  "(defn f [x] x) (defonce f nil)"
+                  "(do (defonce f (fn [x] x)) (defonce f (fn [] 2)))"
+                  "(def f) (defonce f (fn [x] x))"
+                  "(def f (fn [x] x)) (def f) (defonce f nil)"]]
+    (let [declarations (analyzer/declarations (str "(ns producer) " source))
+          result (analyzer/analyze "(ns consumer (:require [producer :as p])) (p/f)"
+                                   {:project {"producer" (:definitions declarations)}})]
+      (is (= #{1} (get-in declarations [:definitions "f" :fixed-arities])))
+      (is (= [:invalid-arity] (errors result))))))
+
+(deftest only-evaluated-root-forms-prove-initialization-test
+  (doseq [ignored ["'(def f nil)" "(quote (def f nil))" "(comment (def f nil))"
+                   "#_(def f nil)" "#?(:clj (def f nil) :lpy310+ :ignored)"
+                   "`(def f nil)"]]
+    (let [source (str "(ns blt-defonce-data-" (gensym) ") (defonce f (fn [x] x)) "
+                      ignored " (defonce f nil) (f 1)")
+          result (analyzer/analyze source)]
+      (is (= 1 (binding [*ns* *ns*] (load-string source))) ignored)
+      (is (empty? (errors result)))
+      (is (= #{1} (get-in result [:definitions "f" :fixed-arities])))))
+  (doseq [body ["(defonce f (fn [x] x)) (defonce f (do (def g nil) nil)) (defonce g (fn [x] x)) (g 1)"
+                "(defn f [x] (defonce f nil) x) (defonce f nil) (f 1)"]]
+    (let [source (str "(ns blt-defonce-nested-" (gensym) ") " body)]
+      (is (= 1 (binding [*ns* *ns*] (load-string source))))
+      (is (empty? (errors (analyzer/analyze source))))))
+  ;; A skipped initializer is still compiled, so its unresolved references matter.
+  (is (= [:unresolved-symbol]
+         (errors (analyzer/analyze "(defonce f 1) (defonce f absent)")))))
+
+(deftest specialized-definitions-initialize-roots-test
+  (doseq [[body expected]
+          [["(defmulti f identity) (defmethod f :value [_] 42) (defonce f nil) (f :value)" 42]
+           ["(deftest f 1) (defonce f nil) (python/callable f)" true]
+           ["(defprotocol P (f [this])) (defonce P nil) (defonce f nil) (and (some? P) (python/callable f))" true]
+           ["(defrecord Record [x]) (defonce ->Record nil) (:x (->Record 42))" 42]
+           ["(defrecord Record [x]) (defonce map->Record nil) (:x (map->Record {:x 42}))" 42]
+           ["(defrecord R [x]) (defonce ->R nil) (def result (:x (->R 1))) (def ->R (fn [x y] 0)) result" 1]]]
+    (let [source (str "(ns blt-defonce-special-" (gensym) " (:require [basilisp.test :refer [deftest]])) " body)
+          result (analyzer/analyze source)]
+      (is (= expected (binding [*ns* *ns*] (load-string source))) body)
+      (is (empty? (errors result)) body))))
+
+(deftest generated-hook-definitions-do-not-prove-root-initialization-test
+  (doseq [[before expansion after expected]
+          [["" "(when false (def f nil))" "(defonce f (fn [x] x)) (f 1)" 1]
+           ["(def f (fn [] 2))" "(when false (def f (fn [x] x)))" "(defonce f nil) (f)" 2]]]
+    (let [ns-name (str "blt-defonce-hook-" (gensym))
+          source (str "(ns " ns-name ") " before " (defmacro custom [] '" expansion ") (custom) " after)
+          config {:hooks {:__dangerously-allow-string-hooks__ true
+                          :analyze-call {(symbol (str ns-name "/custom"))
+                                         (str "(fn [_] {:node (clj-kondo.hooks-api/coerce '" expansion ")})")}}}
+          result (analyzer/analyze source {:config config})]
+      (is (= expected (binding [*ns* *ns*] (load-string source))))
+      (is (empty? (errors result)))
+      (is (nil? (get-in result [:definitions "f" :python-type])))
+      (is (nil? (get-in result [:definitions "f" :fixed-arities]))))))

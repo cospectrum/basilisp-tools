@@ -389,6 +389,10 @@
                   nil)]
       (or found (metadata-entry-node target key)))))
 
+(def ^:private value-keys
+  [:python-type :python-member :python-module :python-path :return-info :return-by-arity
+   :tag :parameter-tags :arglists :fixed-arities :varargs-min-arity])
+
 (defn- definition [parsed filename ns-name node name-node tail macro? private?]
   (let [head-name (last (str/split (or (token (first (forms node))) "") #"/"))
         function? (#{"defn" "defn-" "defasync" "defmacro" "defmacro-"} head-name)
@@ -434,6 +438,61 @@
       (mapcat declaration-forms (rest (forms node)))
       [node])))
 
+(def ^:private additional-root-definitions
+  #{"defmulti" "deftest" "defprotocol" "definterface" "deftype" "deftype*" "defrecord"})
+
+(defn- initialized-var-names [head args]
+  (let [name (token (first args))]
+    (cond-> [name]
+      (op/eq "defprotocol" head) (into (keep #(when (op/eq :list (:kind %)) (token (first (forms %)))) (rest args)))
+      (#{"deftype" "defrecord"} head) (conj (str "->" name))
+      (op/eq "defrecord" head) (conj (str "map->" name)))))
+
+(defn- initialized-value [head args defined]
+  (let [name (token (first args))]
+    (cond
+      (and (#{"deftype" "defrecord"} head) (= defined (str "->" name)))
+      {:fixed-arities #{(count (forms (second args)))}}
+      (and (op/eq "defrecord" head) (= defined (str "map->" name)))
+      {:fixed-arities #{1}}
+      (op/eq "defprotocol" head)
+      (when-let [method (first (filter #(and (op/eq :list (:kind %)) (= defined (token (first (forms %))))) (rest args)))]
+        (merge-arities (map parameters-arity (filter #(op/eq :vector (:kind %)) (rest (forms method))))))
+      :else {})))
+
+(defn- initializing-definition? [head args]
+  (or (#{"defn" "defn-" "defasync" "defmacro" "defmacro-" "defonce"} head)
+      (contains? additional-root-definitions head)
+      (and (op/eq "def" head) (seq (rest args)))))
+
+(defn- initialization-structure [root]
+  ;; Nested definitions may execute later or conditionally; they cannot prove a root value.
+  (let [roots (set (map :start (mapcat declaration-forms (forms root))))
+        uncertain (atom #{})]
+    (letfn [(scan [node quoted]
+              (let [node (unwrap node) kind (:kind node)]
+                (when (seq (:children node))
+                  (let [xs (forms node)
+                        raw (when (op/eq :list kind) (token (first xs)))
+                        head (when raw (last (str/split raw #"/")))
+                        initializer? (initializing-definition? head (rest xs))]
+                    (cond
+                      (#{:quote :var-quote :discard} kind) nil
+                      (op/eq :syntax-quote kind) (doseq [child xs] (scan child (inc quoted)))
+                      (#{:unquote :unquote-splicing} kind) (doseq [child xs] (scan child (max 0 (dec quoted))))
+                      (and (zero? quoted)
+                           (#{"quote" "comment" "comment*" "basilisp.core/quote" "basilisp.core/comment"
+                              "basilisp.core/comment*" "clojure.core/quote" "clojure.core/comment"} raw)) nil
+                      (and (op/eq :tagged kind) (not= "#py" (:text (first (:children node))))) nil
+                      :else
+                      (do
+                        (when (and (zero? quoted) initializer? (not (contains? roots (:start node)))
+                                   (op/eq :symbol (:kind (unwrap (second xs)))))
+                          (swap! uncertain into (initialized-var-names head (rest xs))))
+                        (doseq [child xs] (scan child quoted))))))))]
+      (scan root 0))
+    {:root-initializations roots :uncertain-initializations @uncertain}))
+
 (defn declarations
   "Read namespace and top-level definitions without evaluating the source."
   ([source] (declarations source {}))
@@ -465,6 +524,8 @@
                                  :when (op/eq ":refer" (token option))
                                  referred (forms value)]
                              [(token referred) (str (token (first xs)) "/" (token referred))]))
+           structure (initialization-structure (:root parsed))
+           initialized (atom #{})
            defs (atom {})]
        (doseq [node (mapcat declaration-forms top) :when (op/eq :list (:kind node))]
          (let [[head name-node & tail] (forms node) raw (token head)
@@ -481,10 +542,18 @@
            (cond
              (#{"defn" "defn-" "defasync" "defmacro" "defmacro-" "def" "defonce" "defmulti" "deftest"} h)
              (when (op/eq :symbol (:kind (unwrap name-node)))
-               (swap! defs assoc (token name-node)
-                      (definition parsed filename ns-name node name-node tail
-                        (#{"defmacro" "defmacro-"} h)
-                        (or (#{"defn-" "defmacro-"} h) (metadata-private? name-node)))))
+               (let [name (token name-node)
+                     uncertain? (and (op/eq "defonce" h) (contains? (:uncertain-initializations structure) name))
+                     preserve? (and (contains? @initialized name)
+                                    (or (op/eq "defonce" h) (and (op/eq "def" h) (empty? tail))))
+                     info (definition parsed filename ns-name node name-node tail
+                            (#{"defmacro" "defmacro-"} h)
+                            (or (#{"defn-" "defmacro-"} h) (metadata-private? name-node)))]
+                 (swap! defs assoc name
+                        (cond uncertain? (apply dissoc info value-keys)
+                              preserve? (merge (apply dissoc info value-keys) (select-keys (get @defs name) value-keys))
+                              :else info))
+                 (when (or (not (op/eq "def" h)) (seq tail)) (swap! initialized conj name))))
              (op/eq h "declare")
              (doseq [name-node (rest (forms node))]
                (when-not (contains? @defs (token name-node))
@@ -493,6 +562,7 @@
                                :declared true))))
              (#{"defprotocol" "definterface" "deftype" "deftype*" "defrecord"} h)
              (do
+               (swap! initialized into (initialized-var-names h (rest (forms node))))
                (swap! defs assoc (token name-node)
                       (definition parsed filename ns-name node name-node [] false false))
                (when (op/eq h "defprotocol")
@@ -515,7 +585,7 @@
                                    :name (str "map->" (token name-node)) :fixed-arities #{1})))))))))
        {:namespace ns-name :namespace-meta (node-metadata (second (forms ns-node)))
         :definitions (with-meta @defs {:namespace-meta (node-metadata (second (forms ns-node)))})
-        :parsed parsed}))))
+        :parsed parsed :initialization-structure structure}))))
 
 (defn- var-info [ns-name name value]
   (let [m (meta value)
@@ -2592,6 +2662,12 @@
             true? (finding! ctx node :constant-condition "Condition always true")))
     value))
 
+(defn- remember-root-value! [ctx node name value]
+  ;; Presence means initialized even when inference is unknown and the snapshot is {}.
+  (when (and (not (:hook-origin ctx)) (not (:generated node)) (not (:derived-location node))
+             (contains? (:root-initializations @(:state ctx)) (:start node)))
+    (swap! (:state ctx) assoc-in [:root-bound-values name] (select-keys value value-keys))))
+
 (defn- walk-list-form! [ctx env node]
   (let [[head & args] (forms node)
         name (dispatch-name ctx (:call-identity ctx))]
@@ -2604,6 +2680,13 @@
                   "defprotocol" "definterface" "deftype" "deftype*" "defrecord" "reify" "reify*" "proxy" "proxy-super" "extend-type" "extend-protocol"
                   "defmethod" "defmulti" "deftest" "are" "is" "if" "if-not" "do-template" "apply-method" "apply-method-kw"} name))
       (resolve-symbol! ctx env head))
+    ;; Generated descendants can share their top-level call's source range.
+    (when (and (or (:hook-origin ctx) (:generated node) (:derived-location node))
+               (initializing-definition? name args))
+      (swap! (:state ctx) update :uncertain-initializations into (initialized-var-names name args)))
+    (when (contains? additional-root-definitions name)
+      (doseq [defined (initialized-var-names name args)]
+        (remember-root-value! ctx node defined (initialized-value name args defined))))
     (let [dispatch-value name]
       (cond
         (op/eq dispatch-value "ns")
@@ -2616,8 +2699,9 @@
         (walk-var! ctx env args)
         (contains? #{"def" "defonce"} dispatch-value)
         (let [name (token (first args))
-              value-keys [:python-type :python-member :python-module :python-path :return-info :return-by-arity
-                          :tag :parameter-tags :arglists :fixed-arities :varargs-min-arity]
+              once? (op/eq "defonce" dispatch-value)
+              bound (:root-bound-values @(:state ctx))
+              uncertain? (and once? (contains? (:uncertain-initializations @(:state ctx)) name))
               shallow? (or (get-in (context-config ctx) [:analysis :var-definitions :shallow])
                            (get-in (context-config ctx) [:output :analysis :var-definitions :shallow]))
               value (if shallow?
@@ -2625,11 +2709,16 @@
                                      (first args) (rest args) false (metadata-private? (first args))) value-keys)
                       (walk-body! ctx (assoc env :caller (get-in @(:state ctx) [:definitions name]))
                                   (if (and (> (count args) 2) (= :string (:kind (second args))))
-                                    (drop 2 args) (rest args))))]
+                                    (drop 2 args) (rest args))))
+              value (cond uncertain? nil
+                          (and once? (contains? bound name)) (get bound name)
+                          :else value)]
           (swap! (:state ctx) update-in [:definitions name]
                  #(merge (apply dissoc (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args) false (metadata-private? (first args)))) (when (seq (rest args)) value-keys))
                          ;; An unknown reassignment must not retain a previous value's type or arities.
                          (when-not (:dynamic (node-metadata (first args))) (select-keys value value-keys))))
+          (when (seq (rest args))
+            (remember-root-value! ctx node name (get-in @(:state ctx) [:definitions name])))
           value)
         (contains? #{"defn" "defn-" "defasync" "defmacro" "defmacro-"} dispatch-value)
         (let [name (token (first args))
@@ -2640,6 +2729,7 @@
               _ (swap! (:state ctx) assoc-in [:definitions name] declaration)
               value (walk-function! ctx (assoc env :scope node :async? (or (op/eq "defasync" dispatch-value) (:async (node-metadata (first args)))) :caller declaration) (rest args))]
           (swap! (:state ctx) update-in [:definitions name] merge value)
+          (remember-root-value! ctx node name (get-in @(:state ctx) [:definitions name]))
           value)
         (op/eq dispatch-value "declare")
         (doseq [arg args :when (contains? (:seen-definitions @(:state ctx)) (token arg))]
@@ -3030,7 +3120,7 @@
   ([source {:keys [filename] :or {filename "<stdin>"} :as opts}]
    (binding [*node-cache* (or *node-cache* #py {0 (python/dict) 1 (python/dict) 2 (python/dict)})
              *reader-features* (or *reader-features* (configured-reader-features (:python-options opts)))]
-     (let [{:keys [namespace definitions parsed]} (or (:declarations opts) (declarations source opts))
+     (let [{:keys [namespace definitions parsed] :as declared} (or (:declarations opts) (declarations source opts))
            config (expand-ignore (:config opts))
            ns-config (reduce (fn [cfg name]
                                (merge-config cfg (get-in config [:config-in-ns name])))
@@ -3041,7 +3131,10 @@
                               (map-settings (first (filter #(= :map (:kind %)) (drop 2 (forms ns-node))))))
            config (merge-settings config (source-settings ns-settings))
            opts (assoc opts :config config)
+           structure (or (:initialization-structure declared) (initialization-structure (:root parsed)))
            state (atom {:opts opts :namespace namespace :definitions definitions
+                        :root-initializations (:root-initializations structure)
+                        :uncertain-initializations (:uncertain-initializations structure) :root-bound-values {}
                         :findings #py [] :namespace-definitions #py [] :namespace-usages #py []
                         :var-definitions (vec (vals definitions)) :var-usages #py []
                         :locals #py [] :local-usages #py [] :python-usages #py [] :keywords #py [] :implementations #py [] :protocol-methods (vec (filter :protocol-name (vals definitions))) :calls #py [] :python-expressions #py []
