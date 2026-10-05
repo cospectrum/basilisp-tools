@@ -12,6 +12,9 @@
 (def ^:private number-start-re (re/compile "-*[0-9]"))
 (def ^:private number-body-re (re/compile "-*[0-9][0-9A-Za-z/.+\\-]*"))
 (def ^:private identifier-re (re/compile "([^\\d/]\\S*/)?(/|[^\\d/][^/]*)"))
+;; Keyword namespaces and names may start with digits in Basilisp and Clojure.
+(def ^:private keyword-re (re/compile "([^/]+/)?[^/]*|/"))
+(def ^:private clojure-keyword-re (re/compile "([^/].*/)?(/|[^/]*)"))
 (def ^:private integer-re (re/compile "-?(?:\\d|[1-9]\\d+)N?"))
 (def ^:private decimal-re (re/compile "-?(?:\\d|[1-9]\\d+)(?:\\.\\d*)?M?"))
 (def ^:private scientific-re (re/compile "-?\\d+(?:\\.\\d*)?[Ee][+-]?\\d+M?"))
@@ -154,18 +157,14 @@
     (.match number-start-re s) :number
     :else :symbol))
 
-(defn- atom-error [kind s]
+(defn- atom-error [kind s dialect]
   (cond
     (op/eq kind :number) (when-not (valid-number? s) "Invalid numeric literal")
     (op/eq kind :keyword)
     (let [body (subs s (if (.startswith s "::") 2 1))]
-      ;; Basilisp 0.5.1 accepts empty and numeric keyword names, including
-      ;; the bare :: commonly used to obtain the current namespace. Keep
-      ;; these readable even though newer readers tightened identifiers.
-      (when-not (or (empty? body) (.isnumeric body)
-                    (.fullmatch identifier-re body)
-                    (and (.endswith body "/") (op/eq 1 (.count body "/"))
-                         (.fullmatch identifier-re (subs body 0 (dec (count body))))))
+      ;; Unlike symbols, keywords accept numeric names and namespaces.
+      ;; Empty names remain readable on the minimum supported Basilisp 0.5.1.
+      (when-not (.fullmatch (if (op/eq :clojure dialect) clojure-keyword-re keyword-re) body)
         "Invalid keyword"))
     (op/eq kind :symbol)
     (when-not (.fullmatch identifier-re s) "Invalid symbol")
@@ -175,20 +174,14 @@
   (let [i (op/getitem state "offset")
         source (op/getitem state "source")
         numeric? (.match number-start-re source i)
-        numeric-keyword? (and (op/eq ":" (peek-char state))
-                              (some-> (char-at source (inc i)) .isnumeric))
-        end (cond
-              numeric? (match-end number-body-re state)
-              numeric-keyword? (loop [j (inc i)]
-                                 (if (some-> (char-at source j) .isnumeric)
-                                   (recur (inc j)) j))
-              :else (or (match-end atom-re state) (inc i)))
+        end (if numeric? (match-end number-body-re state)
+                (or (match-end atom-re state) (inc i)))
         [node state] (leaf state :symbol end)
         kind (atom-kind (:text node))
         problem (when-not (and (op/eq :clojure (op/getitem state "dialect"))
                                (op/eq :symbol kind)
                                (re/fullmatch "[^\\d/][^/\\s]*/[1-9]" (:text node)))
-                  (atom-error kind (:text node)))]
+                  (atom-error kind (:text node) (op/getitem state "dialect")))]
     [(assoc node :kind kind)
      (if problem (issue state :invalid-token problem i end) state)]))
 

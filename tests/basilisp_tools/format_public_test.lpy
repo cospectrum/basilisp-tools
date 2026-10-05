@@ -1,7 +1,8 @@
 (ns basilisp-tools.format-public-test
   (:require [basilisp.test :refer [deftest is testing]]
             [basilisp-tools.format :as fmt]
-            [basilisp-tools.syntax :as syntax]))
+            [basilisp-tools.syntax :as syntax])
+  (:import [pathlib] [tempfile]))
 
 (deftest supported-runtime-keyword-forms-test
   ;; Public nREPL and Blender integrations use (namespace ::). These forms
@@ -47,3 +48,39 @@
   (doseq [source ["(do\n  (f) ; keep\n  )\n\n(g)\n"
                   "{:a 1\n ;; keep\n }\n\n(g)\n"]]
     (is (= source (fmt/format-string source)))))
+
+(deftest numeric-keyword-names-remain-single-forms-test
+  ;; options-basilisp uses :timeframe/1m; Hiccup's Lein profiles use :1.8.
+  ;; Compare actual runtime values, not just our parser's token kinds.
+  (doseq [source [":timeframe/1m" ":ns/1" ":1.8" ":1abc" ":1/ns"
+                  ":1.2/ns" ":ns/1.2" ":1/" "::1abc"]]
+    (testing source
+      (let [value (read-string source)
+            parsed (syntax/parse source)
+            forms (syntax/forms (:root parsed))
+            formatted (fmt/format-string source)]
+        (is (keyword? value))
+        (is (empty? (:diagnostics parsed)))
+        (is (= 1 (count forms)))
+        (is (= :keyword (:kind (first forms))))
+        (is (= source (syntax/text (:root parsed))))
+        (is (= source formatted))
+        (is (= value (read-string formatted))))))
+  (is (seq (:diagnostics (syntax/parse ":one/two/three")))))
+
+(deftest numeric-lein-profile-names-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))]
+    (try
+      (.write_text
+       (.joinpath root "project.clj")
+       "(defproject sample \"1.0\" :profiles
+          {:dev {:dependencies [[criterium \"0.4.4\"]]}
+           :1.8 {:dependencies [[org.clojure/clojure \"1.8.0\"]]
+                 :cljfmt {:indentation? false}}
+           :1.10 {:dependencies [[org.clojure/clojure \"1.10.3\"]]}
+           :1.11 {:dependencies [[org.clojure/clojure \"1.11.1\"]]}})"
+       ** :encoding "utf-8")
+      (is (map? (fmt/load-config root)))
+      (is (false? (:indentation? (fmt/load-config root {:lein-profiles [:1.8]}))))
+      (finally (.cleanup temp)))))
