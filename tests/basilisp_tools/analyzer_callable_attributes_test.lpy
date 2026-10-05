@@ -1,0 +1,66 @@
+(ns basilisp-tools.analyzer-callable-attributes-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [sys]))
+
+(defn- with-package [f]
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (py/create-cache)
+        options {:python-options {:python-paths [(str root)]
+                                  :python-inspection? false :python-cache cache}}]
+    (try
+      (.write_text (.joinpath root "callablefixture.py")
+                   (str "import math\n"
+                        "class Widget:\n"
+                        "    def __init__(self, value: int): self.value = value\n"
+                        "    def render(self, prefix: str) -> str: return prefix + str(self.value)\n"
+                        "    @staticmethod\n"
+                        "    def increment(value: int) -> int: return value + 1\n"
+                        "    @classmethod\n"
+                        "    def make(cls, value: int) -> 'Widget': return cls(value)\n"
+                        "    @property\n"
+                        "    def label(self) -> str: return str(self.value)\n"
+                        "def encode(value: int) -> str: return str(value)\n")
+                   ** :encoding "utf-8")
+      (.insert sys/path 0 (str root))
+      (f options)
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules "callablefixture" nil)
+        (py/stop-cache! cache)
+        (.cleanup temporary)))))
+
+(defn- source [body]
+  (str "(ns blt-callable-attributes (:import callablefixture)) " body))
+
+(deftest python-function-class-and-method-attributes-are-values-test
+  (with-package
+    (fn [options]
+      (doseq [[body expected]
+              [["(let [encode (.-encode callablefixture)] (encode 42))" "42"]
+               ["(vec (map (.-encode callablefixture) [1 2]))" ["1" "2"]]
+               ["(let [widget (.-Widget callablefixture)] (.-label (widget 42)))" "42"]
+               ["(let [widget (callablefixture/Widget 42) render (.-render widget)] (render \"x\"))" "x42"]
+               ["(let [increment (.-increment callablefixture/Widget)] (increment 41))" 42]
+               ["(let [make (.-make callablefixture/Widget)] (.-label (make 42)))" "42"]
+               ["(-> callablefixture (.-encode) (apply [42]))" "42"]
+               ["(let [module (.-math callablefixture)] (.fabs module -2.0))" 2.0]]]
+        (let [source (source body)]
+          (is (= expected (load-string source)))
+          (is (empty? (:findings (analyzer/analyze source options)))))))))
+
+(deftest attribute-aliases-keep-call-contracts-test
+  (with-package
+    (fn [options]
+      (doseq [[body expected]
+              [["(let [encode (.-encode callablefixture)] (encode))" :invalid-arity]
+               ["(let [encode (.-encode callablefixture)] (encode \"wrong\"))" :type-mismatch]
+               ["(let [widget (.-Widget callablefixture)] (widget))" :invalid-arity]
+               ["(let [widget (callablefixture/Widget 42) render (.-render widget)] (render))" :invalid-arity]
+               ["(let [widget (callablefixture/Widget 42) render (.-render widget)] (render 1))" :type-mismatch]
+               ["(let [label (.-label (callablefixture/Widget 42))] (label))" :type-mismatch]]]
+        (when (or (= :invalid-arity expected) (.endswith body "(label))"))
+          (is (thrown? python/TypeError (load-string (source body)))))
+        (is (= [expected] (mapv :type (:findings (analyzer/analyze (source body) options)))))))))

@@ -832,6 +832,12 @@
         (finding! ctx (:node entry) :python-inspection
                   (str "Unable to inspect Python module " (:name entry) " (" (:reason module) ")"))))))
 
+(defn- python-member-value [module path member]
+  (merge {:python-member member :python-module module :python-path path}
+         (when-let [type (py/callable-type member)]
+           (select-keys (python-value type) [:python-type :tag]))
+         (when (#{:variable :property} (:kind member)) (python-return module member))))
+
 (defn- python-reference! [ctx node module-name member-name]
   (let [path (when member-name (python-path member-name))
         module (python-module ctx module-name)
@@ -856,12 +862,7 @@
       (finding! ctx node :unresolved-namespace (str "Unresolved namespace " module-name ". Are you missing an import?"))
       (and member-name (op/eq :known (:status module)) (nil? member))
       (finding! ctx node :unresolved-symbol (str "Unresolved symbol: " module-name "/" member-name)))
-    (when member
-      (merge {:python-member member :python-module module-name
-              :python-path (or path [])}
-             (when-let [type (py/callable-type member)]
-               (select-keys (python-value type) [:python-type :tag]))
-             (when (#{:variable :property} (:kind member)) (python-return module-name member))))))
+    (when member (python-member-value module-name (or path []) member))))
 
 (defn- lint-reference! [ctx env node info]
   (when (and info (:ns info) (:name info))
@@ -1950,9 +1951,13 @@
         (finding! ctx head :unresolved-symbol (str "Unresolved Python member: " member-name))
         nil))
     (when member
-      (if field? (python-return (:module object) member)
-          (python-call-value ctx node member arguments values
-                             (when (pos? extra-positional) injected))))))
+      (if field?
+        (if (#{:function :class :module} (:kind member))
+          (python-member-value (:module object)
+                               (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true)) member)
+          (python-return (:module object) member))
+        (python-call-value ctx node member arguments values
+                           (when (pos? extra-positional) injected))))))
 
 (defn- walk-call! [ctx env node injected]
   (let [[head & args] (forms node)
