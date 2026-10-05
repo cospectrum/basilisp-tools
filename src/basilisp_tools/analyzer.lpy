@@ -743,7 +743,7 @@
               nil))
           (finding! ctx clause :unknown-ns-option (str "Unknown ns option: " (syntax/text clause))))))))
 
-(declare walk! walk-body! bind-pattern! walk-call! walk-thread! call-context python-return python-value tagged nonnil-value)
+(declare walk! walk-body! bind-pattern! walk-call! walk-thread! walk-list-form! dispatch-name call-context python-return python-value tagged nonnil-value)
 
 (defn- excluded? [ctx type value]
   (let [config (context-config ctx)
@@ -1911,8 +1911,14 @@
   (let [[head & args] (forms node)
         ctx (if (pos? injected) (call-context ctx env head) ctx)]
     (cond
-      (and (pos? injected) (#{"->" "->>" "some->" "some->>" "doto"} (token head)))
-      (walk-thread! ctx env (cons nil args))
+      (and (pos? injected)
+           (#{"->" "->>" "some->" "some->>" "cond->" "cond->>" "as->" "doto"}
+            (dispatch-name ctx (:call-identity ctx))))
+      ;; Reuse the outer value without walking its source or recording usages twice.
+      (let [thread (:thread-target env)
+            value-node (assoc (:node thread) :kind :analyzed-value :analysis-value (:value thread) :children [])
+            args (if (:last? thread) (conj (vec args) value-node) (cons value-node args))]
+        (walk-list-form! ctx (dissoc env :thread-target) (assoc node :children (vec (cons head args)))))
       (and (op/eq :symbol (:kind head)) (.endswith (token head) ".")
            (not (#{"." ".."} (token head))))
       (let [raw (subs (token head) 0 (dec (count (token head))))
@@ -1972,19 +1978,9 @@
         last? (contains? #{"->>" "some->>"} (:name (:call-identity ctx)))]
     (loop [steps (rest args) value initial previous (first args)]
       (if-let [step (first steps)]
-        (let [result (if (op/eq :list (:kind step))
-                       (walk-call! ctx (assoc env :thread-target {:value value :node previous :last? last?}) step 1)
-                       (if (and (op/eq :symbol (:kind step)) (.startswith (token step) "."))
-                         (walk-python-method! ctx (assoc env :thread-target {:value value :node previous}) step step [])
-                         (let [call-ctx (call-context ctx env step)
-                               info (walk! call-ctx env step)]
-                           (record-call! call-ctx env step step [] (or (:python-member info) info)
-                                         {:implicit-arguments 1})
-                           (if-let [member (:python-member info)]
-                             (do (doseq [problem (py/check-call member 1 [])]
-                                   (finding! call-ctx step (:type problem) (:message problem)))
-                                 (python-return (:python-module info) member))
-                             (do (check-arity! call-ctx step info 1) (:return-info info))))))]
+        (let [call (if (op/eq :list (:kind step)) step
+                       (assoc step :kind :list :text nil :children [step]))
+              result (walk-call! ctx (assoc env :thread-target {:value value :node previous :last? last?}) call 1)]
           (recur (rest steps) (if doto? initial result) step))
         value))))
 
@@ -2130,8 +2126,6 @@
       (basilisp.core/name lint-as)
       (#{"basilisp.core" "basilisp.test"} (:ns identity)) (:name identity)
       :else nil)))
-
-(declare walk-list-form!)
 
 (defn- call-context [ctx env head]
   (let [identity (call-identity ctx env head)
@@ -2575,10 +2569,13 @@
           value)
         (contains? #{"defn" "defn-" "defasync" "defmacro" "defmacro-"} dispatch-value)
         (let [name (token (first args))
-              value (walk-function! ctx (assoc env :scope node :async? (or (op/eq "defasync" dispatch-value) (:async (node-metadata (first args)))) :caller (get-in @(:state ctx) [:definitions name])) (rest args))]
-          (swap! (:state ctx) update-in [:definitions name]
-                 #(merge (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args)
-                                 (#{"defmacro" "defmacro-"} name) (#{"defn-" "defmacro-"} name))) value))
+              declaration (or (get-in @(:state ctx) [:definitions name])
+                              (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args)
+                                (#{"defmacro" "defmacro-"} dispatch-value) (#{"defn-" "defmacro-"} dispatch-value)))
+              ;; Hook-generated definitions are not present in the source declaration pass.
+              _ (swap! (:state ctx) assoc-in [:definitions name] declaration)
+              value (walk-function! ctx (assoc env :scope node :async? (or (op/eq "defasync" dispatch-value) (:async (node-metadata (first args)))) :caller declaration) (rest args))]
+          (swap! (:state ctx) update-in [:definitions name] merge value)
           value)
         (op/eq dispatch-value "declare")
         (doseq [arg args :when (contains? (:seen-definitions @(:state ctx)) (token arg))]
@@ -2898,20 +2895,22 @@
         :else (walk-body! ctx env (forms node))))))
 
 (defn- walk! [ctx env node]
-  (let [value (walk-node! ctx env node)]
-    (when (op/eq :keyword (:kind node))
-      (let [raw (token node) auto? (.startswith raw "::")
-            text (subs raw (if auto? 2 1))
-            parts (if (op/eq text "/") [text] (str/split text #"/" 2))
-            prefix (when (> (count parts) 1) (first parts))
-            ns-name (if auto? (if prefix (get-in @(:state ctx) [:aliases prefix]) (current-ns ctx)) prefix)]
-        (emit! ctx :keywords (merge (loc ctx node)
-                                    {:name (last parts) :ns ns-name :auto-resolved auto? :alias (when auto? prefix)
-                                     :reg (:reg node) :context (:context ctx)
-                                     :generated (:generated node) :derived-location (:derived-location node)}))))
-    (when (:python-type value)
-      (emit! ctx :python-expressions (merge (loc ctx node) (select-keys value [:python-type]))))
-    value))
+  (if (op/eq :analyzed-value (:kind node))
+    (:analysis-value node)
+    (let [value (walk-node! ctx env node)]
+      (when (op/eq :keyword (:kind node))
+        (let [raw (token node) auto? (.startswith raw "::")
+              text (subs raw (if auto? 2 1))
+              parts (if (op/eq text "/") [text] (str/split text #"/" 2))
+              prefix (when (> (count parts) 1) (first parts))
+              ns-name (if auto? (if prefix (get-in @(:state ctx) [:aliases prefix]) (current-ns ctx)) prefix)]
+          (emit! ctx :keywords (merge (loc ctx node)
+                                      {:name (last parts) :ns ns-name :auto-resolved auto? :alias (when auto? prefix)
+                                       :reg (:reg node) :context (:context ctx)
+                                       :generated (:generated node) :derived-location (:derived-location node)}))))
+      (when (:python-type value)
+        (emit! ctx :python-expressions (merge (loc ctx node) (select-keys value [:python-type]))))
+      value)))
 
 (defn- unused! [ctx]
   (let [state @(:state ctx)]

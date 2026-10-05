@@ -1,0 +1,60 @@
+(ns basilisp-tools.analyzer-threading-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer])
+  (:import [pathlib] [tempfile]))
+
+(defn- errors [source & [options]]
+  (filterv #(= :error (:level %)) (:findings (analyzer/analyze source options))))
+
+(deftest nested-thread-macros-retain-injected-values-test
+  (doseq [[expression expected]
+          [["(-> 1 inc)" 2]
+           ["(->> 3 (- 10))" 7]
+           ["(:value (-> {} (cond-> true (assoc :value 42))))" 42]
+           ["(-> {} (cond-> true (assoc :value 42)) (cond-> true (update :value inc)) :value)" 43]
+           ["(-> 1 (-> (+ 2) (* 3)))" 9]
+           ["(-> 1 (->> (+ 2) (* 3)))" 9]
+           ["(-> 1 (some-> (+ 2)))" 3]
+           ["(-> 1 (some->> (+ 2)))" 3]
+           ["(-> 1 (cond->> true (+ 2)))" 3]
+           ["(-> 1 (as-> x (+ x 2)))" 3]
+           ["(-> 1 (doto (identity)))" 1]
+           ["(->> :value (-> {:value 42}))" 42]
+           ["(let [cond-> (fn [value addition] (+ value addition))] (-> 1 (cond-> 2)))" 3]
+           ["(-> 1 (basilisp.core/cond-> true (+ 2)))" 3]]]
+    (testing expression
+      (is (= expected (load-string expression)))
+      (is (empty? (errors expression))))))
+
+(deftest nested-thread-diagnostics-and-source-usages-test
+  (doseq [expression ["(-> \"bad\" (-> inc))"
+                      "(-> {} (cond-> true (assoc :value \"bad\")) :value inc)"
+                      "(-> 1 (cond-> true (+ \"bad\")))"]]
+    (testing expression
+      (is (try (load-string expression) false (catch python/Exception _ true)))
+      (is (= [:type-mismatch] (mapv :type (errors expression))))))
+  (is (= [:invalid-arity]
+         (mapv :type (errors "(let [f (fn [] 1)] (-> 1 f))"))))
+  (let [analysis (analyzer/analyze "(let [value {}] (-> value (cond-> true (assoc :n 1))))")]
+    (is (= 1 (count (:local-usages analysis))))
+    (is (empty? (:findings analysis)))))
+
+(deftest hook-generated-functions-resolve-recursive-calls-test
+  (with [directory (tempfile/TemporaryDirectory)]
+        (let [root (pathlib/Path directory)
+              config {:cfg-dir directory
+                      :hooks {:analyze-call {'user/defelem 'hook/defelem}}}]
+          (.write_text (.joinpath root "hook.clj")
+                       "(ns hook (:require [clj-kondo.hooks-api :as api]))
+                    (defn defelem [{:keys [node]}]
+                      {:node (api/list-node (cons (api/token-node 'clojure.core/defn)
+                                                  (rest (:children node))))})"
+                       ** :encoding "utf-8")
+          (let [source "(defelem countdown ([n] (countdown n 0)) ([n total] (if (zero? n) total (countdown (dec n) (inc total))))) (countdown 3)"
+                result (analyzer/analyze source {:config config})
+                definition (first (filter #(= "countdown" (:name %)) (:var-definitions result)))]
+            (is (empty? (:findings result)))
+            (is (= #{1 2} (:fixed-arities definition)))
+            (is (= 'user/defelem (:hook-origin definition))))
+          (is (= [:invalid-arity]
+                 (mapv :type (errors "(defelem countdown [n] (countdown n 1))" {:config config})))))))
