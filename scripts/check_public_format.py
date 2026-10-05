@@ -14,12 +14,57 @@ import argparse
 import difflib
 import importlib
 import json
+import os
+import signal
+import statistics
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+
+
+try:
+    import resource
+except ImportError:  # Windows does not provide per-child CPU accounting here.
+    resource = None
+
+
+def run_command(command, cwd, timeout):
+    """Measure this waited child process tree; kill its group on timeout."""
+    before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+    started = time.perf_counter()
+    with subprocess.Popen(
+        command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=os.name == "posix",
+    ) as process:
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+    after = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+    user = after.ru_utime - before.ru_utime if resource else None
+    system = after.ru_stime - before.ru_stime if resource else None
+    return {
+        "code": "timeout" if timed_out else process.returncode,
+        "seconds": round(time.perf_counter() - started, 6),
+        "child_user_seconds": round(user, 6) if resource else None,
+        "child_system_seconds": round(system, 6) if resource else None,
+        "child_cpu_seconds": round(user + system, 6) if resource else None,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
 
 
 def tracked_sources(checkout: Path) -> list[str]:
@@ -47,15 +92,26 @@ def main() -> int:
         "--diff-dir", type=Path, help="Retain complete diffs for review."
     )
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument(
+        "--project", action="append",
+        help="Repository basename or owner/name; repeat to select projects",
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=1,
+        help="Number of steady-state --check processes after formatting (default: 1)",
+    )
     args = parser.parse_args()
     executable = args.blt.absolute()
     if not executable.is_file():
         parser.error(f"CLI not found: {executable}; pass --blt /path/to/blt")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if args.timeout <= 0 or args.repeat < 1:
+        parser.error("--timeout and --repeat must be positive")
     if args.diff_dir:
         args.diff_dir.mkdir(parents=True, exist_ok=True)
-    projects = json.loads(args.manifest.read_text(encoding="utf-8"))
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    projects = manifest.get("projects", []) if isinstance(manifest, dict) else manifest
 
     from basilisp.lang.keyword import keyword as kw
     from basilisp.lang.map import map as lmap
@@ -84,15 +140,18 @@ def main() -> int:
     reports = []
     for project in projects:
         name = project["repo"].split("/")[-1]
+        if args.project and not {name, project["repo"]}.intersection(args.project):
+            continue
         checkout = args.corpus / name
         revision = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
         ).strip()
-        if revision != project["sha"]:
+        expected = project.get("sha") or project.get("revision")
+        if expected and revision != expected:
             parser.error(
-                f"{project['repo']}: expected {project['sha']}, got {revision}"
+                f"{project['repo']}: expected {expected}, got {revision}"
             )
-        files = tracked_sources(checkout)
+        files = project.get("files") or tracked_sources(checkout)
         report = {
             "repo": project["repo"],
             "sha": revision,
@@ -101,6 +160,14 @@ def main() -> int:
             "runs": [],
             "changes": [],
             "problems": [],
+            "benchmark_notes": [
+                "Processes run sequentially; unrelated host workloads are not controlled.",
+                "Compiler and OS caches are not cleared; parser imports can warm compiler caches.",
+                "Child CPU includes waited subprocess descendants, excluding preservation review.",
+            ],
+            "compiler_cache_disabled_env": os.environ.get(
+                "BASILISP_DO_NOT_CACHE_NAMESPACES"
+            ),
         }
         if not files:
             report["problems"].append(
@@ -124,28 +191,15 @@ def main() -> int:
                 relative: (target / relative).read_bytes() for relative in files
             }
             report["bytes"] = sum(map(len, originals.values()))
-            for label, flags in [("format", []), ("check-formatted", ["--check"])]:
-                command = [str(executable), "format", *flags, "."]
-                started = time.perf_counter()
-                try:
-                    process = subprocess.run(
-                        command,
-                        cwd=target,
-                        text=True,
-                        capture_output=True,
-                        timeout=args.timeout,
-                        check=False,
-                    )
-                    run = {
-                        "stage": label,
-                        "command": command,
-                        "code": process.returncode,
-                        "stdout": process.stdout,
-                        "stderr": process.stderr,
-                    }
-                except subprocess.TimeoutExpired:
-                    run = {"stage": label, "command": command, "code": "timeout"}
-                run["seconds"] = round(time.perf_counter() - started, 3)
+            stages = [("format", [])] + [
+                ("check-formatted" if index == 0 else f"check-formatted-{index + 1}", ["--check"])
+                for index in range(args.repeat)
+            ]
+            for label, flags in stages:
+                targets = files if "files" in project else ["."]
+                command = [str(executable), "format", *flags, *targets]
+                run = {"stage": label, "command": command}
+                run.update(run_command(command, target, args.timeout))
                 report["runs"].append(run)
                 if run["code"] != 0:
                     report["problems"].append({"stage": label, "detail": run})
@@ -196,6 +250,17 @@ def main() -> int:
                 (args.diff_dir / f"{name}.diff").write_text(
                     "".join(diffs), encoding="utf-8"
                 )
+        steady = report["runs"][1:]
+        report["benchmark"] = {
+            "steady_state_runs": len(steady),
+            **{
+                key + "_median": (
+                    statistics.median(run[key] for run in steady)
+                    if all(run[key] is not None for run in steady) else None
+                )
+                for key in ("seconds", "child_cpu_seconds")
+            },
+        }
         reports.append(report)
         if args.report:
             args.report.write_text(
@@ -206,6 +271,8 @@ def main() -> int:
             f"{len(report['problems'])} problems",
             flush=True,
         )
+    if not reports:
+        parser.error("No projects matched")
     failures = sum(len(report["problems"]) for report in reports)
     print(
         f"Public formatter audit: {len(reports)} projects, "

@@ -8,9 +8,15 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # Windows still records wall time.
+    resource = None
 
 BLT = str(Path(__file__).resolve().parent.parent / ".venv" / "bin" / "blt")
 
@@ -18,6 +24,9 @@ BLT = str(Path(__file__).resolve().parent.parent / ".venv" / "bin" / "blt")
 class Client:
     def __init__(self, root, output, blt=BLT):
         self.output = output
+        self.started_at = time.monotonic()
+        self.usage_before = child_usage()
+        self.process_metrics = {}
         self.stderr = open(str(output) + ".stderr", "w")  # noqa: SIM115 - Owned until stop().
         self.process = subprocess.Popen(
             [str(blt), "lsp"],
@@ -31,6 +40,9 @@ class Client:
         self.next_id = 0
         self.timings = []
         self.transcript = []
+        self.received_at = {}
+        self.document_sends = {}
+        self.timed_diagnostics = set()
         threading.Thread(target=self.read, daemon=True).start()
 
     def read(self):
@@ -48,21 +60,46 @@ class Client:
                 message = json.loads(
                     self.process.stdout.read(int(headers["content-length"]))
                 )
-                self.messages.put(message)
+                self.messages.put((message, time.monotonic()))
         except (EOFError, OSError, ValueError, IndexError) as error:
-            self.messages.put({"reader_error": repr(error)})
+            self.messages.put(({"reader_error": repr(error)}, time.monotonic()))
 
     def send(self, method=None, params=None, **fields):
         message = {"jsonrpc": "2.0", **fields}
         if method is not None:
             message.update(method=method, params=params)
         body = json.dumps(message, ensure_ascii=False).encode()
+        if method in {"textDocument/didOpen", "textDocument/didChange"}:
+            document = params["textDocument"]
+            self.document_sends[(document["uri"], document["version"])] = (
+                time.monotonic(),
+                method,
+            )
         self.process.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
         self.process.stdin.flush()
 
     def receive(self, deadline):
-        message = self.messages.get(timeout=max(0.001, deadline - time.monotonic()))
+        message, received_at = self.messages.get(
+            timeout=max(0.001, deadline - time.monotonic())
+        )
         self.transcript.append(message)
+        self.received_at[id(message)] = received_at
+        if message.get("method") == "textDocument/publishDiagnostics":
+            params = message.get("params") or {}
+            key = (params.get("uri"), params.get("version"))
+            sent = self.document_sends.get(key)
+            if sent is not None and key not in self.timed_diagnostics:
+                self.timed_diagnostics.add(key)
+                self.timings.append(
+                    {
+                        "method": "diagnostics",
+                        "uri": key[0],
+                        "version": key[1],
+                        "trigger": sent[1],
+                        "seconds": round(received_at - sent[0], 4),
+                    }
+                )
+                print(json.dumps(self.timings[-1]), flush=True)
         if "reader_error" in message:
             raise RuntimeError(message)
         if "method" in message and "id" in message:
@@ -88,7 +125,10 @@ class Client:
                 ) from error
             if message.get("id") == request_id and "method" not in message:
                 self.timings.append(
-                    {"method": method, "seconds": round(time.monotonic() - begin, 4)}
+                    {
+                        "method": method,
+                        "seconds": round(self.received_at[id(message)] - begin, 4),
+                    }
                 )
                 print(
                     json.dumps(
@@ -123,14 +163,6 @@ class Client:
                     f"diagnostics version {version} did not arrive within {timeout}s"
                 ) from error
             if matched(message):
-                self.timings.append(
-                    {
-                        "method": "diagnostics",
-                        "version": version,
-                        "seconds": round(time.monotonic() - begin, 4),
-                    }
-                )
-                print(json.dumps(self.timings[-1]), flush=True)
                 return message["params"]["diagnostics"]
             self.notifications.append(message)
 
@@ -146,6 +178,10 @@ class Client:
             if self.process.poll() is None:
                 self.process.kill()
             self.process.wait()
+            self.process_metrics = {
+                "lifecycle_seconds": round(time.monotonic() - self.started_at, 4),
+                **child_usage_delta(self.usage_before),
+            }
             for stream in (self.process.stdin, self.process.stdout):
                 try:
                     stream.close()
@@ -168,13 +204,44 @@ def at(uri, source, offset):
     }
 
 
-def audit(root, filename, output, source_paths=None, python_executable=None, blt=BLT):
+def child_usage():
+    if resource is None:
+        return None
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime, usage.ru_stime
+
+
+def child_usage_delta(before):
+    after = child_usage()
+    if before is None or after is None:
+        return {}
+    user, system = (new - old for new, old in zip(after, before))
+    return {
+        "child_user_seconds": round(user, 4),
+        "child_system_seconds": round(system, 4),
+        "child_cpu_seconds": round(user + system, 4),
+        "cpu_scope": "children reaped during this sequential client lifetime",
+    }
+
+
+def cache_snapshot(path):
+    sizes = [file.stat().st_size for file in path.rglob("*.json") if file.is_file()]
+    return {"files": len(sizes), "bytes": sum(sizes)}
+
+
+def audit(
+    root, filename, output, source_paths=None, python_executable=None, blt=BLT,
+    cache_path=None,
+):
     print(
         json.dumps({"project": root.name, "file": str(filename), "status": "starting"}),
         flush=True,
     )
     source = filename.read_text()
     uri = filename.as_uri()
+    cache_path = Path(cache_path or (str(output) + ".cache")).resolve()
+    cache_before = cache_snapshot(cache_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
     client = Client(root, output, blt=blt)
     report = {
         "root": str(root),
@@ -182,6 +249,12 @@ def audit(root, filename, output, source_paths=None, python_executable=None, blt
         "bytes": len(source.encode()),
         "assertions": [],
         "observations": {},
+        "analysis_cache": {
+            "path": str(cache_path),
+            "before": cache_before,
+            "start_state": "populated" if cache_before["files"] else "empty",
+            "compiler_bytecode": "unchanged by harness",
+        },
     }
 
     def verify(label, condition):
@@ -190,7 +263,7 @@ def audit(root, filename, output, source_paths=None, python_executable=None, blt
     try:
         settings = {
             "text-document-sync-kind": "incremental",
-            "cache-path": str(output) + ".cache",
+            "cache-path": str(cache_path),
         }
         if source_paths:
             settings["source-paths"] = source_paths
@@ -399,6 +472,8 @@ def audit(root, filename, output, source_paths=None, python_executable=None, blt
         except Exception as error:  # noqa: BLE001 - Persist shutdown failure evidence.
             report["shutdown_error"] = repr(error)
         report["timings"] = client.timings
+        report["process_metrics"] = client.process_metrics
+        report["analysis_cache"]["after"] = cache_snapshot(cache_path)
         published = [
             message["params"]
             for message in client.transcript
@@ -464,6 +539,35 @@ def successful(report):
     )
 
 
+def repeated_audit(
+    root, filename, output, source_paths, python_executable, blt,
+    repeat=1, isolated_cache=False,
+):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    cache_path = None
+    if isolated_cache or repeat > 1:
+        # A fresh directory prevents a previous audit from warming run one.
+        # Retain it alongside reports for inspection, never delete user caches.
+        cache_path = Path(
+            tempfile.mkdtemp(prefix=output.stem + ".cache-", dir=output.parent)
+        )
+    reports = []
+    for index in range(repeat):
+        destination = (
+            output if repeat == 1 else
+            output.with_name(f"{output.stem}.run-{index + 1}{output.suffix}")
+        )
+        report = audit(
+            root, filename, destination, source_paths, python_executable,
+            blt, cache_path=cache_path,
+        )
+        report["process_run"] = index + 1
+        report["process_runs"] = repeat
+        destination.write_text(json.dumps(report, indent=2))
+        reports.append(report)
+    return reports
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, nargs="?")
@@ -492,21 +596,35 @@ def main():
     parser.add_argument("--blt", default=BLT)
     parser.add_argument("--source-path", action="append")
     parser.add_argument("--python-executable")
+    parser.add_argument(
+        "--repeat", type=int, default=1,
+        help="Total fresh LSP processes; repeats share a new isolated analysis cache",
+    )
+    parser.add_argument(
+        "--isolated-cache", action="store_true",
+        help="Use a new analysis cache even for a single process; compiler bytecode is unchanged",
+    )
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
     if args.corpus and not args.manifest:
         args.manifest = Path(__file__).with_name("public_projects.json")
     if not args.manifest:
         if not (args.root and args.file and args.report):
             parser.error("provide root/file/report or --manifest and --output")
-        report = audit(
+        reports = repeated_audit(
             args.root.resolve(),
             args.file.resolve(),
             args.report,
             args.source_path,
             args.python_executable,
             args.blt,
+            args.repeat,
+            args.isolated_cache,
         )
-        return 0 if successful(report) else 1
+        if args.repeat > 1:
+            args.report.write_text(json.dumps(reports, indent=2))
+        return 0 if all(successful(report) for report in reports) else 1
     if not args.output:
         parser.error("--manifest requires --output")
     if not args.corpus and any(
@@ -533,18 +651,26 @@ def main():
         ).strip()
         if entry.get("sha") and revision != entry["sha"]:
             parser.error(f"{name}: checkout differs from the pinned manifest")
-        filename = root / (PUBLIC_FILES.get(name) or entry["files"][0])
-        report = audit(
+        selected = entry.get("lsp_file") or PUBLIC_FILES.get(name)
+        if not selected:
+            selected = next(iter(entry.get("files", [])), None)
+        if not selected:
+            parser.error(f"{name}: manifest requires lsp_file")
+        filename = root / selected
+        project_reports = repeated_audit(
             root,
             filename,
             args.output / (name.replace("/", "__") + ".json"),
             args.source_path or ["."],
             args.python_executable,
             args.blt,
+            args.repeat,
+            args.isolated_cache,
         )
-        report["repo"] = name
-        report["sha"] = entry.get("sha")
-        reports.append(report)
+        for report in project_reports:
+            report["repo"] = name
+            report["sha"] = revision
+        reports.extend(project_reports)
     if not reports:
         parser.error("no projects matched")
     (args.output / "summary.json").write_text(json.dumps(reports, indent=2))
