@@ -163,3 +163,30 @@ def cases(case_type):
         "(value-0000 1)",
         "invalid-arity",
     )
+
+    yield case_type(
+        "native-backslash-names",
+        {
+            "demo/main.lpy": (
+                "(ns demo.main)\n"
+                "(defn value\\path [x] (+ x 1))\n"
+                "(defn run []\n"
+                "(let [payload {:a\\b 98}]\n"
+                "(+ (:a\\b payload) (value\\path 1))))\n"
+            ),
+        },
+        "100",
+        "(value\\path)",
+        "invalid-arity",
+    )
+    yield case_type(
+        "native-keyword-quote-boundaries",
+        {
+            "demo/main.lpy": (
+                "(ns demo.main)\n(defn run []\n(+ 96 (count [:'a :ns/'b])))\n"
+            ),
+        },
+        "100",
+        "(run 1)",
+        "invalid-arity",
+    )

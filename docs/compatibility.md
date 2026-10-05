@@ -36,10 +36,11 @@ supported refactorings preserve values and evaluation order.
 - **Discovery:** blt reads ancestor LSP configuration from each actual directory.
   The pinned clojure-lsp version repeats the root configuration instead.
 
-Formatting accepts Clojure reader text needed by upstream fixtures, including
-read-eval forms, without executing it. Basilisp-only strings and reader forms
-have separate preservation tests. The syntax parser defaults to Basilisp
-validation; its Clojure dialect is opt-in.
+Formatting `.lpy`, `.cljc`, stdin, and LSP documents follows Basilisp token
+rules. Explicit `.clj` inputs, configuration, and the existing formatter library
+arities use Clojure rules, including read-eval text, without executing it. Native
+reader differences have separate preservation tests; the Clojure mode matches
+the upstream fixtures. The syntax parser defaults to Basilisp validation.
 
 See [Formatting](formatting.md), [Checking](checking.md), and
 [Language server](lsp.md) for usage and supported settings.

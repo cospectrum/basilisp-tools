@@ -127,13 +127,15 @@ Namespace sorting and column alignment are optional. Sorting keeps attached and
 dangling comments. Formatting does not wrap lines to a maximum length. Inputs
 nested more than 128 levels deep are rejected.
 
-The supported options follow cljfmt. The formatter also preserves Clojure
-reader forms such as read-eval text and legacy metadata without executing them.
-See [Compatibility](compatibility.md) for details and development checks.
+The supported options follow cljfmt. Files ending in `.lpy` or `.cljc`, stdin,
+and LSP formatting use Basilisp token rules. Explicit `.clj` inputs and
+configuration use Clojure rules, preserving read-eval text and legacy metadata
+without executing them. See [Compatibility](compatibility.md) for details.
 
 ## Library API
 
 `basilisp-tools.format/format-string` takes source and an optional options map.
-It returns formatted source or raises `ExceptionInfo` for malformed syntax or
-invalid options. `load-config`, in the same namespace, accepts a file or directory
+These existing arities use Clojure syntax for compatibility. Use
+`(format-string source options :basilisp)` for native source. The function returns
+formatted source or raises `ExceptionInfo` for malformed syntax or invalid options. `load-config`, in the same namespace, accepts a file or directory
 and defaults to the working directory. Neither function evaluates project code.

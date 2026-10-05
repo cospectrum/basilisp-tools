@@ -38,10 +38,13 @@ without inserting synthetic characters.
 - Reader conditionals and splicing conditionals, with all branches preserved.
 - Line comments, shebang comments, whitespace, and commas.
 
-A lone colon or backslash is reported as an error. The default dialect validates
-Basilisp syntax. `(parse source {:dialect :clojure})` additionally accepts
-read-eval text, legacy metadata, aliased namespaced maps, and array-class symbols
-for lossless tooling; it still never evaluates source.
+The default dialect follows Basilisp token rules, including empty or numeric
+keyword names, backslashes inside names, and native quote boundaries. A lone
+backslash is an incomplete character literal.
+
+`(parse source {:dialect :clojure})` selects Clojure token rules, including
+read-eval text, legacy metadata, aliased namespaced maps, and array-class symbols.
+Neither dialect evaluates source.
 
 ## Traversal
 
