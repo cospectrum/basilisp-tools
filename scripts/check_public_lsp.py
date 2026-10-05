@@ -278,6 +278,162 @@ def cache_snapshot(path):
     return {"files": len(sizes), "bytes": sum(sizes)}
 
 
+
+def unresolved_symbol_policy(root, filename, source, settings):
+    """Only waive the probe when an applicable global disable is confirmed."""
+    import importlib
+
+    import basilisp_tools  # noqa: F401 - Initialize the Basilisp importer.
+    from basilisp.lang.keyword import keyword as kw
+    from basilisp.lang.runtime import to_lisp
+
+    lsp = importlib.import_module("basilisp_tools.lsp")
+    checker = importlib.import_module("basilisp_tools.check")
+    resolved = lsp.load_settings(to_lisp({
+        "root": str(root), "client-settings": settings,
+    }))
+    options = {"filename": str(filename), "cwd": str(root)}
+    configured = resolved.get(kw("kondo-config-dir"))
+    if configured:
+        options["config-dir"] = str(root / configured)
+    config = checker.load_config(to_lisp(options))
+    level = config.get(kw("linters"), {}).get(
+        kw("unresolved-symbol"), {}
+    ).get(kw("level"))
+    # Do not infer a global override through namespace groups or source metadata.
+    # Such a project needs a targeted investigation, rather than a waived failure.
+    scoped = bool(config.get(kw("config-in-ns"))) or "clj-kondo/config" in source
+    return {
+        "disabled": level == kw("off") and not scoped,
+        "resolved_level": str(level).removeprefix(":") if level is not None else None,
+        "config_directory": str(config.get(kw("cfg-dir"))),
+        "config_directories": [str(value) for value in config.get(kw("config-directories"), [])],
+        "scoped_override_requires_review": scoped,
+    }
+
+
+def diagnostic_edit_probes(client, root, filename, source, settings, report, verify):
+    """Check configured semantic diagnostics and an unconditional syntax edit."""
+    uri = filename.as_uri()
+    suffix = '\n(def blt-audit-emoji "😀")\nblt-audit-missing\n'
+    client.send(
+        "textDocument/didChange",
+        {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{
+                "range": {
+                    "start": at(uri, source, len(source))["position"],
+                    "end": at(uri, source, len(source))["position"],
+                },
+                "text": suffix,
+            }],
+        },
+    )
+    changed = source + suffix
+    changed_diagnostics = client.diagnostics(uri, 2)
+    has_missing = any(
+        diagnostic.get("code") == "unresolved-symbol"
+        and "blt-audit-missing" in diagnostic.get("message", "")
+        for diagnostic in changed_diagnostics
+    )
+    if not has_missing:
+        try:
+            policy = unresolved_symbol_policy(root, filename, source, settings)
+        except Exception as error:  # noqa: BLE001 - Failure to resolve is not a waiver.
+            policy = {"disabled": False, "error": repr(error)}
+        report["observations"]["unresolved_symbol_policy"] = policy
+    else:
+        policy = {"disabled": False}
+    if policy["disabled"]:
+        report["observations"].setdefault("skipped_probes", []).append({
+            "name": "edit introduces unresolved symbol",
+            "reason": "Resolved project configuration disables :unresolved-symbol globally.",
+            "configuration": policy,
+        })
+        verify("disabled unresolved-symbol setting honored", not has_missing)
+    else:
+        verify("edit introduces unresolved symbol", has_missing)
+    start = changed.index("blt-audit-missing")
+    client.send(
+        "textDocument/didChange",
+        {
+            "textDocument": {"uri": uri, "version": 3},
+            "contentChanges": [{
+                "range": {
+                    "start": at(uri, changed, start)["position"],
+                    "end": at(uri, changed, start + len("blt-audit-missing"))["position"],
+                },
+                "text": "blt-audit-emoji",
+            }],
+        },
+    )
+    repaired = changed[:start] + "blt-audit-emoji" + changed[start + len("blt-audit-missing"):]
+    fixed = client.diagnostics(uri, 3)
+    verify(
+        "edit removes unresolved symbol",
+        not any("blt-audit-missing" in diagnostic.get("message", "") for diagnostic in fixed),
+    )
+
+    # The unexpected delimiter follows an astral character on the same line.
+    # Checking its exact range exercises UTF-16 conversion, even when a project
+    # intentionally disables unresolved-symbol diagnostics.
+    invalid_suffix = '\n(do "😀" ])\n'
+    client.send(
+        "textDocument/didChange",
+        {
+            "textDocument": {"uri": uri, "version": 4},
+            "contentChanges": [{
+                "range": {
+                    "start": at(uri, repaired, len(repaired))["position"],
+                    "end": at(uri, repaired, len(repaired))["position"],
+                },
+                "text": invalid_suffix,
+            }],
+        },
+    )
+    invalid = repaired + invalid_suffix
+    error_offset = len(repaired) + invalid_suffix.index("]")
+    error_start = at(uri, invalid, error_offset)["position"]
+    error_end = at(uri, invalid, error_offset + 1)["position"]
+    broken = client.diagnostics(uri, 4)
+    syntax_errors = [
+        diagnostic for diagnostic in broken
+        if diagnostic.get("code") == "syntax"
+        and diagnostic.get("range", {}).get("start", {}).get("line") == error_start["line"]
+    ]
+    verify("edit introduces syntax error", bool(syntax_errors))
+    verify(
+        "syntax diagnostic range uses UTF-16",
+        any(diagnostic.get("range") == {"start": error_start, "end": error_end}
+            for diagnostic in syntax_errors),
+    )
+    client.send(
+        "textDocument/didChange",
+        {
+            "textDocument": {"uri": uri, "version": 5},
+            "contentChanges": [{
+                "range": {"start": error_start, "end": error_end},
+                "text": "nil",
+            }],
+        },
+    )
+    syntax_repaired = client.diagnostics(uri, 5)
+    verify(
+        "edit repairs introduced syntax error",
+        not any(
+            diagnostic.get("code") == "syntax"
+            and diagnostic.get("range", {}).get("start", {}).get("line", -1) >= error_start["line"]
+            for diagnostic in syntax_repaired
+        ),
+    )
+    report["observations"]["probe_diagnostics"] = {
+        "unresolved": changed_diagnostics,
+        "unresolved_repaired": fixed,
+        "syntax": broken,
+        "syntax_repaired": syntax_repaired,
+    }
+
+
 def audit(
     root, filename, output, source_paths=None, python_executable=None, blt=BLT,
     cache_path=None, python_timeout=None, workspace_scope=None,
@@ -429,55 +585,8 @@ def audit(
             },
         )
         report["observations"]["format_edits"] = formatted
-        # Exercise a UTF-16 ranged edit, and then remove its own diagnostic.
-        suffix = '\n(def blt-audit-emoji "😀")\nblt-audit-missing\n'
-        client.send(
-            "textDocument/didChange",
-            {
-                "textDocument": {"uri": uri, "version": 2},
-                "contentChanges": [
-                    {
-                        "range": {
-                            "start": at(uri, source, len(source))["position"],
-                            "end": at(uri, source, len(source))["position"],
-                        },
-                        "text": suffix,
-                    }
-                ],
-            },
-        )
-        changed = source + suffix
-        changed_diagnostics = client.diagnostics(uri, 2)
-        verify(
-            "edit introduces unresolved symbol",
-            any(
-                d.get("code") == "unresolved-symbol"
-                and "blt-audit-missing" in d.get("message", "")
-                for d in changed_diagnostics
-            ),
-        )
-        start = changed.index("blt-audit-missing")
-        client.send(
-            "textDocument/didChange",
-            {
-                "textDocument": {"uri": uri, "version": 3},
-                "contentChanges": [
-                    {
-                        "range": {
-                            "start": at(uri, changed, start)["position"],
-                            "end": at(uri, changed, start + len("blt-audit-missing"))[
-                                "position"
-                            ],
-                        },
-                        "text": "blt-audit-emoji",
-                    }
-                ],
-            },
-        )
-        fixed = client.diagnostics(uri, 3)
-        verify(
-            "edit removes unresolved symbol",
-            not any("blt-audit-missing" in d.get("message", "") for d in fixed),
+        diagnostic_edit_probes(
+            client, root, filename, source, settings, report, verify,
         )
         # Supplement real source with an in-memory stdlib interop buffer.
         python_uri = (filename.parent / "__blt_audit_interop.lpy").as_uri()

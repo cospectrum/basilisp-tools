@@ -136,3 +136,97 @@ def test_cleanup_reaps_an_already_gone_group(monkeypatch):
     monkeypatch.setattr(harness.os, "killpg", missing)
     harness.kill_process_tree(SimpleNamespace(pid=42, wait=lambda: calls.append("wait")))
     assert calls == ["wait"]
+
+
+def diagnostic_probe_client(unresolved=True, syntax_character=9):
+    messages = []
+    missing = [{
+        "code": "unresolved-symbol", "message": "Unresolved symbol: blt-audit-missing",
+    }] if unresolved else []
+    syntax = [{
+        "code": "syntax",
+        "message": "Unexpected closing delimiter",
+        "range": {
+            "start": {"line": 5, "character": syntax_character},
+            "end": {"line": 5, "character": syntax_character + 1},
+        },
+    }]
+    diagnostics = {2: missing, 3: [], 4: syntax, 5: []}
+    return SimpleNamespace(
+        send=lambda method, params: messages.append((method, params)),
+        diagnostics=lambda uri, version: diagnostics[version],
+        sent=messages,
+    )
+
+
+def run_diagnostic_probes(client, tmp_path):
+    report = {"observations": {}}
+    assertions = {}
+
+    def verify(name, condition):
+        assertions[name] = bool(condition)
+
+    harness.diagnostic_edit_probes(
+        client, tmp_path, tmp_path / "demo.lpy", "(ns demo)\n", {}, report, verify,
+    )
+    return report, assertions
+
+
+def test_diagnostic_probes_require_semantic_and_utf16_syntax_errors(tmp_path):
+    client = diagnostic_probe_client()
+    report, assertions = run_diagnostic_probes(client, tmp_path)
+    assert all(assertions.values())
+    assert "skipped_probes" not in report["observations"]
+    versions = [params["textDocument"]["version"] for _, params in client.sent]
+    assert versions == [2, 3, 4, 5]
+    repair = client.sent[-1][1]["contentChanges"][0]
+    assert repair == {
+        "range": {
+            "start": {"line": 5, "character": 9},
+            "end": {"line": 5, "character": 10},
+        },
+        "text": "nil",
+    }
+    _, wrong_range = run_diagnostic_probes(
+        diagnostic_probe_client(syntax_character=8), tmp_path,
+    )
+    assert not wrong_range["syntax diagnostic range uses UTF-16"]
+
+
+def test_disabled_semantic_probe_still_requires_syntax_roundtrip(tmp_path, monkeypatch):
+    evidence = {
+        "disabled": True, "resolved_level": "off",
+        "config_directory": str(tmp_path / ".clj-kondo"),
+    }
+    monkeypatch.setattr(harness, "unresolved_symbol_policy", lambda *args: evidence)
+    report, assertions = run_diagnostic_probes(
+        diagnostic_probe_client(unresolved=False), tmp_path,
+    )
+    assert all(assertions.values())
+    assert assertions["edit introduces syntax error"]
+    assert assertions["edit repairs introduced syntax error"]
+    assert report["observations"]["skipped_probes"][0]["configuration"] == evidence
+    assert "edit introduces unresolved symbol" not in assertions
+    assert assertions["disabled unresolved-symbol setting honored"]
+
+
+def test_missing_diagnostic_is_not_waived_without_confirmed_disable(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        harness, "unresolved_symbol_policy",
+        lambda *args: {"disabled": False, "scoped_override_requires_review": True},
+    )
+    report, assertions = run_diagnostic_probes(
+        diagnostic_probe_client(unresolved=False), tmp_path,
+    )
+    assert not assertions["edit introduces unresolved symbol"]
+    assert "skipped_probes" not in report["observations"]
+
+    def configuration_error(*args):
+        raise ValueError("bad config")
+
+    monkeypatch.setattr(harness, "unresolved_symbol_policy", configuration_error)
+    report, assertions = run_diagnostic_probes(
+        diagnostic_probe_client(unresolved=False), tmp_path,
+    )
+    assert not assertions["edit introduces unresolved symbol"]
+    assert "bad config" in report["observations"]["unresolved_symbol_policy"]["error"]
