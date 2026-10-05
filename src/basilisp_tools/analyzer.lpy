@@ -837,10 +837,13 @@
         module (python-module ctx module-name)
         munged (when (and member-name (= 1 (count path))) [(util/munge member-name)])
         preferred (when munged (py/resolve-member module (first munged)))
-        member (when member-name
-                 (or preferred
-                     (py/inspect-path module-name path (get-in @(:state ctx) [:opts :python-options] {}))))
         path (if preferred munged path)
+        reexport? (or (:target-module preferred)
+                      (and (:target preferred) (not (:members preferred))))
+        member (when member-name
+                 (or (when-not reexport? preferred)
+                     (py/inspect-path module-name path (get-in @(:state ctx) [:opts :python-options] {}))
+                     preferred))
         member (if member-name member module)
         entry (merge (loc ctx node) {:name (or member-name module-name) :ns module-name
                                      :python true :definition member :python-module module-name

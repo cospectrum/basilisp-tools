@@ -1,0 +1,47 @@
+(ns basilisp-tools.analyzer-reexports-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile]))
+
+(deftest deferred-python-reexports-retain-navigation-and-call-contracts-test
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (py/create-cache)
+        options {:python-options {:python-paths [(str root)]
+                                  :python-inspection? false :python-cache cache}}]
+    (try
+      ;; A broad import graph leaves later reexports for demand-driven resolution.
+      (doseq [i (range 70)]
+        (.write_text (.joinpath root (str "export_dependency_" i ".py"))
+                     "value: int = 1\n" ** :encoding "utf-8"))
+      (.write_text (.joinpath root "export_target.py")
+                   (str "class Widget:\n"
+                        "    def __init__(self, value: int): pass\n"
+                        "    def label(self) -> str: return 'ready'\n")
+                   ** :encoding "utf-8")
+      (.write_text (.joinpath root "export_facade.py")
+                   (str (apply str (for [i (range 70)]
+                                     (str "from export_dependency_" i " import value as value_" i "\n")))
+                        "from export_target import Widget as Public_Widget\n"
+                        "import export_target as helpers\n")
+                   ** :encoding "utf-8")
+      (let [module (py/inspect-module "export_facade" (:python-options options))]
+        (is (= "export_target" (:target-module (py/resolve-member module "Public_Widget")))))
+      (let [source "(ns sample (:import [export_facade :as api])) (.upper (.label (api/Public-Widget 1)))"
+            result (analyzer/analyze source options)
+            usage (first (filter #(= "Public-Widget" (:name %)) (:python-usages result)))]
+        (is (empty? (:findings result)))
+        (is (= :class (get-in usage [:definition :kind])))
+        (is (= (str (.resolve (.joinpath root "export_target.py"))) (get-in usage [:definition :filename])))
+        (is (= ["Public_Widget"] (:python-path usage)))
+        (is (= "api/Public-Widget" (subs source (:start usage) (:end usage)))))
+      (doseq [[call expected] [["(api/Public-Widget)" :invalid-arity]
+                               ["(api/Public-Widget \"wrong\")" :type-mismatch]]]
+        (let [result (analyzer/analyze (str "(ns sample (:import [export_facade :as api])) " call) options)]
+          (is (= [expected] (mapv :type (:findings result))))))
+      (let [result (analyzer/analyze "(ns sample (:import [export_facade :as api])) (def module api/helpers) module" options)
+            usage (first (filter #(= "helpers" (:name %)) (:python-usages result)))]
+        (is (= :module (get-in usage [:definition :kind])))
+        (is (= (str (.resolve (.joinpath root "export_target.py"))) (get-in usage [:definition :filename]))))
+      (finally (py/stop-cache! cache) (.cleanup temporary)))))
