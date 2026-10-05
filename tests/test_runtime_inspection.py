@@ -173,3 +173,115 @@ def test_bound_self_uses_each_receiver_without_executing_descriptors(worker):
         assert info["parameters"] == []
         assert info["type-path"][-1] == type(receiver).__name__
         assert info["instance-method?"] is False
+
+
+def source_module(monkeypatch, root, name, source):
+    path = root / (name + ".py")
+    path.write_text(source)
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    monkeypatch.setitem(sys.modules, name, module)
+    exec(compile(source, str(path), "exec"), vars(module))
+    return path, module
+
+
+def assert_identifier(info, path, name):
+    source = path.read_text()
+    assert info["filename"] == str(path)
+    assert source[info["start"]:info["end"]] == name
+    before = source[:info["start"]]
+    assert info["row"] == before.count("\n") + 1
+    assert info["col"] == len(before.rsplit("\n", 1)[-1]) + 1
+
+
+def test_runtime_class_definitions_identify_original_source_names(worker, tmp_path, monkeypatch):
+    source = ("def identity(value): return value\n"
+              "@identity\nclass Café:\n"
+              "    class Nested: pass\n"
+              "Alias = Café\n")
+    path, module = source_module(monkeypatch, tmp_path, "blt_class_locations", source)
+    inspector = worker.StaticInspector([], list(sys.path))
+    token = worker._runtime_inspector.set(inspector)
+    try:
+        outer = worker.safe_member("Alias", module.Alias, depth=0)
+        nested = worker.safe_member("Nested", module.Alias.Nested, depth=0)
+    finally:
+        worker._runtime_inspector.reset(token)
+    assert_identifier(outer, path, "Café")
+    assert_identifier(nested, path, "Nested")
+    assert outer["row"] == 3
+    assert str(path) in inspector.dependencies
+
+
+def test_cached_functions_keep_signatures_and_original_identifier_spans(worker, tmp_path, monkeypatch):
+    source = ("import functools\n"
+              "note = '😀'\n"
+              "@functools.lru_cache(maxsize=8)\n"
+              "def résumé(value: int) -> str:\n"
+              "    raise AssertionError('function must not execute')\n"
+              "alias = résumé\n")
+    path, module = source_module(monkeypatch, tmp_path, "blt_cached_locations", source)
+    info = worker.safe_member("alias", module.alias)
+    assert info["kind"] == "function"
+    assert [item["name"] for item in info["parameters"]] == ["value"]
+    assert info["type-path"] == ["str"]
+    assert_identifier(info, path, "résumé")
+    assert info["row"] == 4
+
+
+def test_source_lookup_does_not_invoke_metaclass_or_wrapper_descriptors(worker, tmp_path, monkeypatch):
+    source = ("class Guard(type):\n"
+              "    def __getattribute__(self, name):\n"
+              "        raise AssertionError('metaclass must not execute')\n"
+              "class Protected(metaclass=Guard): pass\n")
+    path, module = source_module(monkeypatch, tmp_path, "blt_guarded_locations", source)
+    assert_identifier(worker.safe_member("Alias", module.Protected, depth=0), path, "Protected")
+
+    class Untrusted:
+        def __getattribute__(self, name):
+            raise AssertionError("wrapper attributes must not execute")
+
+    wrapper = worker.functools.lru_cache()(lambda: None)
+    wrapper.__wrapped__ = Untrusted()
+    info = worker.safe_member("wrapper", wrapper)
+    assert info["status"] == "known"
+    assert "filename" not in info
+    assert "parameters" not in info
+
+
+def test_runtime_source_locations_refresh_after_source_changes(worker, tmp_path, monkeypatch):
+    name = "blt_edited_locations"
+    path, first = source_module(monkeypatch, tmp_path, name, "class Original: pass\n")
+    old = worker.safe_member("alias", first.Original, depth=0)
+    assert_identifier(old, path, "Original")
+    path, second = source_module(monkeypatch, tmp_path, name, "# source changed\n\nclass Original: pass\n")
+    current = worker.safe_member("alias", second.Original, depth=0)
+    assert_identifier(current, path, "Original")
+    assert current["row"] == 3
+    assert current["start"] != old["start"]
+
+
+def test_wrapped_function_definition_points_to_original_declaration(worker, tmp_path, monkeypatch):
+    source = ("from functools import wraps\n"
+              "def decorate(function):\n"
+              "    @wraps(function)\n"
+              "    def wrapper(*args, **kwargs):\n"
+              "        raise AssertionError('wrapper must not execute')\n"
+              "    return wrapper\n"
+              "@decorate\n"
+              "def original(value: int) -> str: pass\n"
+              "alias = original\n")
+    path, module = source_module(monkeypatch, tmp_path, "blt_wrapped_locations", source)
+    info = worker.safe_member("alias", module.alias)
+    assert [item["name"] for item in info["parameters"]] == ["value"]
+    assert_identifier(info, path, "original")
+    assert info["row"] == 8
+
+
+def test_reexported_class_with_rewritten_module_uses_own_method_source(worker, tmp_path, monkeypatch):
+    path, original = source_module(monkeypatch, tmp_path, "blt_original_locations",
+                                   "class Public:\n    def method(self): pass\n")
+    _, exported = source_module(monkeypatch, tmp_path, "blt_exported_locations", "# public exports\n")
+    exported.Alias = original.Public
+    exported.Alias.__module__ = exported.__name__
+    assert_identifier(worker.safe_member("Alias", exported.Alias, depth=0), path, "Public")

@@ -13,12 +13,14 @@ import functools
 import importlib
 import importlib.machinery
 import inspect
+import io
 import json
 import os
 from pathlib import Path
 import sys
 import sysconfig
 import types
+import tokenize
 import typing
 
 CALLABLE_TYPES = (types.FunctionType, types.BuiltinFunctionType,
@@ -344,6 +346,102 @@ def source_context(module):
         return runtime_source_context(module, filename, stat.st_mtime_ns, stat.st_size, _runtime_inspector.get())
     except (OSError, ValueError, SyntaxError, UnicodeError, RecursionError):
         return None
+
+
+@functools.lru_cache(maxsize=32)
+def source_locations(filename, modified, size):
+    """Locate declared identifiers, retaining Unicode and decorator positions."""
+    with tokenize.open(filename) as stream:
+        source = stream.read()
+    tree = ast.parse(source, filename=filename, type_comments=True)
+    offsets, offset = [], 0
+    for line in source.splitlines(keepends=True):
+        offsets.append(offset)
+        offset += len(line)
+    declarations, pending = {}, None
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if pending and token.type == tokenize.NAME:
+            row, col = token.start
+            start = offsets[row - 1] + col
+            declarations[pending] = {
+                "filename": filename, "row": row, "col": col + 1,
+                "start": start, "end": start + len(token.string),
+            }
+            pending = None
+        if token.type == tokenize.NAME and token.string in ("class", "def"):
+            pending = (token.string, token.start[0])
+    classes, functions = {}, {}
+
+    def visit(node, parents=()):
+        scope = parents
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            kind = "class" if isinstance(node, ast.ClassDef) else "def"
+            location = declarations.get((kind, node.lineno))
+            first_line = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+            scope = (*parents, node.name)
+            if kind == "class":
+                classes.setdefault(".".join(scope), []).append((first_line, node.lineno, location))
+            else:
+                functions[first_line, node.name] = location
+                scope = (*scope, "<locals>")
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree)
+    return classes, functions
+
+
+def runtime_source_location(value):
+    """Read trusted object fields and source ASTs; never evaluate descriptors."""
+    if is_class(value):
+        module = class_attribute(value, "__module__")
+        loaded = sys.modules.get(module) if type(module) is str else None
+        filenames = [vars(loaded).get("__file__")] if type(loaded) is types.ModuleType else []
+        name = class_attribute(value, "__qualname__")
+        namespace = class_attribute(value, "__dict__")
+        first_line = namespace.get("__firstlineno__")
+        # Re-exported classes can rewrite __module__. Their own methods retain
+        # original code filenames; inherited or borrowed methods are excluded.
+        for member in namespace.values():
+            if exact_type(member, (classmethod, staticmethod)):
+                member = member.__func__
+            elif type(member) is property:
+                member = member.fget
+            if type(member) is types.FunctionType and member.__qualname__.rsplit(".", 1)[0] == name:
+                filenames.append(member.__code__.co_filename)
+    elif type(value) is types.FunctionType:
+        seen = set()
+        while id(value) not in seen:
+            seen.add(id(value))
+            wrapped = value.__dict__.get("__wrapped__")
+            if type(wrapped) is not types.FunctionType:
+                break
+            value = wrapped
+        filenames = [value.__code__.co_filename]
+    else:
+        return {}
+    filenames = dict.fromkeys(filename for filename in filenames
+                              if type(filename) is str and filename.endswith((".py", ".pyi")))
+    for filename in filenames:
+        try:
+            stat = Path(filename).stat()
+            classes, functions = source_locations(filename, stat.st_mtime_ns, stat.st_size)
+            if is_class(value):
+                candidates = classes.get(name, []) if type(name) is str else []
+                if len(candidates) != 1:
+                    candidates = [entry for entry in candidates
+                                  if type(first_line) is int and first_line in entry[:2]]
+                location = candidates[0][2] if len(candidates) == 1 else None
+            else:
+                location = functions.get((value.__code__.co_firstlineno, value.__code__.co_name))
+            if location:
+                inspector = _runtime_inspector.get()
+                if inspector is not None:
+                    inspector.dependency(Path(filename))
+                return location
+        except (OSError, SyntaxError, ValueError, UnicodeError, RecursionError, tokenize.TokenError):
+            continue
+    return {}
 
 
 def runtime_source_reference(node, module, owner=None):
@@ -735,6 +833,10 @@ def pydantic_parameters(value):
 
 def runtime_member(name, value, depth=1, owner=None):
     result = {"status": "known", "name": name}
+    if type(value) is functools._lru_cache_wrapper:
+        wrapped = vars(value).get("__wrapped__")
+        if type(wrapped) is types.FunctionType:
+            value = wrapped
     bound_method = type(value) is types.MethodType and type(value.__func__) is types.FunctionType
     if bound_method:
         # MethodType's intrinsic fields do not invoke receiver descriptors.
@@ -764,6 +866,7 @@ def runtime_member(name, value, depth=1, owner=None):
         # Constructors produce their class regardless of an __init__ -> None annotation.
         result["return-type"] = annotation(value)
         result.update(runtime_type(value))
+        result.update(runtime_source_location(value))
         model_params = pydantic_parameters(value)
         if model_params is not None:
             result.update(parameters=model_params, signature=signature_text(model_params, result["return-type"]))
@@ -853,6 +956,7 @@ def runtime_member(name, value, depth=1, owner=None):
             result["async?"] = bool(value.__code__.co_flags & inspect.CO_COROUTINE)
             result["generator?"] = bool(value.__code__.co_flags & (inspect.CO_GENERATOR | inspect.CO_ASYNC_GENERATOR))
             result.update(filename=value.__code__.co_filename, row=value.__code__.co_firstlineno)
+            result.update(runtime_source_location(value))
     else:
         result.update(kind="variable", **{"return-type": annotation(type(value)), **runtime_type(type(value))})
     doc = (value.__doc__ if exact_type(value, CALLABLE_TYPES)
