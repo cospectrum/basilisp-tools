@@ -285,3 +285,51 @@ def test_reexported_class_with_rewritten_module_uses_own_method_source(worker, t
     exported.Alias = original.Public
     exported.Alias.__module__ = exported.__name__
     assert_identifier(worker.safe_member("Alias", exported.Alias, depth=0), path, "Public")
+
+
+@pytest.mark.parametrize("extension", ["py", "pyi"])
+def test_property_accessors_preserve_read_types(worker, tmp_path, extension):
+    source = """raise AssertionError("source must not execute")
+class Shape:
+    @property
+    def shape(self) -> tuple[int, ...]:
+        "Read dimensions."
+        ...
+    @shape.setter
+    def shape(self, value: list[int]) -> None: ...
+    @shape.deleter
+    def shape(self) -> None: ...
+    @property
+    def label(self) -> int: ...
+    @label.getter
+    def label(self) -> str: ...
+    @label.setter
+    def alias(self, value: str) -> None: ...
+class Decorator:
+    def setter(self, fn): return fn
+ordinary = Decorator()
+class Unrelated:
+    @ordinary.setter
+    def method(self) -> int: ...
+"""
+    filename = tmp_path / f"property_accessors.{extension}"
+    filename.write_text(source)
+    inspector = worker.StaticInspector([str(tmp_path)], [])
+    module = inspector.module("property_accessors")
+    members = module["members"]["Shape"]["members"]
+    ordinary = module["members"]["Unrelated"]["members"]["method"]
+    assert ordinary["kind"] == "function" and ordinary["type-path"] == ["int"]
+    shape = members["shape"]
+    assert shape["kind"] == "property"
+    assert shape["type-module"] == "builtins" and shape["type-path"] == ["tuple"]
+    assert shape["type-arguments"][0]["type-path"] == ["int"]
+    assert shape["doc"] == "Read dimensions."
+    assert shape["row"] == 4
+    for name in ("label", "alias"):
+        assert members[name]["kind"] == "property"
+        assert members[name]["type-path"] == ["str"]
+        assert members[name]["row"] == 14
+    for info in members.values():
+        assert not info["instance-method?"]
+        assert "parameters" not in info and "signature" not in info
+    assert "property_accessors" not in sys.modules

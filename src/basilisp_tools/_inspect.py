@@ -1680,7 +1680,20 @@ class StaticModule:
         complete = True
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                accessor = next((decorator for decorator in node.decorator_list
+                                 if isinstance(decorator, ast.Attribute)
+                                 and decorator.attr in {"getter", "setter", "deleter"}
+                                 and isinstance(decorator.value, ast.Name)
+                                 and members.get(decorator.value.id, {}).get("kind") == "property"), None)
+                if accessor is not None and accessor.attr != "getter":
+                    # A setter/deleter changes assignment behavior, not the getter's value type.
+                    members[node.name] = dict(members[accessor.value.id])
+                    continue
                 info = self.function(node, owner)
+                if accessor is not None:
+                    info.update(kind="property", **{"instance-method?": False})
+                    info.pop("parameters", None)
+                    info.pop("signature", None)
                 if "overload" in self.decorators(node):
                     overloads.setdefault(node.name, []).append(info)
                 members[node.name] = info
