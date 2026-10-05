@@ -1,4 +1,4 @@
-"""Standard-library-only inspection worker for a possibly different interpreter.
+"""Inspect Python metadata without dependencies, using a possibly different interpreter.
 
 Invoked by python.lpy with isolated Python. Project files are parsed, never
 imported. Installed dependency inspection is enabled by default and can be disabled;
