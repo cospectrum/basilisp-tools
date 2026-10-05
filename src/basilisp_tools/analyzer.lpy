@@ -149,7 +149,9 @@
       :keyword (let [raw (token node)]
                  (if (.startswith raw "::") (edn/read-string raw) (keyword (subs raw 1))))
       :number (let [raw (token node)]
-                (if (re/fullmatch "[+-]?[0-9]+" raw) (python/int raw) (edn/read-string raw)))
+                (if (re/fullmatch "-?(?:0|[1-9][0-9]*)" raw)
+                  (python/int raw)
+                  (python/next (basilisp.lang.reader/read-str raw))))
       :string (let [raw (syntax/text node)]
                 (if (neg? (.find raw "\\")) (subs raw 1 (dec (count raw))) (python/next (basilisp.lang.reader/read-str raw))))
       (:symbolic-number :character) (edn/read-string (syntax/text node))

@@ -1,0 +1,50 @@
+(ns basilisp-tools.analyzer-constants-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- matching [source type]
+  (filterv #(= type (:type %))
+           (:findings (analyzer/analyze source {:python-options {:python-inspection? false}}))))
+
+(deftest numeric-case-constants-agree-with-native-reader-test
+  ;; The EDN reader does not support every Basilisp numeric spelling.
+  (doseq [source ["(case 1/2 1 :wrong 1/2 :right)"
+                  "(case 0x7B 0 :wrong 0x7B :right)"
+                  "(case 2r101 2 :wrong 2r101 :right)"
+                  "(case 077 77 :wrong 077 :right)"
+                  "(case 1J 1 :wrong 1J :right)"]]
+    (testing source
+      (is (= :right (eval (read-string source))))
+      (is (empty? (matching source :case-duplicate-test))))))
+
+(deftest equal-numeric-spellings-still-report-case-collisions-test
+  (doseq [source ["(case 1/2 1/2 :first 2/4 :last)"
+                  "(case 123 123 :first 0x7B :last)"
+                  "(case 5 5 :first 2r101 :last)"
+                  "(case 63 63 :first 077 :last)"
+                  "(case 1 1 :first 1.0 :last)"
+                  "(case 1 1 :first true :last)"]]
+    (testing source
+      ;; Basilisp uses Python map equality: the later equal key wins.
+      (is (= :last (eval (read-string source))))
+      (is (= 1 (count (matching source :case-duplicate-test)))))))
+
+(deftest distinct-numeric-set-forms-agree-with-native-reader-test
+  ;; mmllm uses calls with eight different hexadecimal ASCII constants.
+  (doseq [source ["#{(python/int 0x7B) (python/int 0x7D)}"
+                  "#{(python/int 0x5B) (python/int 0x5D) (python/int 0x28) (python/int 0x29)}"
+                  "{(python/int 0x7B) :open (python/int 0x7D) :close}"]]
+    (testing source
+      (is (<= 2 (count (eval (read-string source)))))
+      (is (empty? (matching source :duplicate-set-key)))
+      (is (empty? (matching source :duplicate-map-key))))))
+
+(deftest equal-source-forms-still-report-reader-duplicates-test
+  (doseq [[source type]
+          [["#{(python/int 0x7B) (python/int 123)}" :duplicate-set-key]
+           ["{(python/int 0x7B) :open (python/int 123) :again}" :duplicate-map-key]
+           ["#{1/2 2/4}" :duplicate-set-key]
+           ["{077 :first 63 :again}" :duplicate-map-key]]]
+    (testing source
+      (is (thrown? python/Exception (read-string source)))
+      (is (= 1 (count (matching source type)))))))
