@@ -674,10 +674,6 @@
 
 (def ^:private analysis-cache-schema 2)
 
-(defn- cache-encode [value] (cache/encode value))
-
-(defn- cache-decode [value] (cache/decode value))
-
 (defn- analysis-cache-stat [file]
   (try
     (let [path (.resolve (pathlib/Path file)) stat (.stat path)]
@@ -712,7 +708,7 @@
                  :environment (mapv analysis-cache-stat (py/environment-paths options))
                  :python-sources (analysis-cache-source-files (:python-paths options) #{".py" ".pyi"})
                  :hook-sources (analysis-cache-source-files (:config-directories config) #{".lpy" ".cljc" ".clj" ".edn"})}]
-    (.hexdigest (hashlib/sha256 (.encode (json/dumps (cache-encode context) ** :ensure_ascii false) "utf-8")))))
+    (.hexdigest (hashlib/sha256 (.encode (json/dumps (cache/encode context) ** :ensure_ascii false) "utf-8")))))
 
 (defn- analysis-cache-key [document project options settings config]
   (let [storage (:persistent-cache-context options)
