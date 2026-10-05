@@ -1,0 +1,82 @@
+(ns basilisp-tools.analyzer-destructuring-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private source-prefix
+  "(ns blt-destructure-runtime (:require [basilisp.string :as s])) ")
+
+(def ^:private binding-cases
+  [["auto keys" "{::keys [x]}" "{::x 42}"]
+   ["auto symbols" "{::syms [x]}" "{'blt-destructure-runtime/x 42}"]
+   ["aliased keys" "{::s/keys [x]}" "{:basilisp.string/x 42}"]
+   ["aliased symbols" "{::s/syms [x]}" "{'basilisp.string/x 42}"]
+   ["explicit namespace" "{:example/keys [x]}" "{:example/x 42}"]
+   ["plain strings" "{:strs [x]}" "{\"x\" 42}"]
+   ["keyword binding" "{:keys [::x]}" "{::x 42}"]
+   ["aliased keyword binding" "{:keys [::s/x]}" "{:basilisp.string/x 42}"]
+   ["qualified symbol binding" "{:keys [example/x]}" "{:example/x 42}"]])
+
+(defn- errors [source]
+  (filterv #(= :error (:level %)) (:findings (analyzer/analyze source))))
+
+(deftest namespaced-destructuring-agrees-with-native-runtime-test
+  ;; Execute only these original fixtures as an independent runtime oracle.
+  (doseq [[label pattern values] binding-cases]
+    (testing label
+      (let [source (str source-prefix "(let [" pattern " " values "] x)")]
+        (is (= 42 (load-string source)))
+        (is (empty? (errors source))))
+      (let [source (str source-prefix "(let [" pattern " " values "] (inc x))")]
+        (is (= 43 (load-string source)))
+        (is (empty? (errors source))))
+      (let [source (str source-prefix "(let [" pattern " " values "] (count x))")]
+        (is (= [:type-mismatch] (mapv :type (errors source))))))))
+
+(deftest only-plain-strs-is-a-native-destructuring-directive-test
+  (doseq [directive ["::strs" ":example/strs" "::s/strs"]]
+    (let [source (str source-prefix "(let [{" directive " [x]} {}] x)")
+          failed? (try (load-string source) false (catch python/Exception _ true))]
+      (is failed?)
+      (is (some #(= :syntax (:type %)) (errors source))))))
+
+(deftest namespaced-destructuring-defaults-and-alias-usages-test
+  (doseq [pattern ["{::keys [x] :or {x 42}}" "{::s/keys [x] :or {x 42}}"
+                   "{:keys [::x] :or {x 42}}" "{::syms [x] :or {x 42}}"]]
+    (let [source (str source-prefix "(let [" pattern " {}] x)")]
+      (is (= 42 (load-string source)))
+      (is (empty? (errors source)))))
+  (let [source (str source-prefix "(fn [{::s/keys [x]}] x)")
+        analysis (analyzer/analyze source)]
+    (is (empty? (:findings (analyzer/analyze source))))
+    (is (some #(and (= "keys" (:name %)) (= "basilisp.string" (:ns %))
+                    (= "s" (:alias %))) (:keywords analysis))))
+  (is (= [:unresolved-namespace]
+         (mapv :type (:findings (analyzer/analyze "(ns example) (fn [{::missing/keys [x]}] x)"))))))
+
+(deftest source-keyword-values-use-source-namespace-test
+  (doseq [expression ["(inc ({'[::x] 42} '[:blt-destructure-runtime/x]))"
+                      "(inc (::x {:blt-destructure-runtime/x 42}))"
+                      "(inc (:blt-destructure-runtime/x {::x 42}))"
+                      "(inc (get {::s/x 42} :basilisp.string/x))"
+                      "(inc ({:basilisp.string/x 42} ::s/x))"
+                      "(inc (get (assoc {} ::s/x 42) :basilisp.string/x))"]]
+    (let [source (str source-prefix expression)]
+      (is (= 43 (load-string source)))
+      (is (empty? (errors source)))))
+  (is (= [:type-mismatch]
+         (mapv :type (errors (str source-prefix "(inc (::s/x {:basilisp.string/x \"bad\"}))")))))
+  (is (= [:duplicate-map-key]
+         (mapv :type (errors (str source-prefix "{::x 1 :blt-destructure-runtime/x 2}"))))))
+
+(deftest slash-and-empty-keyword-names-test
+  (doseq [[raw expected-ns expected-name] [[":/" nil "/"] ["::/" "blt-destructure-runtime" "/"]
+                                           [":" nil ""] ["::" "blt-destructure-runtime" ""]]]
+    (let [source (str source-prefix raw)
+          value (load-string source)
+          result (analyzer/analyze source)
+          occurrence (first (:keywords result))]
+      (is (= expected-ns (namespace value)))
+      (is (= expected-name (name value)))
+      (is (= expected-ns (:ns occurrence)))
+      (is (= expected-name (:name occurrence)))
+      (is (empty? (errors source))))))

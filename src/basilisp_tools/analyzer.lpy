@@ -172,26 +172,41 @@
           value)))
     (decode-config-data node)))
 
-(defn- quoted-data [node]
+(defn- source-keyword
+  "Resolve source keywords against the analyzed namespace, without invoking a reader."
+  [ctx node]
+  (let [raw (token node) auto? (.startswith raw "::")
+        text (subs raw (if auto? 2 1))
+        parts (if (op/eq text "/") [text] (str/split text #"/" 2))
+        prefix (when (> (count parts) 1) (first parts))
+        state @(:state ctx)
+        ns-name (if auto? (if prefix (get-in state [:aliases prefix]) (:namespace state)) prefix)]
+    (when (and auto? prefix (nil? ns-name))
+      (throw (python/ValueError (str "Unresolved namespace " prefix))))
+    (keyword ns-name (last parts))))
+
+(defn- quoted-data [ctx node]
   (let [node (unwrap node) children (forms node)]
     (case (:kind node)
-      :quote (list 'quote (quoted-data (first children)))
-      :list (apply list (map quoted-data children))
-      :vector (mapv quoted-data children)
-      :set (set (map quoted-data children))
-      :map (into {} (map (fn [[key value]] [(quoted-data key) (quoted-data value)]) (partition 2 children)))
+      :quote (list 'quote (quoted-data ctx (first children)))
+      :list (apply list (map #(quoted-data ctx %) children))
+      :vector (mapv #(quoted-data ctx %) children)
+      :set (set (map #(quoted-data ctx %) children))
+      :map (into {} (map (fn [[key value]] [(quoted-data ctx key) (quoted-data ctx value)]) (partition 2 children)))
+      :keyword (source-keyword ctx node)
       (config-data node))))
 
 (defn- constant-data
   "Return [value] only when the code form has a statically known literal value."
-  [node]
+  [ctx node]
   (let [node (unwrap node) kind (:kind node)]
     (try
       (cond
+        (op/eq :keyword kind) [(source-keyword ctx node)]
         (contains? literal-kinds kind) [(config-data node)]
-        (op/eq :quote kind) [(quoted-data (first (forms node)))]
+        (op/eq :quote kind) [(quoted-data ctx (first (forms node)))]
         (#{:map :vector :set} kind)
-        (let [values (mapv constant-data (forms node))]
+        (let [values (mapv #(constant-data ctx %) (forms node))]
           (when (every? some? values)
             [(case kind :map (into {} (map vec (partition 2 (map first values))))
                    :vector (mapv first values) :set (set (map first values)))])))
@@ -1002,6 +1017,14 @@
     (finding! ctx bindings :conditional-build-up
               "Prefer cond-> to build a map with successive conditional assocs.")))
 
+(defn- destructuring-directive [node]
+  (when (op/eq :keyword (:kind node))
+    (let [raw (token node) name (last (str/split raw #"[:/]"))]
+      (when (or (#{"keys" "syms"} name) (op/eq ":strs" raw)) name))))
+
+(defn- destructured-name [node]
+  (last (str/split (str/replace (token node) #"^::?" "") #"/")))
+
 (defn- destructured-names [pattern]
   (let [node (unwrap pattern) children (forms node)]
     (case (:kind node)
@@ -1013,9 +1036,8 @@
                 (cond
                   (= ":or" (token key)) #{}
                   (= ":as" (token key)) (destructured-names value)
-                  (or (contains? #{":keys" ":strs" ":syms"} (token key))
-                      (some #(.endswith (or (token key) "") %) ["/keys" "/strs" "/syms"]))
-                  (set (map #(last (str/split (str/replace (token %) #"^:" "") #"/")) (forms value)))
+                  (destructuring-directive key)
+                  (set (map destructured-name (forms value)))
                   :else (destructured-names key))))
       #{})))
 
@@ -1133,8 +1155,8 @@
             pairs (partition 2 xs)
             names (set (mapcat (fn [[key value]]
                                  (cond
-                                   (or (#{":keys" ":syms" ":strs"} (token key)) (re/search #"/(keys|syms|strs)$" (or (token key) "")))
-                                   (map #(last (str/split (token %) #"/")) (forms value))
+                                   (destructuring-directive key)
+                                   (map destructured-name (forms value))
                                    (op/eq :symbol (:kind key)) [(token key)]
                                    :else [])) pairs))]
         (doseq [[key defaults] pairs :when (op/eq ":or" (token key))
@@ -1144,33 +1166,35 @@
         (let [scope (reduce (fn [scope [key value]]
                               (let [name (token key)]
                                 (cond
-                                  (or (op/eq name ":keys") (op/eq name ":syms") (op/eq name ":strs")
-                                      (and (op/eq :keyword (:kind key)) (re/search #"/(keys|syms|strs)$" name)))
-                                  (reduce (fn [scope binding]
-                                            (let [name (token binding)
-                                                  local-name (if (op/eq :keyword (:kind binding)) (basilisp.core/name (config-data binding))
-                                                                 (last (str/split name #"/")))]
-                                              (when (and (op/eq :keyword (:kind binding)) (not (.startswith name "::")) (neg? (.find name "/")))
-                                                (finding! ctx binding :keyword-binding (str "Keyword binding should be a symbol: :" local-name)))
-                                              (let [directive (token key)
-                                                    qualified? (pos? (.find directive "/"))
-                                                    namespace (when qualified? (subs directive 1 (.rfind directive "/")))
-                                                    kind (last (str/split directive #"[:/]"))
-                                                    lookup-key (case kind
-                                                                 "strs" (if namespace (str namespace "/" local-name) local-name)
-                                                                 "syms" (if namespace (symbol namespace local-name) (symbol name))
-                                                                 (if namespace (keyword namespace local-name)
-                                                                     (keyword (if (.startswith name ":") (subs name 1) name))))
-                                                    inferred (get-in destructure-value [:map-values lookup-key])
-                                                    inferred (or inferred
-                                                                 (when-let [type (:python-type destructure-value)]
-                                                                   (when-let [element (py/element-type type lookup-key (get-in @(:state ctx) [:opts :python-options] {}))]
-                                                                     (python-value element))))]
-                                                (binding! ctx scope (assoc binding :text local-name)
-                                                          (merge (when (:fn-args env) {:tag :any}) inferred
-                                                                 {:ignore-unused (and (:fn-args env)
-                                                                                      (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-keys-in-fn-args]))})))))
-                                          scope (forms value))
+                                  (destructuring-directive key)
+                                  (do (walk! ctx env key)
+                                      (reduce (fn [scope binding]
+                                                (let [name (token binding)
+                                                      local-name (destructured-name binding)]
+                                                  (when (op/eq :keyword (:kind binding)) (walk! ctx env binding))
+                                                  (when (and (op/eq :keyword (:kind binding)) (not (.startswith name "::")) (neg? (.find name "/")))
+                                                    (finding! ctx binding :keyword-binding (str "Keyword binding should be a symbol: :" local-name)))
+                                                  (let [directive (try (source-keyword ctx key) (catch python/ValueError _ nil))
+                                                        namespace (when directive (basilisp.core/namespace directive))
+                                                        kind (destructuring-directive key)
+                                                        bound-key (if (op/eq :keyword (:kind binding))
+                                                                    (try (source-keyword ctx binding) (catch python/ValueError _ nil))
+                                                                    (symbol name))
+                                                        lookup-key (case kind
+                                                                     "strs" local-name
+                                                                     "syms" (if namespace (symbol namespace local-name) bound-key)
+                                                                     (if namespace (keyword namespace local-name)
+                                                                         (when bound-key (keyword (basilisp.core/namespace bound-key) local-name))))
+                                                        inferred (get-in destructure-value [:map-values lookup-key])
+                                                        inferred (or inferred
+                                                                     (when-let [type (:python-type destructure-value)]
+                                                                       (when-let [element (py/element-type type lookup-key (get-in @(:state ctx) [:opts :python-options] {}))]
+                                                                         (python-value element))))]
+                                                    (binding! ctx scope (assoc binding :text local-name)
+                                                              (merge (when (:fn-args env) {:tag :any}) inferred
+                                                                     {:ignore-unused (and (:fn-args env)
+                                                                                          (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-keys-in-fn-args]))})))))
+                                              scope (forms value)))
                                   (op/eq name ":as") (bind-pattern! ctx scope value
                                                                     (assoc destructure-value :ignore-unused (get-in (context-config ctx) [:linters :unused-binding :exclude-destructured-as])))
                                   (op/eq name ":or") scope
@@ -1670,24 +1694,24 @@
           element (assoc-in [:python-type :arguments] [element])
           (not (contains? (first values) :elements)) (dissoc :elements)))
       (op/eq :keyword (:tag info)) (lookup-value (first values) (:literal-value info) (second values))
-      (op/eq :map (:tag info)) (when-let [[key] (constant-data (first args))] (lookup-value info key (second values)))
+      (op/eq :map (:tag info)) (when-let [[key] (constant-data ctx (first args))] (lookup-value info key (second values)))
       (and (op/eq "basilisp.core" (:ns info)) (op/eq "get" (:name info)) (:map-values (first values)))
-      (when-let [[key] (constant-data (second args))] (lookup-value (first values) key (nth values 2 nil)))
+      (when-let [[key] (constant-data ctx (second args))] (lookup-value (first values) key (nth values 2 nil)))
       (and (op/eq "basilisp.core" (:ns info)) (op/eq "nth" (:name info)) (:elements (first values)))
-      (let [index (first (constant-data (second args)))]
+      (let [index (first (constant-data ctx (second args)))]
         (when (and (int? index) (<= 0 index) (< index (count (:elements (first values)))))
           (get (:elements (first values)) index)))
       (#{"identity" "with-meta" "vary-meta"} (:name info)) (first values)
       (and (op/eq "basilisp.core" (:ns info)) (op/eq "assoc" (:name info)) (#{:nil :map} (:tag (first values))))
       (reduce (fn [out [[key-node _] [value-node value]]]
-                (if-let [[key] (constant-data key-node)]
+                (if-let [[key] (constant-data ctx key-node)]
                   (assoc-in out [:map-values key] (assoc value :node value-node))
                   (assoc out :map-closed? false :map-values {})))
               (merge {:tag :map :map-values {} :map-closed? true} (dissoc (first values) :tag))
               (partition 2 (map vector (rest args) (rest values))))
       (and (op/eq "basilisp.core" (:ns info)) (op/eq "dissoc" (:name info)) (op/eq :map (:tag (first values))))
       (reduce (fn [out key-node]
-                (if-let [[key] (constant-data key-node)]
+                (if-let [[key] (constant-data ctx key-node)]
                   (update out :map-values dissoc key)
                   (assoc out :map-closed? false :map-values {})))
               (first values) (rest args))
@@ -1699,7 +1723,7 @@
       (python-value {:module "builtins" :path ["str"] :nullable? true})
       (and (op/eq "basilisp.core" (:ns info)) (#{"get" "nth" "aget"} (:name info)) (:python-type (first values)))
       (when-let [type (py/element-type (:python-type (first values))
-                                       (first (constant-data (second args)))
+                                       (first (constant-data ctx (second args)))
                                        (get-in @(:state ctx) [:opts :python-options] {}))]
         (python-value type))
       (:ret spec) (spec-value (:ret spec))
@@ -1986,7 +2010,7 @@
       (finding! ctx (last xs) :missing-map-value (str "missing value for key " (syntax/text (last xs)))))
     (loop [xs (seq keys) seen #{}]
       (when-let [key (first xs)]
-        (let [value (try [:data (if-let [[value] (constant-data key)] value (config-data key))] (catch python/Exception _ nil))]
+        (let [value (try [:data (if-let [[value] (constant-data ctx key)] value (config-data key))] (catch python/Exception _ nil))]
           (when (and value (contains? seen value))
             (finding! ctx key (if (op/eq :map (:kind node)) :duplicate-map-key :duplicate-set-key)
                       (if (op/eq :edn (get-in @(:state ctx) [:opts :lang]))
@@ -2258,7 +2282,7 @@
     (when (#{"assoc" "dissoc"} name)
       (loop [keys (seq (if (op/eq "assoc" name) (take-nth 2 (rest args)) (rest args))) seen {}]
         (when-let [key (first keys)]
-          (let [identity (or (constant-data key) (when (op/eq :symbol (:kind key)) [(symbol (token key))]))
+          (let [identity (or (constant-data ctx key) (when (op/eq :symbol (:kind key)) [(symbol (token key))]))
                 previous (get seen identity 0)]
             (when (and identity (= 1 previous))
               (finding! ctx key :duplicate-key-args
@@ -2823,7 +2847,7 @@
         (let [xs (forms node)
               values (mapv #(assoc (or (walk! ctx env %) {}) :node %) xs)
               pairs (partition 2 (map vector xs values))
-              keys (mapv (fn [[[key _] _]] (constant-data key)) pairs)]
+              keys (mapv (fn [[[key _] _]] (constant-data ctx key)) pairs)]
           (duplicate-literals! ctx node)
           {:tag :map :map-closed? (every? some? keys)
            :map-values (reduce (fn [out [known [[_ _] [_ value]]]]
@@ -2846,7 +2870,7 @@
                                     (swap! (:state ctx) update :used-aliases conj prefix))
                         (finding! ctx node :unresolved-namespace
                                   (str "Unresolved namespace " prefix ". Are you missing a require?")))))))
-            {:tag :keyword :literal-value (try (config-data node) (catch python/Exception _ nil))})
+            {:tag :keyword :literal-value (try (source-keyword ctx node) (catch python/Exception _ nil))})
         (op/eq dispatch-value :vector)
         (let [values (mapv #(assoc (or (walk! ctx env %) {}) :node %) (forms node))]
           {:tag :vector :elements values
@@ -2878,7 +2902,7 @@
     (when (op/eq :keyword (:kind node))
       (let [raw (token node) auto? (.startswith raw "::")
             text (subs raw (if auto? 2 1))
-            parts (str/split text #"/" 2)
+            parts (if (op/eq text "/") [text] (str/split text #"/" 2))
             prefix (when (> (count parts) 1) (first parts))
             ns-name (if auto? (if prefix (get-in @(:state ctx) [:aliases prefix]) (current-ns ctx)) prefix)]
         (emit! ctx :keywords (merge (loc ctx node)
