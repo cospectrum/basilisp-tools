@@ -2608,14 +2608,16 @@
         (walk-var! ctx env args)
         (contains? #{"def" "defonce"} dispatch-value)
         (let [name (token (first args))
+              value-keys [:python-type :python-member :python-module :python-path :return-info :return-by-arity
+                          :tag :parameter-tags :arglists :fixed-arities :varargs-min-arity]
               value (when-not (or (get-in (context-config ctx) [:analysis :var-definitions :shallow])
                                   (get-in (context-config ctx) [:output :analysis :var-definitions :shallow]))
                       (walk-body! ctx (assoc env :caller (get-in @(:state ctx) [:definitions name]))
                                   (drop-while #(= :string (:kind %)) (rest args))))]
           (swap! (:state ctx) update-in [:definitions name]
-                 #(merge (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args) false (metadata-private? (first args))))
-                         (when-not (:dynamic (node-metadata (first args)))
-                           (select-keys value [:python-type :python-member :python-module :python-path :return-info :return-by-arity :tag :parameter-tags :arglists :fixed-arities :varargs-min-arity]))))
+                 #(merge (apply dissoc (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args) false (metadata-private? (first args)))) (when (seq (rest args)) value-keys))
+                         ;; An unknown reassignment must not retain a previous value's type or arities.
+                         (when-not (:dynamic (node-metadata (first args))) (select-keys value value-keys))))
           value)
         (contains? #{"defn" "defn-" "defasync" "defmacro" "defmacro-"} dispatch-value)
         (let [name (token (first args))

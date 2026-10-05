@@ -1,0 +1,46 @@
+(ns basilisp-tools.analyzer-redefinition-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- errors [source]
+  (filterv #(= :error (:level %)) (:findings (analyzer/analyze source))))
+
+(deftest unknown-global-reassignments-clear-stale-value-information-test
+  (doseq [[expression expected]
+          [["(def value nil) (defn replace [x] (def value x) (.upper value)) (replace \"ok\")" "OK"]
+           ["(def operation (fn [] 1)) (defn replace [f] (def operation f) (operation 42)) (replace inc)" 43]]]
+    (let [source (str "(ns blt-redefinition-runtime) " expression)]
+      (is (= expected (load-string source)))
+      (is (empty? (errors source)))))
+  ;; Merely analyzing this function does not establish a concrete new global type.
+  (let [result (analyzer/analyze "(def value nil) (defn replace [x] (def value x))")]
+    (is (nil? (get-in result [:definitions "value" :python-type])))
+    (is (some #(= :inline-def (:type %)) (:findings result)))))
+
+(deftest lazy-python-constructor-reassignments-do-not-keep-nil-types-test
+  (let [source "(ns example (:import [concurrent.futures :as futures]))
+                (defn run []
+                  (def executor nil)
+                  (try (def executor (futures/ThreadPoolExecutor))
+                       (vec (.map executor inc [1 2]))
+                       (finally (when executor (.shutdown executor)))))"
+        analysis (analyzer/analyze source)]
+    ;; No executor is created by analysis. The lazy export may remain unknown.
+    (is (empty? (filter #(= :error (:level %)) (:findings analysis))))))
+
+(deftest unchanged-nil-and-invalid-reassigned-values-still-report-test
+  (doseq [source ["(def value nil) (defn read-value [] (.-real value))"
+                  "(def value nil) (def value) (.-real value)"
+                  "(def value (python/complex 1 2)) (def value nil) (.-real value)"]]
+    (is (= [:unresolved-symbol] (mapv :type (errors source)))))
+  (is (= [:invalid-arity]
+         (mapv :type (errors "(def operation (fn [] 1)) (def operation (fn [x] x)) (operation)")))))
+
+(deftest reassignment-preserves-declared-annotations-test
+  (let [source "(def ^{:tag python/str :doc \"Declared text value\"} value nil)
+                (defn replace [x] (def value x))"
+        definition (get-in (analyzer/analyze source) [:definitions "value"])]
+    (is (= 'python/str (:type-hint definition)))
+    (is (= 'python/str (get-in definition [:meta :tag])))
+    (is (= "Declared text value" (get-in definition [:meta :doc])))
+    (is (nil? (:python-type definition)))))
