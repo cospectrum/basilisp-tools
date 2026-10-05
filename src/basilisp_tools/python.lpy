@@ -1284,18 +1284,24 @@
       :else nil)))
 
 (defn call-result
-  "Infer call results from overloads and TypeVars. Ambiguous unknown calls return nil."
+  "Infer call results from overloads and TypeVars. Ambiguous unknown calls return nil.
+  Optional preselected signatures must describe this exact call; nil selects them here."
   ([metadata positional-types keyword-types] (call-result metadata positional-types keyword-types {}))
-  ([metadata positional-types keyword-types opts]
+  ([metadata positional-types keyword-types opts] (call-result metadata positional-types keyword-types opts nil))
+  ([metadata positional-types keyword-types opts preselected]
    (if (seq (:union-members metadata))
      (union-type (map #(call-result % positional-types keyword-types opts) (:union-members metadata)))
      (let [expanded (expand-arguments positional-types keyword-types)]
        (when expanded
-         (let [results (mapv (fn [[positional keyword]]
-                               (or (when (and (:builtin-call metadata)
-                                              (not (seq (check-call metadata (count positional) (keys keyword)))))
-                                     (builtin-call-result metadata positional keyword opts))
-                                   (signature-result (call-signatures metadata positional keyword opts)))) expanded)]
+         (let [reuse? (and (some? preselected) (= 1 (count expanded))
+                           (= [(vec positional-types) keyword-types] (first expanded)))
+               results (mapv (fn [[positional keyword]]
+                               (when-not (and reuse? (empty? preselected))
+                                 (or (when (and (:builtin-call metadata)
+                                                (not (seq (check-call metadata (count positional) (keys keyword)))))
+                                       (builtin-call-result metadata positional keyword opts))
+                                     (signature-result (if reuse? preselected
+                                                           (call-signatures metadata positional keyword opts)))))) expanded)]
            (if (= 1 (count results)) (first results) (union-type results))))))))
 
 (defn element-type

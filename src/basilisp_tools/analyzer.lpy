@@ -1914,7 +1914,7 @@
                 (str "No Python signature accepts argument types ("
                      (str/join ", " (concat (map py/type-label positional-types)
                                             (map (fn [[name type]] (str name "=" (py/type-label type))) keyword-types))) ")")))
-    (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types options))]
+    (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types options candidates))]
       (python-value type))))
 
 (defn- merge-values [values]

@@ -337,3 +337,34 @@
     (is (= str-type (py/call-result generic [(list-of str-type)] {} opts)))
     (is (= int-type (py/call-result generic [(list-of int-type)] {} opts)))
     (is (= [variable] (:arguments (first (:parameters generic)))))))
+
+(deftest call-results-can-use-signatures-selected-for-the-same-call
+  (let [signature (container-signature int-type str-type)
+        opts {:python-inspection? false}
+        selected (py/call-signatures signature [int-type] {} opts)
+        length {:kind :function :builtin-call "len"
+                :parameters [{:name "value" :kind :positional-only :required? true}]
+                :type-module "builtins" :type-path ["int"]}]
+    (is (= str-type (py/call-result signature [int-type] {} opts selected)))
+    (is (= str-type (py/call-result signature [int-type] {} opts nil)))
+    (is (nil? (py/call-result signature [int-type] {} opts [])))
+    (is (= int-type (py/call-result length [str-type] {} opts
+                                    (py/call-signatures length [str-type] {} opts))))
+    (is (nil? (py/call-result length [str-type] {} opts [])))
+    (is (nil? (py/call-result length [] {} opts
+                              (py/call-signatures length [] {} opts))))))
+
+(deftest expanded-calls-and-union-receivers-select-their-own-signatures
+  (let [integer (container-signature int-type str-type)
+        string (container-signature str-type int-type)
+        overload {:kind :function :overloads [integer string]}
+        receiver {:union-members [integer (container-signature int-type bool-type)]}
+        opts {:python-inspection? false}]
+    (doseq [actual [{:union [int-type str-type]} {:union [int-type]} (assoc int-type :nullable? true)]]
+      ;; Even a single expanded branch is a different call from its union-typed input.
+      (is (= (py/call-result overload [actual] {} opts)
+             (py/call-result overload [actual] {} opts [])))
+      (is (= (py/call-result overload [] {"value" actual} opts)
+             (py/call-result overload [] {"value" actual} opts []))))
+    (is (= (py/call-result receiver [int-type] {} opts)
+           (py/call-result receiver [int-type] {} opts [])))))
