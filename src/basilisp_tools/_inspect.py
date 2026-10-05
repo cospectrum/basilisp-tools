@@ -735,6 +735,13 @@ def pydantic_parameters(value):
 
 def runtime_member(name, value, depth=1, owner=None):
     result = {"status": "known", "name": name}
+    bound_method = type(value) is types.MethodType and type(value.__func__) is types.FunctionType
+    if bound_method:
+        # MethodType's intrinsic fields do not invoke receiver descriptors.
+        # Exported instance/class methods already have their first argument bound.
+        receiver = value.__self__
+        owner = receiver if is_class(receiver) else type(receiver)
+        value = value.__func__
     static = type(value) is staticmethod
     cls_method = type(value) is classmethod or type(value) is types.ClassMethodDescriptorType
     if static or type(value) is classmethod:
@@ -829,19 +836,19 @@ def runtime_member(name, value, depth=1, owner=None):
                 for base in class_attribute(value, "__mro__"))
     elif exact_type(value, CALLABLE_TYPES):
         result["kind"] = "function"
-        result.update(runtime_signature(value, drop_first=cls_method, owner=owner))
+        result.update(runtime_signature(value, drop_first=cls_method or bound_method, owner=owner))
         if type(value) is types.FunctionType and depth:
             attributes = value.__dict__
             result["members"] = {key: safe_member(key, child, depth=depth - 1)
                                  for key, child in attributes.items()
                                  if type(key) is str and not key.startswith("_")}
         if type(value) is types.FunctionType and hasattr(typing, "get_overloads"):
-            overloads = [{"status": "known", "instance-method?": bool(owner is not None and not static and not cls_method),
-                          **runtime_signature(fn, drop_first=cls_method, owner=owner)}
+            overloads = [{"status": "known", "instance-method?": bool(owner is not None and not static and not cls_method and not bound_method),
+                          **runtime_signature(fn, drop_first=cls_method or bound_method, owner=owner)}
                          for fn in typing.get_overloads(value)]
             if overloads:
                 result["overloads"] = overloads
-        result["instance-method?"] = bool(owner is not None and not static and not cls_method)
+        result["instance-method?"] = bool(owner is not None and not static and not cls_method and not bound_method)
         if type(value) is types.FunctionType:
             result["async?"] = bool(value.__code__.co_flags & inspect.CO_COROUTINE)
             result["generator?"] = bool(value.__code__.co_flags & (inspect.CO_GENERATOR | inspect.CO_ASYNC_GENERATOR))

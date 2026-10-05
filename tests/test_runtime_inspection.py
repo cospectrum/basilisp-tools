@@ -125,3 +125,51 @@ def test_cyclic_runtime_annotation_sources_remain_conservative(worker, tmp_path,
     (package / "clean.py").write_text("value: str = 'ok'\n")
     clean = worker.inspect_module("blt_runtime_cycle.clean", [str(tmp_path)], False, inspector)
     assert clean["members"]["value"]["type-path"] == ["str"]
+
+
+def test_exported_bound_methods_keep_signatures_and_unknown_returns(worker):
+    class Service:
+        def typed(self, value: int, *, label: str = "") -> str:
+            raise AssertionError("method must not execute")
+
+        def unannotated(self, value):
+            raise AssertionError("method must not execute")
+
+        @classmethod
+        def create(cls, value: int) -> "Self":
+            raise AssertionError("method must not execute")
+
+    instance = Service()
+    typed = worker.safe_member("exported", instance.typed)
+    assert typed["kind"] == "function"
+    assert [p["name"] for p in typed["parameters"]] == ["value", "label"]
+    assert typed["parameters"][1]["kind"] == "keyword-only"
+    assert typed["type-path"] == ["str"]
+    assert typed["instance-method?"] is False
+    unknown = worker.safe_member("unannotated", instance.unannotated)
+    assert unknown["kind"] == "function"
+    assert [p["name"] for p in unknown["parameters"]] == ["value"]
+    assert not worker.type_fields(unknown)
+    created = worker.safe_member("create", Service.create)
+    assert [p["name"] for p in created["parameters"]] == ["value"]
+    assert created["type-path"][-1] == "Service"
+
+
+def test_bound_self_uses_each_receiver_without_executing_descriptors(worker):
+    class Base:
+        def clone(self) -> "Self":
+            raise AssertionError("method must not execute")
+
+        def __getattribute__(self, name):
+            raise AssertionError("receiver attributes must not execute")
+
+    class Child(Base):
+        pass
+
+    method = Base.__dict__["clone"]
+    for receiver in [Base(), Child(), Base()]:
+        bound = types.MethodType(method, receiver)
+        info = worker.safe_member("clone", bound)
+        assert info["parameters"] == []
+        assert info["type-path"][-1] == type(receiver).__name__
+        assert info["instance-method?"] is False
