@@ -14,6 +14,8 @@ spec.loader.exec_module(harness)
 
 def client_without_process():
     client = harness.Client.__new__(harness.Client)
+    client.request_timeout = None
+    client.diagnostic_timeout = None
     client.process = SimpleNamespace(stdin=io.BytesIO())
     client.messages = queue.Queue()
     client.notifications = []
@@ -65,7 +67,8 @@ def test_repeated_processes_share_only_their_new_cache(tmp_path, monkeypatch):
     observed = []
 
     def audit(root, filename, output, source_paths, python_executable, blt, cache_path,
-              python_timeout=None, workspace_scope=None):
+              python_timeout=None, workspace_scope=None,
+              request_timeout=None, diagnostic_timeout=None):
         before = harness.cache_snapshot(cache_path)
         observed.append((cache_path, before))
         (cache_path / "entry.json").write_text("{}")
