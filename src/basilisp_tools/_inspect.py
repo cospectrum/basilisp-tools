@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import contextvars
 import functools
 import importlib
 import importlib.machinery
@@ -317,13 +318,19 @@ def runtime_type(value, module=None, owner=None, depth=0, seen=frozenset()):
     return {}
 
 
+# Runtime annotations and explicit module requests share one bounded source graph.
+# Scope it to the inspection call so library use cannot mix separate environments.
+_runtime_inspector = contextvars.ContextVar("blt_runtime_inspector", default=None)
+
+
 @functools.lru_cache(maxsize=32)
-def runtime_source_context(module, filename, mtime, size):
+def runtime_source_context(module, filename, mtime, size, inspector=None):
     import tokenize
     with tokenize.open(filename) as stream:
         tree = ast.parse(stream.read(), filename=filename, type_comments=True)
-    inspector = StaticInspector([], [entry for entry in sys.path if type(entry) is str])
+    inspector = inspector or StaticInspector([], [entry for entry in sys.path if type(entry) is str])
     inspector.source_packages.add(module.split(".")[0])
+    inspector.dependency(Path(filename))
     return StaticModule(inspector, module, Path(filename), tree)
 
 
@@ -334,7 +341,7 @@ def source_context(module):
         return None
     try:
         stat = Path(filename).stat()
-        return runtime_source_context(module, filename, stat.st_mtime_ns, stat.st_size)
+        return runtime_source_context(module, filename, stat.st_mtime_ns, stat.st_size, _runtime_inspector.get())
     except (OSError, ValueError, SyntaxError, UnicodeError, RecursionError):
         return None
 
@@ -1683,9 +1690,17 @@ def static_module(name, path, inspector=None):
 
 
 def inspect_module(name, roots, enabled, inspector=None, skip_stubs=False):
+    inspector = inspector or StaticInspector(roots, [p for p in sys.path if p])
+    token = _runtime_inspector.set(inspector)
+    try:
+        return _inspect_module(name, roots, enabled, inspector, skip_stubs)
+    finally:
+        _runtime_inspector.reset(token)
+
+
+def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
     if name == "python":
         name = "builtins"
-    inspector = inspector or StaticInspector(roots, [p for p in sys.path if p])
     local = local_file(name, roots)
     path = local or (None if skip_stubs else stub_file(name, inspector.installed))
     if path is not None:
