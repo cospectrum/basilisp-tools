@@ -94,6 +94,10 @@ def main():
     parser.add_argument("--blt", default="blt")
     parser.add_argument("--python", help="Dependency interpreter passed to blt check")
     parser.add_argument(
+        "--python-timeout", type=float,
+        help="Inspection timeout forwarded to blt check (CLI default: 5 seconds)",
+    )
+    parser.add_argument(
         "--project", action="append",
         help="Repository basename or owner/name; repeat to select projects",
     )
@@ -110,6 +114,8 @@ def main():
     args = parser.parse_args()
     if args.timeout <= 0 or args.repeat < 1:
         parser.error("--timeout and --repeat must be positive")
+    if args.python_timeout is not None and args.python_timeout <= 0:
+        parser.error("--python-timeout must be positive")
     if args.isolated_cache and args.repeat < 2:
         parser.error("--isolated-cache requires --repeat >= 2 for empty/reused passes")
     args.output = args.output.resolve()
@@ -146,6 +152,8 @@ def main():
             command.extend(["--cache", "false"])
         if args.python:
             command.extend(["--python", args.python])
+        if args.python_timeout is not None:
+            command.extend(["--python-timeout", str(args.python_timeout)])
         if args.no_python_inspection:
             command.append("--no-python-inspection")
         command.extend(files)
@@ -153,6 +161,9 @@ def main():
             "repo": item["repo"], "sha": sha, "files": len(files),
             "bytes": sum((root / path).stat().st_size for path in files),
             "command": command, "runs": [], "findings_stable": True,
+            "python_timeout_seconds": (
+                args.python_timeout if args.python_timeout is not None else 5.0
+            ),
             "benchmark_notes": [
                 "Processes run sequentially; unrelated host workloads are not controlled.",
                 "Compiler and OS caches are not cleared; an empty declaration cache is not a cold compiler.",
