@@ -75,7 +75,41 @@ def tracked_sources(checkout: Path) -> list[str]:
         .decode("utf-8")
         .split("\0")
     )
-    return sorted(path for path in paths if path and (checkout / path).is_file())
+    return sorted(path for path in paths if path)
+
+
+
+def source_symlinks(checkout: Path, files: list[str]) -> list[str]:
+    """Reject links in selected source paths, including symlinked parents."""
+    linked = []
+    for relative in files:
+        path = checkout
+        for part in Path(relative).parts:
+            path = path / part
+            if path.is_symlink():
+                linked.append(relative)
+                break
+    return linked
+
+
+def copy_checkout(checkout: Path, target: Path) -> list[str]:
+    """Copy regular project files without traversing checkout symlinks."""
+    ignore_patterns = shutil.ignore_patterns(
+        ".git", ".venv", "__pycache__", ".cache", ".mypy_cache", ".pytest_cache",
+    )
+    links = []
+
+    def ignore(directory, names):
+        ignored = set(ignore_patterns(directory, names))
+        for name in names:
+            path = Path(directory) / name
+            if path.is_symlink():
+                ignored.add(name)
+                links.append(str(path.relative_to(checkout)))
+        return ignored
+
+    shutil.copytree(checkout, target, ignore=ignore)
+    return sorted(links)
 
 
 def main() -> int:
@@ -152,6 +186,12 @@ def main() -> int:
                 f"{project['repo']}: expected {expected}, got {revision}"
             )
         files = project.get("files") or tracked_sources(checkout)
+        linked = source_symlinks(checkout, files)
+        if linked:
+            parser.error(f"{project['repo']}: source symlinks are unsupported: {linked}")
+        missing = [path for path in files if not (checkout / path).is_file()]
+        if missing:
+            parser.error(f"{project['repo']}: missing selected sources: {missing}")
         report = {
             "repo": project["repo"],
             "sha": revision,
@@ -175,18 +215,7 @@ def main() -> int:
             )
         with tempfile.TemporaryDirectory(prefix=f"blt-format-{name}-") as temporary:
             target = Path(temporary) / name
-            shutil.copytree(
-                checkout,
-                target,
-                ignore=shutil.ignore_patterns(
-                    ".git",
-                    ".venv",
-                    "__pycache__",
-                    ".cache",
-                    ".mypy_cache",
-                    ".pytest_cache",
-                ),
-            )
+            report["ignored_symlinks"] = copy_checkout(checkout, target)
             originals = {
                 relative: (target / relative).read_bytes() for relative in files
             }
