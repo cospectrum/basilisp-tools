@@ -1,7 +1,7 @@
 (ns basilisp-tools.regex
   "Java-style configuration patterns, without requiring a JVM at runtime."
   (:require [basilisp.string :as str])
-  (:import [re] [regex :as engine] [operator :as op] [basilisp.lang.obj :as obj] [unicodedata]))
+  (:import [re] [functools] [regex :as engine] [operator :as op] [basilisp.lang.obj :as obj] [unicodedata]))
 
 (defrecord Pattern [pattern compiled])
 
@@ -232,11 +232,17 @@
                            (and closing? (seq stack)) (pop stack)
                            :else stack)))))))))
 
+(def ^:private compile-string
+  ;; Settings reuse a small set of immutable patterns across every source file.
+  ;; Bound the cache so changing configurations cannot retain patterns forever.
+  ((functools/lru_cache ** :maxsize 512)
+   (fn [source]
+     (->Pattern source (engine/compile (str "(?-f)" (translate source)) engine/VERSION1)))))
+
 (defn compile
   "Compile a Java-style pattern. Existing Python compiled patterns pass through."
   [value]
-  (if (pattern? value) value
-      (->Pattern value (engine/compile (str "(?-f)" (translate value)) engine/VERSION1))))
+  (if (pattern? value) value (compile-string value)))
 
 (defn- native-pattern [value]
   (let [compiled (compile value)]

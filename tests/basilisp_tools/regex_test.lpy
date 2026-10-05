@@ -46,3 +46,11 @@
   (let [native (re/compile "\\w+")]
     (is (identical? native (regex/compile native)))
     (is (some? (regex/fullmatch native "é")))))
+
+(deftest compiled-string-patterns-are-reused-test
+  (let [sensitive (regex/compile "blt-cache-pattern")
+        insensitive (regex/compile "(?i)blt-cache-pattern")]
+    (is (identical? sensitive (regex/compile "blt-cache-pattern")))
+    (is (identical? insensitive (regex/compile "(?i)blt-cache-pattern")))
+    (is (nil? (regex/fullmatch sensitive "BLT-CACHE-PATTERN")))
+    (is (some? (regex/fullmatch insensitive "BLT-CACHE-PATTERN")))))
