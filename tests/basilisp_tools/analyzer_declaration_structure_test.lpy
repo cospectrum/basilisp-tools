@@ -1,0 +1,35 @@
+(ns basilisp-tools.analyzer-declaration-structure-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private versioned-source
+  "(ns blt-versioned)
+   (do #?@(:lpy39- [(defn unavailable [] (missing-old-feature))]
+            :lpy310+ [(defn answer [] 42)]))")
+
+(deftest top-level-do-declarations-select-native-reader-branches-test
+  (is (= 42 (load-string (str versioned-source " (answer)"))))
+  (let [declarations (:definitions (analyzer/declarations versioned-source))
+        project {"blt-versioned" declarations}
+        source "(ns caller (:require [blt-versioned :as v])) (v/answer)"
+        result (analyzer/analyze source {:project project})]
+    (is (= #{"answer"} (set (keys declarations))))
+    (is (= #{0} (:fixed-arities (get declarations "answer"))))
+    (is (empty? (:findings result)))
+    (is (= [:invalid-arity]
+           (mapv :type (:findings (analyzer/analyze (str source " (v/answer 1)") {:project project})))))))
+
+(deftest declaration-traversal-stops-at-evaluated-bodies-and-quoted-data-test
+  (let [source "(do (defn outer [] (defn inner [] 1))
+                    (do (defn sibling [] 2)))
+                 '(do (defn quoted [] 3))
+                 (unrecognized-macro (defn hidden [] 4))"
+        definitions (:definitions (analyzer/declarations source))]
+    (is (= #{"outer" "sibling"} (set (keys definitions))))))
+
+(deftest only-top-level-splice-container-avoids-redundant-do-test
+  (is (empty? (:findings (analyzer/analyze versioned-source))))
+  (doseq [source ["(do 42)"
+                  "(fn [] (do #?@(:lpy310+ [42])))"
+                  "(do (do #?@(:lpy310+ [42])))"]]
+    (is (some #(= :redundant-do (:type %)) (:findings (analyzer/analyze source))))))

@@ -394,6 +394,13 @@
              (op/eq :symbol (:kind (first (forms target)))))
         (assoc node :children [(assoc head :text "ns") (first (forms target))])))))
 
+(defn- declaration-forms [node]
+  (let [node (unwrap node)]
+    (if (and (op/eq :list (:kind node))
+             (#{"do" "basilisp.core/do" "clojure.core/do"} (token (first (forms node)))))
+      (mapcat declaration-forms (rest (forms node)))
+      [node])))
+
 (defn declarations
   "Read namespace and top-level definitions without evaluating the source."
   ([source] (declarations source {}))
@@ -426,7 +433,7 @@
                                  referred (forms value)]
                              [(token referred) (str (token (first xs)) "/" (token referred))]))
            defs (atom {})]
-       (doseq [node top :when (op/eq :list (:kind node))]
+       (doseq [node (mapcat declaration-forms top) :when (op/eq :list (:kind node))]
          (let [[head name-node & tail] (forms node) raw (token head)
                parts (when raw (str/split raw #"/"))
                prefix (when (> (count parts) 1) (str/join "/" (butlast parts)))
@@ -2390,6 +2397,8 @@
         body (drop (if (#{"do" "try" "future"} parent-name) 1 2) parent-forms)
         body? (some #(= (:start %) (:start node)) body)]
     (when (and (op/eq "do" name) (not (#{"fn*" "let*"} parent-name))
+               ;; A splice cannot occur directly at the reader's top level.
+               (not (and (nil? parent) (some #(op/eq :reader-splice (:kind %)) (syntax/forms node))))
                (or (< (count args) 2) (and implicit body?)))
       (finding! ctx node :redundant-do "redundant do"))
     (when (and (op/eq "let" name)
