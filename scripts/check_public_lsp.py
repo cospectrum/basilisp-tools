@@ -4,6 +4,7 @@
 import argparse
 import collections
 import json
+import math
 import os
 import queue
 import re
@@ -24,8 +25,11 @@ BLT = str(Path(__file__).resolve().parent.parent / ".venv" / "bin" / "blt")
 
 
 class Client:
-    def __init__(self, root, output, blt=BLT, extra_args=()):
+    def __init__(self, root, output, blt=BLT, extra_args=(),
+                 request_timeout=None, diagnostic_timeout=None):
         self.output = output
+        self.request_timeout = request_timeout
+        self.diagnostic_timeout = diagnostic_timeout
         self.started_at = time.monotonic()
         self.usage_before = child_usage()
         self.process_metrics = {}
@@ -115,6 +119,10 @@ class Client:
         return message
 
     def request(self, method, params, timeout=180):
+        # Explicit audit budgets override foreground requests, including the
+        # longer references probe. Shutdown keeps its separate cleanup bound.
+        if self.request_timeout is not None and method != "shutdown":
+            timeout = self.request_timeout
         self.next_id += 1
         request_id = self.next_id
         begin = time.monotonic()
@@ -145,6 +153,8 @@ class Client:
             self.notifications.append(message)
 
     def diagnostics(self, uri, version, timeout=300):
+        if self.diagnostic_timeout is not None:
+            timeout = self.diagnostic_timeout
         begin = time.monotonic()
 
         def matched(message):
@@ -437,6 +447,7 @@ def diagnostic_edit_probes(client, root, filename, source, settings, report, ver
 def audit(
     root, filename, output, source_paths=None, python_executable=None, blt=BLT,
     cache_path=None, python_timeout=None, workspace_scope=None,
+    request_timeout=None, diagnostic_timeout=None,
 ):
     print(
         json.dumps({"project": root.name, "file": str(filename), "status": "starting"}),
@@ -448,7 +459,8 @@ def audit(
     cache_before = cache_snapshot(cache_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     extra_args = [] if python_timeout is None else ["--python-timeout", str(python_timeout)]
-    client = Client(root, output, blt=blt, extra_args=extra_args)
+    client = Client(root, output, blt=blt, extra_args=extra_args,
+                    request_timeout=request_timeout, diagnostic_timeout=diagnostic_timeout)
     report = {
         "root": str(root),
         "file": str(filename),
@@ -456,6 +468,13 @@ def audit(
         "assertions": [],
         "observations": {},
         "workspace_scope": workspace_scope,
+        "timeouts": {
+            "request_seconds": request_timeout if request_timeout is not None else 180,
+            "references_seconds": request_timeout if request_timeout is not None else 900,
+            "diagnostic_seconds": diagnostic_timeout if diagnostic_timeout is not None else 300,
+            "shutdown_seconds": 30,
+            "python_inspection_seconds": python_timeout,  # None retains the selected tool's default.
+        },
         "analysis_cache": {
             "path": str(cache_path),
             "before": cache_before,
@@ -705,6 +724,7 @@ def successful(report):
 def repeated_audit(
     root, filename, output, source_paths, python_executable, blt,
     repeat=1, isolated_cache=False, python_timeout=None, workspace_scope=None,
+    request_timeout=None, diagnostic_timeout=None,
 ):
     output.parent.mkdir(parents=True, exist_ok=True)
     cache_path = None
@@ -724,6 +744,7 @@ def repeated_audit(
             root, filename, destination, source_paths, python_executable,
             blt, cache_path=cache_path, python_timeout=python_timeout,
             workspace_scope=workspace_scope,
+            request_timeout=request_timeout, diagnostic_timeout=diagnostic_timeout,
         )
         report["process_run"] = index + 1
         report["process_runs"] = repeat
@@ -762,6 +783,14 @@ def main():
     parser.add_argument("--python-executable")
     parser.add_argument("--python-timeout", type=float, help="Forward inspection timeout to blt lsp")
     parser.add_argument(
+        "--request-timeout", type=float,
+        help="Override foreground request deadlines (defaults: 180s, references 900s; shutdown stays 30s)",
+    )
+    parser.add_argument(
+        "--diagnostic-timeout", type=float,
+        help="Override each diagnostics deadline (default: 300s)",
+    )
+    parser.add_argument(
         "--repeat", type=int, default=1,
         help="Total fresh LSP processes; repeats share a new isolated analysis cache",
     )
@@ -774,6 +803,10 @@ def main():
         parser.error("--repeat must be positive")
     if args.python_timeout is not None and args.python_timeout <= 0:
         parser.error("--python-timeout must be positive")
+    for name in ("request_timeout", "diagnostic_timeout"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error("--" + name.replace("_", "-") + " must be positive and finite")
     if args.corpus and not args.manifest:
         args.manifest = Path(__file__).with_name("public_projects.json")
     if not args.manifest:
@@ -789,6 +822,7 @@ def main():
             args.repeat,
             args.isolated_cache,
             args.python_timeout,
+            request_timeout=args.request_timeout, diagnostic_timeout=args.diagnostic_timeout,
         )
         if args.repeat > 1:
             args.report.write_text(json.dumps(reports, indent=2))
@@ -839,6 +873,7 @@ def main():
             args.isolated_cache,
             args.python_timeout,
             scope,
+            request_timeout=args.request_timeout, diagnostic_timeout=args.diagnostic_timeout,
         )
         for report in project_reports:
             report["repo"] = name
