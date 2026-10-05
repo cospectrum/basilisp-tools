@@ -1174,6 +1174,11 @@
        (recur (rest uris) (assoc result uri (await (analyzed! state uri))))
        result))))
 
+(defn- mapcatv [f coll]
+  ;; Consume each document's results before advancing, including empty results.
+  ;; Nested lazy comprehensions otherwise retain a stack frame per document.
+  (reduce (fn [result item] (into result (f item))) [] coll))
+
 (defn- occurrences [analyses identity declarations?]
   ;; Realize each document before advancing: nested lazy comprehensions retain
   ;; a stack frame per document when a long run has no matching occurrences.
@@ -2457,10 +2462,12 @@
         index (first (keep-indexed #(when (= (:start node) (:start %2)) %1) members))
         target (when index (+ index direction))
         identity (identity-of definition)
-        calls (vec (for [[uri analysis] analyses call (:calls analysis)
-                         :when (= identity (identity-of (:definition call)))] [uri call]))
-        usages (for [[uri analysis] analyses use (:var-usages analysis)
-                     :when (= identity (identity-of use))] [uri use])
+        calls (mapcatv (fn [[uri analysis]]
+                         (for [call (:calls analysis)
+                               :when (= identity (identity-of (:definition call)))] [uri call])) analyses)
+        usages (mapcatv (fn [[uri analysis]]
+                          (for [use (:var-usages analysis)
+                                :when (= identity (identity-of use))] [uri use])) analyses)
         direct-usages? (every? (fn [[uri use]]
                                  (some (fn [[call-uri call]]
                                          (and (= uri call-uri) (= (:start use) (:start (:name-range call))))) calls)) usages)
@@ -3397,16 +3404,18 @@
                [filename (update analysis :findings into (map #(assoc % :lsp? true) (concat (get cross filename) custom)))]))))
 
 (defn- namespace-batch-query [documents analyses command from to include-declaration?]
-  (let [definitions (for [[filename analysis] analyses entry (:namespace-definitions analysis)
-                          :when (and (not (:python entry)) (= from (:name entry)))] [filename entry])]
+  (let [definitions (mapcatv (fn [[filename analysis]]
+                               (for [entry (:namespace-definitions analysis)
+                                     :when (and (not (:python entry)) (= from (:name entry)))]
+                                 [filename entry])) analyses)]
     (cond
       (empty? definitions) {:result [] :edits {} :exit-code 1}
       (= command "references")
-      {:result (vec (for [[filename analysis] analyses
-                          entry (concat (:namespace-usages analysis)
-                                        (when include-declaration? (:namespace-definitions analysis)))
-                          :when (= from (:name entry))]
-                      (assoc entry :filename filename)))
+      {:result (mapcatv (fn [[filename analysis]]
+                          (for [entry (concat (:namespace-usages analysis)
+                                              (when include-declaration? (:namespace-definitions analysis)))
+                                :when (= from (:name entry))]
+                            (assoc entry :filename filename))) analyses)
        :edits {} :exit-code 0}
       (= command "rename")
       (do
@@ -3479,8 +3488,9 @@
         (let [parts (str/split (str to) #"/")
               name (last parts)
               definition (or (definition-of analysis item)
-                             (first (for [[_ result] analyses candidate (:var-definitions result)
-                                          :when (= identity (identity-of candidate))] candidate)))]
+                             (some (fn [result]
+                                     (some #(when (= identity (identity-of %)) %) (:var-definitions result)))
+                                   (vals analyses)))]
           (when-not (and identity definition (valid-name? name)
                          (contains? documents (:filename definition))
                          (not (:generated definition)) (not (:derived-location definition))
@@ -4233,11 +4243,13 @@
                       identity (identity-of definition)]
                   (python/list
                    (keep #(location state %)
-                         (for [[_ analysis] (await (all-analyses! state uri))
-                               implementation (:implementations analysis)
-                               :when (or (= identity (identity-of (:definition implementation)))
-                                         (= identity [:var (:protocol-ns implementation) (:protocol-name implementation)]))]
-                           implementation))))))
+                         (mapcatv
+                          (fn [[_ analysis]]
+                            (for [implementation (:implementations analysis)
+                                  :when (or (= identity (identity-of (:definition implementation)))
+                                            (= identity [:var (:protocol-ns implementation) (:protocol-name implementation)]))]
+                              implementation))
+                          (await (all-analyses! state uri))))))))
      ((.command ls "move-form")
       (fn ^:async move-command [uri line character target-filename]
         (let [root (root-for state uri)
@@ -4405,9 +4417,10 @@
               (fn ^:async handler [params]
                 (let [{:keys [uri analysis item]} (await (query! state params))]
                   (if (:namespace? item)
-                    (location state (first (for [[_ analysis] (await (all-analyses! state uri))
-                                                 definition (:namespace-definitions analysis)
-                                                 :when (= (:name item) (:name definition))] definition)))
+                    (location state
+                              (some (fn [analysis]
+                                      (some #(when (= (:name item) (:name %)) %) (:namespace-definitions analysis)))
+                                    (vals (await (all-analyses! state uri)))))
                     (location state (definition-of analysis item))))))
      (feature lsp/TEXT_DOCUMENT_REFERENCES
               (fn ^:async handler [params]
@@ -4572,9 +4585,10 @@
               (fn ^:async handler [params]
                 (let [item (.-item params) identity (item-identity item)
                       analyses (await (all-analyses! state (.-uri item)))
-                      matches (for [[uri analysis] analyses call (:calls analysis)
-                                    :when (and (:caller call) (= identity (identity-of (:definition call))))]
-                                [uri call])]
+                      matches (mapcatv (fn [[uri analysis]]
+                                         (for [call (:calls analysis)
+                                               :when (and (:caller call) (= identity (identity-of (:definition call))))]
+                                           [uri call])) analyses)]
                   (python/list
                    (keep (fn [[_ calls]]
                            (let [[uri first-call] (first calls)
@@ -4615,13 +4629,15 @@
               (fn ^:async handler [params]
                 (let [query (.lower (.-query params))]
                   (python/list
-                   (for [[_uri analysis] (await (all-analyses! state))
-                         definition (:var-definitions analysis)
-                         :when (str/includes? (.lower (:name definition)) query)
-                         :let [loc (location state definition)]
-                         :when loc]
-                     (lsp/SymbolInformation loc (:name definition) (definition-kind definition)
-                                            ** :container_name (:ns definition)))))))
+                   (mapcatv
+                    (fn [[_uri analysis]]
+                      (for [definition (:var-definitions analysis)
+                            :when (str/includes? (.lower (:name definition)) query)
+                            :let [loc (location state definition)]
+                            :when loc]
+                        (lsp/SymbolInformation loc (:name definition) (definition-kind definition)
+                                               ** :container_name (:ns definition))))
+                    (await (all-analyses! state)))))))
      (feature lsp/TEXT_DOCUMENT_FORMATTING
               (fn ^:async handler [params]
                 (refresh-settings! state)
