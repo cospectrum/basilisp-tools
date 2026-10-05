@@ -375,6 +375,15 @@
            [(.-st_mtime_ns stat) (.-st_size stat)])
          (catch python/OSError _ nil))))
 
+(defn- declaration-engine []
+  ;; Stat the package once per run, never once per cached declaration. Retain
+  ;; old entries so a tool upgrade can reindex cached-only dependency sources.
+  (let [root (.-parent (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.check"))))]
+    {:runtime (vec sys/version_info)
+     :sources (mapv (fn [file] [(str (.relative_to file root)) (fingerprint file)])
+                    (sort (filter #(contains? #{".py" ".lpy"} (.-suffix %))
+                                  (iterator-seq (.rglob root "*")))))}))
+
 (defn- cache-key [filename]
   (.hexdigest (hashlib/sha256 (.encode filename "utf-8"))))
 
@@ -420,18 +429,19 @@
     {:filename filename :owner (str owner) :source source
      :lang (or (:lang entry) (if (.endswith filename ".edn") :edn :lpy))}))
 
-(defn- cached-project [directory current-files config python-options debug?]
+(defn- cached-project [directory current-files config python-options engine debug?]
   (if (and directory (.is_dir directory))
     (let [python-version (py/environment-version python-options)
           config-key (declaration-config config)]
       (reduce (fn [project file]
                 (try
                   (if-let [entry (cached-entry file)]
-                    (let [compatible? (and (= config-key (:declaration-config entry))
+                    (let [compatible? (and (= engine (:engine entry))
+                                           (= config-key (:declaration-config entry))
                                            (= python-version (:python-version entry)))
                           declarations (if compatible? (:declarations entry)
                                            (cached-declarations (cached-source entry) directory
-                                                                config python-options debug?))]
+                                                                config python-options engine debug?))]
                       (update project (:namespace declarations) merge (:definitions declarations)))
                     project)
                   ;; Dependency caches are advisory; corrupt or unavailable
@@ -444,14 +454,15 @@
 (defn- declaration-cache-name [{:keys [owner filename lang]}]
   (str (cache-key (pr-str [owner filename lang])) ".edn"))
 
-(defn- cached-declarations [source directory config python-options debug?]
+(defn- cached-declarations [source directory config python-options engine debug?]
   (let [{:keys [filename owner]} source
         digest (.hexdigest (hashlib/sha256 (.encode (:source source) "utf-8")))
         python-version (py/environment-version python-options)
         config-key (declaration-config config)
         file (when (and directory owner) (.joinpath directory (declaration-cache-name source)))
         entry (when (and file (.is_file file)) (cached-entry file))]
-    (if (and entry (= digest (:digest entry)) (= filename (:filename entry))
+    (if (and entry (= engine (:engine entry))
+             (= digest (:digest entry)) (= filename (:filename entry))
              (= config-key (:declaration-config entry))
              (= python-version (:python-version entry)))
       (do (when debug? (.write sys/stderr (str "[blt] Cached declarations: " filename "\n")))
@@ -467,7 +478,7 @@
               (try
                 (.write_text temporary
                              (pr-str {:filename filename :owner owner :fingerprint (fingerprint owner)
-                                      :digest digest :lang (:lang source) :declaration-config config-key :python-version python-version :declarations (dissoc declarations :parsed)}) ** :encoding "utf-8")
+                                      :digest digest :lang (:lang source) :engine engine :declaration-config config-key :python-version python-version :declarations (dissoc declarations :parsed)}) ** :encoding "utf-8")
                 (.replace temporary file)
                 (finally (when (.exists temporary) (.unlink temporary)))))
             (catch python/OSError e
@@ -512,6 +523,7 @@
          copied (when (:copy-configs options) (copy-exports! paths initial-config))
          config (if (and (:dependencies options) (:copy-configs options)) (load-config options) initial-config)
          cache-dir (cache-directory options config)
+         engine (when cache-dir (declaration-engine))
          collected (collect-sources paths options config)
          problems (atom (:findings collected))
          sources (if-let [pattern (:exclude-files config)]
@@ -528,7 +540,7 @@
          sources (mapv (fn [{:keys [filename] :as item}]
                          (let [item (assoc item :lang (if (.endswith filename ".edn") :edn (:lang options :lpy)))]
                            (try
-                             (assoc item :declarations (cached-declarations item cache-dir config python-options (:debug options)))
+                             (assoc item :declarations (cached-declarations item cache-dir config python-options engine (:debug options)))
                              (catch python/Exception e
                                (assoc item :declaration-error (file-finding filename (str "Analysis failed: " e)))))))
                        sources)
@@ -536,7 +548,7 @@
                            (if declarations
                              (update result (:namespace declarations) merge (:definitions declarations)) result))
                          (cached-project cache-dir (set (map declaration-cache-name sources))
-                                         config python-options (:debug options)) sources)
+                                         config python-options engine (:debug options)) sources)
          dependency-cache (or (:dependency-cache options) (analyzer/create-cache))
          hook-cache (or (:hook-cache options) (hooks/create-cache))
          completed (atom 0)

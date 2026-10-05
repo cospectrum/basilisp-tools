@@ -1,5 +1,6 @@
 (ns basilisp-tools.check-input-recovery-test
-  (:require [basilisp.test :refer [deftest is]]
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is]]
             [basilisp-tools.check :as check])
   (:import [importlib] [pathlib] [tempfile] [zipfile] [unittest.mock :as mock]))
 
@@ -218,3 +219,68 @@
                 uncached (check/run (assoc options :paths [(str dependency)] :config after :cache false))]
             (is (= (get-in selected [:sources 0 :declarations])
                    (get-in uncached [:sources 0 :declarations])))))))))
+
+(deftest tool-upgrades-reindex-cached-only-dependencies-test
+  ;; An earlier tool version may have indexed a source differently. Preserve
+  ;; its path and re-read it even when only the consumer is selected next.
+  (doseq [[archive? canonical?] [[false false] [true false] [true true]]
+          legacy-entry? [false true]]
+    (with-open [temp (tempfile/TemporaryDirectory)]
+      (let [root (pathlib/Path temp) vendor (.joinpath root "vendor")
+            _ (.mkdir vendor)
+            dependency (.joinpath vendor (if archive? "library.whl" "library.lpy"))
+            consumer (.joinpath root "consumer.lpy")
+            source "(ns library)\n(defn which [x] x)"
+            cache (.joinpath root "cache")
+            options {:repro true :cwd (str root) :python-inspection? false
+                     :cache-dir (str cache) :config {:output {:canonical-paths canonical?}}}
+            consume (assoc options :paths [(str consumer)])]
+        (if archive?
+          (with-open [archive (zipfile/ZipFile dependency "w")]
+            (.writestr archive "library.lpy" source))
+          (.write_text dependency source ** :encoding "utf-8"))
+        (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/which 1)"
+                     ** :encoding "utf-8")
+        (with-open [engine (mock/patch "basilisp_tools.check.declaration_engine"
+                                       ** :return_value {:generation :old})]
+          (check/run (assoc options :paths [(str dependency)] :dependencies true))
+          (is (= 1 (.-call_count engine)))
+          (let [file (first (iterator-seq (.glob (.joinpath cache "blt-v3") "*.edn")))
+                entry (edn/read-string (.read_text file ** :encoding "utf-8"))
+                stale (assoc-in entry [:declarations :definitions "which" :fixed-arities] #{0})]
+            (.write_text file (pr-str stale) ** :encoding "utf-8")
+            ;; The simulated older engine trusts its own old declaration.
+            (is (= [:invalid-arity] (mapv :type (:findings (check/run consume)))))
+            (when legacy-entry?
+              (.write_text file (pr-str (dissoc stale :engine)) ** :encoding "utf-8"))
+            (with-open [_new (mock/patch "basilisp_tools.check.declaration_engine"
+                                         ** :return_value {:generation :new})]
+              (is (empty? (:findings (check/run consume))))
+              (let [updated (edn/read-string (.read_text file ** :encoding "utf-8"))
+                    modified (.-st_mtime_ns (.stat file))]
+                (is (= {:generation :new} (:engine updated)))
+                (is (= #{1} (get-in updated [:declarations :definitions "which" :fixed-arities])))
+                (is (empty? (:findings (check/run consume))))
+                (is (= modified (.-st_mtime_ns (.stat file)))))
+              ;; Migration retains the dependency rather than silently dropping it.
+              (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/which)"
+                           ** :encoding "utf-8")
+              (is (= [:invalid-arity] (mapv :type (:findings (check/run consume))))))))))))
+
+(deftest tool-upgrades-reindex-selected-declarations-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) source (.joinpath root "selected.lpy")
+          cache (.joinpath root "cache")
+          options {:repro true :cwd (str root) :python-inspection? false
+                   :paths [(str source)] :cache-dir (str cache)}]
+      (.write_text source "(ns selected)\n(defn which [x] x)" ** :encoding "utf-8")
+      (check/run options)
+      (let [file (first (iterator-seq (.glob (.joinpath cache "blt-v3") "*.edn")))
+            entry (edn/read-string (.read_text file ** :encoding "utf-8"))
+            stale (-> entry (assoc :engine {:generation :obsolete})
+                      (assoc-in [:declarations :definitions "which" :fixed-arities] #{0}))]
+        (.write_text file (pr-str stale) ** :encoding "utf-8")
+        (let [selected (check/run options)
+              fresh (check/run (assoc options :cache false))]
+          (is (= (get-in fresh [:sources 0 :declarations])
+                 (get-in selected [:sources 0 :declarations]))))))))
