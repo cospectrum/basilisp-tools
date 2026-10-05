@@ -1,6 +1,7 @@
 (ns basilisp-tools.lsp-cache-test
   (:require [basilisp.test :refer [deftest is]]
             [basilisp-tools.lsp]
+            [basilisp-tools.cache :as cache]
             [basilisp-tools.regex :as regex])
   (:import [datetime] [decimal] [fractions] [json] [pathlib] [re] [sys] [tempfile] [uuid]
            [pygls.workspace :as workspace] [unittest.mock :as mock]))
@@ -266,3 +267,23 @@
         (is (= original (.read_text file)))
         (is (empty? (vec (.glob root ".blt-*.tmp")))))
       (finally (.cleanup temporary)))))
+
+(deftest cache-rejects-unsupported-values-and-unknown-tags-test
+  (let [encode (internal 'cache-encode) decode (internal 'cache-decode)]
+    (is (thrown? python/TypeError (encode (python/object))))
+    (is (thrown? python/ValueError (decode #py ["eval" "(print :unexpected)"])))
+    (is (thrown? python/ValueError (decode #py ["keyword" "name" "extra"])))
+    (is (thrown? python/ValueError (decode #py {"unexpected" "map"})))))
+
+(deftest native-name-parts-survive-cache-roundtrip-test
+  (doseq [value [(keyword "" "k") (keyword "/" "k") (keyword nil "/")
+                 (symbol "" "k") (symbol "/" "k") (symbol nil "/")
+                 (with-meta (symbol "/" "k") {:tag (symbol "" "type")})]
+          [encode decode] [[cache/encode cache/decode] [cache/encode-graph cache/decode-graph]]]
+    (let [restored (decode (json/loads (json/dumps (encode value))))]
+      (is (= (namespace value) (namespace restored)))
+      (is (= (name value) (name restored)))
+      (is (= (meta value) (meta restored)))))
+  (is (= :example/name (cache/decode #py ["keyword" "example/name"])))
+  (is (= 'example/name (cache/decode #py ["symbol" "example/name"])))
+  (is (thrown? python/ValueError (cache/decode #py ["keyword" #py ["ns" "name" "extra"]]))))

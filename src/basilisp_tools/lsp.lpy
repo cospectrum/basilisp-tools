@@ -5,14 +5,14 @@
             [basilisp.edn :as edn]
             [basilisp-tools.analyzer :as analyzer]
             [basilisp-tools.check :as check]
+            [basilisp-tools.cache :as cache]
             [basilisp-tools.hooks :as hooks]
             [basilisp-tools.format :as fmt]
             [basilisp-tools.python :as py]
             [basilisp-tools.regex :as regex]
             [basilisp-tools.syntax :as syntax])
-  (:import [importlib.util :as import-util]
-           [concurrent.futures :as futures] [contextvars] [queue] [threading]
-           [base64] [datetime] [decimal] [fractions] [hashlib] [json] [tempfile] [uuid]
+  (:import [concurrent.futures :as futures] [contextvars] [queue] [threading]
+           [hashlib] [json] [tempfile]
            [urllib.parse :as url] [zipfile] [asyncio] [functools] [logging] [os] [os.path :as pathutil] [pathlib] [re] [sys]
            [importlib] [importlib.metadata :as metadata]
            [lsprotocol.types :as lsp]
@@ -672,105 +672,11 @@
 
 (declare kondo-options)
 
-(def ^:private cache-codec
-  ;; Like the inspection decoder, load the stdlib-only helper without running
-  ;; the parent package bootstrap while this Basilisp namespace is importing.
-  (let [file (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.lsp"))) "_inspect.py")
-        spec (import-util/spec-from-file-location "_blt_analysis_codec" (str file))
-        module (import-util/module-from-spec spec)]
-    (.exec_module (.-loader spec) module)
-    module))
-
 (def ^:private analysis-cache-schema 2)
 
-(defn- cache-tag [tag value]
-  (python/list [tag value]))
+(defn- cache-encode [value] (cache/encode value))
 
-(declare cache-encode-value)
-
-(defn- cache-encode-base [value seen]
-  (cond
-    (or (nil? value) (string? value) (boolean? value)) value
-    (keyword? value) (cache-tag "keyword" (subs (str value) 1))
-    (symbol? value) (cache-tag "symbol" (str value))
-    (python/isinstance value re/Pattern) (cache-tag "pyregex" (python/list [(.-pattern value) (.-flags value)]))
-    (regex/pattern? value) (cache-tag "regex" (regex/source value))
-    (python/isinstance value datetime/datetime) (cache-tag "datetime" (.isoformat value))
-    (python/isinstance value datetime/date) (cache-tag "date" (.isoformat value))
-    (python/isinstance value uuid/UUID) (cache-tag "uuid" (str value))
-    (python/isinstance value decimal/Decimal) (cache-tag "decimal" (str value))
-    (python/isinstance value fractions/Fraction)
-    (cache-tag "ratio" (python/list [(.-numerator value) (.-denominator value)]))
-    (python/isinstance value python/bytes) (cache-tag "bytes" (.decode (base64/b64encode value) "ascii"))
-    (python/isinstance value python/int) value
-    (python/isinstance value python/float) (cache-tag "float" (python/repr value))
-    (or (map? value) (python/isinstance value python/dict))
-    (cache-tag (if (map? value) "map" "dict")
-               (python/sorted (map (fn [[key item]] (python/list [(cache-encode-value key seen) (cache-encode-value item seen)]))
-                                   (if (map? value) value (.items value)))
-                              ** :key #(json/dumps (first %) ** :ensure_ascii false)))
-    (or (set? value) (python/isinstance value (python/tuple [python/set python/frozenset])))
-    (cache-tag (cond (set? value) "set" (python/isinstance value python/frozenset) "frozenset" :else "pyset")
-               (python/sorted (map #(cache-encode-value % seen) value) ** :key #(json/dumps % ** :ensure_ascii false)))
-    (vector? value) (cache-tag "vector" (python/list (map #(cache-encode-value % seen) value)))
-    (seq? value) (cache-tag "list" (python/list (map #(cache-encode-value % seen) value)))
-    (python/isinstance value python/list) (cache-tag "pylist" (python/list (map #(cache-encode-value % seen) value)))
-    (python/isinstance value python/tuple) (cache-tag "tuple" (python/list (map #(cache-encode-value % seen) value)))
-    :else (throw (python/TypeError (str "Unsupported analysis cache value: " (python/type value))))))
-
-(defn- cache-encode-value [value seen]
-  (if (or (nil? value) (string? value) (boolean? value) (python/isinstance value python/int))
-    value
-    (if-let [prior (.get seen (python/id value))]
-      (second prior)
-      (let [data (cache-encode-base value seen)
-            metadata (meta value)
-            encoded (if (seq metadata) (cache-tag "meta" (python/list [data (cache-encode-value metadata seen)])) data)]
-        ;; Analysis contains shared immutable definitions and Python metadata.
-        ;; Retaining the value also prevents id reuse for temporary sequences.
-        (.__setitem__ seen (python/id value) (python/tuple [value encoded]))
-        encoded))))
-
-(defn- cache-encode [value]
-  (cache-encode-value value (python/dict)))
-
-(defn- cache-decode-value [value seen]
-  (if (python/isinstance value python/list)
-    (if-let [prior (.get seen (python/id value))]
-      (second prior)
-      (let [[tag item] value
-            _ (when-not (= 2 (count value)) (throw (python/ValueError "Malformed analysis cache tag")))
-            decoded (case tag
-                      "keyword" (keyword item)
-                      "symbol" (symbol item)
-                      "pyregex" (re/compile (first item) (second item))
-                      "regex" (regex/compile item)
-                      "datetime" (.fromisoformat datetime/datetime item)
-                      "date" (.fromisoformat datetime/date item)
-                      "uuid" (uuid/UUID item)
-                      "decimal" (decimal/Decimal item)
-                      "ratio" (fractions/Fraction (first item) (second item))
-                      "bytes" (base64/b64decode item ** :validate true)
-                      "float" (python/float item)
-                      "map" (into {} (map (fn [[key child]] [(cache-decode-value key seen) (cache-decode-value child seen)]) item))
-                      "dict" (python/dict (python/list (map (fn [[key child]]
-                                                              (python/tuple [(cache-decode-value key seen) (cache-decode-value child seen)])) item)))
-                      "set" (set (map #(cache-decode-value % seen) item))
-                      "pyset" (python/set (map #(cache-decode-value % seen) item))
-                      "frozenset" (python/frozenset (map #(cache-decode-value % seen) item))
-                      "vector" (mapv #(cache-decode-value % seen) item)
-                      "list" (apply list (map #(cache-decode-value % seen) item))
-                      "pylist" (python/list (map #(cache-decode-value % seen) item))
-                      "tuple" (python/tuple (map #(cache-decode-value % seen) item))
-                      "meta" (with-meta (cache-decode-value (first item) seen) (cache-decode-value (second item) seen))
-                      (throw (python/ValueError "Unknown analysis cache tag")))]
-        (.__setitem__ seen (python/id value) (python/tuple [value decoded]))
-        decoded))
-    (if (or (nil? value) (string? value) (boolean? value) (python/isinstance value python/int))
-      value (throw (python/ValueError "Malformed analysis cache scalar")))))
-
-(defn- cache-decode [value]
-  (cache-decode-value value (python/dict)))
+(defn- cache-decode [value] (cache/decode value))
 
 (defn- analysis-cache-stat [file]
   (try
@@ -861,7 +767,7 @@
         (when (and (= analysis-cache-schema (get payload "schema"))
                    (= fingerprint (get payload "fingerprint"))
                    (every? #(= (vec %) (analysis-cache-stat (first %))) (get payload "dependencies" [])))
-          (let [analysis (cache-decode (.decode_graph cache-codec (get payload "analysis")))]
+          (let [analysis (cache/decode-graph (get payload "analysis"))]
             (when (and (map? analysis) (vector? (:findings analysis))) analysis)))))
     (catch python/Exception _ nil)))
 
@@ -871,7 +777,7 @@
       (when (current?)
         (let [payload #py {"schema" analysis-cache-schema "fingerprint" fingerprint
                            "dependencies" (lisp->py (analysis-cache-dependencies analysis))
-                           "analysis" (.encode_graph cache-codec (cache-encode analysis))}]
+                           "analysis" (cache/encode-graph analysis)}]
           (.mkdir (.-parent file) ** :parents true :exist_ok true)
           (let [stream (tempfile/NamedTemporaryFile ** :mode "w" :encoding "utf-8"
                                                     :dir (str (.-parent file)) :prefix ".blt-" :suffix ".tmp" :delete false)]

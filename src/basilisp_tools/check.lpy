@@ -3,6 +3,7 @@
   (:require [basilisp.edn :as edn]
             [basilisp.string :as str]
             [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.cache :as cache]
             [basilisp-tools.hooks :as hooks]
             [basilisp-tools.python :as py]
             [basilisp-tools.regex :as regex]
@@ -387,19 +388,32 @@
 (defn- cache-key [filename]
   (.hexdigest (hashlib/sha256 (.encode filename "utf-8"))))
 
-(defn- cached-entry [file]
+(defn- read-cached-entry [file]
   (try
-    (let [entry (edn/read-string (.read_text file ** :encoding "utf-8") {:readers {'re regex/compile}})]
-      (when (and (map? entry) (string? (:owner entry))
-                 (map? (get-in entry [:declarations :definitions]))
-                 (string? (get-in entry [:declarations :namespace]))
-                 (string? (:digest entry))
-                 (= (:fingerprint entry) (fingerprint (:owner entry))))
-        ;; EDN printing omits collection metadata. Reattach the namespace
-        ;; metadata used by analyzer resolution from its explicit cached field.
-        (update-in entry [:declarations :definitions]
-                   with-meta {:namespace-meta (get-in entry [:declarations :namespace-meta])})))
+    (when (and (.is_file file) (<= (.-st_size (.stat file)) (* 64 1024 1024)))
+      (let [json? (= ".json" (.-suffix file))
+            text (.read_text file ** :encoding "utf-8")
+            entry (if json?
+                    (let [payload (json/loads text)]
+                      (when (= 1 (get payload "schema"))
+                        (cache/decode-graph (get payload "entry"))))
+                    (edn/read-string text {:readers {'re regex/compile}}))]
+        (when (and (map? entry) (string? (:owner entry))
+                   (map? (get-in entry [:declarations :definitions]))
+                   (string? (get-in entry [:declarations :namespace]))
+                   (string? (:digest entry))
+                   (= (:fingerprint entry) (fingerprint (:owner entry))))
+          ;; Legacy EDN omitted collection metadata. Keep its source paths so
+          ;; cached-only dependencies can be reindexed and migrated to JSON.
+          (with-meta
+            (update-in entry [:declarations :definitions]
+                       with-meta {:namespace-meta (get-in entry [:declarations :namespace-meta])})
+            {:json-cache? json?}))))
     (catch python/Exception _ nil)))
+
+(defn- cached-entry [file]
+  (or (read-cached-entry file)
+      (read-cached-entry (.with_suffix file ".edn"))))
 
 (defn- config-cache-value [value]
   ;; Compare data rather than compiled regex identities, retaining the metadata
@@ -436,7 +450,7 @@
       (reduce (fn [project file]
                 (try
                   (if-let [entry (cached-entry file)]
-                    (let [compatible? (and (= engine (:engine entry))
+                    (let [compatible? (and (:json-cache? (meta entry)) (= engine (:engine entry))
                                            (= config-key (:declaration-config entry))
                                            (= python-version (:python-version entry)))
                           declarations (if compatible? (:declarations entry)
@@ -448,11 +462,14 @@
                   ;; entries must not prevent checking the selected sources.
                   (catch python/Exception _ project)))
               {} (remove #(contains? current-files (.-name %))
-                         (sort (iterator-seq (.glob directory "*.edn"))))))
+                         (sort (distinct
+                                (map #(.with_suffix % ".json")
+                                     (filter #(contains? #{".json" ".edn"} (.-suffix %))
+                                             (iterator-seq (.iterdir directory)))))))))
     {}))
 
 (defn- declaration-cache-name [{:keys [owner filename lang]}]
-  (str (cache-key (pr-str [owner filename lang])) ".edn"))
+  (str (cache-key (pr-str [owner filename lang])) ".json"))
 
 (defn- cached-declarations [source directory config python-options engine debug?]
   (let [{:keys [filename owner]} source
@@ -460,7 +477,7 @@
         python-version (py/environment-version python-options)
         config-key (declaration-config config)
         file (when (and directory owner) (.joinpath directory (declaration-cache-name source)))
-        entry (when (and file (.is_file file)) (cached-entry file))]
+        entry (when file (read-cached-entry file))]
     (if (and entry (= engine (:engine entry))
              (= digest (:digest entry)) (= filename (:filename entry))
              (= config-key (:declaration-config entry))
@@ -477,11 +494,17 @@
             (let [temporary (.with_suffix file (str "." (os/getpid) "." (time/monotonic_ns) ".tmp"))]
               (try
                 (.write_text temporary
-                             (pr-str {:filename filename :owner owner :fingerprint (fingerprint owner)
-                                      :digest digest :lang (:lang source) :engine engine :declaration-config config-key :python-version python-version :declarations (dissoc declarations :parsed)}) ** :encoding "utf-8")
+                             (json/dumps
+                              #py {"schema" 1
+                                   "entry" (cache/encode-graph
+                                            {:filename filename :owner owner :fingerprint (fingerprint owner)
+                                             :digest digest :lang (:lang source) :engine engine
+                                             :declaration-config config-key :python-version python-version
+                                             :declarations (dissoc declarations :parsed)})}
+                              ** :ensure_ascii false :allow_nan false) ** :encoding "utf-8")
                 (.replace temporary file)
                 (finally (when (.exists temporary) (.unlink temporary)))))
-            (catch python/OSError e
+            (catch python/Exception e
               (when debug? (.write sys/stderr (str "[blt] Cache write failed: " e "\n"))))))
         declarations))))
 

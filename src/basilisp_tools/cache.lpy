@@ -1,0 +1,126 @@
+(ns basilisp-tools.cache
+  "Safe data serialization shared by declaration and language-server caches."
+  (:require [basilisp-tools.regex :as regex])
+  (:import [importlib.util :as import-util] [pathlib] [sys]
+           [base64] [datetime] [decimal] [fractions] [json] [re] [uuid]))
+
+(defn- cache-tag [tag value]
+  (python/list [tag value]))
+
+(declare cache-encode-value)
+
+(defn- cache-encode-base [value seen]
+  (cond
+    (or (nil? value) (string? value) (boolean? value)) value
+    (keyword? value) (cache-tag "keyword" (python/list [(namespace value) (name value)]))
+    (symbol? value) (cache-tag "symbol" (python/list [(namespace value) (name value)]))
+    (python/isinstance value re/Pattern) (cache-tag "pyregex" (python/list [(.-pattern value) (.-flags value)]))
+    (regex/pattern? value) (cache-tag "regex" (regex/source value))
+    (python/isinstance value datetime/datetime) (cache-tag "datetime" (.isoformat value))
+    (python/isinstance value datetime/date) (cache-tag "date" (.isoformat value))
+    (python/isinstance value uuid/UUID) (cache-tag "uuid" (str value))
+    (python/isinstance value decimal/Decimal) (cache-tag "decimal" (str value))
+    (python/isinstance value fractions/Fraction)
+    (cache-tag "ratio" (python/list [(.-numerator value) (.-denominator value)]))
+    (python/isinstance value python/bytes) (cache-tag "bytes" (.decode (base64/b64encode value) "ascii"))
+    (python/isinstance value python/int) value
+    (python/isinstance value python/float) (cache-tag "float" (python/repr value))
+    (or (map? value) (python/isinstance value python/dict))
+    (cache-tag (if (map? value) "map" "dict")
+               (python/sorted (map (fn [[key item]] (python/list [(cache-encode-value key seen) (cache-encode-value item seen)]))
+                                   (if (map? value) value (.items value)))
+                              ** :key #(json/dumps (first %) ** :ensure_ascii false)))
+    (or (set? value) (python/isinstance value (python/tuple [python/set python/frozenset])))
+    (cache-tag (cond (set? value) "set" (python/isinstance value python/frozenset) "frozenset" :else "pyset")
+               (python/sorted (map #(cache-encode-value % seen) value) ** :key #(json/dumps % ** :ensure_ascii false)))
+    (vector? value) (cache-tag "vector" (python/list (map #(cache-encode-value % seen) value)))
+    (seq? value) (cache-tag "list" (python/list (map #(cache-encode-value % seen) value)))
+    (python/isinstance value python/list) (cache-tag "pylist" (python/list (map #(cache-encode-value % seen) value)))
+    (python/isinstance value python/tuple) (cache-tag "tuple" (python/list (map #(cache-encode-value % seen) value)))
+    :else (throw (python/TypeError (str "Unsupported tool cache value: " (python/type value))))))
+
+(defn- cache-encode-value [value seen]
+  (if (or (nil? value) (string? value) (boolean? value) (python/isinstance value python/int))
+    value
+    (if-let [prior (.get seen (python/id value))]
+      (second prior)
+      (let [data (cache-encode-base value seen)
+            metadata (meta value)
+            encoded (if (seq metadata) (cache-tag "meta" (python/list [data (cache-encode-value metadata seen)])) data)]
+        ;; Analysis contains shared immutable definitions and Python metadata.
+        ;; Retaining the value also prevents id reuse for temporary sequences.
+        (.__setitem__ seen (python/id value) (python/tuple [value encoded]))
+        encoded))))
+
+(defn encode
+  "Encode immutable tool data as safe, tagged JSON values."
+  [value]
+  (cache-encode-value value (python/dict)))
+
+(defn- decode-name [constructor item]
+  ;; Older LSP snapshots used a string; native slash namespaces require a pair.
+  (cond
+    (string? item) (constructor item)
+    (and (python/isinstance item python/list) (= 2 (count item))
+         (or (nil? (first item)) (string? (first item))) (string? (second item)))
+    (constructor (first item) (second item))
+    :else (throw (python/ValueError "Malformed cached name"))))
+
+(defn- cache-decode-value [value seen]
+  (if (python/isinstance value python/list)
+    (if-let [prior (.get seen (python/id value))]
+      (second prior)
+      (let [[tag item] value
+            _ (when-not (= 2 (count value)) (throw (python/ValueError "Malformed tool cache tag")))
+            decoded (case tag
+                      "keyword" (decode-name keyword item)
+                      "symbol" (decode-name symbol item)
+                      "pyregex" (re/compile (first item) (second item))
+                      "regex" (regex/compile item)
+                      "datetime" (.fromisoformat datetime/datetime item)
+                      "date" (.fromisoformat datetime/date item)
+                      "uuid" (uuid/UUID item)
+                      "decimal" (decimal/Decimal item)
+                      "ratio" (fractions/Fraction (first item) (second item))
+                      "bytes" (base64/b64decode item ** :validate true)
+                      "float" (python/float item)
+                      "map" (into {} (map (fn [[key child]] [(cache-decode-value key seen) (cache-decode-value child seen)]) item))
+                      "dict" (python/dict (python/list (map (fn [[key child]]
+                                                              (python/tuple [(cache-decode-value key seen) (cache-decode-value child seen)])) item)))
+                      "set" (set (map #(cache-decode-value % seen) item))
+                      "pyset" (python/set (map #(cache-decode-value % seen) item))
+                      "frozenset" (python/frozenset (map #(cache-decode-value % seen) item))
+                      "vector" (mapv #(cache-decode-value % seen) item)
+                      "list" (apply list (map #(cache-decode-value % seen) item))
+                      "pylist" (python/list (map #(cache-decode-value % seen) item))
+                      "tuple" (python/tuple (map #(cache-decode-value % seen) item))
+                      "meta" (with-meta (cache-decode-value (first item) seen) (cache-decode-value (second item) seen))
+                      (throw (python/ValueError "Unknown tool cache tag")))]
+        (.__setitem__ seen (python/id value) (python/tuple [value decoded]))
+        decoded))
+    (if (or (nil? value) (string? value) (boolean? value) (python/isinstance value python/int))
+      value (throw (python/ValueError "Malformed tool cache scalar")))))
+
+(defn decode
+  "Restore tagged tool data without evaluating source or arbitrary objects."
+  [value]
+  (cache-decode-value value (python/dict)))
+
+(def ^:private graph-codec
+  ;; Like the inspection decoder, load the stdlib-only helper without running
+  ;; the parent package bootstrap while this Basilisp namespace is importing.
+  (let [file (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.cache"))) "_inspect.py")
+        spec (import-util/spec-from-file-location "_blt_cache_codec" (str file))
+        module (import-util/module-from-spec spec)]
+    (.exec_module (.-loader spec) module)
+    module))
+
+(defn encode-graph
+  "Preserve shared immutable values when serializing tagged data as JSON."
+  [value]
+  (.encode_graph graph-codec (encode value)))
+
+(defn decode-graph
+  "Restore a validated JSON graph and its tagged immutable values."
+  [value]
+  (decode (.decode_graph graph-codec value)))

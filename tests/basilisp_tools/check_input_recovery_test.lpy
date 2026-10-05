@@ -1,8 +1,15 @@
 (ns basilisp-tools.check-input-recovery-test
-  (:require [basilisp.edn :as edn]
-            [basilisp.test :refer [deftest is]]
-            [basilisp-tools.check :as check])
-  (:import [importlib] [pathlib] [tempfile] [zipfile] [unittest.mock :as mock]))
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.check :as check]
+            [basilisp-tools.cache :as cache])
+  (:import [json] [importlib] [pathlib] [tempfile] [zipfile] [unittest.mock :as mock]))
+
+(defn- read-cache [file]
+  (cache/decode-graph (get (json/loads (.read_text file ** :encoding "utf-8")) "entry")))
+
+(defn- write-cache! [file entry]
+  (.write_text file (json/dumps #py {"schema" 1 "entry" (cache/encode-graph entry)})
+               ** :encoding "utf-8"))
 
 (defn- check-path [path canonical?]
   (check/run {:paths [(str path)] :repro true :cache false
@@ -245,18 +252,19 @@
                                        ** :return_value {:generation :old})]
           (check/run (assoc options :paths [(str dependency)] :dependencies true))
           (is (= 1 (.-call_count engine)))
-          (let [file (first (iterator-seq (.glob (.joinpath cache "blt-v3") "*.edn")))
-                entry (edn/read-string (.read_text file ** :encoding "utf-8"))
+          (let [file (first (iterator-seq (.glob (.joinpath cache "blt-v3") "*.json")))
+                entry (read-cache file)
                 stale (assoc-in entry [:declarations :definitions "which" :fixed-arities] #{0})]
-            (.write_text file (pr-str stale) ** :encoding "utf-8")
+            (write-cache! file stale)
             ;; The simulated older engine trusts its own old declaration.
             (is (= [:invalid-arity] (mapv :type (:findings (check/run consume)))))
             (when legacy-entry?
-              (.write_text file (pr-str (dissoc stale :engine)) ** :encoding "utf-8"))
+              (.write_text (.with_suffix file ".edn") (pr-str (dissoc stale :engine)) ** :encoding "utf-8")
+              (.unlink file))
             (with-open [_new (mock/patch "basilisp_tools.check.declaration_engine"
                                          ** :return_value {:generation :new})]
               (is (empty? (:findings (check/run consume))))
-              (let [updated (edn/read-string (.read_text file ** :encoding "utf-8"))
+              (let [updated (read-cache file)
                     modified (.-st_mtime_ns (.stat file))]
                 (is (= {:generation :new} (:engine updated)))
                 (is (= #{1} (get-in updated [:declarations :definitions "which" :fixed-arities])))
@@ -275,12 +283,63 @@
                    :paths [(str source)] :cache-dir (str cache)}]
       (.write_text source "(ns selected)\n(defn which [x] x)" ** :encoding "utf-8")
       (check/run options)
-      (let [file (first (iterator-seq (.glob (.joinpath cache "blt-v3") "*.edn")))
-            entry (edn/read-string (.read_text file ** :encoding "utf-8"))
+      (let [file (first (iterator-seq (.glob (.joinpath cache "blt-v3") "*.json")))
+            entry (read-cache file)
             stale (-> entry (assoc :engine {:generation :obsolete})
                       (assoc-in [:declarations :definitions "which" :fixed-arities] #{0}))]
-        (.write_text file (pr-str stale) ** :encoding "utf-8")
+        (write-cache! file stale)
         (let [selected (check/run options)
               fresh (check/run (assoc options :cache false))]
           (is (= (get-in fresh [:sources 0 :declarations])
                  (get-in selected [:sources 0 :declarations]))))))))
+
+(deftest legacy-dependency-cache-migrates-with-corrupt-json-fallback-test
+  (doseq [[archive? canonical?] [[false false] [true false] [true true]]
+          json-state [:missing :corrupt :future :graph-version :graph-reference]]
+    (with-open [temp (tempfile/TemporaryDirectory)]
+      (let [root (pathlib/Path temp) dependency (.joinpath root (if archive? "library.whl" "library.lpy"))
+            consumer (.joinpath root "consumer.lpy")
+            options {:repro true :cwd (str root) :python-inspection? false
+                     :cache-dir (str (.joinpath root "cache"))
+                     :config {:output {:canonical-paths canonical?}}}
+            consume (assoc options :paths [(str consumer)])
+            source "(ns ^{:custom true} library)\n(defn which [x] x)"]
+        (if archive?
+          (with-open [archive (zipfile/ZipFile dependency "w")]
+            (.writestr archive "library.lpy" source))
+          (.write_text dependency source ** :encoding "utf-8"))
+        (.write_text consumer "(ns consumer (:require [library :as lib]))\n(lib/which)"
+                     ** :encoding "utf-8")
+        (check/run (assoc options :paths [(str dependency)] :dependencies true))
+        (let [file (first (iterator-seq (.glob (.joinpath root "cache/blt-v3") "*.json")))
+              entry (read-cache file)
+              legacy (.with_suffix file ".edn")]
+          ;; Keep the same engine identity: the format itself requires migration.
+          (.write_text legacy (pr-str entry) ** :encoding "utf-8")
+          (case json-state
+            :missing (.unlink file)
+            :corrupt (.write_text file "{not JSON" ** :encoding "utf-8")
+            :future (.write_text file "{\"schema\":999}" ** :encoding "utf-8")
+            :graph-version (.write_text file "{\"schema\":1,\"entry\":{\"$blt_graph\":99,\"records\":[],\"root\":null}}"
+                                        ** :encoding "utf-8")
+            :graph-reference (.write_text file "{\"schema\":1,\"entry\":{\"$blt_graph\":1,\"records\":[],\"root\":{\"$ref\":0}}}"
+                                          ** :encoding "utf-8"))
+          (is (= [:invalid-arity] (mapv :type (:findings (check/run consume)))))
+          (is (= (:declarations entry) (:declarations (read-cache file))))
+          (let [modified (.-st_mtime_ns (.stat file))]
+            ;; The retained old entry must not duplicate or replace the JSON data.
+            (is (= [:invalid-arity] (mapv :type (:findings (check/run consume)))))
+            (is (= modified (.-st_mtime_ns (.stat file)))))
+          (is (.is_file legacy)))))))
+
+(deftest unsupported-cache-values-do-not-prevent-checking-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp) source (.joinpath root "sample.lpy")
+          options {:paths [(str source)] :repro true :cwd (str root)
+                   :python-inspection? false :cache-dir (str (.joinpath root "cache"))}]
+      (.write_text source "(ns sample)\n(inc)" ** :encoding "utf-8")
+      (with-open [_encode (mock/patch "basilisp_tools.cache.encode"
+                                      ** :side_effect (python/TypeError "unsupported cache value"))]
+        (is (= [:invalid-arity] (mapv :type (:findings (check/run options))))))
+      (is (empty? (iterator-seq (.glob (.joinpath root "cache/blt-v3") "*.tmp"))))
+      (is (= [:invalid-arity] (mapv :type (:findings (check/run options))))))))

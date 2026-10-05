@@ -90,7 +90,7 @@
       (check/run (assoc opts :paths [(str dependency)] :dependencies true))
       (is (empty? (:findings (check/run (assoc opts :stdin consumer)))))
       ;; Damaged cache entries are harmless and get rebuilt from source.
-      (doseq [file (iterator-seq (.glob cache-dir "*.edn"))] (.write_text file "not an edn map"))
+      (doseq [file (iterator-seq (.glob cache-dir "*.json"))] (.write_text file "not an edn map"))
       (is (empty? (:findings (check/run (assoc opts :paths [(str dependency)])))))
       (.unlink dependency)
       (is (empty? (:findings (check/run (assoc opts :stdin consumer)))))
