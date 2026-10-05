@@ -4437,11 +4437,11 @@
                         analyses (await (all-analyses! state uri))
                         matches (occurrences analyses identity true)
                         uris (set (map first matches))]
-                    (doseq [[_uri analysis] analyses
-                            [_alias referred] (:refers analysis)
-                            :when (and (:renamed referred)
-                                       (= identity [:var (:ns referred) (:name referred)]))]
-                      (failure "Renaming a var used through :rename requires updating its alias declarations manually."))
+                    (doseq [[_uri analysis] analyses]
+                      (doseq [[_alias referred] (:refers analysis)
+                              :when (and (:renamed referred)
+                                         (= identity [:var (:ns referred) (:name referred)]))]
+                        (failure "Renaming a var used through :rename requires updating its alias declarations manually.")))
                     (when (or (contains? (analyzer/core-symbols) name)
                               (some (fn [uri]
                                       (or (contains? (:imports (get analyses uri)) name)

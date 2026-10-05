@@ -1409,3 +1409,84 @@
     (is (= [3] (mapv :row usages)))
     (is (empty? (:result absent)))
     (is (= 1 (:exit-code absent)))))
+
+(deftest protocol-references-and-rename-across-many-unrelated-documents-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (.resolve (pathlib/Path (.-name temp)))
+        target (.joinpath root "target.lpy")
+        uri (.as_uri target)
+        source "(ns target)\n(def value 1)\nvalue\n"
+        declaration {:start {:line 1 :character 5} :end {:line 1 :character 10}}
+        usage {:start {:line 2 :character 0} :end {:line 2 :character 5}}
+        _ (.write_text target source ** :encoding "utf-8")
+        _ (doseq [i (range 300)]
+            (.write_text (.joinpath root (str "noise" i ".lpy"))
+                         (str "(ns noise" i ")\n(def value " i ")\n")
+                         ** :encoding "utf-8"))
+        c (client root)
+        ;; These requests inspect all 301 source files, including on cold CI workers.
+        request-long! (fn [method params]
+                        (let [id (swap! (:id c) inc)]
+                          (send! c {:id id :method method :params params})
+                          (response! c id 90)))
+        result-long! (fn [method params]
+                       (let [response (request-long! method params)]
+                         (when-let [error (:error response)]
+                           (throw (python/RuntimeError (str error))))
+                         (:result response)))
+        document-diagnostics!
+        (fn [document-uri version]
+          (let [match? #(and (= "textDocument/publishDiagnostics" (:method %))
+                             (= document-uri (get-in % [:params :uri]))
+                             (= version (get-in % [:params :version])))]
+            (or (some #(when (match? %) (:params %)) @(:notifications c))
+                (loop []
+                  (let [message (.get (:messages c) ** :timeout 90)]
+                    (when (:reader-error message)
+                      (throw (python/RuntimeError (:reader-error message))))
+                    (if (match? message) (:params message)
+                        (do (swap! (:notifications c) conj message) (recur))))))))]
+    (try
+      (result-long! "initialize"
+                    {:processId nil :rootUri (.as_uri root)
+                     :initializationOptions {:source-paths ["."] :cache-path false}
+                     :capabilities {:workspace {:workspaceEdit {:documentChanges true}}}})
+      (notification! c "initialized" {})
+      (notification! c "textDocument/didOpen"
+                     {:textDocument {:uri uri :languageId "basilisp" :version 1 :text source}})
+      (let [findings (:diagnostics (document-diagnostics! uri 1))]
+        (is (empty? findings) (pr-str findings)))
+      (testing "Identically named vars in other namespaces are excluded"
+        (let [references (result-long! "textDocument/references"
+                                       (assoc (at uri 2 2) :context {:includeDeclaration true}))]
+          (is (= 2 (count references)))
+          (is (= #{{:uri uri :range declaration} {:uri uri :range usage}}
+                 (set references))))
+        (let [edit (result-long! "textDocument/rename"
+                                 (assoc (at uri 2 2) :newName "renamed"))
+              documents (:documentChanges edit)
+              document (first documents)
+              edits (:edits document)]
+          (is (= 1 (count documents)))
+          (is (= uri (get-in document [:textDocument :uri])))
+          (is (= 2 (count edits)))
+          (is (= #{{:range declaration :newText "renamed"}
+                   {:range usage :newText "renamed"}}
+                 (set edits)))))
+      (testing "The renamed-refer safety guard still rejects unsafe workspace edits"
+        ;; The preceding edit was only returned, so the original target is unchanged.
+        (let [alias-uri (.as_uri (.joinpath root "alias_user.lpy"))
+              alias-source "(ns alias-user (:require [target :refer [value] :rename {value local-value}]))\nlocal-value\n"]
+          (notification! c "textDocument/didOpen"
+                         {:textDocument {:uri alias-uri :languageId "basilisp"
+                                         :version 2 :text alias-source}})
+          (let [findings (:diagnostics (document-diagnostics! alias-uri 2))]
+            (is (empty? findings) (pr-str findings)))
+          (is (= {:uri uri :range declaration}
+                 (result-long! "textDocument/definition" (at alias-uri 1 2))))
+          (let [response (request-long! "textDocument/rename"
+                                        (assoc (at uri 2 2) :newName "renamed"))]
+            (is (= -32602 (get-in response [:error :code])))
+            (is (= "Renaming a var used through :rename requires updating its alias declarations manually."
+                   (get-in response [:error :message]))))))
+      (finally (stop! c) (.cleanup temp)))))
