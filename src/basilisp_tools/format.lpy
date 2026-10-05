@@ -18,10 +18,9 @@
 (def ^:private literals #{:string :bytes :regex :f-string})
 (def ^:private punctuation #{:delimiter :prefix :string-text})
 (def ^:private gap-kinds #{:whitespace :newline :gap})
+(def ^:private non-form-kinds (into (conj punctuation :comment :discard) gap-kinds))
 (defn- gap? [n] (contains? gap-kinds (:kind n)))
-(defn- form? [n]
-  (not (or (gap? n) (syntax/trivia? n)
-           (contains? punctuation (:kind n)) (op/eq :discard (:kind n)))))
+(defn- form? [n] (not (contains? non-form-kinds (:kind n))))
 (defn- node-forms [node] (filterv form? (:children node)))
 (defn- leaf [kind text] {:kind kind :text text})
 (defn- column-width [s]
@@ -33,7 +32,7 @@
 (defn- bare [n]
   (if (op/eq :metadata (:kind n)) (recur (last (node-forms n))) n))
 (defn- head [n]
-  (let [f (bare (first (node-forms n)))
+  (let [f (bare (first (filter form? (:children n))))
         f (if (#{:reader-conditional :reader-splice} (:kind f))
             (some->> (node-forms f)
                      (drop-while #(not (op/eq :keyword (:kind (bare %)))))
