@@ -1,0 +1,33 @@
+(ns basilisp-tools.analyzer-def-string-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(deftest string-initializers-are-values-test
+  (doseq [[prefix declaration doc]
+          [["plain" "(def value \"abc\")" nil]
+           ["documented" "(def value \"Description\" \"abc\")" "Description"]
+           ["once" "(defonce value \"abc\")" nil]]]
+    (let [source (str "(ns blt-string-value-" prefix ") " declaration " (.upper value)")
+          result (analyzer/analyze source)]
+      (is (= "ABC" (load-string source)))
+      (is (empty? (:findings result)))
+      (is (= {:module "builtins" :path ["str"] :literal-values ["abc"]}
+             (get-in result [:definitions "value" :python-type])))
+      (is (= doc (get-in result [:definitions "value" :doc]))))))
+
+(deftest string-initializers-preserve-type-checking-test
+  (doseq [[prefix declaration]
+          [["plain" "(def value \"abc\")"]
+           ["documented" "(def value \"Description\" \"abc\")"]
+           ["once" "(defonce value \"abc\")"]]]
+    (let [source (str "(ns blt-string-error-" prefix ") " declaration " (inc value)")]
+      (is (thrown? python/TypeError (load-string source)))
+      (is (= [:type-mismatch] (mapv :type (:findings (analyzer/analyze source))))))))
+
+(deftest optional-docstring-does-not-replace-the-initializer-test
+  (let [source "(ns blt-string-doc-number) (def value \"Description\" 41) (inc value)"
+        result (analyzer/analyze source)]
+    (is (= 42 (load-string source)))
+    (is (empty? (:findings result)))
+    (is (= "Description" (get-in result [:definitions "value" :doc])))
+    (is (= ["int"] (get-in result [:definitions "value" :python-type :path])))))

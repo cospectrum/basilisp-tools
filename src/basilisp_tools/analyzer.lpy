@@ -2616,7 +2616,8 @@
               value (when-not (or (get-in (context-config ctx) [:analysis :var-definitions :shallow])
                                   (get-in (context-config ctx) [:output :analysis :var-definitions :shallow]))
                       (walk-body! ctx (assoc env :caller (get-in @(:state ctx) [:definitions name]))
-                                  (drop-while #(= :string (:kind %)) (rest args))))]
+                                  (if (and (> (count args) 2) (= :string (:kind (second args))))
+                                    (drop 2 args) (rest args))))]
           (swap! (:state ctx) update-in [:definitions name]
                  #(merge (apply dissoc (or % (definition (:parsed ctx) (:filename ctx) (current-ns ctx) node (first args) (rest args) false (metadata-private? (first args)))) (when (seq (rest args)) value-keys))
                          ;; An unknown reassignment must not retain a previous value's type or arities.
