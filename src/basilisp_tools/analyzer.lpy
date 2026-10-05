@@ -177,15 +177,44 @@
 (defn- source-keyword
   "Resolve source keywords against the analyzed namespace, without invoking a reader."
   [ctx node]
-  (let [raw (token node) auto? (.startswith raw "::")
-        text (subs raw (if auto? 2 1))
-        parts (if (op/eq text "/") [text] (str/split text #"/" 2))
-        prefix (when (> (count parts) 1) (first parts))
-        state @(:state ctx)
-        ns-name (if auto? (if prefix (get-in state [:aliases prefix]) (:namespace state)) prefix)]
-    (when (and auto? prefix (nil? ns-name))
-      (throw (python/ValueError (str "Unresolved namespace " prefix))))
-    (keyword ns-name (last parts))))
+  (if-let [value (:keyword-value node)]
+    value
+    (let [raw (token node) auto? (.startswith raw "::")
+          text (subs raw (if auto? 2 1))
+          parts (if (op/eq text "/") [text] (str/split text #"/" 2))
+          prefix (when (> (count parts) 1) (first parts))
+          state @(:state ctx)
+          ns-name (if auto? (if prefix (get-in state [:aliases prefix]) (:namespace state)) prefix)]
+      (when (and auto? prefix (nil? ns-name))
+        (throw (python/ValueError (str "Unresolved namespace " prefix))))
+      (keyword ns-name (last parts)))))
+
+(defn- namespace-map-key [ctx ns-name node]
+  (if (op/eq :metadata (:kind node))
+    (update node :children #(assoc % (dec (count %)) (namespace-map-key ctx ns-name (last %))))
+    (when node
+      (let [kind (:kind node)
+            value (case kind
+                    :keyword (try (source-keyword ctx node) (catch python/ValueError _ nil))
+                    :symbol (symbol (token node))
+                    nil)
+            prefix (when value (namespace value))]
+        (if (and value (or (nil? prefix) (op/eq "_" prefix)))
+          (let [constructor (if (op/eq :keyword kind) keyword symbol)
+                qualified (constructor (when-not (op/eq "_" prefix) ns-name) (name value))]
+            (cond-> (assoc node :text (str qualified))
+              (op/eq :keyword kind) (assoc :keyword-value qualified :source-keyword-text (token node))))
+          node)))))
+
+(defn- namespace-map-node [ctx node]
+  (let [prefix (token (first (:children node)))
+        ns-name (if (.startswith prefix "#::") (:namespace @(:state ctx)) (subs prefix 2))
+        map-node (first (forms node))]
+    (when map-node
+      (assoc map-node :children
+             (mapv (fn [index child]
+                     (if (even? index) (namespace-map-key ctx ns-name child) child))
+                   (range) (forms map-node))))))
 
 (defn- quoted-data [ctx node]
   (let [node (unwrap node) children (forms node)]
@@ -196,6 +225,7 @@
       :set (set (map #(quoted-data ctx %) children))
       :map (into {} (map (fn [[key value]] [(quoted-data ctx key) (quoted-data ctx value)]) (partition 2 children)))
       :keyword (source-keyword ctx node)
+      :namespaced-map (quoted-data ctx (namespace-map-node ctx node))
       (config-data node))))
 
 (defn- constant-data
@@ -204,6 +234,7 @@
   (let [node (unwrap node) kind (:kind node)]
     (try
       (cond
+        (op/eq :namespaced-map kind) (constant-data ctx (namespace-map-node ctx node))
         (op/eq :keyword kind) [(source-keyword ctx node)]
         (contains? literal-kinds kind) [(config-data node)]
         (op/eq :quote kind) [(quoted-data ctx (first (forms node)))]
@@ -1034,33 +1065,35 @@
 (defn- destructured-name [node]
   (last (str/split (str/replace (token node) #"^::?" "") #"/")))
 
-(defn- destructured-names [pattern]
-  (let [node (unwrap pattern) children (forms node)]
+(defn- destructured-names [ctx pattern]
+  (let [node (unwrap pattern)
+        node (if (op/eq :namespaced-map (:kind node)) (namespace-map-node ctx node) node)
+        children (forms node)]
     (case (:kind node)
       :symbol (if (= "&" (token node)) #{} #{(token node)})
-      :vector (reduce into #{} (map destructured-names children))
+      :vector (reduce into #{} (map #(destructured-names ctx %) children))
       :map
       (reduce into #{}
               (for [[key value] (partition 2 children)]
                 (cond
                   (= ":or" (token key)) #{}
-                  (= ":as" (token key)) (destructured-names value)
+                  (= ":as" (token key)) (destructured-names ctx value)
                   (destructuring-directive key)
                   (set (map destructured-name (forms value)))
-                  :else (destructured-names key))))
+                  :else (destructured-names ctx key))))
       #{})))
 
 ;; Traverse default expressions with lexical shadowing. Quoted forms are data.
 ;; Real analyzer identities handle the conditional step; this helper is only for
 ;; otherwise-invalid references to bindings introduced by the same map.
-(defn- default-free-symbols [node names bound]
+(defn- default-free-symbols [ctx node names bound]
   (let [node (unwrap node) children (forms node)
-        scan #(default-free-symbols % names bound)
+        scan #(default-free-symbols ctx % names bound)
         scan-bindings
         (fn [pairs initial]
           (reduce (fn [[found scope] [pattern init]]
-                    [(into found (default-free-symbols init names scope))
-                     (into scope (destructured-names pattern))])
+                    [(into found (default-free-symbols ctx init names scope))
+                     (into scope (destructured-names ctx pattern))])
                   [[] initial] pairs))]
     (case (:kind node)
       :symbol (if (and (contains? names (token node)) (not (contains? bound (token node)))) [node] [])
@@ -1075,17 +1108,17 @@
                 tail (if named (rest tail) tail)
                 scope (cond-> bound named (conj (token named)))]
             (mapcat (fn [{:keys [params body]}]
-                      (mapcat #(default-free-symbols % names
-                                                     (into scope (destructured-names params))) body))
+                      (mapcat #(default-free-symbols ctx % names
+                                                     (into scope (destructured-names ctx params))) body))
                     (function-bodies tail)))
           (contains? #{"letfn" "basilisp.core/letfn"} head)
           (let [bindings (forms (first tail))
                 scope (into bound (map #(token (first (forms %))) bindings))]
             (concat (mapcat (fn [binding]
                               (mapcat (fn [{:keys [params body]}]
-                                        (mapcat #(default-free-symbols % names (into scope (destructured-names params))) body))
+                                        (mapcat #(default-free-symbols ctx % names (into scope (destructured-names ctx params))) body))
                                       (function-bodies (rest (forms binding))))) bindings)
-                    (mapcat #(default-free-symbols % names scope) (rest tail))))
+                    (mapcat #(default-free-symbols ctx % names scope) (rest tail))))
           (contains? #{"for" "doseq" "basilisp.core/for" "basilisp.core/doseq"} head)
           (let [[found scope]
                 (reduce (fn [[found scope] [pattern init]]
@@ -1094,34 +1127,34 @@
                             (let [[nested nested-scope] (scan-bindings (partition 2 (forms init)) scope)]
                               [(into found nested) nested-scope])
                             (#{":when" ":while"} (token pattern))
-                            [(into found (default-free-symbols init names scope)) scope]
+                            [(into found (default-free-symbols ctx init names scope)) scope]
                             :else
-                            [(into found (default-free-symbols init names scope))
-                             (into scope (destructured-names pattern))]))
+                            [(into found (default-free-symbols ctx init names scope))
+                             (into scope (destructured-names ctx pattern))]))
                         [[] bound] (partition 2 (forms (first tail))))]
-            (into found (mapcat #(default-free-symbols % names scope) (rest tail))))
+            (into found (mapcat #(default-free-symbols ctx % names scope) (rest tail))))
           (contains? #{"catch" "basilisp.core/catch"} head)
           (concat (scan (first tail))
-                  (mapcat #(default-free-symbols % names (conj bound (token (second tail)))) (drop 2 tail)))
+                  (mapcat #(default-free-symbols ctx % names (conj bound (token (second tail)))) (drop 2 tail)))
           (contains? #{"let" "loop" "binding" "with-open" "with" "with-async" "dotimes" "basilisp.core/let"} head)
           (let [[found scope] (scan-bindings (partition 2 (forms (first tail))) bound)]
-            (into found (mapcat #(default-free-symbols % names scope) (rest tail))))
+            (into found (mapcat #(default-free-symbols ctx % names scope) (rest tail))))
           (contains? #{"if-let" "if-some" "when-let" "when-some"} head)
           (let [[found scope] (scan-bindings (partition 2 (forms (first tail))) bound)]
-            (into found (concat (default-free-symbols (second tail) names scope)
-                                (mapcat #(default-free-symbols % names
+            (into found (concat (default-free-symbols ctx (second tail) names scope)
+                                (mapcat #(default-free-symbols ctx % names
                                                                (if (contains? #{"if-let" "if-some"} head) bound scope))
                                         (drop 2 tail)))))
           :else (mapcat scan children)))
       (mapcat scan children))))
 
 (defn- lint-destructured-defaults! [ctx pattern]
-  (let [names (destructured-names pattern)]
+  (let [names (destructured-names ctx pattern)]
     (doseq [[key defaults] (partition 2 (forms (unwrap pattern)))
             :when (= ":or" (token key))
             [binding expression] (partition 2 (forms defaults))
             :when (not (and (= :symbol (:kind expression)) (= (token binding) (token expression))))
-            node (default-free-symbols expression names #{})]
+            node (default-free-symbols ctx expression names #{})]
       (finding! ctx node :destructured-or-binding-of-same-map
                 (str "Destructured :or refers to binding of same map: " (token node))))))
 
@@ -1134,7 +1167,9 @@
                 "Unreachable code: default reader conditional branch should go last"))))
 
 (defn- bind-pattern! [ctx env pattern value]
-  (let [original pattern pattern (unwrap pattern) xs (forms pattern) destructure-value value]
+  (let [original pattern pattern (unwrap pattern)
+        pattern (if (op/eq :namespaced-map (:kind pattern)) (namespace-map-node ctx pattern) pattern)
+        xs (forms pattern) destructure-value value]
     (case (:kind pattern)
       :symbol (if (op/eq "&" (token pattern)) env (binding! ctx env original value))
       :vector
@@ -2855,6 +2890,8 @@
                       {:python-type {:module "builtins" :path [type] :arguments arguments}}))
                 (walk! (assoc ctx :config config) env value)))
             (walk-body! (assoc ctx :config config) env (forms node))))
+        (op/eq dispatch-value :namespaced-map)
+        (walk! ctx env (namespace-map-node ctx node))
         (op/eq dispatch-value :map)
         (let [xs (forms node)
               values (mapv #(assoc (or (walk! ctx env %) {}) :node %) xs)
@@ -2914,13 +2951,15 @@
     (:analysis-value node)
     (let [value (walk-node! ctx env node)]
       (when (op/eq :keyword (:kind node))
-        (let [raw (token node) auto? (.startswith raw "::")
+        (let [raw (or (:source-keyword-text node) (token node)) auto? (.startswith raw "::")
+              literal (:literal-value value)
               text (subs raw (if auto? 2 1))
               parts (if (op/eq text "/") [text] (str/split text #"/" 2))
               prefix (when (> (count parts) 1) (first parts))
-              ns-name (if auto? (if prefix (get-in @(:state ctx) [:aliases prefix]) (current-ns ctx)) prefix)]
+              ns-name (if literal (namespace literal)
+                          (if auto? (if prefix (get-in @(:state ctx) [:aliases prefix]) (current-ns ctx)) prefix))]
           (emit! ctx :keywords (merge (loc ctx node)
-                                      {:name (last parts) :ns ns-name :auto-resolved auto? :alias (when auto? prefix)
+                                      {:name (if literal (name literal) (last parts)) :ns ns-name :auto-resolved auto? :alias (when auto? prefix)
                                        :reg (:reg node) :context (:context ctx)
                                        :generated (:generated node) :derived-location (:derived-location node)}))))
       (when (:python-type value)

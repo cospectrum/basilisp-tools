@@ -1,0 +1,63 @@
+(ns basilisp-tools.analyzer-namespace-maps-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private prefix "(ns blt-map-runtime) ")
+
+(defn- errors [expression]
+  (filterv #(= :error (:level %)) (:findings (analyzer/analyze (str prefix expression)))))
+
+(deftest namespaced-map-lookups-agree-with-native-runtime-test
+  (doseq [expression ["(+ (:sample/n #:sample{:n 46}) 54)"
+                      "(+ (::n #::{:n 46}) 54)"
+                      "(+ (:foreign/n #:sample{:foreign/n 46}) 54)"
+                      "(+ (:n #:sample{:_/n 46}) 54)"
+                      "(+ (get-in #:outer{:nested #:inner{:n 46}} [:outer/nested :inner/n]) 54)"
+                      "(+ (get '#:sample{n 46} 'sample/n) 54)"
+                      "(let [x :key] (+ (:key #:sample{_/x 46}) 54))"
+                      "(let [#:sample{:keys [n]} #:sample{:n 46}] (+ n 54))"
+                      "(+ (get #:{:n 46} (keyword \"\" \"n\")) 54)"
+                      "(+ (get #:/{:n 46} (keyword \"/\" \"n\")) 54)"
+                      "(+ (:123/n #:123{:n 46}) 54)"
+                      "(+ (get #:_ {:n 46} (keyword \"_\" \"n\")) 54)"]]
+    (testing expression
+      (is (= 100 (load-string (str prefix expression))))
+      (is (empty? (errors expression))))))
+
+(deftest namespaced-map-values-retain-type-diagnostics-test
+  (doseq [expression ["(inc (:sample/n #:sample{:n \"bad\"}))"
+                      "(inc (::n #::{:n \"bad\"}))"
+                      "(inc (:n #:sample{:_/n \"bad\"}))"
+                      "(let [#:sample{:keys [n]} #:sample{:n \"bad\"}] (inc n))"]]
+    (is (try (load-string (str prefix expression)) false (catch python/Exception _ true)))
+    (is (= [:type-mismatch] (mapv :type (errors expression)))))
+  (is (= [:duplicate-map-key]
+         (mapv :type (errors "#:sample{:n 1 :sample/n 2}")))))
+
+(deftest namespaced-map-keywords-keep-semantic-names-and-source-ranges-test
+  (doseq [[map-prefix expected-ns] [["#:sample" "sample"] ["#::" "blt-map-runtime"]
+                                    ["#:" ""] ["#:/" "/"] ["#:_" "_"]]]
+    (let [source (str prefix map-prefix "{:n 46}")
+          native (load-string source)
+          actual-key (first (keys native))
+          analysis (analyzer/analyze source)
+          occurrence (first (:keywords analysis))]
+      (is (= expected-ns (namespace actual-key)))
+      (is (= expected-ns (:ns occurrence)))
+      (is (= "n" (:name occurrence)))
+      (is (= (.index source ":n") (:start occurrence)))
+      (is (= (+ (.index source ":n") 2) (:end occurrence)))))
+  (let [result (analyzer/analyze (str prefix "#:sample{:_/plain 1 :foreign/n 2}"))]
+    (is (= #{[nil "plain"] ["foreign" "n"]}
+           (set (map #(vector (:ns %) (:name %)) (:keywords result)))))))
+
+(deftest namespaced-binding-scopes-shadow-destructuring-defaults-test
+  (doseq [default ["(let [#:sample{:keys [n]} {:sample/n 42}] n)"
+                   "(let [#:sample{:_/as n} {:sample/value 42}] (:sample/value n))"
+                   "((fn [#:sample{:keys [n]}] n) {:sample/n 42})"]]
+    (let [expression (str "(let [{:keys [n] :or {n " default "}} {}] n)")
+          source (str prefix expression)
+          findings (:findings (analyzer/analyze source))]
+      (is (= 42 (load-string source)))
+      (is (not-any? #(= :destructured-or-binding-of-same-map (:type %)) findings))
+      (is (empty? (filter #(= :error (:level %)) findings))))))
