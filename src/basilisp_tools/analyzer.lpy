@@ -2391,11 +2391,13 @@
 (defn- lint-call! [ctx node name]
   (let [[head & args] (forms node)
         parent (:parent-node ctx)
-        parent-forms (forms parent)
         parent-name (:parent-name ctx)
         implicit (contains? #{"do" "fn" "defn" "defn-" "let" "when-let" "loop" "binding"
                               "with-open" "doseq" "try" "when" "when-not" "when-first"
                               "when-some" "future" "catch"} parent-name)
+        parent-forms (when (or (and (op/eq "do" name) implicit)
+                               (and (op/eq "let" name) (op/eq "let" parent-name)))
+                       (forms parent))
         body (drop (if (#{"do" "try" "future"} parent-name) 1 2) parent-forms)
         body? (some #(= (:start %) (:start node)) body)]
     (when (and (op/eq "do" name) (not (#{"fn*" "let*"} parent-name))
