@@ -153,9 +153,12 @@ def main() -> int:
     import basilisp_tools  # noqa: F401 - initialize the Basilisp importer
 
     syntax = importlib.import_module("basilisp_tools.syntax")
-    dialect = lmap({kw("dialect"): kw("clojure")})
 
-    def payload(source: str):
+    def source_dialect(relative: str) -> str:
+        return "basilisp" if Path(relative).suffix in {".lpy", ".cljc"} else "clojure"
+
+    def payload(source: str, relative: str):
+        dialect = lmap({kw("dialect"): kw(source_dialect(relative))})
         parsed = syntax.parse(source, dialect)
         if syntax.text(parsed[kw("root")]) != source:
             raise AssertionError("Lossless parser round trip changed source")
@@ -196,6 +199,7 @@ def main() -> int:
             "repo": project["repo"],
             "sha": revision,
             "files": len(files),
+            "source_dialects": sorted({source_dialect(path) for path in files}),
             "bytes": 0,
             "runs": [],
             "changes": [],
@@ -241,8 +245,8 @@ def main() -> int:
                 actual_raw = (target / relative).read_bytes()
                 try:
                     source, actual = raw.decode("utf-8"), actual_raw.decode("utf-8")
-                    before = payload(source)
-                    after = before if actual_raw == raw else payload(actual)
+                    before = payload(source, relative)
+                    after = before if actual_raw == raw else payload(actual, relative)
                     if before != after:
                         raise AssertionError(
                             "Non-whitespace tokens changed; review the diff"

@@ -1343,3 +1343,49 @@
         (when (nil? (.poll (:process c))) (.kill (:process c)))
         (when @child (try (os/kill @child 9) (catch python/ProcessLookupError _ nil)))
         (.cleanup temp)))))
+
+(deftest native-reader-formatting-and-navigation-test
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        c (client root)
+        uri (.as_uri (.joinpath root "native_reader.lpy"))
+        source "(ns native-reader)\n(defn value\\path [x] (+ x 1))\n(defn run []\n(let [payload {:a\\b 98}]\n(+ (:a\\b payload) (value\\path 1))))\n"
+        position (.find (nth (.splitlines source) 4) "value\\path")]
+    (try
+      (initialize! c root)
+      (is (empty? (:diagnostics (open! c uri source))))
+      (let [point (at uri 4 position)
+            definition (result! c "textDocument/definition" point)
+            hover (result! c "textDocument/hover" point)]
+        (is (= {:line 1 :character 6} (get-in definition [:range :start])))
+        (is (= {:line 1 :character 16} (get-in definition [:range :end])))
+        (is (str/includes? (str hover) "value"))
+        (is (= 2 (count (result! c "textDocument/references"
+                                 (assoc point :context {:includeDeclaration true}))))))
+
+      (let [edits (result! c "textDocument/formatting"
+                           {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}})
+            formatted (:newText (first edits))]
+        (is (= 1 (count edits)))
+        (is (str/includes? formatted ":a\\b"))
+        (is (str/includes? formatted "value\\path"))
+        (is (empty? (:diagnostics (syntax/parse formatted))))
+        (is (empty? (:findings (analyzer/analyze formatted)))))
+
+      (let [edits (result! c "textDocument/rangeFormatting"
+                           {:textDocument {:uri uri}
+                            :range {:start {:line 2 :character 0} :end {:line 4 :character 35}}
+                            :options {:tabSize 2 :insertSpaces true}})]
+        (is (= 1 (count edits)))
+        (is (str/includes? (:newText (first edits)) ":a\\b"))
+        (is (empty? (:diagnostics (syntax/parse (:newText (first edits)))))))
+
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 2}
+                      :contentChanges [{:text (str source "\n:a😀\n")}]})
+      (is (seq (:diagnostics (diagnostics! c 2))))
+      (notification! c "textDocument/didChange"
+                     {:textDocument {:uri uri :version 3}
+                      :contentChanges [{:text source}]})
+      (is (empty? (:diagnostics (diagnostics! c 3))))
+      (finally (stop! c) (.cleanup temp)))))

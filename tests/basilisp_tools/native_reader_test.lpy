@@ -1,0 +1,102 @@
+(ns basilisp-tools.native-reader-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.cli :as cli]
+            [basilisp-tools.format :as fmt]
+            [basilisp-tools.syntax :as syntax])
+  (:import [io] [json] [pathlib] [tempfile] [unittest.mock :as mock]))
+
+(defn- forms [source & [dialect]]
+  (syntax/forms (:root (syntax/parse source {:dialect (or dialect :basilisp)}))))
+
+(defn- run-cli [args]
+  (let [out (io/StringIO) err (io/StringIO)]
+    (with-open [_out (mock/patch "sys.stdout" out)
+                _err (mock/patch "sys.stderr" err)]
+      (let [code (cli/main args)]
+        {:code code :out (.getvalue out) :err (.getvalue err)}))))
+
+(def ^:private native-source
+  "(let  [value\\path 97 payload {:a\\b 1}]\n(+ value\\path (:a\\b payload) (count [:'a])))")
+
+(deftest native-name-boundaries-test
+  (doseq [[source expected]
+          [[":a\\b" [:keyword]]
+           ["a\\b" [:symbol]]
+           [":'a" [:keyword :quote]]
+           [":ns/'a" [:keyword :quote]]
+           [":a'b" [:keyword]]
+           [":ns/a'b" [:keyword]]
+           [":123/456" [:keyword]]
+           ["a/42" [:symbol]]
+           ["a/" [:symbol]]
+           ["#:a\\b{:key 1}" [:namespaced-map]]
+           ["#:123{:key 1}" [:namespaced-map]]
+           ["#:/{:key 1}" [:namespaced-map]]
+           ["#:{}" [:namespaced-map]]
+           ["#tag\\name 1" [:tagged]]]]
+    (let [parsed (syntax/parse source)]
+      (is (empty? (:diagnostics parsed)) source)
+      (is (= source (syntax/text (:root parsed))))
+      (is (= expected (mapv :kind (syntax/forms (:root parsed)))) source)))
+  (is (= [":" "'a"] (mapv syntax/text (forms ":'a"))))
+  (is (= [":ns/" "'a"] (mapv syntax/text (forms ":ns/'a"))))
+  (is (= [":'a"] (mapv syntax/text (forms ":'a" :clojure))))
+  (is (= [:keyword :character] (mapv :kind (forms ":a\\b" :clojure))))
+  (is (= [(keyword "a\\b")] [(read-string ":a\\b")]))
+  (is (= 4 (count (read-string "[:'a :ns/'b]"))))
+  (doseq [source [":😀" "😀" ":é" "some/ns/sym" "ns//" ":/'a"]]
+    (is (seq (:diagnostics (syntax/parse source))) source))
+  (doseq [source ["😀" "some/ns/sym" "ns//"]]
+    (is (empty? (:diagnostics (syntax/parse source {:dialect :clojure}))) source)))
+
+(deftest native-character-continuation-test
+  (doseq [source ["\\a_" "\\u_" "\\u0x1" "\\__"]]
+    (let [parsed (syntax/parse source)]
+      (is (= [:invalid-character] (mapv :code (:diagnostics parsed))) source)
+      (is (= [source] (mapv syntax/text (syntax/forms (:root parsed)))) source)))
+  (doseq [source ["\\😀" "\\u1f600" "\\u1_2" "\\_"]]
+    (is (empty? (:diagnostics (syntax/parse source))) source)
+    (is (string? (read-string source)) source)))
+
+(deftest native-formatting-preserves-reader-values-test
+  (is (= 100 (eval (read-string native-source))))
+  (doseq [options [{} {:align-map-columns? true :align-form-columns? true}]]
+    (let [formatted (fmt/format-string native-source options :basilisp)]
+      (is (not= native-source formatted))
+      (is (= 100 (eval (read-string formatted))))
+      (is (= formatted (fmt/format-string formatted options :basilisp)))
+      (is (empty? (:findings (analyzer/analyze formatted))))))
+  (let [source "[:'a :ns/'b]"
+        formatted (fmt/format-string source {} :basilisp)]
+    (is (= (read-string source) (read-string formatted)))
+    (is (= 4 (count (read-string formatted))))
+    (is (= source (fmt/format-string source))))
+  ;; The compatibility API still sees a keyword and character map pair.
+  (is (= "{:a \\b}" (fmt/format-string "{:a\\b}"))))
+
+(deftest native-cli-format-and-check-test
+  (with-open [temp (tempfile/TemporaryDirectory)]
+    (let [root (pathlib/Path temp)
+          config (.joinpath root "format.edn")
+          source "(ns native-reader)\n(defn value\\path [x] (+ x 1))\n(defn run []\n(let [payload {:a\\b 98}]\n(+ (:a\\b payload) (value\\path 1))))\n"]
+      ;; Configuration always uses Clojure syntax, even for native sources.
+      (.write_text config "{:integration/value :'a}" ** :encoding "utf-8")
+      (doseq [extension [".lpy" ".cljc"]]
+        (let [path (.joinpath root (str "native_reader" extension))
+              args ["format" "--config" (str config) (str path)]]
+          (.write_text path source ** :encoding "utf-8")
+          (is (= 0 (:code (run-cli args))))
+          (is (= 0 (:code (run-cli (conj args "--check")))))
+          (is (= 0 (:code (run-cli ["check" "--repro" "--format" "json" (str path)]))))
+          (.write_text path (str source "\n(value\\path)\n") ** :encoding "utf-8")
+          (let [result (run-cli ["check" "--repro" "--format" "json" (str path)])
+                output (json/loads (:out result))]
+            (is (= 3 (:code result)))
+            (is (some #(= "invalid-arity" (get % "type")) (get output "findings"))))
+          (.unlink path)))
+      (with-open [_in (mock/patch "sys.stdin" (io/StringIO native-source))]
+        (let [result (run-cli ["format" "--config" (str config) "-"])]
+          (is (= 0 (:code result)))
+          (is (= 100 (eval (read-string (:out result))))))))))
+

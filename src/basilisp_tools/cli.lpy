@@ -242,7 +242,10 @@
 
 (defn- format-source [source options label]
   (try
-    (fmt/format-string source options)
+    (fmt/format-string source options
+                       (if (or (= label "<stdin>")
+                               (.endswith label (python/tuple [".lpy" ".cljc"])))
+                         :basilisp :clojure))
     (catch python/Exception e
       (if-let [diagnostic (first (:diagnostics (ex-data e)))]
         (let [pos (syntax/offset->position (syntax/parse source) (:start diagnostic))]

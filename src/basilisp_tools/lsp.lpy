@@ -4723,7 +4723,7 @@
                   (if-not (get (settings-for state uri) :document-formatting? true) #py []
                           (let [source (.-source document)
                                 options (await (formatting-options! state uri))
-                                formatted (await (worker! state fmt/format-string source options))]
+                                formatted (await (worker! state fmt/format-string source options :basilisp))]
                             (when (identical? document (get-in @state [:documents uri]))
                               (if (= source formatted) #py []
                                   #py [(lsp/TextEdit (span document 0 (count source)) formatted)])))))))
@@ -4741,7 +4741,7 @@
                                 from (:start (first selected)) to (:end (last selected))]
                             (if-not from #py []
                                     (let [options (await (formatting-options! state uri))
-                                          formatted (await (worker! state fmt/format-string (subs source from to) options))]
+                                          formatted (await (worker! state fmt/format-string (subs source from to) options :basilisp))]
                                       (when (identical? document (get-in @state [:documents uri]))
                                         #py [(lsp/TextEdit (span document from to) formatted)]))))))))
      (python/setattr ls "blt_state" state)

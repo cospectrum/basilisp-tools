@@ -9,11 +9,14 @@
   (:import [re] [bisect] [operator :as op]))
 
 (def ^:private atom-re (re/compile "[^\\s,()\\[\\]{}\";@^~\u0060\\\\]+"))
+;; The native reader accepts backslashes inside names, but not arbitrary
+;; non-whitespace characters (for example emoji or combining marks).
+(def ^:private native-atom-re (re/compile "[\\w\\-+*?/=\\\\!&%><$:.#']+"))
+(def ^:private native-character-tail-re (re/compile "\\w"))
 (def ^:private number-start-re (re/compile "-*[0-9]"))
 (def ^:private number-body-re (re/compile "-*[0-9][0-9A-Za-z/.+\\-]*"))
 (def ^:private identifier-re (re/compile "([^\\d/]\\S*/)?(/|[^\\d/][^/]*)"))
 ;; Keyword namespaces and names may start with digits in Basilisp and Clojure.
-(def ^:private keyword-re (re/compile "([^/]+/)?[^/]*|/"))
 (def ^:private clojure-keyword-re (re/compile "([^/].*/)?(/|[^/]*)"))
 (def ^:private integer-re (re/compile "-?(?:\\d|[1-9]\\d+)N?"))
 (def ^:private decimal-re (re/compile "-?(?:\\d|[1-9]\\d+)(?:\\.\\d*)?M?"))
@@ -157,6 +160,30 @@
     (.match number-start-re s) :number
     :else :symbol))
 
+(defn- native-name-valid? [kind body]
+  (let [slash (.find body "/")]
+    (and (or (empty? body) (.fullmatch native-atom-re body))
+         (not (.startswith body "'"))
+         (or (op/eq -1 slash)
+             (op/eq body "/")
+             (and (op/gt slash 0)
+                  (op/eq -1 (.find body "/" (inc slash)))))
+         ;; Only symbol namespaces reject empty dotted segments.
+         (or (op/eq kind :keyword) (op/le slash 0)
+             (every? seq (.split (subs body 0 slash) "."))))))
+
+(defn- native-atom-end [state start]
+  (let [source (op/getitem state "source")
+        end (or (match-from native-atom-re state start) start)
+        name-start (+ start (if (.startswith source "::" start) 2
+                                (if (.startswith source ":" start) 1 0)))]
+    ;; A quote begins a new form until the current namespace/name segment
+    ;; contains a character. Internal apostrophes remain part of the name.
+    (if (and (op/lt name-start end) (op/eq "'" (char-at source name-start)))
+      name-start
+      (let [boundary (.find source "/'" name-start end)]
+        (if (op/gt boundary name-start) (inc boundary) end)))))
+
 (defn- atom-error [kind s dialect]
   (cond
     (op/eq kind :number) (when-not (valid-number? s) "Invalid numeric literal")
@@ -164,10 +191,15 @@
     (let [body (subs s (if (.startswith s "::") 2 1))]
       ;; Unlike symbols, keywords accept numeric names and namespaces.
       ;; Empty names remain readable on the minimum supported Basilisp 0.5.1.
-      (when-not (.fullmatch (if (op/eq :clojure dialect) clojure-keyword-re keyword-re) body)
+      (when-not (if (op/eq :clojure dialect)
+                  (.fullmatch clojure-keyword-re body)
+                  (native-name-valid? kind body))
         "Invalid keyword"))
     (op/eq kind :symbol)
-    (when-not (.fullmatch identifier-re s) "Invalid symbol")
+    (when-not (if (op/eq :clojure dialect)
+                (.fullmatch identifier-re s)
+                (native-name-valid? kind s))
+      "Invalid symbol")
     :else nil))
 
 (defn- read-atom [state]
@@ -175,7 +207,10 @@
         source (op/getitem state "source")
         numeric? (.match number-start-re source i)
         end (if numeric? (match-end number-body-re state)
-                (or (match-end atom-re state) (inc i)))
+                (if (op/eq :basilisp (op/getitem state "dialect"))
+                  (let [end (native-atom-end state i)]
+                    (if (op/gt end i) end (inc i)))
+                  (or (match-end atom-re state) (inc i))))
         [node state] (leaf state :symbol end)
         kind (atom-kind (:text node))
         problem (when-not (and (op/eq :clojure (op/getitem state "dialect"))
@@ -187,11 +222,15 @@
 
 (defn- read-character [state]
   (let [s (op/getitem state "source") start (op/getitem state "offset") first-pos (inc start)
+        native? (op/eq :basilisp (op/getitem state "dialect"))
         end (if (op/ge first-pos (count s))
               first-pos
               (loop [j (inc first-pos)]
                 (if-let [c (char-at s j)]
-                  (if (.isalnum c) (recur (inc j)) j) j)))
+                  (if (if native?
+                        (.fullmatch native-character-tail-re c)
+                        (.isalnum c))
+                    (recur (inc j)) j) j)))
         body (subs s first-pos end)
         valid? (or (op/eq 1 (count body))
                    (and (op/eq :clojure (op/getitem state "dialect"))
@@ -199,7 +238,7 @@
                         (<= (python/int (subs body 1) 8) 255))
                    (contains? #{"newline" "space" "tab" "formfeed" "backspace" "return"} body)
                    (and (.startswith body "u")
-                        (try (let [v (python/int (subs body 1) 16)]
+                        (try (let [v (python/int (if native? (str "0x" (subs body 1)) (subs body 1)) 16)]
                                (and (seq (subs body 1)) (<= 0 v 1114111)))
                              (catch python/ValueError _ false))))
         [node state] (leaf state :character end)]
@@ -400,7 +439,9 @@
   (let [start (op/getitem state "offset")
         auto? (starts? state "#::")
         base (+ start (if auto? 3 2))
-        end (or (match-from atom-re state base) base)
+        native? (op/eq :basilisp (op/getitem state "dialect"))
+        end (if native? (native-atom-end state base)
+                (or (match-from atom-re state base) base))
         ns-text (subs (op/getitem state "source") base end)
         [head state] (leaf state :prefix end)
         valid-name? (and (seq ns-text) (.fullmatch identifier-re ns-text)
@@ -408,7 +449,10 @@
         valid? (if auto?
                  (or (empty? ns-text)
                      (and (op/eq :clojure (op/getitem state "dialect")) valid-name?))
-                 valid-name?)
+                 (if native?
+                   (and (native-name-valid? :keyword ns-text)
+                        (or (op/eq -1 (.find ns-text "/")) (op/eq ns-text "/")))
+                   valid-name?))
         state (if valid? state
                   (issue state :invalid-map-namespace "Invalid namespaced-map prefix" start end))
         [children state] (consume-trivia state [head])]
@@ -449,12 +493,15 @@
         [node (if (contains? #{"##Inf" "##-Inf" "##NaN"} (:text node)) state
                   (issue state :invalid-number "Unknown symbolic numeric constant" i end))])
       :else
-      (let [end (or (match-from atom-re state (inc i)) (inc i))
+      (let [native? (op/eq :basilisp (op/getitem state "dialect"))
+            end (if native? (native-atom-end state (inc i))
+                    (or (match-from atom-re state (inc i)) (inc i)))
             tag (subs (op/getitem state "source") (inc i) end)]
         (cond
           (op/eq tag "b") (read-prefixed-string state :bytes "#b")
           (op/eq tag "f") (read-prefixed-string state :f-string "#f")
-          (or (empty? tag) (not (.fullmatch identifier-re tag))
+          (or (empty? tag) (not (if native? (native-name-valid? :symbol tag)
+                                    (.fullmatch identifier-re tag)))
               (.startswith tag "?") (.startswith tag "="))
           (let [[node state] (leaf state :error end)]
             [node (issue state :invalid-dispatch "Unknown or incomplete reader dispatch" i end)])

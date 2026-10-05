@@ -52,8 +52,8 @@
   (doseq [[kind examples]
           {:nil ["nil"]
            :boolean ["true" "false"]
-           :symbol ["foo" "foo/bar" "some/ns/sym" "ns//" ".method" ".-field"
-                    "+" "-" "->>" "foo'" "div#id" "%1" "%&" "&" "привет" "😀"]
+           :symbol ["foo" "foo/bar" ".method" ".-field"
+                    "+" "-" "->>" "foo'" "div#id" "%1" "%&" "&" "привет"]
            :keyword [":k" "::k" "::alias/k" ":ns/k" ":123" ":div#id"]
            :number ["0" "-42" "42N" "0.1" "-1." "1M" "2.5M" "0755"
                     "-0755N" "0xFF" "-0XFFN" "2r101" "36rZ" "-16rFF"
@@ -255,8 +255,7 @@
   (doseq [[source kind] [["#^:private answer" :metadata]
                          ["#^{:doc \"value\"} answer" :metadata]
                          ["#=(java.lang.System/exit 1)" :read-eval]
-                         ["#::alias{:key 1}" :namespaced-map]
-                         ["^Long/1 values" :metadata]]]
+                         ["#::alias{:key 1}" :namespaced-map]]]
     (testing source
       (is (seq (:diagnostics (syntax/parse source))))
       (let [parsed (syntax/parse source {:dialect :clojure})
@@ -264,6 +263,9 @@
         (is (empty? (:diagnostics parsed)))
         (is (= kind (:kind form)))
         (is (= source (syntax/text (:root parsed)))))))
+  ;; Numeric symbol names after a namespace slash are native-readable too.
+  (doseq [dialect [:basilisp :clojure]]
+    (is (empty? (:diagnostics (syntax/parse "^Long/1 values" {:dialect dialect})))))
   (doseq [source ["#=" "#^:private" "#::alias[]" "^Long/0 values"]]
     (is (seq (:diagnostics (syntax/parse source {:dialect :clojure})))))
   (is (thrown? python/ValueError (syntax/parse "" {:dialect :unknown}))))

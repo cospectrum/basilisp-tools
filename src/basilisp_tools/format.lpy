@@ -6,10 +6,11 @@
             [basilisp-tools.regex :as regex])
   (:import [pathlib] [re] [sys] [os] [operator :as op]))
 
-(defn- parse-source [source]
-  ;; Formatting is syntactic: recognize shared Clojure source and configs
-  ;; without evaluating reader forms or changing Basilisp analysis semantics.
-  (syntax/parse source {:dialect :clojure}))
+(defn- parse-source
+  ;; Config files and the compatibility API retain Clojure syntax. Native
+  ;; source formatting explicitly selects the Basilisp reader's token rules.
+  ([source] (parse-source source :clojure))
+  ([source dialect] (syntax/parse source {:dialect dialect})))
 
 (def ^:private containers
   #{:root :list :vector :map :set :anonymous-function
@@ -1031,8 +1032,8 @@
          [(:kind node) (if sortable? (frequencies children) (vec children))])
        (source-shape node)))))
 
-(defn- validate-output [original prepared output options]
-  (let [parsed (parse-source output)
+(defn- validate-output [original prepared output options dialect]
+  (let [parsed (parse-source output dialect)
         actual (source-shape (:root parsed))]
     (when (or (seq (:diagnostics parsed))
               (if (:sort-ns-references? options)
@@ -1043,16 +1044,16 @@
                {:code :unsafe-formatting}))
     output))
 
-(defn- format-aligned [source opts ctx]
+(defn- format-aligned [source opts ctx dialect]
   ;; Some upstream alignment cases need multiple passes when moving a
   ;; multiline value shifts another value on its closing line. Return only
   ;; a stable layout, and fail closed on a cycle or excessive convergence.
-  (loop [candidate (align-columns source opts ctx) seen #{source} passes 0]
-    (let [parsed (parse-source candidate)
+  (loop [candidate (align-columns source opts ctx dialect) seen #{source} passes 0]
+    (let [parsed (parse-source candidate dialect)
           _ (when (seq (:diagnostics parsed))
               (invalid "Invalid syntax produced during alignment" {:code :unsafe-formatting}))
           rendered (render (prepare (:root parsed) opts) opts ctx)
-          result (align-columns rendered opts ctx)]
+          result (align-columns rendered opts ctx dialect)]
       (cond
         (op/eq result candidate) result
         (or (contains? seen result) (op/ge passes 15))
@@ -1097,21 +1098,23 @@
 (defn format-string
   "Format Basilisp source without evaluation. Validate source preservation
   before returning output. Invalid syntax/options or unsafe output raises
-  ExceptionInfo."
+  ExceptionInfo. The one- and two-argument compatibility API uses Clojure
+  syntax; pass :basilisp as the third argument for native source token rules."
   ([source] (format-string source {}))
-  ([source options]
+  ([source options] (format-string source options :clojure))
+  ([source options dialect]
    (let [opts (resolve-options options)
-         parsed (parse-source source)
+         parsed (parse-source source dialect)
          _ (when (seq (:diagnostics parsed))
              (invalid "Cannot format invalid syntax" {:diagnostics (:diagnostics parsed)}))
          original (:root parsed)
          normalized (normalize-closing-gaps source original opts)
-         layout-root (if (op/eq source normalized) original (:root (parse-source normalized)))
+         layout-root (if (op/eq source normalized) original (:root (parse-source normalized dialect)))
          ctx (namespace-context layout-root opts)
          prepared (prepare layout-root opts)
          result (render prepared opts ctx)
          result (if (or (:align-map-columns? opts) (:align-form-columns? opts))
-                  (format-aligned result opts ctx) result)
+                  (format-aligned result opts ctx dialect) result)
          result (if (:normalize-newlines-at-file-end? opts)
                   (let [trimmed (re/sub "[ \t\r\n]+$" "" result)]
                     (if (empty? trimmed) "" (str trimmed "\n")))
@@ -1119,7 +1122,7 @@
      ;; An identical result already passed input validation. Avoid parsing
      ;; and walking it a second time during the common --check/editor path.
      (if (op/eq source result) result
-         (validate-output original prepared result opts)))))
+         (validate-output original prepared result opts dialect)))))
 
 (def reformat-string format-string)
 
@@ -1197,17 +1200,17 @@
                          (partition 2 1 (syntax/tokens n))))))))
      rows)))
 
-(defn- align-columns [source opts ctx]
+(defn- align-columns [source opts ctx dialect]
   ;; Resolve one column at a time so padding in earlier columns is included
   ;; in later column widths. Each collection is processed outside-in.
   (loop [source source target-index 0]
-    (let [parsed (parse-source source)
+    (let [parsed (parse-source source dialect)
           targets (vec (alignment-targets (:root parsed) opts ctx))]
       (if-let [target (get targets target-index)]
         (let [columns (apply max 0 (map count (column-rows target parsed opts)))
               source
               (reduce (fn [s column]
-                        (let [p (parse-source s)
+                        (let [p (parse-source s dialect)
                               n (nth (alignment-targets (:root p) opts ctx) target-index)]
                           (apply-edits s (column-edits s p n column opts))))
                       source (range 1 columns))]
