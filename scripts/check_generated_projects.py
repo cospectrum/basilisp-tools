@@ -319,7 +319,7 @@ def expanded_cases(seed, small_files=1, large_files=100):
                 str(sum(values)),
                 "(np/array)"
                 if family == "data"
-                else "(requests/Request ** :method 123)"
+                else "(requests/get 123)"
                 if family == "services"
                 else "(stats/mean)"
                 if family == "stdlib"
