@@ -59,7 +59,6 @@
       "src/portal/runtime/rpc.cljc",
       "src/portal/runtime/shell.cljc",
       "src/portal/runtime/transit.cljc",
-      "src/portal/shortcuts.cljc",
       "src/portal/spec.cljc",
       "src/portal/sync.cljc",
       "src/portal/viewer.cljc",
