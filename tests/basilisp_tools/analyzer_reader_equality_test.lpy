@@ -1,0 +1,29 @@
+(ns basilisp-tools.analyzer-reader-equality-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(def ^:private prefix
+  "(ns blt-reader-values (:require [basilisp.string :as s])) ")
+
+(deftest quoted-data-and-evaluated-bindings-are-distinct-reader-forms-test
+  (doseq [expression ["(let [a 'b] (count #{'a a}))"
+                      "(let [a 'b] (count {'a 1 a 2}))"
+                      "(let [a 'b] (count #{['a] [a]}))"
+                      "(count #{(identity ::n) (identity ::m)})"]]
+    (testing expression
+      (let [source (str prefix expression)
+            findings (:findings (analyzer/analyze source))]
+        (is (= 2 (load-string source)))
+        (is (not-any? #(= :error (:level %)) findings))))))
+
+(deftest equivalent-source-reader-values-report-duplicates-test
+  (doseq [[expression finding]
+          [["#{'a (quote a)}" :duplicate-set-key]
+           ["#{(identity ::n) (identity :blt-reader-values/n)}" :duplicate-set-key]
+           ["{(identity ::n) 1 (identity :blt-reader-values/n) 2}" :duplicate-map-key]
+           ["#{(identity ::s/n) (identity :basilisp.string/n)}" :duplicate-set-key]]]
+    (testing expression
+      (let [source (str prefix expression)
+            findings (:findings (analyzer/analyze source))]
+        (is (try (load-string source) false (catch python/Exception _ true)))
+        (is (= [finding] (mapv :type (filter #(= :error (:level %)) findings))))))))

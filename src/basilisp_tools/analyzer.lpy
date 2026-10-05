@@ -2052,7 +2052,7 @@
       (finding! ctx (last xs) :missing-map-value (str "missing value for key " (syntax/text (last xs)))))
     (loop [xs (seq keys) seen #{}]
       (when-let [key (first xs)]
-        (let [value (try [:data (if-let [[value] (constant-data ctx key)] value (config-data key))] (catch python/Exception _ nil))]
+        (let [value (try [:data (quoted-data ctx key)] (catch python/Exception _ nil))]
           (when (and value (contains? seen value))
             (finding! ctx key (if (op/eq :map (:kind node)) :duplicate-map-key :duplicate-set-key)
                       (if (op/eq :edn (get-in @(:state ctx) [:opts :lang]))
