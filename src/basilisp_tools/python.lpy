@@ -868,7 +868,29 @@
           (let [results (map #(type-compatible? (return-type %) expected opts) (:bases a))]
             (when (some true? results) true)))))))
 
-(defn- argument-pairs [metadata positional-types keyword-types]
+(defn- argument-compatible? [actual expected fresh? opts]
+  (cond
+    (not fresh?) (type-compatible? actual expected opts)
+    (or (:union expected) (:nullable? expected))
+    (any-compatible (map #(argument-compatible? actual % true opts) (variants expected)))
+    (:typevar expected)
+    (cond
+      (:constraints expected) (any-compatible (map #(argument-compatible? actual % true opts) (:constraints expected)))
+      (:bound expected) (argument-compatible? actual (:bound expected) true opts)
+      :else (type-compatible? actual expected opts))
+    (and (= "builtins" (:module actual) (:module expected))
+         (= (:path actual) (:path expected))
+         (contains? #{["dict"] ["list"] ["set"]} (:path expected)))
+    ;; The outer literal is new, but its children can refer to existing mutable values.
+    ;; Contextualize only this container; nested types retain their normal variance.
+    (let [actual-args (:arguments actual) expected-args (:arguments expected)]
+      (cond
+        (empty? expected-args) true
+        (or (empty? actual-args) (not= (count actual-args) (count expected-args))) nil
+        :else (every-compatible (map #(type-compatible? %1 %2 opts) actual-args expected-args))))
+    :else (type-compatible? actual expected opts)))
+
+(defn- argument-pairs [metadata positional-types keyword-types opts]
   (let [params (:parameters metadata)
         positional (filterv #(contains? #{:positional-only :positional-or-keyword} (:kind %)) params)
         varargs (first (filter #(= :var-positional (:kind %)) params))
@@ -876,8 +898,11 @@
         by-name (into {} (map #(vector (:name %) %) params))]
     (concat
      (map-indexed (fn [index actual]
-                    [(return-type (or (get positional index) varargs)) actual]) positional-types)
-     (map (fn [[name actual]] [(return-type (or (get by-name name) kwargs)) actual]) keyword-types))))
+                    [(return-type (or (get positional index) varargs)) actual
+                     (contains? (get-in opts [:python-fresh-arguments :positional]) index)]) positional-types)
+     (map (fn [[name actual]]
+            [(return-type (or (get by-name name) kwargs)) actual
+             (contains? (get-in opts [:python-fresh-arguments :keywords]) name)]) keyword-types))))
 
 (declare infer-bindings)
 
@@ -1021,22 +1046,22 @@
                 (when-not (seq (check-call original (count positional-types) (keys keyword-types)))
                   (let [prepared (unpacked-call-signature original positional-types)
                         signature (:signature prepared)
-                        pairs (vec (argument-pairs signature positional-types keyword-types))
+                        pairs (vec (argument-pairs signature positional-types keyword-types opts))
                         bindings (reduce (fn [result [expected actual]]
                                            (infer-bindings result expected actual)) (:bindings prepared) pairs)
                         specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
                         unchanged? (identical? specialized signature)
-                        specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types))
-                        comparisons (map (fn [[expected actual]]
-                                           (let [result (type-compatible? actual expected opts)
+                        specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types opts))
+                        comparisons (map (fn [[expected actual fresh?]]
+                                           (let [result (argument-compatible? actual expected fresh? opts)
                                                  substituted (substitute-type expected bindings)]
                                              (if (or (false? result) (= expected substituted))
                                                result
-                                               (type-compatible? actual substituted opts)))) specialized-pairs)]
+                                               (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
                     (when-not (or (and (not unchanged?)
-                                       (some (fn [[expected actual]]
+                                       (some (fn [[expected actual fresh?]]
                                                (and (not (:parameter-part expected))
-                                                    (false? (type-compatible? actual expected opts)))) pairs))
+                                                    (false? (argument-compatible? actual expected fresh? opts)))) pairs))
                                   (some false? comparisons)
                                   (and (not (identical? original specialized))
                                        (seq (check-call specialized (count positional-types) (keys keyword-types)))))

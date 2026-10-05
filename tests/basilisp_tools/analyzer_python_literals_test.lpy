@@ -1,0 +1,79 @@
+(ns basilisp-tools.analyzer-python-literals-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [sys]))
+
+(defn- with-package [f]
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (py/create-cache)
+        options {:python-options {:python-paths [(str root)]
+                                  :python-inspection? false :python-cache cache}}]
+    (try
+      (.write_text (.joinpath root "literalfixture.py")
+                   (str "from collections.abc import Hashable\n"
+                        "def route(path_map: dict[Hashable, str] | list[str] | None) -> str: return 'ready'\n"
+                        "def before(path_map: dict[Hashable, str], suffix: str) -> str: return suffix\n"
+                        "def after(prefix: str, path_map: dict[Hashable, str]) -> str: return prefix\n"
+                        "def items(value: list[object]) -> int: return len(value)\n"
+                        "def keys(value: set[Hashable]) -> int: return len(value)\n"
+                        "def nested(value: dict[str, list[object]]) -> int: return len(value)\n"
+                        "def both(left: dict[Hashable, str], right: dict[Hashable, str]) -> int: return 1\n"
+                        "def keep(value: dict[str, str]) -> dict[str, str]: return value\n")
+                   ** :encoding "utf-8")
+      (.insert sys/path 0 (str root))
+      (f options)
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules "literalfixture" nil)
+        (py/stop-cache! cache)
+        (.cleanup temporary)))))
+
+(defn- source [body]
+  (str "(ns blt-python-literals (:import literalfixture)) " body))
+
+(defn- errors [result]
+  (mapv :type (filter #(= :error (:level %)) (:findings result))))
+
+(deftest direct-python-container-literals-receive-call-context-test
+  (with-package
+    (fn [options]
+      (doseq [[body expected]
+              [["(literalfixture/route #py {\"entry\" \"entry\"})" "ready"]
+               ["(literalfixture/route ** :path-map #py {\"entry\" \"entry\"})" "ready"]
+               ["(-> #py {\"entry\" \"entry\"} (literalfixture/before \"ok\"))" "ok"]
+               ["(->> #py {\"entry\" \"entry\"} (literalfixture/after \"ok\"))" "ok"]
+               ["(cond-> #py {\"entry\" \"entry\"} true (literalfixture/before \"ok\"))" "ok"]
+               ["(cond->> #py {\"entry\" \"entry\"} true (literalfixture/after \"ok\"))" "ok"]
+               ["(literalfixture/after \"ok\" ** :path-map #py {\"entry\" \"entry\"})" "ok"]
+               ["(-> #py {\"entry\" \"entry\"} (-> literalfixture/route))" "ready"]
+               ["(literalfixture/items #py [\"item\"])" 1]
+               ["(literalfixture/keys #py #{\"item\"})" 1]
+               ["(literalfixture/both #py {\"left\" \"left\"} #py {\"right\" \"right\"})" 1]]]
+        (let [source (source body)
+              result (analyzer/analyze source options)]
+          (is (= expected (binding [*ns* *ns*] (load-string source))) body)
+          (is (empty? (errors result)) body)
+          ;; The selected return signature is retained after contextual matching.
+          (is (= [(if (string? expected) "str" "int")]
+                 (get-in (last (:python-expressions result)) [:python-type :path])) body))))))
+
+(deftest stored-and-nested-mutable-values-remain-invariant-test
+  (with-package
+    (fn [options]
+      (doseq [body ["(let [value #py {\"entry\" \"entry\"}] (literalfixture/route value))"
+                    "(let [value #py {\"entry\" \"entry\"}] (literalfixture/route ** :path-map value))"
+                    "(let [value #py {\"entry\" \"entry\"}] (-> value literalfixture/route))"
+                    "(literalfixture/route (identity #py {\"entry\" \"entry\"}))"
+                    "(-> #py {\"entry\" \"entry\"} literalfixture/keep (-> literalfixture/route))"
+                    "(cond-> #py {\"entry\" \"entry\"} true literalfixture/keep true literalfixture/route)"
+                    "(cond->> #py {\"entry\" \"entry\"} true literalfixture/keep true literalfixture/route)"
+                    "(let [value #py {\"entry\" \"entry\"}] (cond-> value true literalfixture/route))"
+                    "(let [value #py {\"entry\" \"entry\"}] (cond->> value true literalfixture/route))"
+                    "(let [value #py [\"item\"]] (literalfixture/items value))"
+                    "(let [value #py #{\"item\"}] (literalfixture/keys value))"
+                    "(let [value #py [\"item\"]] (literalfixture/nested #py {\"items\" value}))"
+                    "(let [value #py {\"entry\" \"entry\"}] (literalfixture/both #py {\"entry\" \"entry\"} value))"
+                    "(literalfixture/route #py {\"entry\" 1})"]]
+        (is (= [:type-mismatch] (errors (analyzer/analyze (source body) options))) body)))))

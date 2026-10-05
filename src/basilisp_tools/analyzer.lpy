@@ -1873,15 +1873,32 @@
 
 (declare call-identity)
 
+(defn- fresh-python-container? [node]
+  (let [node (unwrap node)]
+    (or (:fresh-python-container? node)
+        (and (op/eq :tagged (:kind node))
+             (op/eq "#py" (:text (first (:children node))))
+             (#{:map :vector :set} (:kind (first (forms node))))))))
+
 (defn- python-call-value [ctx node member args values injected]
   (let [{:keys [positional keywords valid?]} (python-arguments ctx node args)
         supplied (vec (take positional values))
         supplied (if injected (if (:last? injected) (conj supplied (:value injected)) (vec (cons (:value injected) supplied))) supplied)
+        supplied-nodes (vec (take positional args))
+        supplied-nodes (if injected
+                         (if (:last? injected) (conj supplied-nodes (:node injected)) (vec (cons (:node injected) supplied-nodes)))
+                         supplied-nodes)
         positional-types (mapv :python-type supplied)
         keyword-values (take-nth 2 (drop (+ positional 2) values))
         keyword-types (zipmap keywords (map :python-type keyword-values))
+        fresh-positional (into #{} (keep-indexed #(when (fresh-python-container? %2) %1) supplied-nodes))
+        fresh-keywords (into #{} (keep (fn [[name value]] (when (fresh-python-container? value) name))
+                                       (map vector keywords (take-nth 2 (drop (+ positional 2) args)))))
+        options (cond-> (dissoc (get-in @(:state ctx) [:opts :python-options] {}) :python-fresh-arguments)
+                  (or (seq fresh-positional) (seq fresh-keywords))
+                  (assoc :python-fresh-arguments {:positional fresh-positional :keywords fresh-keywords}))
         problems (when valid? (py/check-call member (count supplied) keywords))
-        candidates (when (and valid? (empty? problems)) (py/call-signatures member positional-types keyword-types (get-in @(:state ctx) [:opts :python-options] {})))]
+        candidates (when (and valid? (empty? problems)) (py/call-signatures member positional-types keyword-types options))]
     (when (and (:type-guard member) (not (:async? member)))
       (swap! (:state ctx) assoc-in [:guard-calls (:start node)]
              {:guard (py/return-type (:type-guard member)) :type-is? (:type-is? member)}))
@@ -1897,7 +1914,7 @@
                 (str "No Python signature accepts argument types ("
                      (str/join ", " (concat (map py/type-label positional-types)
                                             (map (fn [[name type]] (str name "=" (py/type-label type))) keyword-types))) ")")))
-    (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types (get-in @(:state ctx) [:opts :python-options] {})))]
+    (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types options))]
       (python-value type))))
 
 (defn- merge-values [values]
@@ -2038,7 +2055,8 @@
             (dispatch-name ctx (:call-identity ctx))))
       ;; Reuse the outer value without walking its source or recording usages twice.
       (let [thread (:thread-target env)
-            value-node (assoc (:node thread) :kind :analyzed-value :analysis-value (:value thread) :children [])
+            value-node (assoc (:node thread) :kind :analyzed-value :analysis-value (:value thread) :children []
+                              :fresh-python-container? (fresh-python-container? (:node thread)))
             args (if (:last? thread) (conj (vec args) value-node) (cons value-node args))]
         (walk-list-form! ctx (dissoc env :thread-target) (assoc node :children (vec (cons head args)))))
       (and (op/eq :symbol (:kind head)) (.endswith (token head) ".")
@@ -2785,15 +2803,16 @@
         (walk-thread! ctx env args)
         (contains? #{"cond->" "cond->>"} dispatch-value)
         (let [initial (walk! ctx env (first args))]
-          (reduce (fn [value [test step]]
-                    (walk! ctx env test)
-                    (let [scope (assoc env :thread-target {:value value :node (first args) :last? (op/eq "cond->>" name)})]
-                      (or (if (op/eq :list (:kind step))
-                            (walk-call! ctx scope step 1)
-                            (let [info (walk! ctx env step)]
-                              (check-arity! ctx step info 1) (:return-info info)))
-                          value)))
-                  initial (partition 2 (rest args))))
+          (loop [steps (seq (partition 2 (rest args))) value initial previous (first args)]
+            (if-let [[test step] (first steps)]
+              (do
+                (walk! ctx env test)
+                (let [call (if (op/eq :list (:kind step)) step
+                               (assoc step :kind :list :text nil :children [step]))
+                      scope (assoc env :thread-target {:value value :node previous :last? (op/eq "cond->>" name)})
+                      result (walk-call! ctx scope call 1)]
+                  (recur (next steps) (or result value) step)))
+              value)))
         (op/eq dispatch-value "as->")
         (let [value (walk! ctx env (first args))
               scope (bind-pattern! ctx (assoc env :scope node) (second args) value)]

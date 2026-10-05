@@ -288,3 +288,52 @@
                                     (str file)]
                                    ** :capture_output true :text true :timeout 20)]
         (is (= 0 (.-returncode result)) (.-stderr result))))))
+
+(defn- container-signature [argument result]
+  (merge result {:status :known :kind :function
+                 :parameters [(assoc argument :name "value" :kind :positional-or-keyword :required? true)]}))
+
+(deftest fresh-python-containers-receive-only-their-call-context
+  (let [object {:module "builtins" :path ["object"]}
+        opts {:python-inspection? false :python-fresh-arguments {:positional #{0}}}]
+    (doseq [kind ["list" "set" "dict"]
+            :let [type {:module "builtins" :path [kind]}
+                  actual (assoc type :arguments (if (= "dict" kind) [str-type str-type] [str-type]))
+                  expected (assoc type :arguments (if (= "dict" kind) [object str-type] [object]))
+                  signature (container-signature expected int-type)]]
+      (is (= int-type (py/call-result signature [actual] {} opts)))
+      (is (true? (:type-match? (first (py/call-signatures signature [actual] {} opts)))))
+      (is (empty? (py/call-signatures signature [actual] {} {:python-inspection? false})))
+      (is (empty? (py/call-signatures signature [actual] {} (assoc opts :python-fresh-arguments {:positional #{1}}))))
+      (is (= int-type (py/call-result signature [] {"value" actual}
+                                      (assoc opts :python-fresh-arguments {:keywords #{"value"}}))))
+      (is (empty? (py/call-signatures signature [] {"value" actual} opts))))))
+
+(deftest fresh-container-context-keeps-nested-mutable-values-invariant
+  (let [object {:module "builtins" :path ["object"]}
+        list-of (fn [type] {:module "builtins" :path ["list"] :arguments [type]})
+        dict-of (fn [type] {:module "builtins" :path ["dict"] :arguments [str-type type]})
+        opts {:python-inspection? false :python-fresh-arguments {:positional #{0}}}]
+    (doseq [outer [list-of dict-of]
+            :let [signature (container-signature (outer (list-of object)) int-type)]]
+      (is (empty? (py/call-signatures signature [(outer (list-of str-type))] {} opts))))))
+
+(deftest literal-context-selects-overloads-without-leaking-inferred-bindings
+  (let [object {:module "builtins" :path ["object"]}
+        dict-of (fn [key value] {:module "builtins" :path ["dict"] :arguments [key value]})
+        list-of (fn [type] {:module "builtins" :path ["list"] :arguments [type]})
+        dict-branch (container-signature (dict-of object str-type) str-type)
+        list-branch (container-signature (list-of object) int-type)
+        overloaded {:kind :function :overloads [dict-branch list-branch]}
+        union-param (container-signature {:union [(dict-of object str-type) (list-of object)]} bool-type)
+        variable {:typevar "T" :bound object}
+        generic (container-signature (list-of variable) variable)
+        opts {:python-inspection? false :python-fresh-arguments {:positional #{0}}}]
+    (is (= str-type (py/call-result overloaded [(dict-of str-type str-type)] {} opts)))
+    (is (= int-type (py/call-result overloaded [(list-of str-type)] {} opts)))
+    (is (empty? (py/call-signatures overloaded [(dict-of str-type int-type)] {} opts)))
+    (is (= bool-type (py/call-result union-param [(dict-of str-type str-type)] {} opts)))
+    (is (empty? (py/call-signatures union-param [(dict-of str-type int-type)] {} opts)))
+    (is (= str-type (py/call-result generic [(list-of str-type)] {} opts)))
+    (is (= int-type (py/call-result generic [(list-of int-type)] {} opts)))
+    (is (= [variable] (:arguments (first (:parameters generic)))))))
