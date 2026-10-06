@@ -361,16 +361,52 @@
    ["basilisp.lang.seq" "LazySeq"] #{"Iterable"}
    ["basilisp.lang.seq" "_EmptySequence"] #{"Iterable"}})
 
+(defn- invariant-variants [type]
+  (if (seq (:literal-values type))
+    ;; Heterogeneous Literal values are stored on their union wrapper. Split
+    ;; the values first so Literal[1, "x"] never widens to int | str here.
+    (map (fn [value]
+           (if (nil? value) none-type
+               {:module "builtins" :path [(.-__name__ (python/type value))] :literal-values [value]}))
+         (:literal-values type))
+    (mapcat (fn [branch]
+              (if (or (:union branch) (:nullable? branch) (:literal-values branch))
+                (invariant-variants branch) [branch]))
+            (variants type))))
+
+(defn- invariant-compatible?
+  "Compare invariant arguments by meaning; unresolved nested arguments stay unknown."
+  [actual expected]
+  (cond
+    (= actual expected) true
+    (or (nil? actual) (nil? expected) (:any? actual) (:any? expected)
+        (:typevar actual) (:typevar expected)) nil
+    (or (:union actual) (:nullable? actual) (:union expected) (:nullable? expected)
+        (> (count (:literal-values actual)) 1) (> (count (:literal-values expected)) 1))
+    (let [actuals (invariant-variants actual) expecteds (invariant-variants expected)
+          covered? (fn [sources targets]
+                     (every-compatible
+                      (map (fn [source]
+                             (any-compatible (map (fn [target]
+                                                    (let [result (type-compatible? source target)]
+                                                      (if (nil? result) (invariant-compatible? source target) result))) targets))) sources)))]
+      (every-compatible [(covered? actuals expecteds) (covered? expecteds actuals)]))
+    (not= (dissoc actual :arguments :literal-values) (dissoc expected :arguments :literal-values)) false
+    (= none-type (dissoc actual :literal-values)) true
+    (or (:literal-values actual) (:literal-values expected))
+    (and (= (count (:literal-values actual)) (count (:literal-values expected)))
+         (every? true? (map #(and (= (python/type %1) (python/type %2)) (= %1 %2))
+                            (:literal-values actual) (:literal-values expected))))
+    (or (not (contains? actual :arguments)) (not (contains? expected :arguments))) nil
+    (not= (count (:arguments actual)) (count (:arguments expected))) false
+    :else (every-compatible (map invariant-compatible? (:arguments actual) (:arguments expected)))))
+
 (defn- generic-compatible? [actual expected invariant?]
   (cond
     (empty? expected) true
     (or (empty? actual) (not= (count actual) (count expected))) nil
     invariant?
-    (every-compatible
-     (map (fn [a e]
-            (cond (= a e) true
-                  (or (nil? a) (nil? e) (:any? a) (:any? e) (:typevar a) (:typevar e)) nil
-                  :else false)) actual expected))
+    (every-compatible (map invariant-compatible? actual expected))
     :else (every-compatible (map type-compatible? actual expected))))
 
 (defn- collection-arguments [actual expected]
@@ -1024,49 +1060,47 @@
        (let [expanded (for [[positional keyword] calls candidate (:callable-overloads type)]
                         (if (= :positional kind)
                           [(assoc positional key candidate) keyword]
-                          [positional (assoc keyword key candidate)]))]
-         (when (<= (count expanded) 32) (vec expanded)))))
+                          [positional (assoc keyword key candidate)]))
+             bounded (vec (take 33 expanded))]
+         (when (<= (count bounded) 32) bounded))))
    [[(vec positional-types) keyword-types]]
    (concat (keep-indexed #(when (seq (:callable-overloads %2)) [:positional %1 %2]) positional-types)
            (keep (fn [[key type]] (when (seq (:callable-overloads type)) [:keyword key type])) keyword-types))))
 
-(defn call-signatures
-  "Select signatures by argument types. Definite mismatches are excluded.
-  Surviving :type-match? is true for proven matches, nil when evidence is incomplete."
-  ([metadata positional-types keyword-types] (call-signatures metadata positional-types keyword-types {}))
-  ([metadata positional-types keyword-types opts]
-   (let [branches (callable-argument-branches positional-types keyword-types)
-         signatures (or (seq (:overloads metadata)) [metadata])]
-     (if (and branches (> (count branches) 1))
-       (vec (mapcat (fn [[positional keyword]]
-                      (map #(assoc % :callable-branch? true)
-                           (call-signatures metadata positional keyword opts))) branches))
-       (vec
-        (keep (fn [original]
-                (when-not (seq (check-call original (count positional-types) (keys keyword-types)))
-                  (let [prepared (unpacked-call-signature original positional-types)
-                        signature (:signature prepared)
-                        pairs (vec (argument-pairs signature positional-types keyword-types opts))
-                        bindings (reduce (fn [result [expected actual]]
-                                           (infer-bindings result expected actual)) (:bindings prepared) pairs)
-                        specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
-                        unchanged? (identical? specialized signature)
-                        specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types opts))
-                        comparisons (map (fn [[expected actual fresh?]]
-                                           (let [result (argument-compatible? actual expected fresh? opts)
-                                                 substituted (substitute-type expected bindings)]
-                                             (if (or (false? result) (= expected substituted))
-                                               result
-                                               (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
-                    (when-not (or (and (not unchanged?)
-                                       (some (fn [[expected actual fresh?]]
-                                               (and (not (:parameter-part expected))
-                                                    (false? (argument-compatible? actual expected fresh? opts)))) pairs))
-                                  (some false? comparisons)
-                                  (and (not (identical? original specialized))
-                                       (seq (check-call specialized (count positional-types) (keys keyword-types)))))
-                      (assoc specialized :type-match? (every-compatible comparisons))))))
-              signatures))))))
+(defn- select-call-signatures
+  [metadata positional-types keyword-types opts]
+  (let [branches (callable-argument-branches positional-types keyword-types)
+        signatures (or (seq (:overloads metadata)) [metadata])]
+    (if (and branches (> (count branches) 1))
+      (vec (mapcat (fn [[positional keyword]]
+                     (map #(assoc % :callable-branch? true)
+                          (select-call-signatures metadata positional keyword opts))) branches))
+      (vec
+       (keep (fn [original]
+               (when-not (seq (check-call original (count positional-types) (keys keyword-types)))
+                 (let [prepared (unpacked-call-signature original positional-types)
+                       signature (:signature prepared)
+                       pairs (vec (argument-pairs signature positional-types keyword-types opts))
+                       bindings (reduce (fn [result [expected actual]]
+                                          (infer-bindings result expected actual)) (:bindings prepared) pairs)
+                       specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
+                       unchanged? (identical? specialized signature)
+                       specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types opts))
+                       comparisons (map (fn [[expected actual fresh?]]
+                                          (let [result (argument-compatible? actual expected fresh? opts)
+                                                substituted (substitute-type expected bindings)]
+                                            (if (or (false? result) (= expected substituted))
+                                              result
+                                              (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
+                   (when-not (or (and (not unchanged?)
+                                      (some (fn [[expected actual fresh?]]
+                                              (and (not (:parameter-part expected))
+                                                   (false? (argument-compatible? actual expected fresh? opts)))) pairs))
+                                 (some false? comparisons)
+                                 (and (not (identical? original specialized))
+                                      (seq (check-call specialized (count positional-types) (keys keyword-types)))))
+                     (assoc specialized :type-match? (every-compatible comparisons))))))
+             signatures)))))
 
 (defn- expand-arguments [positional-types keyword-types]
   (reduce
@@ -1076,13 +1110,36 @@
              expanded (for [[positional keyword] calls candidate choices]
                         (if (= :positional kind)
                           [(assoc positional key candidate) keyword]
-                          [positional (assoc keyword key candidate)]))]
-         (when (<= (count expanded) 32) (vec expanded)))))
+                          [positional (assoc keyword key candidate)]))
+             bounded (vec (take 33 expanded))]
+         (when (<= (count bounded) 32) bounded))))
    [[(vec positional-types) keyword-types]]
    (concat (keep-indexed (fn [index type]
                            (when (or (:union type) (:nullable? type)) [:positional index type])) positional-types)
            (keep (fn [[key type]]
                    (when (or (:union type) (:nullable? type)) [:keyword key type])) keyword-types))))
+
+(defn call-signatures
+  "Select signatures by argument types, requiring coverage of every union branch.
+  Surviving :type-match? is true for proven matches, nil when evidence is incomplete."
+  ([metadata positional-types keyword-types] (call-signatures metadata positional-types keyword-types {}))
+  ([metadata positional-types keyword-types opts]
+   (let [selected (select-call-signatures metadata positional-types keyword-types opts)
+         union? #(or (:union %) (:nullable? %))]
+     (if (or (some :type-match? selected)
+             (not-any? union? (concat positional-types (vals keyword-types))))
+       selected
+       (if-let [expanded (expand-arguments positional-types keyword-types)]
+         (let [branches (mapv (fn [[positional keyword]]
+                                (select-call-signatures metadata positional keyword opts)) expanded)]
+           (if (every? seq branches) (vec (distinct (mapcat identity branches))) []))
+         ;; Exhausting the branch budget is uncertainty, not a type error.
+         ;; Keep checking independent arguments and call shape without narrowing a result.
+         (mapv #(assoc % :type-match? nil)
+               (select-call-signatures metadata
+                                       (mapv #(when-not (union? %) %) positional-types)
+                                       (into {} (map (fn [[name type]] [name (when-not (union? type) type)]) keyword-types))
+                                       opts)))))))
 
 (defn type-label
   "Render inferred Python types for signatures, hovers, and editor hints."

@@ -1,0 +1,73 @@
+(ns basilisp-tools.python-equivalence-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile]))
+
+(def ^:private int-type {:module "builtins" :path ["int"]})
+(def ^:private str-type {:module "builtins" :path ["str"]})
+(def ^:private bool-type {:module "builtins" :path ["bool"]})
+(def ^:private none-type {:module "builtins" :path ["NoneType"]})
+
+(defn- list-of [element]
+  {:module "builtins" :path ["list"] :arguments [element]})
+
+(deftest invariant-arguments-ignore-union-and-literal-order
+  (doseq [[actual expected]
+          [[{:union [int-type str-type]} {:union [str-type int-type]}]
+           [{:union [int-type bool-type]} int-type]
+           [{:union [(assoc int-type :literal-values [1]) int-type]} int-type]
+           [none-type (assoc none-type :literal-values [nil])]
+           [{:union [int-type str-type] :literal-values [1 "x"]}
+            {:union [str-type int-type] :literal-values ["x" 1]}]
+           [(assoc str-type :literal-values ["first" "last"])
+            (assoc str-type :literal-values ["last" "first" "last"])]
+           [(assoc int-type :nullable? true) {:union [none-type int-type]}]
+           [{:union [(assoc int-type :literal-values [1]) (assoc int-type :literal-values [2])]}
+            (assoc int-type :literal-values [2 1])]
+           [(list-of {:union [int-type str-type]}) (list-of {:union [str-type int-type]})]]]
+    (is (true? (py/type-compatible? (list-of actual) (list-of expected))))
+    (is (true? (py/type-compatible? (list-of expected) (list-of actual))))))
+
+(deftest invariant-arguments-preserve-mutation-contracts
+  (doseq [[actual expected]
+          [[int-type str-type]
+           [{:union [int-type {:any? true}]} str-type]
+           [{:union [int-type str-type] :literal-values [1 "x"]}
+            {:union [int-type str-type] :literal-values [2 "y"]}]
+           [{:union [int-type str-type] :literal-values [1 "x"]}
+            {:union [int-type str-type]}]
+           [bool-type int-type]
+           [{:union [int-type str-type]} int-type]
+           [(assoc int-type :literal-values [1]) int-type]
+           [(assoc bool-type :literal-values [true]) (assoc int-type :literal-values [1])]
+           [(assoc str-type :literal-values ["first" "last"]) (assoc str-type :literal-values ["first"])]
+           [{:module "builtins" :path ["tuple"] :arguments [int-type str-type]}
+            {:module "builtins" :path ["tuple"] :arguments [str-type int-type]}]]]
+    (is (false? (py/type-compatible? (list-of actual) (list-of expected))))))
+
+(deftest nested-unknown-invariant-arguments-stay-unknown
+  (doseq [unknown [nil {:any? true} {:typevar "T"}]]
+    (is (nil? (py/type-compatible? (list-of (list-of unknown)) (list-of (list-of str-type)))))
+    (is (nil? (py/type-compatible? (list-of (list-of str-type)) (list-of (list-of unknown)))))))
+
+(deftest source-alias-equivalence-avoids-false-python-call-errors
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        source (str "from typing import Literal\n"
+                    "def values() -> list[int | str]: ...\n"
+                    "def accept(values: list[str | int]) -> None: ...\n"
+                    "def labels() -> list[Literal['first', 'last']]: ...\n"
+                    "def accept_labels(values: list[Literal['last', 'first']]) -> None: ...\n"
+                    "def integers(values: list[int]) -> None: ...\n")
+        opts {:python-options {:python-paths [(str root)] :python-inspection? false
+                               :cache (py/create-cache)}}]
+    (try
+      (.write_text (.joinpath root "equivalent.pyi") source ** :encoding "utf-8")
+      (doseq [[expression valid?] [["(m/accept (m/values))" true]
+                                   ["(m/accept-labels (m/labels))" true]
+                                   ["(m/integers (m/values))" false]]]
+        (let [result (analyzer/analyze (str "(ns equivalence (:import [equivalent :as m])) " expression) opts)
+              errors (filter #(= :type-mismatch (:type %)) (:findings result))]
+          (is (= valid? (empty? errors)) (str expression " " errors))))
+      (finally (.cleanup temp)))))

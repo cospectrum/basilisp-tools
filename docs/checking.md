@@ -112,6 +112,13 @@ variadic type parameters preserve information through higher-order calls. Known
 types also flow through bindings, returns, common builtins, threaded calls, and
 supported asynchronous or context-manager operations.
 
+Overload checking accounts for unions accepted across multiple signatures.
+Equivalent union and literal spellings do not make mutable containers
+incompatible; genuinely different element types still respect invariance.
+When an unknown decorator may replace a function, its original return type and
+type guards are not assumed to describe the replacement. `typing.no_type_check`
+ignores parameter and return annotations while preserving known argument binding.
+
 Runtime inspection executes package import initialization code. The subprocess
 has a timeout and is not a security sandbox. The timeout covers an inspection
 batch; completed results are retained if a later module times out.

@@ -1,0 +1,58 @@
+(ns basilisp-tools.analyzer-python-decorators-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as bridge])
+  (:import [pathlib] [tempfile] [sys]))
+
+(def ^:private source
+  (str "from typing import no_type_check, overload, TypeGuard\n"
+       "def replace(function): return lambda *args: 42\n"
+       "@replace\ndef changed(value: int) -> str: return 'old'\n"
+       "@replace\nasync def changed_async(value: int) -> str: return 'old'\n"
+       "@replace\ndef changed_guard(value: object) -> TypeGuard[str]: return True\n"
+       "@no_type_check\ndef unchecked(value: int) -> str: return value\n"
+       "@overload\ndef overloaded(value: int) -> str: ...\n"
+       "@overload\ndef overloaded(value: str) -> int: ...\n"
+       "@replace\ndef overloaded(value): return value\n"
+       "def checked(value: int) -> int: return value + 1\n"
+       "@no_type_check\nclass Unchecked:\n"
+       "    def identity(self, value: int) -> str: return value\n"))
+
+(deftest transformed-and-ignored-python-contracts-do-not-create-false-errors
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        module "blt_decorator_contracts_fixture"
+        cache (bridge/create-cache)
+        options {:filename (str (.joinpath root "blt_decorator_contracts_runtime.lpy"))
+                 :python-options {:python-paths [(str root)] :python-inspection? false :python-cache cache}}
+        prefix (str "(ns blt-decorator-contracts-runtime (:import [" module " :as m])) ")]
+    (try
+      (.write_text (.joinpath root (str module ".py")) source)
+      (.insert sys/path 0 (str root))
+      (doseq [[expression expected]
+              [["(inc (m/changed \"value\" \"extra\"))" 43]
+               ["(inc (m/changed-async \"value\"))" 43]
+               ["(inc (m/unchecked 42))" 43]
+               ["(m/unchecked \"value\")" "value"]
+               ["(inc (m/overloaded))" 43]
+               ["(inc (.identity (m/Unchecked) 42))" 43]
+               ["(defn use-guard [value] (when (m/changed-guard value) (m/checked value)))
+                 (use-guard 42)" 43]
+               ["(m/checked 42)" 43]]]
+        (let [program (str prefix expression)
+              findings (:findings (analyzer/analyze program options))]
+          (is (= expected (load-string program)) expression)
+          (is (empty? findings) (str expression " " findings))))
+      (doseq [[expression diagnostic]
+              [["(m/checked \"bad\")" :type-mismatch]
+               ["(m/unchecked)" :invalid-arity]
+               ["(m/unchecked 1 2)" :invalid-arity]]]
+        (let [program (str prefix expression)
+              findings (:findings (analyzer/analyze program options))]
+          (is (thrown? python/TypeError (load-string program)) expression)
+          (is (= [diagnostic] (mapv :type findings)) (str expression " " findings))))
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules module nil)
+        (bridge/stop-cache! cache)
+        (.cleanup temporary)))))

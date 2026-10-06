@@ -558,6 +558,20 @@ def signature_text(params, returns=None):
     return "(" + ", ".join(parts) + ")" + (" -> " + returns if returns else "")
 
 
+def unannotated_signature(info):
+    """Retain Python argument binding while discarding ignored type contracts."""
+    result = {key: value for key, value in info.items()
+              if key not in TYPE_KEYS and key not in (
+                  "return-type", "type-guard", "type-is?", "type-parameters", "overloads")}
+    if "parameters" in result:
+        result["parameters"] = [
+            {key: value for key, value in param.items()
+             if key not in TYPE_KEYS and key != "annotation"}
+            for param in result["parameters"]]
+        result["signature"] = signature_text(result["parameters"])
+    return result
+
+
 def expand_typed_keywords(info, resolve):
     """PEP 692 kwargs are separate keyword-only parameters, not scalar TypedDict values."""
     if "parameters" not in info or not any(
@@ -676,7 +690,7 @@ def source_signature(value):
         return {}
 
 
-def runtime_signature(value, drop_first=False, owner=None):
+def runtime_signature(value, drop_first=False, owner=None, ignore_annotations=False):
     # Never ask arbitrary callable instances for __signature__ or __wrapped__.
     if not (exact_type(value, CALLABLE_TYPES)
             or (is_class(value) and type(value) is type)):
@@ -693,6 +707,22 @@ def runtime_signature(value, drop_first=False, owner=None):
         text_sig = inspect.getattr_static(value, "__text_signature__", None)
         if text_sig is not None and not exact_type(text_sig, (str, types.GetSetDescriptorType)):
             return {}
+        # Match inspect.signature's choice of the first user-defined constructor
+        # in the MRO. A class directive must not erase an inherited typed init.
+        for base in class_attribute(value, "__mro__"):
+            constructor = None
+            for name in ("__new__", "__init__"):
+                member = class_attribute(base, "__dict__").get(name)
+                if type(member) is staticmethod:
+                    member = member.__func__
+                if type(member) is types.FunctionType:
+                    constructor = member
+                    break
+            if constructor is not None:
+                ignore_annotations = ignore_annotations or constructor.__dict__.get("__no_type_check__") is True
+                break
+    ignore_annotations = ignore_annotations or (
+        type(value) is types.FunctionType and value.__dict__.get("__no_type_check__") is True)
     seen = set()
     while type(value) is types.FunctionType and id(value) not in seen:
         seen.add(id(value))
@@ -713,6 +743,8 @@ def runtime_signature(value, drop_first=False, owner=None):
         if type(constructor) is types.FunctionType:
             return runtime_signature(constructor, drop_first=True, owner=value)
     original = value
+    ignore_annotations = ignore_annotations or (
+        type(original) is types.FunctionType and original.__dict__.get("__no_type_check__") is True)
     declared = {}
     if type(value) is types.FunctionType:
         if ((value.__defaults__ is not None and type(value.__defaults__) is not tuple)
@@ -721,7 +753,7 @@ def runtime_signature(value, drop_first=False, owner=None):
         if sys.version_info < (3, 14) and type(value.__annotations__) is not dict:
             return {}
     if sys.version_info >= (3, 14) and type(value) is types.FunctionType:
-        declared = source_signature(value)
+        declared = {} if ignore_annotations else source_signature(value)
         # A fresh function has no lazy annotation evaluator. It is never called.
         value = types.FunctionType(value.__code__, value.__globals__, value.__name__,
                                    value.__defaults__, value.__closure__)
@@ -740,11 +772,13 @@ def runtime_signature(value, drop_first=False, owner=None):
         "kind": KINDS[p.kind],
         "required?": p.default is inspect.Parameter.empty
                      and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD),
-        "annotation": annotation(p.annotation),
-        **runtime_type(p.annotation, module, owner),
+        "annotation": None if ignore_annotations else annotation(p.annotation),
+        **({} if ignore_annotations else runtime_type(p.annotation, module, owner)),
     } for p in sig.parameters.values()]
     if drop_first and params:
         params = params[1:]
+    if ignore_annotations:
+        return unannotated_signature({"parameters": params})
     returns = annotation(sig.return_annotation)
     module = getattr(original, "__module__", None) if exact_type(original, CALLABLE_TYPES) else None
     if not declared and type(original) is types.FunctionType:
@@ -833,6 +867,8 @@ def pydantic_parameters(value):
 
 def runtime_member(name, value, depth=1, owner=None):
     result = {"status": "known", "name": name}
+    ignore_annotations = (exact_type(value, (types.FunctionType, functools._lru_cache_wrapper))
+                          and vars(value).get("__no_type_check__") is True)
     if type(value) is functools._lru_cache_wrapper:
         wrapped = vars(value).get("__wrapped__")
         if type(wrapped) is types.FunctionType:
@@ -940,13 +976,15 @@ def runtime_member(name, value, depth=1, owner=None):
                 for base in class_attribute(value, "__mro__"))
     elif exact_type(value, CALLABLE_TYPES):
         result["kind"] = "function"
-        result.update(runtime_signature(value, drop_first=cls_method or bound_method, owner=owner))
+        result.update(runtime_signature(value, drop_first=cls_method or bound_method, owner=owner,
+                                        ignore_annotations=ignore_annotations))
         if type(value) is types.FunctionType and depth:
             attributes = value.__dict__
             result["members"] = {key: safe_member(key, child, depth=depth - 1)
                                  for key, child in attributes.items()
                                  if type(key) is str and not key.startswith("_")}
-        if type(value) is types.FunctionType and hasattr(typing, "get_overloads"):
+        if (not ignore_annotations and type(value) is types.FunctionType and hasattr(typing, "get_overloads")
+                and value.__dict__.get("__no_type_check__") is not True):
             overloads = [{"status": "known", "instance-method?": bool(owner is not None and not static and not cls_method and not bound_method),
                           **runtime_signature(fn, drop_first=cls_method or bound_method, owner=owner)}
                          for fn in typing.get_overloads(value)]
@@ -1380,8 +1418,22 @@ class StaticModule:
         return {expr_text(d.func if isinstance(d, ast.Call) else d).split(".")[-1]
                 for d in node.decorator_list}
 
-    def function(self, node, owner=()):
+    def no_type_check_decorators(self, node):
+        names = set()
+        for decorator in node.decorator_list:
+            text = expr_text(decorator)
+            parts = text.split(".")
+            module, path = self.aliases.get(parts[0], (None, []))
+            if module in ("typing", "typing_extensions") and path + parts[1:] == ["no_type_check"]:
+                names.add(parts[-1])
+        return names
+
+    def function(self, node, owner=(), known_decorators=()):
         decorators = self.decorators(node)
+        ignored = self.no_type_check_decorators(node)
+        ignore_annotations = bool(ignored) or any(
+            self.no_type_check_decorators(self.classes[owner[:length]])
+            for length in range(1, len(owner) + 1) if owner[:length] in self.classes)
         cls_method = "classmethod" in decorators
         prop = bool(decorators & {"property", "cached_property"})
         info = {**self.location(node, node.name), "kind": "property" if prop else "function",
@@ -1411,11 +1463,15 @@ class StaticModule:
         parameters = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
         parameters += [p for p in (node.args.vararg, node.args.kwarg) if p is not None]
         by_name = {p.arg: p for p in parameters}
-        for param in info["parameters"]:
-            param.update(self.reference(by_name[param["name"]].annotation, owner))
-        info.update(self.reference(node.returns, owner))
-        info = expand_typed_keywords(
-            guard_metadata(info), lambda ref: self.resolve(ref.get("type-module"), ref.get("type-path", [])))
+        if ignore_annotations:
+            info = unannotated_signature(info)
+            info["annotations-ignored?"] = True
+        else:
+            for param in info["parameters"]:
+                param.update(self.reference(by_name[param["name"]].annotation, owner))
+            info.update(self.reference(node.returns, owner))
+            info = expand_typed_keywords(
+                guard_metadata(info), lambda ref: self.resolve(ref.get("type-module"), ref.get("type-path", [])))
         if self.typevars:
             used = set()
             for param in info["parameters"]:
@@ -1432,8 +1488,8 @@ class StaticModule:
         info["generator?"] = function_yields(node)
         known = {"classmethod", "staticmethod", "property", "cached_property", "overload",
                  "abstractmethod", "final", "override", "cache", "lru_cache",
-                 "wraps", "no_type_check", "deprecated", "validate_call", "contextmanager", "asynccontextmanager", "dataclass_transform"}
-        unknown = decorators - known
+                 "wraps", "deprecated", "validate_call", "contextmanager", "asynccontextmanager", "dataclass_transform"}
+        unknown = decorators - known - ignored - set(known_decorators)
         safe_decorators = set()
         for decorator in unknown:
             declaration = next((n for n in self.tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1444,6 +1500,13 @@ class StaticModule:
                     hint = args[0].annotation
                     if expr_text(hint.value).split(".")[-1] == "Callable" and expr_text(hint) == expr_text(declaration.returns):
                         safe_decorators.add(decorator)
+        if unknown - safe_decorators:
+            # A decorator may replace the function, its result, or its guards.
+            # Removing only its parameters would retain an unproven return type.
+            info = unannotated_signature(info)
+            info["signature-unknown?"] = True
+            for key in ("async?", "generator?", "context-manager?", "async-context-manager?"):
+                info.pop(key, None)
         if unknown - safe_decorators or prop:
             info.pop("parameters", None)
             info.pop("signature", None)
@@ -1564,7 +1627,8 @@ class StaticModule:
                             signature=signature_text(inherited_parameters, info["return-type"]))
             elif not node.bases:
                 info.update(parameters=[], signature=signature_text([], info["return-type"]))
-            if self.decorators(node) - {"dataclass", "dataclass_transform", "final", "runtime_checkable"} and not transform:
+            if (self.decorators(node) - {"dataclass", "dataclass_transform", "final", "runtime_checkable"}
+                    - self.no_type_check_decorators(node)) and not transform:
                 for key in ("parameters", "signature", "overloads"):
                     info.pop(key, None)
             if "TypedDict" in base_names or any(child.get("typed-dict?") for child in
@@ -1690,7 +1754,7 @@ class StaticModule:
                     # A setter/deleter changes assignment behavior, not the getter's value type.
                     members[node.name] = dict(members[accessor.value.id])
                     continue
-                info = self.function(node, owner)
+                info = self.function(node, owner, (accessor.attr,) if accessor is not None else ())
                 if accessor is not None:
                     info.update(kind="property", **{"instance-method?": False})
                     info.pop("parameters", None)
@@ -1783,6 +1847,8 @@ class StaticModule:
         for name, signatures in overloads.items():
             info = dict(members[name])
             members[name] = info
+            if info.get("annotations-ignored?") or info.get("signature-unknown?"):
+                continue
             info["overloads"] = signatures
             info.pop("parameters", None)
             info["signature"] = "\n".join(sig["signature"] for sig in signatures if "signature" in sig)

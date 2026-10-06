@@ -1,0 +1,83 @@
+(ns basilisp-tools.python-union-call-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [sys]))
+
+(def ^:private int-type {:module "builtins" :path ["int"]})
+(def ^:private str-type {:module "builtins" :path ["str"]})
+(def ^:private int-or-str {:union [int-type str-type]})
+
+(defn- metadata [type]
+  {:type-module (:module type) :type-path (:path type)})
+
+(defn- signature [argument result]
+  (assoc (metadata result) :kind :function
+         :parameters [(assoc (metadata argument) :name "value" :kind :positional-or-keyword :required? true)]))
+
+(def ^:private overloaded
+  {:kind :function :overloads [(signature int-type str-type) (signature str-type int-type)]})
+
+(deftest overloads-can-cover-different-union-branches
+  (doseq [[positional keywords] [[[int-or-str] {}] [[] {"value" int-or-str}]]]
+    (let [matches (py/call-signatures overloaded positional keywords)]
+      (is (= 2 (count matches)))
+      (is (every? :type-match? matches))
+      (is (= #{int-type str-type} (set (:union (py/call-result overloaded positional keywords {} matches))))))))
+
+(deftest every-union-branch-must-have-a-compatible-overload
+  (doseq [actual [{:union [int-type {:module "builtins" :path ["bytes"]}]}
+                  (assoc int-type :nullable? true)]]
+    (is (empty? (py/call-signatures overloaded [actual] {})))
+    (is (nil? (py/call-result overloaded [actual] {}))))
+  ;; Unknown alternatives are retained without claiming a proven match.
+  (let [matches (py/call-signatures overloaded [{:union [int-type {:any? true}]}] {})]
+    (is (seq matches))
+    (is (some #(nil? (:type-match? %)) matches))))
+
+(deftest expansion-limits-keep-uncertainty-and-independent-errors
+  (let [variadic (fn [type]
+                   (assoc (metadata type) :kind :function
+                          :parameters [(assoc (metadata int-type) :name "head" :kind :positional-only :required? true)
+                                       (assoc (metadata type) :name "items" :kind :var-positional :required? false)]))
+        function {:kind :function :overloads [(variadic int-type) (variadic str-type)]}
+        alternatives (vec (repeat 6 int-or-str))
+        arguments (vec (cons int-type alternatives))
+        matches (py/call-signatures function arguments {})]
+    ;; Sixty-four combinations exceed the bounded analysis, so neither validity
+    ;; nor a narrowed result can be claimed. An independently invalid head can.
+    (is (seq matches))
+    (is (every? #(nil? (:type-match? %)) matches))
+    (is (nil? (py/call-result function arguments {} {} matches)))
+    (is (empty? (py/call-signatures function (vec (cons str-type alternatives)) {})))))
+
+(deftest analyzer-and-runtime-agree-on-covered-union-calls
+  (let [temp (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temp))
+        module "blt_union_call_fixture"
+        source (str "from typing import overload\n"
+                    "@overload\ndef choose(value: int) -> str: ...\n"
+                    "@overload\ndef choose(value: str) -> int: ...\n"
+                    "def choose(value):\n"
+                    "    return str(value) if isinstance(value, int) else len(value)\n"
+                    "def consume(value: str | int) -> None: pass\n")
+        opts {:python-options {:python-paths [(str root)] :python-inspection? false
+                               :cache (py/create-cache)}}]
+    (try
+      (.write_text (.joinpath root (str module ".py")) source ** :encoding "utf-8")
+      (.insert sys/path 0 (str root))
+      (doseq [expression ["(m/choose (if flag 1 \"x\"))"
+                          "(m/choose ** :value (if flag 1 \"x\"))"
+                          "(m/consume (m/choose (if flag 1 \"x\")))"]]
+        (let [source (str "(ns blt-union-call-runtime (:import [" module " :as m])) "
+                          "(defn run [flag] " expression ") (run true) (run false)")
+              errors (filter #(= :type-mismatch (:type %)) (:findings (analyzer/analyze source opts)))]
+          (is (empty? errors) (str expression " " errors))
+          (is (nil? (try (load-string source) nil (catch python/Exception error (str error)))))))
+      (let [source (str "(ns union-negative (:import [" module " :as m])) "
+                        "(defn run [flag] (m/choose (if flag 1 nil)))")]
+        (is (some #(= :type-mismatch (:type %)) (:findings (analyzer/analyze source opts)))))
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules module nil)
+        (.cleanup temp)))))

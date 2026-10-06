@@ -318,7 +318,10 @@ class Unrelated:
     module = inspector.module("property_accessors")
     members = module["members"]["Shape"]["members"]
     ordinary = module["members"]["Unrelated"]["members"]["method"]
-    assert ordinary["kind"] == "function" and ordinary["type-path"] == ["int"]
+    # A similarly named arbitrary decorator is not a property accessor, and
+    # its transformed callable's return type has not been established.
+    assert ordinary["kind"] == "function" and not worker.type_fields(ordinary)
+    assert ordinary["signature-unknown?"]
     shape = members["shape"]
     assert shape["kind"] == "property"
     assert shape["type-module"] == "builtins" and shape["type-path"] == ["tuple"]
