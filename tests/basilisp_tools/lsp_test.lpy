@@ -90,7 +90,11 @@
     (try
       (result! client "shutdown" nil)
       (notification! client "exit" nil)
-      (is (= 0 (.wait process ** :timeout 10)))
+      (let [status (.wait process ** :timeout 10)]
+        (is (= 0 status)
+            (str "Language server exited with " status
+                 (when (not= 0 status)
+                   (str ": " (.decode (.read (.-stderr process)) "utf-8" "replace"))))))
       (finally
         (when (nil? (.poll process)) (.kill process))
         (.wait process)
@@ -1289,8 +1293,10 @@
                        (str "import sys, time\nfrom pathlib import Path\n"
                             "from basilisp_tools.cli import main\nimport basilisp_tools.lsp as lsp\n"
                             "def slow_worker(jobs):\n"
-                            "    future, context, function, arguments = jobs.get()\n"
-                            "    future.set_running_or_notify_cancel()\n"
+                            "    job = jobs.get()\n"
+                            "    if job is None:\n        return\n"
+                            "    future, context, function, arguments = job\n"
+                            "    if not future.set_running_or_notify_cancel():\n        return\n"
                             "    Path('analysis-started').write_text('running')\n"
                             "    time.sleep(60)\n    return {}\n"
                             "lsp.worker_loop = slow_worker\nsys.argv = ['blt', 'lsp']\nmain()\n"))
