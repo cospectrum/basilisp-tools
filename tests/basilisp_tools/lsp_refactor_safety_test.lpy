@@ -16,6 +16,18 @@
 (defn- analyze [source]
   (analyzer/analyze source {:filename "/tmp/blt-refactor-safety.lpy"}))
 
+(deftest extraction-without-a-target-declines-safely-test
+  (doseq [[source offset] [["" 0]
+                           ["   " 1]
+                           ["\n\n" 1]
+                           ["\n(inc 5)" 0]
+                           ["(inc 5)\n\n" 8]
+                           ["(inc 5)\n  (inc 8)" 9]
+                           ["(inc 5)\n  ;; retained comment" 9]]
+          command ["introduce-let" "extract-function" "extract-to-def"]]
+    (is (empty? (lsp/refactor-edits source (analyze source) command offset ["value"]))
+        (str command " at " offset " in " (pr-str source)))))
+
 (defn- inline [source marker]
   (apply-edits source (lsp/refactor-edits source (analyze source)
                                           "inline-function" (.rfind source marker) [])))

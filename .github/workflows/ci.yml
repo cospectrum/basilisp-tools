@@ -96,13 +96,19 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: clj-kondo/clj-kondo
+          ref: 6267607412e55ed3b91710ef542f3fee2ad7aa05
+          path: .clj-kondo-reference
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
           repository: basilisp-lang/basilisp
           ref: 2f993f9e53b4195316426140384c38728304341e
           path: .basilisp-reference
           persist-credentials: false
       - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
       - name: Compare upstream cases and verify idempotence
-        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference --corpus .basilisp-reference
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_cljfmt.py --cljfmt .cljfmt-reference --corpus .basilisp-reference --report cljfmt-upstream-report.json
       - name: Compare configuration precedence with Leiningen plugin
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_config.py --cljfmt .cljfmt-reference
       - name: Compare literal Leiningen profile merging
@@ -121,3 +127,13 @@ jobs:
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lsp_refactors.py --clojure-lsp .clojure-lsp-reference
       - name: Compare language server configuration with clojure-lsp
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lsp_config.py --clojure-lsp .clojure-lsp-reference
+      - name: Audit upstream language server test assertions
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_lsp_upstream.py --clojure-lsp .clojure-lsp-reference --baseline scripts/lsp_upstream_baseline.json --report lsp-upstream-report.json
+      - name: Audit upstream checker test inputs
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_upstream.py --checkout .clj-kondo-reference --baseline scripts/kondo_upstream_baseline.json --report kondo-upstream-report.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: upstream-test-reports
+          path: '*-upstream-report.json'
+          if-no-files-found: warn

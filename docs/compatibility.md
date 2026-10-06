@@ -7,13 +7,18 @@ it is not a claim that the Python and JVM language environments are identical.
 | Command | Upstream tool | Compared in CI |
 | --- | --- | --- |
 | `blt format` | [cljfmt](https://github.com/weavejester/cljfmt) | Whole-file output, configuration precedence, and Leiningen profiles |
-| `blt check` | [clj-kondo](https://github.com/clj-kondo/clj-kondo) | Diagnostics and ranges, configuration, analysis output, hooks, and exit codes |
-| `blt lsp` | [clojure-lsp](https://clojure-lsp.io/) | Configuration and shared refactoring forms |
+| `blt check` | [clj-kondo](https://github.com/clj-kondo/clj-kondo) | Diagnostics and ranges, configuration, analysis output, hooks, exit codes, and an upstream test-input audit |
+| `blt lsp` | [clojure-lsp](https://clojure-lsp.io/) | Configuration, shared refactoring forms, and an upstream test-assertion audit |
 
 Configuration regexes are also compared with Java Pattern. LSP tests exercise
 the actual protocol, including unsaved edits, workspace isolation, navigation,
 Python support, and refactoring behavior. Separate execution tests check that
 supported refactorings preserve values and evaluation order.
+
+The [upstream test audit](upstream-tests.md) also replays cases taken directly
+from the tools' test suites. Its checker and LSP reports expose outstanding
+differences; their audit steps do not require complete upstream parity. Existing
+strict compatibility comparisons continue to fail on mismatches.
 
 ## Differences that matter
 

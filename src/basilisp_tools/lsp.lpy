@@ -1854,7 +1854,7 @@
       (when (not= original cleaned) [[start (:end node) cleaned]]))))
 
 (defn- executable-node? [tree analysis node]
-  (let [ancestors (enclosing-nodes tree (:start node))
+  (let [ancestors (when node (enclosing-nodes tree (:start node)))
         definition? (some #(and (= (:start node) (:start %)) (= (:end node) (:end %)))
                           (concat (:locals analysis) (:var-definitions analysis)))
         binding-vectors
