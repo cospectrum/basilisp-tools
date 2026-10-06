@@ -1,0 +1,137 @@
+(ns basilisp-tools.analyzer-upstream-lint-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- findings
+  ([source] (findings source {}))
+  ([source config]
+   (:findings (analyzer/analyze source {:python-options {:python-inspection? false}
+                                        :config config}))))
+
+(defn- matching [source type config]
+  (filterv #(= type (:type %)) (findings source config)))
+
+(deftest reader-data-is-checked-inside-quotes-and-metadata-test
+  (doseq [source ["'{[1 2] :a [1 2] :b}"
+                  "(quote {[1 2] :a [1 2] :b})"
+                  "^{:a 1 :a 2} []"]]
+    (testing source
+      (is (= [:duplicate-map-key] (mapv :type (findings source))))))
+  ;; Native vector/list hashes differ on some supported Python versions;
+  ;; mixed-key collision expectations apply when those hashes agree.
+  (when (= (hash [1 2]) (hash '(1 2)))
+    (doseq [source ["'{[1 2] :a (1 2) :b}"
+                    "(quote {[1 2] :a (1 2) :b})"
+                    "{[1 2] :a '(1 2) :b}"]]
+      (is (= [:duplicate-map-key] (mapv :type (findings source)))))
+    (is (= 1 (load-string "(count {[1 2] :a '(1 2) :b})"))))
+  ;; Inside a quote, (quote x) stays data instead of evaluating to x.
+  (is (= 2 (load-string "(count '{[1 2] :a '(1 2) :b})")))
+  (is (empty? (findings "'{[1 2] :a '(1 2) :b}"))))
+
+(deftest missing-map-value-has-one-precise-diagnostic-test
+  (doseq [source ["{:a}" "(fn [x] {:post} x)" "(let [{:keys [x] :oops} {}] x)" "'{:a}"]]
+    (let [result (findings source)]
+      (is (= [:missing-map-value] (mapv :type result)))
+      (is (< (:col (first result)) (:end-col (first result))))))
+  (let [result (:findings (analyzer/analyze "{:a" {:lang :edn}))
+        missing (filterv #(= :missing-map-value (:type %)) result)]
+    (is (= 3 (count result)))
+    (is (= ["missing value for key :a"] (mapv :message missing)))
+    (is (= [2 4] ((juxt :col :end-col) (first missing))))))
+
+(deftest metadata-expressions-use-lexical-and-namespace-bindings-test
+  (is (= {:value "ab"} (load-string "(let [a \"a\" b \"b\"] (meta ^{:value (str a b)} []))")))
+  (is (empty? (findings "(defn f [a b] ^{:value (str a b)} [])")))
+  (is (empty? (findings "(ns sample (:require [basilisp.string :refer [starts-with?]])) (defn f {:test-fn starts-with?} [])")))
+  (is (empty? (findings "^{:clj-kondo/ignore [:unresolved-symbol]} missing"))))
+
+(deftest nested-syntax-quote-tracks-unquote-depth-test
+  (is (empty? (findings "(defmacro evaluator [expr] `(fn [& args#] (eval `(~'~expr ~@args#))))")))
+  (is (empty? (findings "'(fn [x] `(dude ~x))")))
+  (is (= ["Unquote (~) not syntax-quoted"]
+         (mapv :message (matching "'~x" :unquote-not-syntax-quoted {}))))
+  (is (= ["Unquote-splicing (~@) not syntax-quoted"]
+         (mapv :message (matching "~@x" :unquote-not-syntax-quoted {})))))
+
+(deftest opaque-data-readers-preserve-possible-lexical-usage-test
+  (is (empty? (findings "(let [text \"2022-02-10\" date #time/date text] date)")))
+  (is (empty? (findings "#custom.Record{:field (\"literal data\")}"))))
+
+(deftest decimal-rounding-options-are-unevaluated-symbols-test
+  (let [source "(with-precision 6 :rounding CEILING (+ 3.5555555M 1))"]
+    (is (= 4.55556M (load-string source)))
+    (is (empty? (findings source)))))
+
+(deftest library-predicates-need-test-assertions-test
+  (let [prefix "(ns sample (:require [basilisp.test :as t] [basilisp.set :as sets])) "]
+    (doseq [body ["(sets/subset? #{1} #{1 2})"
+                  "(t/testing \"subset\" (sets/subset? #{1} #{1 2}))"
+                  "(t/testing \"subset\" (let [x #{1}] (sets/subset? x #{1 2})))"]]
+      (is (= 1 (count (matching (str prefix "(t/deftest subset " body ")") :missing-test-assertion {})))))
+    (is (empty? (matching (str prefix "(t/deftest subset (t/is (sets/subset? #{1} #{1 2})))")
+                          :missing-test-assertion {})))))
+
+(deftest used-lint-as-targets-must-be-qualified-test
+  (let [config {:lint-as {'foreign.macros/m 'when-let}}
+        result (matching "(require '[foreign.macros :as m]) (m/m)" :clj-kondo-config config)]
+    (is (= [{:row 0 :col 0 :level :warning
+             :message "Configuration error. Expected fully qualified symbol, got: when-let"}]
+           (mapv #(select-keys % [:row :col :level :message]) result)))
+    (is (empty? (findings "(inc 1)" config)))))
+
+(deftest clojure-namespace-groups-only-map-equivalent-core-libraries-test
+  (let [config {:ns-groups [{:pattern "clojure[.].*" :name 'legacy}]
+                :linters {:discouraged-namespace {'legacy {:message "Avoid legacy."}}}}]
+    (is (= 1 (count (matching "(require '[basilisp.string :as text]) (text/join [])"
+                              :discouraged-namespace config))))
+    (is (empty? (matching "(require '[basilisp.custom :as custom]) (custom/f)"
+                          :discouraged-namespace config)))))
+
+(deftest anonymous-function-body-and-call-ranges-test
+  (doseq [source ["#(do)" "#(do :value)" "#(do {:value %})"]]
+    (is (empty? (findings source))))
+  (let [result (first (matching "#(inc)" :invalid-arity {}))]
+    (is (= [2 7] [(:col result) (:end-col result)])))
+  (is (= ["Nested #()s are not allowed"]
+         (mapv :message (matching "#(inc #(inc %))" :syntax {})))))
+
+(deftest discouraged-reference-position-arity-level-and-tag-range-test
+  (let [source "(juxt :x) (map juxt [1]) juxt"
+        config {:linters {:discouraged-var {'basilisp.core/juxt {:positions [:call] :level :error}}}}
+        result (matching source :discouraged-var config)]
+    (is (= [:error] (mapv :level result)))
+    (is (= [1] (mapv :col result))))
+  (let [result (matching "(map inc) (map inc [1])" :discouraged-var
+                         {:linters {:discouraged-var {'basilisp.core/map {:arities #{2 :varargs}}}}})]
+    (is (= [11] (mapv :col result))))
+  (let [result (first (matching "#inst \"2020-01-01\"" :discouraged-tag
+                                {:linters {:discouraged-tag {'inst {}}}}))]
+    (is (= "Discouraged tag literal: inst" (:message result)))
+    (is (= [2 6] [(:col result) (:end-col result)]))))
+
+(deftest constructor-key-duplicates-and-unused-statements-test
+  (doseq [source ["(hash-map :x 1 :x 2)" "(hash-set :x :x)"
+                  "(assoc! (transient {}) :x 1 :x 2 :x 3)"
+                  "(disj! (transient #{:x}) :x :x)"]]
+    (is (= 1 (count (matching source :duplicate-key-args {})))))
+  (is (= ["Unused value: x" "Unused value: 1"]
+         (mapv :message (matching "(defn f [x] (try x 1 2 (catch python/Exception _ nil)))"
+                                  :unused-value {}))))
+  ;; Basilisp transient updates mutate in place; the return can be ignored.
+  (is (= {:x 1} (load-string "(let [t (transient {})] (assoc! t :x 1) (persistent! t))")))
+  (is (empty? (matching "(let [t (transient {})] (assoc! t :x 1) (persistent! t))" :unused-value {})))
+  (is (= 1 (count (matching "(defn f [] (assoc! (transient {}) :x 1) nil)" :unused-value {})))))
+
+(deftest docstring-metadata-is-checked-test
+  (let [config {:linters {:docstring-leading-trailing-whitespace {:level :warning}
+                          :missing-docstring {:level :warning}}}]
+    (doseq [source ["(def ^{:doc \" Trailing.\"} f 1)"
+                    "(defn f {:doc \"Trailing. \"} [] 1)"]]
+      (is (= [:docstring-leading-trailing-whitespace] (mapv :type (findings source config)))))
+    (is (empty? (findings "(defn f {:doc \"A sentence.\"} [] 1)" config))))
+  (is (= ["#'user/old is deprecated"]
+         (mapv :message (matching "(defmulti old \"Dispatch.\" {:deprecated true} identity) (old 1)"
+                                  :deprecated-var {}))))
+  (is (= "From metadata."
+         (get-in (analyzer/declarations "(defn f {:doc \"From metadata.\"} [])") [:definitions "f" :doc]))))

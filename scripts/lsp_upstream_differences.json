@@ -1,0 +1,558 @@
+{
+  "expand-let-test:46": {
+    "reason": "The upstream expansion splices all let body forms into the surrounding call as arguments, although only the last body value was an argument originally. Keep a do expression around the multiple bodies to preserve argument count and evaluation.",
+    "evidence": {
+      "expansion_original": {
+        "source": "(do (defn something [x] 5) (+ (* 3 3) (let [x 4] (something 1) (* x x))))",
+        "result": {
+          "value": "25"
+        }
+      },
+      "expansion_upstream": {
+        "source": "(do (defn something [x] 5) (let [x 4] (+ (* 3 3) (something 1) (* x x))))",
+        "result": {
+          "value": "30"
+        }
+      }
+    },
+    "input_sha256": "b47163cc6880950256dade5de7ca154ef01e6666fac677d26a3f01be19c9b098",
+    "observed": {
+      "actual": "(let [x 4]\n (+ (* 3 3) (do (something 1)\n (* x x))))",
+      "actual_document": "(let [x 4]\n (+ (* 3 3) (do (something 1)\n (* x x))))",
+      "edit_count": 1
+    }
+  },
+  "expand-let-test:49": {
+    "reason": "The parent is a defn arity signature, not an executable expression. Wrapping that signature in let produces an invalid fn declaration. Decline this expansion and retain the valid original definition.",
+    "evidence": {
+      "invalid_defn_original": {
+        "source": "(do (defn foo ([bar] (let [a 1] a 2))) (foo 9))",
+        "result": {
+          "value": "2"
+        }
+      },
+      "invalid_defn_upstream": {
+        "source": "(defn foo (let [a 1] ([bar] a 2)))",
+        "result": {
+          "error": "CompilerException",
+          "message": "error occurred during macroexpansion {:phase :macroexpansion, :file \"<Load Input>\", :form (basilisp.core/fn foo (let [a 1] ([bar] a 2)))}"
+        }
+      }
+    },
+    "input_sha256": "634711c123d8e6414ce7883889da3958fefa698d51adb9ff09af050f0ab4172d",
+    "observed": {
+      "actual": "(defn foo ([bar] (let [a 1] a 2)))",
+      "actual_document": "(defn foo ([bar] (let [a 1] a 2)))",
+      "edit_count": 0
+    }
+  },
+  "promote-fn-test:115": {
+    "reason": "The upstream wrapper passes %& as one argument instead of spreading it, nesting the rest sequence. Use partial to forward the same variadic arguments.",
+    "evidence": {
+      "note": "The upstream fixture applies + to a rest sequence, which is itself ill-typed. This executable witness keeps exactly its binding/parameter/wrapper structure and replaces the body with a vector to observe the argument packaging.",
+      "variadic_original": {
+        "source": "(let [a 1] ((fn [element & args] [a element args]) 2 3 4))",
+        "result": {
+          "value": "[1 2 (3 4)]"
+        }
+      },
+      "variadic_upstream": {
+        "source": "(do (defn- new-function [a element & args] [a element args]) (let [a 1] (#(new-function a %1 %&) 2 3 4)))",
+        "result": {
+          "value": "[1 2 ((3 4))]"
+        }
+      },
+      "variadic_basilisp": {
+        "source": "(do (defn- new-function [a element & args] [a element args]) (let [a 1] ((partial new-function a) 2 3 4)))",
+        "result": {
+          "value": "[1 2 (3 4)]"
+        }
+      }
+    },
+    "input_sha256": "0b94bf0767fb390b647ef15d41709d893d78fd77d2fd059a9bfcadbd482baac3",
+    "observed": {
+      "actual": [
+        "\n(defn- new-function [a element & args] (+ 1 a element args))\n",
+        "(partial new-function a)"
+      ],
+      "actual_document": "\n(defn- new-function [a element & args] (+ 1 a element args))\n(let [a 1] (partial new-function a))",
+      "edit_count": 2
+    }
+  },
+  "change-coll-test:127": {
+    "reason": "The requested target map has three forms, so it cannot be read as a Basilisp map. Decline creation of invalid syntax; the inverse map-to-vector repair is implemented and matches upstream.",
+    "evidence": {
+      "source": "{some-fun 1 2}",
+      "result": {
+        "error": "SyntaxError",
+        "message": "Unexpected char '}'; expected map value (line: 1, col: 24)"
+      }
+    },
+    "input_sha256": "cdf2f03f4c4ab70082ae6dbca568a067d3bbb71125e70a07da313f5c975f68ca",
+    "observed": {
+      "actual": null,
+      "actual_document": "(some-fun 1 2)",
+      "edit_count": 0
+    }
+  },
+  "get-in-more-test:142": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m))))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (get (:y (:x m)) :z))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "7f2802516e71cbf699c5b7c8b966e8680ddfa98a58ac12dd5118108fa1aeccaa",
+    "observed": {
+      "actual": "(:z (:y (:x m)))",
+      "actual_document": "(:z (:y (:x m)))",
+      "edit_count": 0
+    }
+  },
+  "get-in-more-test:143": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x #py {:y {:z 7}}}",
+      "original": "(let [m {:x #py {:y {:z 7}}}] (get (:y (:x m)) :z))",
+      "upstream": "(let [m {:x #py {:y {:z 7}}}] (get-in (:x m) [:y :z]))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "15c656d766c8f3e0998a8a801598cd0d404b87913f3681924af1bb44ed4298c6",
+    "observed": {
+      "actual": "(get (:y (:x m)) :z)",
+      "actual_document": "(get (:y (:x m)) :z)",
+      "edit_count": 0
+    }
+  },
+  "get-in-more-test:144": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x {:y {:z 7}}}",
+      "original": "(let [m #py {:x {:y {:z 7}}}] (get-in (:x m) [:y :z]))",
+      "upstream": "(let [m #py {:x {:y {:z 7}}}] (get-in m [:x :y :z]))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "470bb21187d16ecdd84a8581a4c4d37bf010d6993c58b300dbab39eaece40271",
+    "observed": {
+      "actual": "(get-in (:x m) [:y :z])",
+      "actual_document": "(get-in (:x m) [:y :z])",
+      "edit_count": 0
+    }
+  },
+  "get-in-all-test:145": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x 7}",
+      "original": "(let [m #py {:x 7}] (:x m))",
+      "upstream": "(let [m #py {:x 7}] (get m :x))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "3f379f3c763dd2e684a19cfa0d1707f7df235efd9946114c0f52b547c4eacdf9",
+    "observed": {
+      "actual": "(:x m)",
+      "actual_document": "(:x m)",
+      "edit_count": 0
+    }
+  },
+  "get-in-all-test:146": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m))))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (get-in m [:x :y :z]))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "0b5a0f0b01c0d306fbadc69a60e609ef76b6ffac8c1f54249c32e6a1fb60fa84",
+    "observed": {
+      "actual": "(:z (:y (:x m)))",
+      "actual_document": "(:z (:y (:x m)))",
+      "edit_count": 0
+    }
+  },
+  "get-in-less-test:147": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x {:y {:z 7}}}",
+      "original": "(let [m #py {:x {:y {:z 7}}}] (get-in m [:x :y :z]))",
+      "upstream": "(let [m #py {:x {:y {:z 7}}}] (get-in (:x m) [:y :z]))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "None"
+      }
+    },
+    "input_sha256": "6d448847d78e7a411c8c99fb82cd7e81a1b30911b137ac01906579cd662767c3",
+    "observed": {
+      "actual": "(basilisp.core/get-in (basilisp.core/get m :x) [:y :z])",
+      "actual_document": "(basilisp.core/get-in (basilisp.core/get m :x) [:y :z])",
+      "edit_count": 1
+    }
+  },
+  "get-in-less-test:148": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x #py {:y {:z 7}}}",
+      "original": "(let [m {:x #py {:y {:z 7}}}] (get-in (:x m) [:y :z]))",
+      "upstream": "(let [m {:x #py {:y {:z 7}}}] (get (:y (:x m)) :z))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "None"
+      }
+    },
+    "input_sha256": "49d6c47f3cf44ccc3f44a9f9e0ca278e3004dd9015055e37cde10ec85edf857d",
+    "observed": {
+      "actual": "(basilisp.core/get (basilisp.core/get (:x m) :y) :z)",
+      "actual_document": "(basilisp.core/get (basilisp.core/get (:x m) :y) :z)",
+      "edit_count": 1
+    }
+  },
+  "get-in-less-test:149": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (get (:y (:x m)) :z))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m))))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "None"
+      }
+    },
+    "input_sha256": "b9cbdc853d6ee15be297dbb7e4e961ad637482b3fb0e87f250975374cba55280",
+    "observed": {
+      "actual": "(basilisp.core/get (:y (:x m)) :z)",
+      "actual_document": "(basilisp.core/get (:y (:x m)) :z)",
+      "edit_count": 1
+    }
+  },
+  "get-in-none-test:150": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x 7}",
+      "original": "(let [m #py {:x 7}] (get m :x))",
+      "upstream": "(let [m #py {:x 7}] (:x m))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "None"
+      }
+    },
+    "input_sha256": "64f08424fd5a0de997b83c9df40925bc5cf7bfc964851e7b75efbb7bff566a0a",
+    "observed": {
+      "actual": "(basilisp.core/get m :x)",
+      "actual_document": "(basilisp.core/get m :x)",
+      "edit_count": 1
+    }
+  },
+  "get-in-none-test:151": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (get-in m [:x :y :z]))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m))))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "None"
+      }
+    },
+    "input_sha256": "c457800bf1c1f720eabf871bb5c200e9956f59e8d182a3ccf5fb46478058aa86",
+    "observed": {
+      "actual": "(basilisp.core/get (basilisp.core/get (basilisp.core/get m :x) :y) :z)",
+      "actual_document": "(basilisp.core/get (basilisp.core/get (basilisp.core/get m :x) :y) :z)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:152": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x 7}",
+      "original": "(let [m #py {:x 7}] (get m :x 1))",
+      "upstream": "(let [m #py {:x 7}] (:x m 1))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "1"
+      }
+    },
+    "input_sha256": "c1c288418c8c5e897d62d186e0df5754d13e017154c82b84e9389f4ce9f18999",
+    "observed": {
+      "actual": "(basilisp.core/get m :x 1)",
+      "actual_document": "(basilisp.core/get m :x 1)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:153": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {'x 7}",
+      "original": "(let [m #py {'x 7}] (get m 'x 1))",
+      "upstream": "(let [m #py {'x 7}] ('x m 1))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "None"
+      }
+    },
+    "input_sha256": "2e003f180c2425c06baa456bbe5a4831b3485840ef4307315fe5382543b16948",
+    "observed": {
+      "actual": "(get m 'x 1)",
+      "actual_document": "(get m 'x 1)",
+      "edit_count": 0
+    }
+  },
+  "default-values-test:154": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x 7}",
+      "original": "(let [m #py {:x 7}] (get-in m [:x] 1))",
+      "upstream": "(let [m #py {:x 7}] (:x m 1))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "1"
+      }
+    },
+    "input_sha256": "c475c60717ab8c9da901bf70b0f03b05e85664ce660b0014072dee89c4db60e7",
+    "observed": {
+      "actual": "(basilisp.core/get m :x 1)",
+      "actual_document": "(basilisp.core/get m :x 1)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:155": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x {:y {:z 7}}}",
+      "original": "(let [m #py {:x {:y {:z 7}}}] (get-in m [:x :y] 1))",
+      "upstream": "(let [m #py {:x {:y {:z 7}}}] (get (:x m) :y 1))",
+      "original_result": {
+        "value": "{:z 7}"
+      },
+      "upstream_result": {
+        "value": "1"
+      }
+    },
+    "input_sha256": "80568d7eec35c6c3d36f6811dbec2d50fece1c2e5e2cd106452d6674080bc652",
+    "observed": {
+      "actual": "(basilisp.core/get (basilisp.core/get m :x) :y 1)",
+      "actual_document": "(basilisp.core/get (basilisp.core/get m :x) :y 1)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:156": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x {:y {:z 7}}}",
+      "original": "(let [m #py {:x {:y {:z 7}}}] (get-in m [:x :y :z] 1))",
+      "upstream": "(let [m #py {:x {:y {:z 7}}}] (get-in (:x m) [:y :z] 1))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "1"
+      }
+    },
+    "input_sha256": "8f7004600e62dda1e2b9e4617e096f5e27181b341ea2fad784a64b7df338d334",
+    "observed": {
+      "actual": "(basilisp.core/get-in (basilisp.core/get m :x) [:y :z] 1)",
+      "actual_document": "(basilisp.core/get-in (basilisp.core/get m :x) [:y :z] 1)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:157": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x #py {:y {:z 7}}}",
+      "original": "(let [m {:x #py {:y {:z 7}}}] (get-in m [:x :y] 1))",
+      "upstream": "(let [m {:x #py {:y {:z 7}}}] (:y (:x m) 1))",
+      "original_result": {
+        "value": "{:z 7}"
+      },
+      "upstream_result": {
+        "value": "1"
+      }
+    },
+    "input_sha256": "e4aad62cd694112131f5c439a6a9c1c2ba366228b5d863e63cefa471612e83d7",
+    "observed": {
+      "actual": "(basilisp.core/get (basilisp.core/get m :x) :y 1)",
+      "actual_document": "(basilisp.core/get (basilisp.core/get m :x) :y 1)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:158": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (get-in m [:x :y :z] 1))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m)) 1))",
+      "original_result": {
+        "value": "7"
+      },
+      "upstream_result": {
+        "value": "1"
+      }
+    },
+    "input_sha256": "c8e3398bfdd0817f4a768523cb9a38f21b3c1317730a5bd4f4b9429e1f4be5dd",
+    "observed": {
+      "actual": "(basilisp.core/get (basilisp.core/get (basilisp.core/get m :x) :y) :z 1)",
+      "actual_document": "(basilisp.core/get (basilisp.core/get (basilisp.core/get m :x) :y) :z 1)",
+      "edit_count": 1
+    }
+  },
+  "default-values-test:159": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x 7}",
+      "original": "(let [m #py {:x 7}] (:x m 1))",
+      "upstream": "(let [m #py {:x 7}] (get m :x 1))",
+      "original_result": {
+        "value": "1"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "984a9f02a4c7fadd1744557cd345335574f85d99572fb659d826a195b8883f9e",
+    "observed": {
+      "actual": "(:x m 1)",
+      "actual_document": "(:x m 1)",
+      "edit_count": 0
+    }
+  },
+  "default-values-test:160": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:y {:z 7}}",
+      "original": "(let [m #py {:y {:z 7}}] (get (:y m) :z 1))",
+      "upstream": "(let [m #py {:y {:z 7}}] (get-in m [:y :z] 1))",
+      "original_result": {
+        "value": "1"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "42f328c20d20d548b425a15d9a607ee013d70087c366c76be998531c1f576ea5",
+    "observed": {
+      "actual": "(get (:y m) :z 1)",
+      "actual_document": "(get (:y m) :z 1)",
+      "edit_count": 0
+    }
+  },
+  "default-values-test:161": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "#py {:x {:y {:z 7}}}",
+      "original": "(let [m #py {:x {:y {:z 7}}}] (get-in (:x m) [:y :z] 1))",
+      "upstream": "(let [m #py {:x {:y {:z 7}}}] (get-in m [:x :y :z] 1))",
+      "original_result": {
+        "value": "1"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "3ceae2a6718038de633c76d28005c1dba735e9db4050642fc0de11f10124733b",
+    "observed": {
+      "actual": "(get-in (:x m) [:y :z] 1)",
+      "actual_document": "(get-in (:x m) [:y :z] 1)",
+      "edit_count": 0
+    }
+  },
+  "default-values-test:162": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m 1))))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (get-in (:x m 1) [:y :z]))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "ba595d5e431ea322c3c1b2f6dabb94a729b9ca28b398e4a9fe80897df67f1db8",
+    "observed": {
+      "actual": "(:z (:y (:x m 1)))",
+      "actual_document": "(:z (:y (:x m 1)))",
+      "edit_count": 0
+    }
+  },
+  "default-values-test:163": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m) 1)))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (get (:y (:x m) 1) :z))",
+      "original_result": {
+        "value": "None"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "faf62a44400b7e0536a22e6aae23835a65a54b090aa4149918c5d21ba45cb57a",
+    "observed": {
+      "actual": "(:z (:y (:x m) 1))",
+      "actual_document": "(:z (:y (:x m) 1))",
+      "edit_count": 0
+    }
+  },
+  "default-values-test:164": {
+    "reason": "Basilisp keyword/symbol invocation uses ILookup.val_at; core get/get-in also support native Python dicts. The unknown m may contain Python dicts at the rewritten lookup. Adopting the upstream spelling changes the result/default, so preserve the original lookup protocol.",
+    "evidence": {
+      "binding": "{:x {:y #py {:z 7}}}",
+      "original": "(let [m {:x {:y #py {:z 7}}}] (:z (:y (:x m)) 1))",
+      "upstream": "(let [m {:x {:y #py {:z 7}}}] (get-in m [:x :y :z] 1))",
+      "original_result": {
+        "value": "1"
+      },
+      "upstream_result": {
+        "value": "7"
+      }
+    },
+    "input_sha256": "3528a745310a937ea93442de37490ef9b56a5ce2b2c94330757fb3fcb9e75ac3",
+    "observed": {
+      "actual": "(:z (:y (:x m)) 1)",
+      "actual_document": "(:z (:y (:x m)) 1)",
+      "edit_count": 0
+    }
+  }
+}

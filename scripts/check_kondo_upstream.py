@@ -19,11 +19,15 @@ import tempfile
 from unittest.mock import patch
 
 from check_kondo import FIELDS, KONDO_VERSION
+from upstream_differences import review_regressions
 
 KONDO_REVISION = "6267607412e55ed3b91710ef542f3fee2ad7aa05"
 NAMESPACES = ("core", "test", "template", "string", "set")
 NAMESPACE_PATTERN = re.compile(
     r"(?<![\w./-])clojure\.(" + "|".join(NAMESPACES) + r")(?![\w.-])"
+)
+MESSAGE_NAMESPACE_PATTERN = re.compile(
+    r"(?<![\w./-])clojure\.(" + "|".join(NAMESPACES) + r")(?![\w-]|\.[\w-])"
 )
 
 
@@ -36,7 +40,9 @@ def normalize(findings, source=None):
     lines = source.splitlines() if source is not None else []
     for finding in findings:
         item = {field: finding.get(field) for field in FIELDS}
-        item["message"] = adapt(item["message"])
+        item["message"] = MESSAGE_NAMESPACE_PATTERN.sub(
+            lambda match: f"basilisp.{match[1]}", item["message"]
+        )
         for row_key, column_key in (("row", "col"), ("end-row", "end-col")):
             row, column = item[row_key], item[column_key]
             if row and column and row <= len(lines):
@@ -66,6 +72,7 @@ def main():
     parser.add_argument("--report", type=Path)
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--baseline", type=Path, help="Require previously matching cases to stay exact.")
+    parser.add_argument("--differences", type=Path, help="Require every difference to match a reviewed Basilisp expectation.")
     parser.add_argument("--write-baseline", type=Path, help="Record case coverage and exact matches.")
     args = parser.parse_args()
     checkout = args.checkout.resolve()
@@ -162,6 +169,9 @@ def main():
         regressions = sorted(set(baseline["matched"]) - set(matched))
         if len(comparisons) != baseline["cases"] or len(skipped) != baseline["skipped"]:
             regressions.append("extraction coverage changed")
+    if args.differences:
+        reviews = json.loads(args.differences.read_text(encoding="utf-8"))
+        regressions.extend(review_regressions(comparisons, reviews, lambda case: case["match"]))
     counts = {
         "extracted": len(comparisons), "matched": len(matched), "mismatched": len(mismatches),
         "exceptions": len(exceptions), "skipped": len(skipped), "regressions": len(regressions),
@@ -182,7 +192,7 @@ def main():
         print(f"  exception {case['id']}: {case['exception']}")
     for regression in regressions:
         print(f"  regression {regression}")
-    return int(bool(exceptions or regressions or (mismatches and not (args.report_only or args.baseline))))
+    return int(bool(exceptions or regressions or (mismatches and not (args.report_only or args.baseline or args.differences))))
 
 
 if __name__ == "__main__":

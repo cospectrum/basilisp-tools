@@ -670,8 +670,6 @@
                                 :end (offset (:end-row item) (:end-col item)))) records)]
     (assoc analysis :keyword-usages keywords)))
 
-(declare kondo-options)
-
 (def ^:private analysis-cache-schema 2)
 
 (defn- analysis-cache-stat [file]
@@ -1669,21 +1667,55 @@
                            (keys (:refers analysis)) (keys (:imports analysis)) (keys (analyzer/core-symbols))))]
     (first (remove names (cons base (map #(str base %) (range 1 10000)))))))
 
-(defn- thread-form [source node direction all? keep-parens?]
-  (when (and (= :list (:kind node)) (> (count (syntax/forms node)) 1) (plain-tree? node)
+(defn- core-text [analysis offset name]
+  (if (or (contains? (:definitions analysis) name)
+          (contains? (:core-excluded analysis) name)
+          (contains? (:imports analysis) name)
+          (and (contains? (:refers analysis) name) (not= "basilisp.core" (get-in analysis [:refers name :ns])))
+          (some #(and (= name (:name %)) (<= (:scope-start % 0) offset)
+                      (< offset (:scope-end % 0))) (:locals analysis)))
+    (str "basilisp.core/" name) name))
+
+(defn- source-column [source offset]
+  (- offset (inc (.rfind source "\n" 0 offset))))
+
+(defn- refactor-target [source tree offset]
+  (when (< offset (count source))
+    (let [nodes (filter #(and (<= (:start %) offset) (< offset (:end %))) (syntax/nodes (:root tree)))
+          smallest (first (sort-by #(- (:end %) (:start %)) nodes))
+          trivia? (contains? #{:whitespace :newline :comment :comma} (:kind smallest))
+          ancestors (filter #(< offset (:end %)) (enclosing-nodes tree offset))]
+      (if trivia?
+        (let [boundary (:end (first (filter #(contains? #{:list :vector :map :set :anonymous-function} (:kind %)) ancestors))
+                             (count source))]
+          (first (sort-by (fn [node] [(:start node) (- (:start node) (:end node))])
+                          (filter #(and (<= offset (:start %)) (< (:start %) boundary)
+                                        (not (contains? #{:root :delimiter :prefix :string-text :whitespace :newline :comment :comma} (:kind %))))
+                                  (syntax/nodes (:root tree))))))
+        (first ancestors)))))
+
+(defn- thread-form [source analysis node direction all? keep-parens?]
+  (when (and (= :list (:kind node)) (> (count (syntax/forms node)) 1)
+             (not-any? #(contains? #{:comment :reader-conditional :reader-conditional-splicing
+                                     :reader-splice :syntax-quote :unquote :unquote-splicing} (:kind %))
+                       (syntax/nodes node))
              (not (contains? #{"ns" "def" "defn" "defn-" "defprotocol" "deftype" "defrecord" "fn" "let" "loop" "binding" "quote"} (head-name node))))
-    (loop [node node steps []]
-      (let [parts (vec (syntax/forms node))
-            index (if (= direction :first) 1 (dec (count parts)))
-            argument (nth parts index)
-            remaining (concat (subvec parts 0 index) (subvec parts (inc index)))
-            step (if (and (= 1 (count remaining)) (not keep-parens?)) (source-of source (first remaining))
-                     (list-text (map #(source-of source %) remaining)))
-            steps (cons step steps)]
-        (if (and all? (= :list (:kind argument)) (> (count (syntax/forms argument)) 1))
-          (recur argument steps)
-          (list-text (concat [(if (= direction :first) "basilisp.core/->" "basilisp.core/->>")
-                              (source-of source argument)] steps)))))))
+    (let [head (core-text analysis (:start node) (if (= direction :first) "->" "->>"))
+          indentation (apply str (repeat (+ (source-column source (:start node)) (count head) 2) " "))]
+      (loop [node node steps []]
+        (let [parts (vec (syntax/forms node))
+              index (if (= direction :first) 1 (dec (count parts)))
+              argument (nth parts index)
+              remaining (concat (subvec parts 0 index) (subvec parts (inc index)))
+              before (.rstrip (subs source (inc (:start node)) (:start argument)))
+              after (.lstrip (subs source (:end argument) (dec (:end node))))
+              step (if (and (= 1 (count remaining)) (not keep-parens?) (empty? after)) before
+                       (str "(" before (when (seq after) (str " " after)) ")"))
+              steps (cons step steps)]
+          (if (and all? (= :list (:kind argument)) (> (count (syntax/forms argument)) 1))
+            (recur argument steps)
+            (str "(" head " " (source-of source argument) "\n" indentation
+                 (str/join (str "\n" indentation) steps) ")")))))))
 
 (defn- unwind-form [source node all?]
   (let [parts (syntax/forms node) head (:text (first parts))]
@@ -1853,21 +1885,34 @@
           cleaned (clean-apply cleaned (clean-refer-edits cleaned (syntax/parse cleaned) settings))]
       (when (not= original cleaned) [[start (:end node) cleaned]]))))
 
+(defn- prepost-maps [ancestors]
+  (keep (fn [parent]
+          (let [forms (syntax/forms parent)
+                params (first (filter #(= :vector (:kind %)) forms))
+                bodies (rest (drop-while #(not= params %) forms))]
+            (when (and (or (contains? #{"fn" "defn" "defn-" "defmacro"} (head-name parent))
+                           (= :vector (:kind (first forms))))
+                       (> (count bodies) 1) (= :map (:kind (first bodies))))
+              (first bodies)))) ancestors))
+
 (defn- executable-node? [tree analysis node]
   (let [ancestors (when node (enclosing-nodes tree (:start node)))
         definition? (some #(and (= (:start node) (:start %)) (= (:end node) (:end %)))
                           (concat (:locals analysis) (:var-definitions analysis)))
         binding-vectors
-        (keep (fn [parent]
-                (let [forms (syntax/forms parent) head (:text (first forms))]
-                  (cond
-                    (contains? #{"let" "loop" "binding" "with-open" "doseq" "for" "letfn" "when-let" "if-let" "when-some" "if-some"} head)
-                    (second forms)
-                    (contains? #{"defn" "defn-" "fn" "defmacro"} head)
-                    (first (filter #(= :vector (:kind %)) (rest forms)))
-                    (= :vector (:kind (first forms))) (first forms)))) ancestors)]
-    (and node (not definition?)
-         (not-any? #(and (<= (:start %) (:start node)) (<= (:end node) (:end %))) binding-vectors)
+        (mapcat (fn [parent]
+                  (let [forms (syntax/forms parent) head (:text (first forms))]
+                    (cond
+                      (contains? #{"let" "basilisp.core/let" "loop"} head)
+                      (take-nth 2 (syntax/forms (second forms)))
+                      (contains? #{"binding" "with-open" "doseq" "for" "letfn" "when-let" "if-let" "when-some" "if-some"} head)
+                      [(second forms)]
+                      (contains? #{"defn" "defn-" "fn" "defmacro"} head)
+                      [(first (filter #(= :vector (:kind %)) (rest forms)))]
+                      (= :vector (:kind (first forms))) [(first forms)]))) ancestors)]
+    (and node (not (contains? #{:comment :whitespace :newline :comma} (:kind node))) (not definition?)
+         (not (some #{node} (prepost-maps ancestors)))
+         (not-any? #(and % (<= (:start %) (:start node)) (<= (:end node) (:end %))) binding-vectors)
          (not-any? #(or (contains? #{:quote :syntax-quote :discard :metadata :var-quote} (:kind %))
                         (contains? #{"ns" "defprotocol" "deftype" "defrecord" "quote"} (head-name %))) ancestors)
          (not (and (= :list (:kind node))
@@ -2005,12 +2050,20 @@
     :else nil))
 
 (defn- promote-literal [source node analysis name]
-  (when (and (= :anonymous-function (:kind node)) (plain-tree? node))
-    (let [tokens (filter #(and (= :symbol (:kind %)) (.startswith (:text %) "%")) (syntax/nodes node))
+  (when (and (= :anonymous-function (:kind node))
+             (or (nil? name) (and (valid-name? name) (= name (unique-name analysis name))))
+             (not-any? #(contains? #{:reader-conditional :reader-conditional-splicing :reader-splice} (:kind %)) (syntax/nodes node)))
+    (let [tokens (filter #(and (= :symbol (:kind %)) (re/fullmatch "%(?:[1-9][0-9]*|&)?" (:text %))) (syntax/nodes node))
           highest (reduce max 0 (keep #(when (re/fullmatch "%[0-9]+" (:text %))
                                          (python/int (subs (:text %) 1))) tokens))
           highest (max highest (if (some #(= "%" (:text %)) tokens) 1 0))
-          args (mapv #(unique-name analysis (str "arg" %)) (range 1 (inc highest)))
+          args (mapv (fn [index]
+                       (let [used? (some #(or (= (str "%" index) (:text %))
+                                              (and (= index 1) (= "%" (:text %)))) tokens)]
+                         (if used?
+                           (unique-name analysis (if (and (= index 1) (some #(= "%" (:text %)) tokens))
+                                                   "element" (str "element" index)))
+                           "_"))) (range 1 (inc highest)))
           rest-name (when (some #(= "%&" (:text %)) tokens) (unique-name analysis "args"))
           replacements (map (fn [token] [(:start token) (:end token)
                                          (cond (= "%&" (:text token)) rest-name
@@ -2019,9 +2072,17 @@
           body (reduce (fn [text [start end replacement]]
                          (str (subs text 0 (- start (:start node) 1)) replacement
                               (subs text (- end (:start node) 1))))
-                       (subs (source-of source node) 1) (sort-by first > replacements))]
+                       (subs (source-of source node) 1) (sort-by first > replacements))
+          parsed (first (syntax/forms (:root (syntax/parse body))))
+          forms (syntax/forms parsed)
+          prefix (when (seq forms) (subs body 1 (:start (first forms))))
+          body (cond
+                 (empty? forms) ""
+                 (= "do" (:text (first forms))) (str/trim (subs body (:end (first forms)) (dec (count body))))
+                 (str/includes? prefix ";") (str (.lstrip prefix) "(" (subs body (:start (first forms))))
+                 :else body)]
       (str "(fn " (when name (str name " ")) "[" (str/join " " args)
-           (when rest-name (str (when (seq args) " ") "& " rest-name)) "] " body ")"))))
+           (when rest-name (str (when (seq args) " ") "& " rest-name)) "]" (when (seq body) (str " " body)) ")"))))
 
 (defn- suppress-edits [_source node code]
   (when (and node code (re/fullmatch "[A-Za-z0-9-]+" (str code)))
@@ -2039,27 +2100,121 @@
                              (< (:start node) (:scope-end % 0))) (:locals analysis))))))
 
 (defn- demote-function [source analysis node]
-  (let [[head bindings body & more] (syntax/forms node)
-        params (syntax/forms bindings)
-        definitions (filter #(some (fn [param] (= (:start param) (:start %))) params) (:locals analysis))]
-    (when (and (= "fn" (:text head)) (= :vector (:kind bindings)) (= :list (:kind body))
-               (empty? more) (every? #(= :symbol (:kind %)) params)
-               (not-any? #(= "&" (:text %)) params)
+  (let [[head next & tail] (syntax/forms node)
+        named? (= :symbol (:kind next))
+        bindings (if named? (first tail) next)
+        body (if named? (rest tail) tail)
+        params (vec (remove #(= "&" (:text %)) (syntax/forms bindings)))
+        rest? (some #(= "&" (:text %)) (syntax/forms bindings))
+        fixed (if rest? (vec (butlast params)) params)
+        definitions (filter #(some (fn [param] (= (:start param) (:start %))) params) (:locals analysis))
+        name-definition (when named? (first (filter #(= (:start next) (:start %)) (:locals analysis))))]
+    (when (and (= "fn" (:text head)) (= :vector (:kind bindings))
+               (every? #(= :symbol (:kind %)) params)
                (= (count params) (count definitions))
-               (or (empty? params) (some #(and (= (:id (last definitions)) (:id %))
-                                               (<= (:start body) (:start %)) (< (:end %) (:end body))) (:local-usages analysis)))
-               (plain-tree? node)
+               (or (empty? fixed) (some #(and (= (:start (last fixed)) (:start (get (into {} (map (juxt :id identity) definitions)) (:id %))))
+                                              (<= (:start node) (:start %)) (< (:end %) (:end node))) (:local-usages analysis)))
+               (or (not rest?) (some #(= (:id (last definitions)) (:id %)) (:local-usages analysis)))
+               (not (some #(= (:id name-definition) (:id %)) (:local-usages analysis)))
+               (not= :map (:kind (first body)))
                (not-any? #(or (= :anonymous-function (:kind %))
+                              (contains? #{:reader-conditional :reader-conditional-splicing :syntax-quote} (:kind %))
                               (and (= :symbol (:kind %)) (.startswith (:text %) "%")))
-                         (syntax/nodes body)))
-      (let [names (into {} (map-indexed (fn [index param] [(:start param) (str "%" (inc index))]) params))
+                         (mapcat syntax/nodes body)))
+      (let [names (into {} (map-indexed (fn [index param] [(:start param) (cond
+                                                                            (and rest? (= param (last params))) "%&"
+                                                                            (= 1 (count fixed)) "%"
+                                                                            :else (str "%" (inc index)))]) params))
             by-id (into {} (map (fn [definition] [(:id definition) (get names (:start definition))]) definitions))
-            uses (filter #(contains? by-id (:id %)) (:local-usages analysis))
+            uses (filter #(and (contains? by-id (:id %)) (<= (:end bindings) (:start %))
+                               (< (:end %) (:end node))) (:local-usages analysis))
+            start (:end bindings)
             body-text (reduce (fn [text use]
-                                (str (subs text 0 (- (:start use) (:start body))) (get by-id (:id use))
-                                     (subs text (- (:end use) (:start body)))))
-                              (source-of source body) (sort-by :start > uses))]
-        (str "#" body-text)))))
+                                (str (subs text 0 (- (:start use) start)) (get by-id (:id use))
+                                     (subs text (- (:end use) start))))
+                              (subs source start (dec (:end node))) (sort-by :start > uses))
+            body-text (.lstrip body-text)
+            parsed (syntax/parse body-text)
+            forms (syntax/forms (:root parsed))]
+        (cond
+          (empty? forms) "#()"
+          (and (= 1 (count body)) (= :list (:kind (first body))))
+          (let [node (first forms) prefix (subs body-text 0 (:start node))]
+            (str "#(" prefix (subs body-text (inc (:start node)))))
+          :else (str "#(do " body-text ")"))))))
+
+(declare move-scope-sensitive-python?)
+
+(defn- promote-function-edits [source tree analysis node provided-name]
+  (let [[head next & tail] (syntax/forms node)
+        named? (= :symbol (:kind next))
+        signature (if named? tail (cons next tail))
+        single? (= :vector (:kind (first signature)))
+        parameters (if single? [(first signature)] (map #(first (syntax/forms %)) signature))
+        inside? #(and (<= (:start node) (:start %)) (<= (:end %) (:end node)))
+        definitions (into {} (map (juxt :id identity) (:locals analysis)))
+        uses (filter inside? (:local-usages analysis))
+        self (when named? (first (filter #(= (:start next) (:start %)) (:locals analysis))))
+        free (vec (distinct (keep (fn [usage]
+                                    (let [definition (get definitions (:id usage))]
+                                      (when (and definition (not (inside? definition))) (:name definition)))) uses)))
+        ancestors (rest (enclosing-nodes tree (:start node)))
+        nested-literal? (some #(= :anonymous-function (:kind %)) ancestors)
+        variadic? (some #(= "&" (:text %)) (mapcat syntax/forms parameters))
+        partial? (or (not single?) variadic? nested-literal?)
+        loop-capture? (and (seq free) partial?
+                           (some #(contains? #{"loop" "loop*" "dotimes"}
+                                             (last (str/split (or (head-name %) "") #"/"))) ancestors))
+        reserved (update analysis :locals #(remove (fn [definition] (= (:id self) (:id definition))) %))
+        name (or provided-name (unique-name reserved (if named? (:text next) "new-function")))
+        top (first (filter #(and (<= (:start %) (:start node)) (<= (:end node) (:end %))) (syntax/forms (:root tree))))]
+    (when (and (= "fn" (:text head)) top (seq parameters) (every? #(= :vector (:kind %)) parameters)
+               (valid-name? name) (= name (unique-name reserved name))
+               (not-any? #(and (inside? %) (contains? (set free) (:name %))) (:locals analysis))
+               (not-any? #(or (contains? #{:syntax-quote :reader-conditional :reader-splice :tagged} (:kind %))
+                              (contains? #{"yield" "await" "set!"} (:text %))) (syntax/nodes node))
+               ;; Adding closure parameters changes recur's arity. An explicit
+               ;; self reference also needs the captured arguments at every use.
+               (not (and (seq free)
+                         (or (some #(= "recur" (:text %)) (syntax/nodes node))
+                             (some #(= (:id self) (:id %)) uses))))
+               ;; Python loop cells change across iterations; partial would
+               ;; snapshot their values instead of retaining the closure cells.
+               (not loop-capture?)
+               (not-any? move-scope-sensitive-python? (filter inside? (:python-usages analysis))))
+      (let [start (:start (first signature))
+            insertions (when (seq free)
+                         (map (fn [params] [(inc (:start params)) (inc (:start params))
+                                            (str (str/join " " free) (when (seq (syntax/forms params)) " "))]) parameters))
+            renames (when (and self (not= name (:text next)))
+                      (map (fn [usage] [(:start usage) (:end usage) name]) (filter #(= (:id self) (:id %)) uses)))
+            body (reduce (fn [text [from to replacement]]
+                           (str (subs text 0 (- from start)) replacement (subs text (- to start))))
+                         (subs source start (:end node)) (sort-by first > (concat insertions renames)))
+            metadata? (get-in analysis [:settings :use-metadata-for-privacy?])
+            definition (str "\n(" (core-text analysis (:start top) (if metadata? "defn" "defn-"))
+                            (when metadata? " ^:private") " " name " " body "\n")
+            replacement (cond
+                          (empty? free) name
+                          partial?
+                          (list-text (concat [(core-text analysis (:start node) "partial") name] free))
+                          :else (str "#" (list-text (concat [name] free
+                                                            (map #(str "%" %) (range 1 (inc (count (syntax/forms (first parameters))))))))))]
+        [[(:start top) (:start top) definition]
+         [(:start node) (:end node) replacement]]))))
+
+(defn- privacy-edits [source analysis ancestors]
+  (when-let [definition (first (filter #(contains? #{"def" "defonce" "defn" "defn-" "defmacro"} (head-name %)) ancestors))]
+    (let [[head name] (syntax/forms definition)
+          private-wrapper (first (filter #(and (= :metadata (:kind %)) (= ":private" (:text (first (syntax/forms %)))))
+                                         (syntax/nodes name)))
+          metadata? (get-in analysis [:settings :use-metadata-for-privacy?])]
+      (cond
+        (= "defn-" (:text head)) [[(:start head) (:end head) "defn"]]
+        private-wrapper [[(:start private-wrapper) (:end private-wrapper)
+                          (source-of source (last (syntax/forms private-wrapper)))]]
+        (and (= "defn" (:text head)) (not metadata?)) [[(:start head) (:end head) "defn-"]]
+        :else [[(:start name) (:end name) (str "^:private " (source-of source name))]]))))
 
 (defn- add-libspec [_source tree clause lib alias refer]
   (let [ns-node (first (filter #(= "ns" (head-name %)) (syntax/forms (:root tree))))
@@ -2682,7 +2837,7 @@
                (str "(basilisp.core/get " name " " key
                     (when-let [default (get defaults local)] (str " " (source-of source default))) ")")])))))
 
-(defn- move-binding-edits [source tree analysis node command name]
+(defn- move-for-binding-edits [source tree analysis node command name]
   (let [parents (rest (enclosing-nodes tree (:start node)))
         wanted (if (= command "move-to-for-let") #{"for" "doseq"} #{"let" "basilisp.core/let"})
         parent (first (filter #(contains? wanted (head-name %)) parents))
@@ -2698,21 +2853,152 @@
                (str name " " (source-of source node))))]
        [(:start node) (:end node) name]])))
 
-(defn- expand-let-edits [source tree _analysis offset]
+(defn- constant-integer [tree analysis node visited]
+  ;; This is static arithmetic on integer literals, never evaluation of source.
+  (cond
+    (and (= :number (:kind node)) (re-matches #"[+-]?[0-9]+" (:text node))) (python/int (:text node))
+    (= :symbol (:kind node))
+    (let [definition (definition-of analysis (occurrence analysis (:start node)))
+          id (:id definition)
+          [_ _ initial] (when id (literal-binding tree definition))]
+      (when (and initial (not (contains? visited id)))
+        (constant-integer tree analysis initial (conj visited id))))
+    (= :list (:kind node))
+    (let [[head & arguments] (syntax/forms node)
+          values (mapv #(constant-integer tree analysis % visited) arguments)
+          op (last (str/split (:text head "") #"/"))]
+      (when (and (core-call? analysis node) (every? some? values))
+        (case op
+          "inc" (when (= 1 (count values)) (inc (first values)))
+          "dec" (when (= 1 (count values)) (dec (first values)))
+          "+" (apply + values)
+          "-" (when (seq values) (apply - values))
+          "*" (apply * values)
+          nil)))
+    :else nil))
+
+(defn- stable-extraction? [tree analysis node]
+  (or (contains? #{:nil :boolean :keyword} (:kind node))
+      ;; Reusing the cached small Python integer also preserves object identity.
+      (when-let [value (constant-integer tree analysis node #{})] (<= -5 value 256))
+      (and (= :symbol (:kind node)) (:id (definition-of analysis (occurrence analysis (:start node)))))))
+
+(defn- same-expression? [source analysis left right]
+  (and (= (source-of source left) (source-of source right))
+       (= (mapv (fn [node] (:id (definition-of analysis (occurrence analysis (:start node)))))
+                (filter #(= :symbol (:kind %)) (syntax/nodes left)))
+          (mapv (fn [node] (:id (definition-of analysis (occurrence analysis (:start node)))))
+                (filter #(= :symbol (:kind %)) (syntax/nodes right))))))
+
+(defn- captures-name? [tree name start end replaced]
+  (some (fn [node]
+          (and (= :symbol (:kind node)) (= name (:text node))
+               (<= start (:start node)) (< (:start node) end)
+               (not-any? #(and (<= (:start %) (:start node)) (<= (:end node) (:end %))) replaced)))
+        (syntax/nodes (:root tree))))
+
+(defn- wrap-binding-edit [source analysis context node name & [indent]]
+  (let [relative-start (- (:start node) (:start context))
+        relative-end (- (:end node) (:start context))
+        original (source-of source context)]
+    [(:start context) (:end context)
+     (str "(" (core-text analysis (:start context) "let") " [" name " " (source-of source node) "]\n"
+          (apply str (repeat (+ (source-column source (:start context)) (or indent 2)) " "))
+          (subs original 0 relative-start) name (subs original relative-end) ")")]))
+
+(defn- move-binding-edits [source tree analysis node command name]
+  (if (= command "move-to-for-let")
+    (move-for-binding-edits source tree analysis node command name)
+    (let [ancestors (enclosing-nodes tree (:start node))
+          scopes #{"let" "basilisp.core/let" "fn" "defn" "defn-" "when-let" "if-let" "when-some" "if-some"
+                   "doseq" "for" "loop" "letfn" "binding" "with-open" "try" "catch" "finally" "if" "when" "do"}
+          scope (first (filter #(or (= :anonymous-function (:kind %)) (contains? scopes (head-name %))) (rest ancestors)))
+          [_ bindings & bodies] (syntax/forms scope)
+          in-let? (and (contains? #{"let" "basilisp.core/let"} (head-name scope)) (= :vector (:kind bindings)))
+          pair (when in-let? (first (filter (fn [[_ value]] (and (<= (:start value) (:start node))
+                                                                 (<= (:end node) (:end value))))
+                                            (partition 2 (syntax/forms bindings)))))
+          context (or (when pair (second pair))
+                      (first (filter #(and (<= (:start %) (:start node)) (<= (:end node) (:end %)))
+                                     (if in-let? bodies (syntax/forms scope))))
+                      node)
+          ;; A multi-arity signature is not an expression: select its body form.
+          context (if (and (= :list (:kind context)) (= :vector (:kind (first (syntax/forms context)))))
+                    (or (first (filter #(and (<= (:start %) (:start node)) (<= (:end node) (:end %)))
+                                       (rest (syntax/forms context)))) node) context)
+          stable? (stable-extraction? tree analysis node)
+          initial-first? (and pair (= (:start node) (:start (first (syntax/forms (second pair))))))
+          direct? (and (= node context) (or (not in-let?) pair (= context (first bodies))))
+          insertion (if pair (:start (first pair)) (when in-let? (dec (:end bindings))))
+          region-start (or insertion (:start context))
+          region-end (if in-let? (:end scope) (:end context))
+          locals-available? (or (and (not in-let?) (= context node))
+                                (every? (fn [usage]
+                                          (let [definition (definition-of analysis usage)]
+                                            (or (not (and (<= (:start node) (:start usage)) (< (:start usage) (:end node))))
+                                                (and definition (<= (:start node) (:start definition)) (< (:start definition) (:end node)))
+                                                (and (<= (:scope-start definition 0) region-start)
+                                                     (< region-start (:scope-end definition 0)))))) (:local-usages analysis)))
+          replaced (if (and stable? in-let?)
+                     (filter #(and (<= region-start (:start %)) (<= (:end %) region-end)
+                                   (executable-node? tree analysis %) (same-expression? source analysis node %))
+                             (syntax/nodes (:root tree)))
+                     [node])]
+      (when (and (valid-name? name) locals-available? (or direct? stable? initial-first?)
+                 (not (captures-name? tree name region-start region-end replaced)))
+        (if in-let?
+          (let [column (source-column source (:start (first (syntax/forms bindings)) (inc (:start bindings))))
+                gap (str "\n" (apply str (repeat column " ")))
+                entry (str name " " (source-of source node))]
+            (into [[insertion insertion (if pair (str entry gap)
+                                            (str (when (seq (syntax/forms bindings)) gap) entry))]]
+                  (map (fn [target] [(:start target) (:end target) name]) replaced)))
+          [(wrap-binding-edit source analysis context node name (if (= context node) 2 1))])))))
+
+(defn- expand-let-edits [source tree analysis offset]
   (let [ancestors (enclosing-nodes tree offset)
         inner (first (filter #(contains? #{"let" "basilisp.core/let"} (head-name %)) ancestors))
         parent (first (filter #(< (:start %) (:start inner 0)) ancestors))
+        binding-vector? (and (= :vector (:kind parent))
+                             (some #(and (contains? #{"let" "basilisp.core/let" "loop" "binding" "with-open" "doseq" "for" "letfn" "when-let" "if-let"} (head-name %))
+                                         (= parent (second (syntax/forms %)))) ancestors))
         [_ bindings & body] (syntax/forms inner)
-        [_ outer-bindings & outer-body] (syntax/forms parent)]
-    ;; Joining an immediately nested body preserves binding and body evaluation.
-    (when (and inner parent (contains? #{"let" "basilisp.core/let"} (head-name parent))
-               (= 1 (count outer-body)) (= inner (first outer-body))
-               (= :vector (:kind bindings)) (= :vector (:kind outer-bindings))
-               (plain-tree? inner) (plain-tree? parent))
-      [[(:start parent) (:end parent)
-        (str "(basilisp.core/let ["
-             (str/join " " (map #(source-of source %) (concat (syntax/forms outer-bindings) (syntax/forms bindings))))
-             "] " (str/join " " (map #(source-of source %) body)) ")")]])))
+        [_ _ & outer-body] (syntax/forms parent)]
+    (when (and inner parent (seq body) (not binding-vector?) (= :vector (:kind bindings))
+               (executable-node? tree analysis inner)
+               (not-any? #(and (<= (:start %) (:start inner)) (< (:start inner) (:end %))) (prepost-maps ancestors))
+               (plain-tree? inner) (plain-tree? parent)
+               ;; Lifting across an arity signature would produce an invalid defn.
+               (not= :vector (:kind (first (syntax/forms parent))))
+               (not= :anonymous-function (:kind parent)))
+      (let [direct-let? (and (contains? #{"let" "basilisp.core/let"} (head-name parent))
+                             (= 1 (count outer-body)) (= inner (first outer-body)))
+            constants? (every? #(and (= :symbol (:kind (first %)))
+                                     (or (contains? #{:nil :boolean :keyword :number :string} (:kind (second %)))
+                                         (when-let [value (constant-integer tree analysis (second %) #{})]
+                                           (<= -5 value 256))))
+                               (partition 2 (syntax/forms bindings)))
+            outer (when (= "when" (head-name parent))
+                    (first (filter #(and (< (:start %) (:start parent))
+                                         (contains? #{"let" "basilisp.core/let"} (head-name %))) ancestors)))
+            target (or outer parent)
+            names (map :text (take-nth 2 (syntax/forms bindings)))
+            capture? (some #(captures-name? tree % (:start target) (:end target) [inner]) names)
+            body-text (subs source (:start (first body)) (:end (last body)))
+            replacement (if (= 1 (count body)) body-text
+                            (str "(" (core-text analysis (:start inner) "do") " " body-text ")"))
+            inner-bindings (subs source (inc (:start bindings)) (dec (:end bindings)))]
+        (when (and (or direct-let? constants?) (not capture?))
+          (if (or direct-let? outer)
+            (let [outer-bindings (second (syntax/forms target))]
+              [[(dec (:end outer-bindings)) (dec (:end outer-bindings)) (str "\n " inner-bindings)]
+               [(:start inner) (:end inner) (if direct-let? body-text replacement)]])
+            (let [text (source-of source parent)
+                  start (- (:start inner) (:start parent)) end (- (:end inner) (:start parent))]
+              [[(:start parent) (:end parent)
+                (str "(" (core-text analysis (:start parent) "let") " [" inner-bindings "]\n"
+                     (apply str (repeat (inc (source-column source (:start parent))) " "))
+                     (subs text 0 start) replacement (subs text end) ")")]])))))))
 
 (defn- sort-clause-edits [source collection]
   (when (and collection (plain-tree? collection)
@@ -2798,8 +3084,11 @@
   [source analysis command offset args]
   (let [tree (syntax/parse source)
         ancestors (enclosing-nodes tree offset)
-        node (if (and (= "extract-function" command) (:selection-end analysis))
-               (extraction-selection source tree offset (:selection-end analysis)) (first ancestors))
+        node (cond
+               (and (= "extract-function" command) (:selection-end analysis))
+               (extraction-selection source tree offset (:selection-end analysis))
+               (contains? #{"introduce-let" "move-to-let"} command) (refactor-target source tree offset)
+               :else (first ancestors))
         collection (first (filter #(contains? #{:list :vector :map :set} (:kind %)) ancestors))
         call (first (filter #(= :list (:kind %)) ancestors))
         parts (vec (syntax/forms call))
@@ -2808,16 +3097,28 @@
         simple? (and call (plain-tree? call))
         executable? (executable-node? tree analysis node)
         name (or (first args) (unique-name analysis "new-binding"))]
-    (when (empty? (:diagnostics tree))
+    (when (or (empty? (:diagnostics tree))
+              (and (contains? #{"change-coll" "cycle-coll"} command) (= :map (:kind collection))
+                   (every? #(and (= :odd-form-count (:code %))
+                                 (<= (:start collection) (:start %)) (<= (:end %) (:end collection)))
+                           (:diagnostics tree))))
       (case command
-        "thread-first" (replace-node call (thread-form source call :first false (get-in analysis [:settings :keep-parens-when-threading?] false)))
-        "thread-first-all" (replace-node call (thread-form source call :first true (get-in analysis [:settings :keep-parens-when-threading?] false)))
-        "thread-last" (replace-node call (thread-form source call :last false (get-in analysis [:settings :keep-parens-when-threading?] false)))
-        "thread-last-all" (replace-node call (thread-form source call :last true (get-in analysis [:settings :keep-parens-when-threading?] false)))
-        "unwind-thread" (when (core-call? analysis call) (replace-node call (unwind-form source call false)))
-        "unwind-all" (when (core-call? analysis call) (replace-node call (unwind-form source call true)))
+        "thread-first" (replace-node call (thread-form source analysis call :first false (get-in analysis [:settings :keep-parens-when-threading?] false)))
+        "thread-first-all" (replace-node call (thread-form source analysis call :first true (get-in analysis [:settings :keep-parens-when-threading?] false)))
+        "thread-last" (replace-node call (thread-form source analysis call :last false (get-in analysis [:settings :keep-parens-when-threading?] false)))
+        "thread-last-all" (replace-node call (thread-form source analysis call :last true (get-in analysis [:settings :keep-parens-when-threading?] false)))
+        "unwind-thread" (let [thread (first (filter #(contains? #{"->" "->>" "basilisp.core/->" "basilisp.core/->>"} (head-name %)) ancestors))]
+                          (when (core-call? analysis thread) (replace-node thread (unwind-form source thread false))))
+        "unwind-all" (let [thread (first (filter #(contains? #{"->" "->>" "basilisp.core/->" "basilisp.core/->>"} (head-name %)) ancestors))]
+                       (when (core-call? analysis thread) (replace-node thread (unwind-form source thread true))))
         "introduce-let" (when (and executable? (valid-name? name) (= name (unique-name analysis name)))
-                          (replace-node node (str "(basilisp.core/let [" name " " (text node) "] " name ")")))
+                          (let [parent (second (enclosing-nodes tree (:start node)))
+                                [_ bindings body] (syntax/forms parent)]
+                            (if (and (contains? #{"let" "basilisp.core/let"} (head-name parent))
+                                     (= :vector (:kind bindings)) (= node body))
+                              [[(dec (:end bindings)) (dec (:end bindings)) (str "\n " name " " (text node))]
+                               [(:start node) (:end node) name]]
+                              [(wrap-binding-edit source analysis node node name)])))
         "extract-function" (when executable? (extract-edits source tree analysis node
                                                             (or (first args) (unique-name analysis "new-function"))))
         "extract-to-def" (when (and executable? (literal? node)
@@ -2860,9 +3161,7 @@
                                        (or (= 3 (count parts)) (and (= 5 (count parts)) (= ":else" (:text (nth parts 3))))))
                               (replace-node call (str "(if " (text (nth parts 1)) " " (text (nth parts 2))
                                                       (when (= 5 (count parts)) (str " " (text (nth parts 4)))) ")")))
-        "cycle-privacy" (let [definition (first (filter #(contains? #{"defn" "defn-"} (head-name %)) ancestors))
-                              head (first (syntax/forms definition))]
-                          (when head (replace-node head (if (= "defn" (:text head)) "defn-" "defn"))))
+        "cycle-privacy" (privacy-edits source analysis ancestors)
         "raise-sexp" (when (and node (second ancestors))
                        (replace-node (second ancestors) (text node)))
         "kill-sexp" (when node (replace-node node ""))
@@ -2884,8 +3183,10 @@
         "add-missing-import" (contextual-libspec source tree analysis offset ":import" (first args) (second args) nil (:settings analysis))
         "add-import-to-namespace" (contextual-libspec source tree analysis offset ":import" (first args) (second args) nil (:settings analysis))
         "add-require-suggestion" (contextual-libspec source tree analysis offset ":require" (first args) (second args) (nth args 2 nil) (:settings analysis))
-        "promote-fn" (let [literal (first (filter #(= :anonymous-function (:kind %)) ancestors))]
-                       (replace-node literal (promote-literal source literal analysis (first args))))
+        "promote-fn" (let [function (first (filter #(or (= :anonymous-function (:kind %)) (= "fn" (head-name %))) ancestors))]
+                       (if (= :anonymous-function (:kind function))
+                         (replace-node function (promote-literal source function analysis (first args)))
+                         (when function (promote-function-edits source tree analysis function (first args)))))
         "suppress-diagnostic" (suppress-edits source node (first args))
         "sort-map" (when (and collection (= :map (:kind collection)) (plain-tree? collection)
                               (every? literal? (syntax/forms collection)))

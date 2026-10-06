@@ -30,6 +30,12 @@ def test_diagnostic_column_adaptation_tracks_only_replaced_namespaces():
     assert actual["message"] == "basilisp.core/inc"
 
 
+def test_message_adaptation_accepts_sentence_punctuation():
+    result = audit.normalize([{"message": "namespace clojure.string. clojure.core.async"}])
+    assert result[0]["message"] == "namespace basilisp.string. clojure.core.async"
+    assert audit.adapt("clojure.string.") == "clojure.string."
+
+
 def test_empty_extraction_is_an_error():
     with pytest.raises(ValueError, match="no cases"):
         audit.validate_capture({"cases": [], "skipped": []})

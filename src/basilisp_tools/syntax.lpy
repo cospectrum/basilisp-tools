@@ -6,6 +6,7 @@
   prefixes, whitespace and comments are leaves, so concatenating leaf text
   reproduces the input exactly, including invalid input. No runtime symbol
   resolution, macro expansion, imports or tagged-literal evaluation occurs."
+  (:refer-basilisp :exclude [read-string])
   (:import [re] [bisect] [operator :as op]))
 
 (def ^:private atom-re (re/compile "[^\\s,()\\[\\]{}\";@^~\u0060\\\\]+"))

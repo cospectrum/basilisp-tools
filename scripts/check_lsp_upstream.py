@@ -24,6 +24,7 @@ import importlib
 import json
 from pathlib import Path
 import subprocess
+from upstream_differences import review_regressions
 
 CLOJURE_LSP_REVISION = "8ad65c1d681d2fc9022b3854f6dcaf1677d29631"
 SELECTED_TESTS = {
@@ -348,6 +349,7 @@ def main():
     parser.add_argument("--report", type=Path)
     parser.add_argument("--report-only", action="store_true", help="Report mismatches without failing; execution errors still fail")
     parser.add_argument("--baseline", type=Path, help="Require recorded exact passes and extraction coverage to remain")
+    parser.add_argument("--differences", type=Path, help="Require every difference to match a reviewed Basilisp expectation")
     parser.add_argument("--write-baseline", type=Path, help="Record extraction coverage and exact passes")
     args = parser.parse_args()
     checkout = args.clojure_lsp.resolve()
@@ -368,6 +370,9 @@ def main():
             regressions = baseline_regressions(baseline, snapshot)
         except ValueError as error:
             parser.error(str(error))
+    if args.differences:
+        reviews = json.loads(args.differences.read_text(encoding="utf-8"))
+        regressions.extend(review_regressions(results, reviews, lambda case: case["status"] == "exact"))
     for result in results:
         if result["status"] in {"mismatch", "error"}:
             print(f"{result['id']} ({result['command']}): {result['status']}\n"
@@ -391,7 +396,7 @@ def main():
             parser.error("Cannot record a baseline containing execution errors")
         args.write_baseline.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     return int(bool(counts["error"] or regressions)
-               or (not (args.report_only or args.baseline) and any(item["status"] != "exact" for item in results)))
+               or (not (args.report_only or args.baseline or args.differences) and any(item["status"] != "exact" for item in results)))
 
 
 if __name__ == "__main__":

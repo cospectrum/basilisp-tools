@@ -1068,7 +1068,7 @@
     (is (str/includes? result "(basilisp.core/defn selected-part [x]"))
     (is (= (load-string source) (load-string result))))
   (let [source "(inc 1)" analysis (assoc (analyzer/analyze source) :settings {:keep-parens-when-threading? true})]
-    (is (= "(basilisp.core/-> 1 (inc))" (nth (first (lsp/refactor-edits source analysis "thread-first" 0 [])) 2))))
+    (is (= "(-> 1\n    (inc))" (nth (first (lsp/refactor-edits source analysis "thread-first" 0 [])) 2))))
   (let [source "(defn allocation [] [1])"]
     (is (= source (transformed source "extract-to-def" (.index source "[1]") "shared")))))
 

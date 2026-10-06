@@ -12,7 +12,11 @@ import pytest
 script = Path(__file__).resolve().parents[1] / "scripts" / "check_lsp_upstream.py"
 spec = importlib.util.spec_from_file_location("_blt_lsp_upstream", script)
 audit = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(audit)
+sys.path.insert(0, str(script.parent))
+try:
+    spec.loader.exec_module(audit)
+finally:
+    sys.path.pop(0)
 selection = {
     "lib/test/clojure_lsp/refactor/transform_test.clj": {"thread-test", "change-coll-test"},
     "lib/test/clojure_lsp/feature/thread_get_test.clj": None,
@@ -76,7 +80,7 @@ def test_capture_applies_and_resets_threading_settings(tmp_path):
 
 def test_structural_similarity_does_not_count_as_exact_text_passes():
     case = {"command": "thread-first", "source": "(inc 1)", "offset": 0, "args": [],
-            "settings": {}, "expected": "(-> 1\n    inc)"}
+            "settings": {}, "expected": "(-> 1\n       inc)"}
     result, = audit.compare_cases([case])
     assert result["status"] == "structural-only"
     assert result["structural_match"] is True

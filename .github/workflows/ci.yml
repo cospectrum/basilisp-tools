@@ -128,9 +128,9 @@ jobs:
       - name: Compare language server configuration with clojure-lsp
         run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_lsp_config.py --clojure-lsp .clojure-lsp-reference
       - name: Audit upstream language server test assertions
-        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_lsp_upstream.py --clojure-lsp .clojure-lsp-reference --baseline scripts/lsp_upstream_baseline.json --report lsp-upstream-report.json
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_lsp_upstream.py --clojure-lsp .clojure-lsp-reference --baseline scripts/lsp_upstream_baseline.json --differences scripts/lsp_upstream_differences.json --report lsp-upstream-report.json
       - name: Audit upstream checker test inputs
-        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_upstream.py --checkout .clj-kondo-reference --baseline scripts/kondo_upstream_baseline.json --report kondo-upstream-report.json
+        run: nix develop --no-update-lock-file .#compatibility --command uv run --locked python scripts/check_kondo_upstream.py --checkout .clj-kondo-reference --baseline scripts/kondo_upstream_baseline.json --differences scripts/kondo_upstream_differences.json --report kondo-upstream-report.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

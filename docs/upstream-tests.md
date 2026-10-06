@@ -7,11 +7,12 @@ as the `upstream-test-reports` GitHub Actions artifact.
 
 These are selected compatibility experiments, not the full upstream suites or
 a claim that Basilisp implements JVM Clojure. Strict mode is the default for the
-audit scripts. CI uses checked-in baselines for the new checker and LSP audits:
-previously exact cases must remain exact, and extraction counts must stay stable.
-Known differences remain visible without claiming parity. Execution errors and
-baseline regressions fail those audits. Existing strict comparisons remain in
-place. `--report-only` is available for exploring differences without a baseline.
+audit scripts. CI checks both exact-match baselines and reviewed Basilisp
+differences. Each difference records its reason, supporting evidence, an input
+digest, and the exact expected Basilisp output. Unclassified differences, changed
+outputs, obsolete exceptions, execution errors, and changed extraction coverage
+fail CI. Structural similarity alone never passes. Existing strict comparisons
+remain in place. `--report-only` is available for exploring new differences.
 
 ## Formatter
 
@@ -49,27 +50,31 @@ expressions, other dialects, executable hooks, and external fixtures are recorde
 as skips. Existing hook tests continue to run separately.
 
 The 2026-10-06 extraction found 2,480 `lint!` call sites: 1,366 were replayed
-from 68 test files and 1,114 were skipped. There were 771 exact diagnostic and
-exit-code matches, 595 mismatches, and no execution errors. Skips comprise
+from 68 test files and 1,114 were skipped. After the fixes, there are 1,120 exact
+diagnostic and exit-code matches, up from 771, plus 246 reviewed native
+differences and no execution errors. Skips comprise
 959 dynamic arguments, 127 other-dialect
 inputs (including seven selected by filename), ten hook fixtures, sixteen calls
 with unsupported CLI options, and two non-string inputs.
 
-For example, blt missed the upstream invalid-arity diagnostic for `(def x 1 2)`
-and the type-mismatch diagnostic for `(inc ())`. It also reported an unresolved
-namespace for `(ns foo (:require bar)) ::bar/bar`, where clj-kondo reported none.
-Other mismatches involve platform features and libraries without direct Basilisp
-equivalents, so the mismatch count is not a count of confirmed implementation bugs.
+The fixes cover arity and type inference, protocol implementations, lexical
+bindings and destructuring, namespace changes and aliases, configuration scope,
+metadata and quoted reader forms, and diagnostic messages and ranges. Regression
+tests also execute representative forms in Basilisp so that Clojure expectations
+do not override native semantics.
 
 The report includes every extracted input, configuration, comparison, and skip
 reason. The checked-in baseline protects exact matches and extraction counts.
-Remaining differences are findings to investigate, rather than automatically
-classified as bugs or accepted language differences.
+`scripts/kondo_upstream_differences.json` records the remaining native differences:
+Python interop and runtime contracts, reader behavior, and JVM or third-party
+Clojure APIs without Basilisp counterparts. These cases remain in the audit and
+must preserve their reviewed Basilisp diagnostics.
 
 ```sh
 uv run --locked python scripts/check_kondo_upstream.py \
   --checkout /path/to/clj-kondo \
-  --baseline scripts/kondo_upstream_baseline.json --report kondo-upstream-report.json
+  --baseline scripts/kondo_upstream_baseline.json \
+  --differences scripts/kondo_upstream_differences.json --report kondo-upstream-report.json
 ```
 
 ## Language server
@@ -88,25 +93,28 @@ nil zipper inputs, or upstream edit ranges. The other 20 tests contain 237
 assertion forms and are listed as unselected. Other upstream test files are
 outside this audit. Unsupported fixture forms within selected tests are errors.
 
-The 2026-10-06 results were 42 exact matches, 11 structurally similar outputs,
-and 111 mismatches, with no execution errors after the fix below. Structural
-similarity omits trivia and reader discards and normalizes core namespace
-qualification; it does not prove semantic equivalence and does not count as an
-exact pass.
+After the fixes, 137 expectations match exactly, up from 42. There are no
+structural-only results or execution errors. The remaining 27 cases have
+reviewed expectations in `scripts/lsp_upstream_differences.json`:
 
-Differences include binding edits, generated function names, nested unwind
-selection, conservative lookup rewrites for targets with unknown runtime types,
-and refusals to rewrite reader discards or produce an odd-length map. The report
-contains every input, expected output, actual output, and source test location;
-these differences need individual review before changing behavior.
+- 23 lookup rewrites change results for native Python dictionaries. Each case
+  has an executed counterexample comparing the original and upstream output.
+- Two binding expansions change call arguments or produce invalid function
+  syntax. Basilisp preserves the call's argument count or declines the edit.
+- One variadic function promotion incorrectly nests the rest arguments upstream.
+  Basilisp forwards them through `partial`.
+- One collection conversion would create an odd-length map. Basilisp declines
+  that invalid edit and supports repairing an odd map into a vector.
 
-The initial run exposed a crash when `introduce-let` had no expression at the
-cursor. The fix handles an absent target, with 21 regression scenarios covering
-`introduce-let`, `extract-function`, and `extract-to-def` on empty text and
-whitespace.
+The fixes cover threading layout and reader discards, nested cursor selection,
+binding introduction/movement/expansion, privacy metadata, function promotion
+with captures, and function demotion with comments and variadic parameters.
+Execution regressions check values, side effects, lexical scope, and argument
+forwarding. The original empty-target crash regression remains covered.
 
 ```sh
 uv run --locked python scripts/check_lsp_upstream.py \
   --clojure-lsp /path/to/clojure-lsp \
-  --baseline scripts/lsp_upstream_baseline.json --report lsp-upstream-report.json
+  --baseline scripts/lsp_upstream_baseline.json \
+  --differences scripts/lsp_upstream_differences.json --report lsp-upstream-report.json
 ```

@@ -16,9 +16,10 @@ Python support, and refactoring behavior. Separate execution tests check that
 supported refactorings preserve values and evaluation order.
 
 The [upstream test audit](upstream-tests.md) also replays cases taken directly
-from the tools' test suites. Its checker and LSP reports expose outstanding
-differences; their audit steps do not require complete upstream parity. Existing
-strict compatibility comparisons continue to fail on mismatches.
+from the tools' test suites. Each selected case must match upstream exactly or
+match a reviewed Basilisp expectation with an explicit reason and evidence.
+New differences and changed native outcomes fail CI. Existing strict
+compatibility comparisons continue to fail on mismatches.
 
 ## Differences that matter
 

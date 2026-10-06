@@ -1,0 +1,128 @@
+(ns basilisp-tools.analyzer-upstream-types-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp.string :as str]
+            [basilisp.set :as sets]))
+
+(defn- findings [source]
+  (:findings (analyzer/analyze source {:python-options {:python-inspection? false}
+                                       :config {:linters {:unused-binding {:level :off}}}})))
+
+(defn- of-type [source type]
+  (filterv #(= type (:type %)) (findings source)))
+
+(deftest callback-arity-is-checked-at-the-function-argument
+  (doseq [source ["(map inc [1] [2])"
+                  "(map (fn []) [1])"
+                  "(map-indexed (fn [x] x) [1])"
+                  "(some (fn [x y] x) [1])"
+                  "(update {} :a (fn [x y] x))"
+                  "(update-in {} [:a] (fn [x y] x))"
+                  "(swap! (atom nil) (fn [x y] x))"
+                  "(map {} [1] [2] [3])"
+                  "(map [] [1] [2])"]]
+    (is (= 1 (count (of-type source :invalid-arity)))))
+  (is (empty? (of-type "(map (fn []) [])" :invalid-arity)))
+  (is (empty? (of-type "(map (fn [x y] x) [1] [2])" :invalid-arity))))
+
+(deftest local-and-collection-calls-have-accurate-signatures
+  (is (= "f is called with 0 args but expects 1"
+         (:message (first (of-type "(let [f (fn [x] x)] (f))" :invalid-arity)))))
+  (is (= 1 (count (of-type "('key {} nil :extra)" :invalid-arity))))
+  (is (= 1 (count (of-type "([] 1 :fallback)" :invalid-arity))))
+  (is (thrown? python/TypeError ([] 1 :fallback)))
+  (is (= nil ('key {}))))
+
+(deftest special-forms-report-arity-without-crashing
+  (doseq [source ["(defn) (defmacro)" "(deftype)" "(def value 1 2)"
+                  "(cond-> 1 inc)" "(cond->> 1 odd? inc even?)"
+                  "(var)" "(set! x 1 2)" "(let)" "(if-not)"]]
+    (is (seq (of-type source :invalid-arity)))
+    (is (empty? (of-type source :file))))
+  (is (= 2 (count (of-type "(if) (if true 1 2 3)" :syntax))))
+  (is (= 3 (count (of-type "(defn :bad []) (fn :bad []) (fn \"bad\" [])" :syntax)))))
+
+(deftest malformed-overloads-point-to-the-invalid-body
+  (is (= {:col 12 :end-col 14 :message "Invalid function body."}
+         (select-keys (first (of-type "(defn oops ())" :syntax)) [:col :end-col :message])))
+  (is (= {:col 27 :end-col 39 :message "Function arguments should be wrapped in vector."}
+         (select-keys (first (of-type "(defn oopsie ([]) ([x] x) [:not :good])" :syntax)) [:col :end-col :message]))))
+
+(deftest malformed-definitions-avoid-cascading-diagnostics
+  (is (= 1 (count (of-type "(defn f \"dude\" x) (f 1)" :syntax))))
+  (is (empty? (of-type "(defn f \"dude\" [x] \"dude\" x)" :misplaced-docstring)))
+  (is (empty? (of-type "(defmethod)" :syntax)))
+  (is (empty? (of-type "(cond-> {:a 1} (odd? 1) (inc 1))" :type-mismatch))))
+
+(deftest quoted-non-callables-and-discarded-macro-arguments
+  (is (= 2 (count (of-type "('(foo) 1) ('1 1)" :not-a-function))))
+  (is (empty? (of-type "(defmacro discard [& body]) (discard (recur))" :unexpected-recur))))
+
+(deftest configured-def-catch-all-retains-definitions-and-references
+  (let [result (analyzer/analyze "(defn f [arg] (special/define value arg)) value"
+                                 {:python-options {:python-inspection? false}
+                                  :config {:lint-as {'special/define 'clj-kondo.lint-as/def-catch-all}}})]
+    (is (empty? (filter #(#{:unused-binding :unresolved-symbol} (:type %)) (:findings result))))))
+
+(deftest threaded-single-comparisons-use-the-effective-arity
+  (let [result (analyzer/analyze "(-> 1 (>)) (->> 1 (<)) (-> 1 (> 0))"
+                                 {:python-options {:python-inspection? false}
+                                  :config {:linters {:single-operand-comparison {:level :warning}}}})]
+    (is (= 2 (count (filter #(= :single-operand-comparison (:type %)) (:findings result)))))))
+
+(deftest recur-targets-use-the-surrounding-generated-function
+  (doseq [source ["(bound-fn [x] x)" "(defn f [_x] (lazy-seq (recur)))"
+                  "(defn f [_x] (lazy-cat (recur)))" "(future (recur))"]]
+    (is (empty? (of-type source :unexpected-recur)))
+    (is (empty? (of-type source :invalid-arity))))
+  (is (= "recur argument count mismatch (expected 1, got 2)"
+         (:message (first (of-type "(fn [x] (recur x x))" :invalid-arity))))))
+
+(deftest collection-and-conditional-result-types
+  (doseq [source ["(inc ())" "(subvec (map inc [1]) 0)" "(peek #{1})"
+                  "(assoc {} :a 1 :b)" "(zero? \"x\")"
+                  "(inc (if-let [x 1] :a 'b))" "(inc (when-let [x 1] 'b))"
+                  "(inc (or))" "(inc (or :a 'b))"
+                  "(ns sample (:require [basilisp.set :as s])) (s/difference (into [] [1]) #{1})"]]
+    (is (= 1 (count (of-type source :type-mismatch)))))
+  (doseq [source ["(defn f [x y] (when (and x y) :ok))"
+                  "(defn f [opts] (when (and (:x opts) (:y opts)) :ok))"
+                  "(defn f [opts] (when (or (:x opts) (:y opts)) :ok))"
+                  "(defn f [opts] (when (or (:macro opts) (seq (:arglists opts))) :ok))"]]
+    (is (empty? (of-type source :constant-condition)))))
+
+(deftest keyword-results-follow-the-actual-function-argument
+  (is (= "Expected: number, received: keyword."
+         (:message (first (of-type "(let [f (fn [x] (keyword x))] (inc (f \"name\")))" :type-mismatch)))))
+  (is (= "Expected: number, received: nil."
+         (:message (first (of-type "(let [f (fn [x] (keyword x))] (inc (f nil)))" :type-mismatch)))))
+  (is (empty? (of-type "(let [f (fn [x] (keyword x))] (name (f \"name\")))" :type-mismatch))))
+
+(deftest try-results-merge-handlers-and-ignore-finally-values
+  (is (= 1 (try 1 (catch python/Exception _ "caught") (finally :ignored))))
+  (is (= "caught" (try (throw (python/ValueError "fail"))
+                       (catch python/Exception _ "caught") (finally :ignored))))
+  (is (= 1 (count (of-type "(inc (try \"value\" (finally 1)))" :type-mismatch))))
+  (is (empty? (of-type "(inc (try 1 (finally \"ignored\")))" :type-mismatch)))
+  (is (= "Expected: number, received: string or keyword."
+         (:message (first (of-type "(inc (try :body (catch python/Exception _ \"caught\")))" :type-mismatch)))))
+  (is (empty? (of-type "(defn f [x] (try x (catch python/Exception _ nil))) (defn g [x] (when (f x) 1))"
+                       :constant-condition))))
+
+(deftest native-string-and-set-contracts-are-preserved
+  (is (= "abcd" (subs "abcd" nil nil)))
+  (is (= "" (str/replace "foo" #"foo" :foo)))
+  (is (= "foo" (str/replace "foo" \a "foo")))
+  (is (nil? (sets/union nil)))
+  (is (= 1 (sets/difference 1)))
+  (is (empty? (of-type "(subs \"abcd\" nil nil)" :type-mismatch)))
+  (is (= 1 (count (of-type "(ns sample (:require [basilisp.string :as s])) (s/replace \"x\" \"x\" (fn [_]))" :type-mismatch)))))
+
+(deftest test-library-results-are-inferred
+  (is (nil? (is (+ 1 2))))
+  (doseq [source ["(ns sample (:require [basilisp.test :as t])) (inc (t/deftest check))"
+                  "(ns sample (:require [basilisp.test :as t])) (subs (t/testing \"x\" 42) 0)"
+                  "(ns sample (:require [basilisp.test :as t])) (inc (t/is true))"
+                  "(ns sample (:require [basilisp.test :as t])) (inc (t/compose-fixtures))"
+                  "(ns sample (:require [basilisp.test :as t])) (t/join-fixtures 42)"]]
+    (is (= 1 (count (of-type source :type-mismatch))))))

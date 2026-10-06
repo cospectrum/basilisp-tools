@@ -1,0 +1,103 @@
+(ns basilisp-tools.analyzer-upstream-bindings-test
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- findings
+  ([source] (findings source {}))
+  ([source config]
+   (:findings (analyzer/analyze source {:config config :python-options {:enabled false}}))))
+
+(deftest unused-destructuring-defaults-test
+  (is (= ["unused binding value" "unused default for binding value"]
+         (mapv :message (findings "(let [{:keys [value] :or {value 1}} {}])"))))
+  (is (empty? (findings "(let [{:keys [value] :or {value 1}} {}] value)")))
+  (is (empty? (findings "(let [{:keys [value] :or {:value 1}} {}] value)")))
+  (is (= ["Used binding is marked as unused: _local"]
+         (mapv :message (findings "(let [_local 1 {:keys [_key]} {}] [_local _key])"
+                                  {:linters {:used-underscored-binding {:level :warning}}})))))
+
+(deftest dynamic-require-and-alias-test
+  (is (empty? (findings "(let [library 'basilisp.string] (require library))")))
+  (is (empty? (findings "(require (quote [basilisp.string :as s])) (s/join [1 2])")))
+  (is (empty? (findings "(require '[basilisp.string :as s] (case 1 ::s/value 2))")))
+  (is (= [:invalid-arity]
+         (mapv :type (findings "(ns sample (:require [basilisp.core :as c])) (c/select-keys)"))))
+  (is (empty? (findings "(ns sample (:require [basilisp.string :as s])) (require 'basilisp.string :reload) (s/join [])"))))
+
+(deftest independent-source-namespaces-test
+  (let [result (analyzer/analyze "(ns first) (defn value [x] x) (ns second (:require [first :as f])) (f/value)")]
+    (is (= [:invalid-arity] (mapv :type (:findings result))))
+    (is (= ["first" "second"] (mapv :name (:namespace-definitions result))))
+    (is (= "first" (:ns (first (:var-definitions result))))))
+  (is (empty? (findings "(ns first (:require [basilisp.string :as s])) (ns second) (in-ns 'first) (s/join [])")))
+  (is (= [:deprecated-namespace]
+         (mapv :type (findings "(ns first {:deprecated true}) (ns second (:require first))")))))
+
+(deftest quoted-local-definition-names-test
+  (is (empty? (findings "(ns sample) (declare sample/value) sample/value value (def sample/value 1)")))
+  (is (= [:syntax :unresolved-namespace :syntax]
+         (mapv :type (findings "(declare foreign/value) foreign/value value (def foreign/value 1)")))))
+
+(deftest comments-preserve-live-definitions-test
+  (is (= [:invalid-arity]
+         (mapv :type (findings "(defn f [x] x) (comment (defn f [x y] [x y])) (f 1 2)"))))
+  (is (empty? (findings "(comment (def x 1) (def x 2)) (def x 3)")))
+  (is (empty? (findings "(comment (def helper 1)) (defn f [helper] helper)"
+                        {:linters {:shadowed-var {:level :warning}}}))))
+
+(deftest binding-shape-diagnostics-test
+  (doseq [[source expected]
+          [["(let [x 1 y])" "let binding vector requires even number of forms"]
+           ["(let x 1)" "let requires a vector for its binding"]
+           ["(when-let [x 1 y 2])" "when-let binding vector requires exactly 2 forms"]
+           ["(with-redefs 1)" "with-redefs requires a vector for its binding"]
+           ["(with-redefs [basilisp.core/inc])" "with-redefs binding vector requires even number of forms"]
+           ["(fn [a/a])" "unsupported binding form a/a"]]]
+    (testing source
+      (is (some #(= expected (:message %)) (findings source)))))
+  (is (empty? (findings "(when-let [{:keys [_x]} {}])"))))
+
+(deftest binding-metadata-and-special-symbols-test
+  (is (empty? (findings "(let ^{:row 15} [^{:row 15} x 1] (inc x))")))
+  (is (empty? (findings "(try nil (catch python/Exception & &))")))
+  (is (empty? (findings "(let [/ 1] /)")))
+  (let [finding (first (findings "(fn [a &] a)"))]
+    (is (= "Trailing & in binding form" (:message finding)))
+    (is (= 8 (:col finding)))))
+
+(deftest native-array-macro-bindings-test
+  (is (empty? (findings "(let [array (into-array [1 2])] (amap array index result (inc (aget result index))))")))
+  (is (empty? (findings "(let [array (into-array [1 2])] (areduce array index result 0 (+ result (aget array index))))")))
+  (is (empty? (findings "(memfn method first-argument second-argument)"))))
+
+(deftest unused-private-and-redefinitions-test
+  (is (= [:unused-private-var]
+         (mapv :type (findings "(defn- recurse [] (recurse))"))))
+  (is (empty? (findings "(def ^:private _intentionally-unused 1)")))
+  (is (= [:redefined-var]
+         (mapv :type (findings "(let [value 1] (def x value) (def x value))"))))
+  (is (= [:redefined-var]
+         (mapv :type (findings "(defn inc [])"))))
+  (is (= [:redefined-var] (mapv :type (findings "(defn new [] :value)"))))
+  (is (= [:unused-private-var]
+         (mapv :type (findings "(defprotocol ^:private Private (method [self]))"))))
+  (is (= [:var-same-name-except-case]
+         (mapv :type (findings "(defn F []) (defn f [])"
+                               {:linters {:var-same-name-except-case {:level :error}}}))))
+  (is (empty? (findings "(def value 1) (def Value 2)"
+                        {:linters {:var-same-name-except-case {:level :error}}}))))
+
+(deftest invalid-import-and-namespace-clauses-test
+  (doseq [source ["(import 1)" "(import \"\")" "(import '())" "(ns example (:import ()))"]]
+    (testing source (is (= [:syntax] (mapv :type (findings source))))))
+  (is (= [:unknown-ns-option] (mapv :type (findings "(ns example [basilisp.string])")))))
+
+(deftest loop-bindings-forget-initial-collection-values-test
+  (is (empty? (findings "(loop [state {:flag false}] (if (:flag state) :done (recur {:flag true})))")))
+  (is (empty? (findings "(loop [state [nil]] (if (first state) :done (recur [:done])))"))))
+
+(deftest binding-options-apply-only-to-their-own-vector-test
+  (doseq [source ["(defn f [m] (when-let [key (:key m)] (let [value (when (:enabled m) [key])] (if value 1 2))))"
+                  "(defn f [m] (when-let [value (let [candidate (when (:x m) [:ok])] (if candidate candidate nil))] value))"
+                  "(when-first [item [1]] (let [items [2 3]] (+ item (count items))))"]]
+    (is (empty? (findings source)))))

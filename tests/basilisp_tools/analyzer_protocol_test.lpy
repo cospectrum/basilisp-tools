@@ -1,0 +1,49 @@
+(ns basilisp-tools.analyzer-protocol-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]))
+
+(defn- findings [source]
+  (:findings (analyzer/analyze source {:python-options {:python-inspection? false}
+                                       :config {:linters {:unused-binding {:level :off}
+                                                          :missing-protocol-method-arity {:level :warning}}}})))
+
+(deftest empty-implementations-report-all-declared-methods-in-order-test
+  (doseq [implementation ["(deftype T [] P)" "(defrecord T [] P)" "(reify P)"
+                          "(extend-type python/int P)" "(extend-protocol P python/int)"]]
+    (let [source (str "(defprotocol P (zeta [this]) (alpha [this])) " implementation)
+          results (findings source)]
+      (is (= [:missing-protocol-method] (mapv :type results)))
+      (is (= "Missing protocol method(s): zeta, alpha" (:message (first results)))))))
+
+(deftest protocol-overloads-are-checked-together-test
+  (let [declaration "(defprotocol P (f [this] [this x])) "]
+    (is (empty? (findings (str declaration "(deftype T [] P (f [this] 1) (f [this x] x))"))))
+    (is (empty? (findings (str declaration "(reify P (f ([this] 1) ([this x] x)))"))))
+    (is (= ["Protocol method f arity 2 is not implemented"]
+           (mapv :message (findings (str declaration "(deftype T [] P (f [this] 1))")))))
+    (is (= ["Protocol method f arity 2 is not implemented"
+            "Protocol method f is implemented with arity 3 but expects 1, 2"]
+           (mapv :message (findings (str declaration "(reify P (f ([this] 1) ([this x y] x)))")))))))
+
+(deftest interface-methods-include-the-implicit-receiver-test
+  (let [declaration "(definterface I (frobnicate [_x]) (frobnicate [_x _y])) "]
+    (is (empty? (findings (str declaration "(deftype T [] I (frobnicate [this x] x) (frobnicate [this x y] y))"))))
+    (is (= [:missing-protocol-method-arity :protocol-method-arity-mismatch]
+           (mapv :type (findings (str declaration "(deftype T [] I (frobnicate [this] 1))")))))
+    ;; Interface methods are attributes, not namespace Vars like protocol functions.
+    (is (= [:unresolved-symbol] (mapv :type (findings (str declaration "frobnicate")))))))
+
+(deftest method-recur-uses-the-native-receiver-convention-test
+  (doseq [[index implementation]
+          [[0 "(deftype T [] P (f [this n] (let [g (fn [x] (if (zero? x) x (recur (dec x))))] (if (zero? n) (g 2) (recur (dec n)))))) (f (T.) 2)"]
+           [1 "(f (reify P (f [this n] (if (zero? n) n (recur (dec n))))) 2)"]
+           [2 "(extend-type python/int P (f [this n] (if (zero? n) n (recur this (dec n))))) (f 1 2)"]
+           [3 "(extend-protocol P python/int (f [this n] (if (zero? n) n (recur this (dec n))))) (f 1 2)"]]]
+    (let [source (str "(ns protocol-recur-test-" index ") (defprotocol P (f [this n])) " implementation)]
+      (is (= 0 (load-string source)))
+      (is (empty? (findings source)))))
+  (is (= ["recur argument count mismatch (expected 1, got 2)"]
+         (mapv :message (findings "(defprotocol P (f [this n])) (deftype T [] P (f [this n] (recur this n)))")))))
+
+(deftest variadic-protocol-declarations-remain-native-test
+  (is (empty? (findings "(defprotocol P (f [this & xs])) (deftype T [] P (f [this & xs] xs))"))))

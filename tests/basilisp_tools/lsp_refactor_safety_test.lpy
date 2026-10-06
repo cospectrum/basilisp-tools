@@ -20,13 +20,89 @@
   (doseq [[source offset] [["" 0]
                            ["   " 1]
                            ["\n\n" 1]
-                           ["\n(inc 5)" 0]
                            ["(inc 5)\n\n" 8]
-                           ["(inc 5)\n  (inc 8)" 9]
                            ["(inc 5)\n  ;; retained comment" 9]]
           command ["introduce-let" "extract-function" "extract-to-def"]]
     (is (empty? (lsp/refactor-edits source (analyze source) command offset ["value"]))
         (str command " at " offset " in " (pr-str source)))))
+
+(deftest introduce-let-advances-over-trivia-test
+  (doseq [[source offset] [["\n(inc 5)" 0]
+                           ["(inc 5)\n  (inc 8)" 9]
+                           [";; retained comment\n\n(inc 5)" 0]]]
+    (let [result (apply-edits source (lsp/refactor-edits source (analyze source) "introduce-let" offset ["value"]))]
+      (is (not= source result))
+      (is (= (evaluate source) (evaluate result)))
+      (is (= (str/includes? source ";; retained comment") (str/includes? result ";; retained comment"))))))
+
+(defn- refactor-at [source command marker args]
+  (apply-edits source (lsp/refactor-edits source (analyze source) command (.find source marker) args)))
+
+(deftest binding-refactors-preserve-evaluation-and-scope-test
+  (doseq [[source command marker]
+          [["(let [a 1] (inc a))" "move-to-let" "(inc"]
+           ["(let [a (inc 1)] a (inc 1))" "move-to-let" "(inc"]
+           ["(let [a (inc 1)] a (inc 1))" "move-to-let" "1"]
+           ["(let [a 1] (identity (inc a)))" "move-to-let" "(inc"]
+           ["(let [a 1] (#(+ % a) 2))" "move-to-let" "%"]
+           ["(let [x 1] (when-let [y x] y))" "move-to-let" "y))"]
+           ["(let [x 1] (doseq [y [x]] y))" "move-to-let" "y))"]
+           ["(let [a 1] a)" "introduce-let" "a)"]
+           ["(+ 1 (let [a 1] a) 2)" "expand-let" "(let"]
+           ["(let [x 5] (when x (let [y 2] y)))" "expand-let" "(let [y"]
+           ["(do [(let [f 1] f)])" "expand-let" "(let"]
+           ["(defn safety-something [x] 5) (+ (* 3 3) (let [x 4] (safety-something 1) (* x x)))" "expand-let" "(let"]
+           ["(def safety-f (fn [] (let [a 1] a) 2)) (safety-f)" "expand-let" "(let"]]]
+    (let [result (refactor-at source command marker ["new-binding"])]
+      (is (not= source result) (str command " " source))
+      (is (= (evaluate source) (evaluate result)) result))))
+
+(deftest binding-refactors-decline-effects-and-capture-test
+  (doseq [[source command marker name]
+          [["(let [] (println :first) (println :second))" "move-to-let" "(println :second" "value"]
+           ["(let [] (vector (println :first) (println :second)))" "move-to-let" "(println :second" "value"]
+           ["(let [a 1] (+ value a))" "move-to-let" "a))" "value"]
+           ["(let [value 7] (+ value (let [value 1] value)))" "expand-let" "(let [value 1" "unused"]
+           ["(vector (println :first) (let [a (println :second)] a))" "expand-let" "(let" "unused"]
+           ["(let [x (let [a 1] a)] x)" "expand-let" "(let [a" "unused"]
+           ["'(+ 1 (let [a 1] a))" "expand-let" "(let" "unused"]
+           ["(fn [x] {:pre [(let [a 1] (= x a))]} x)" "expand-let" "(let" "unused"]
+           ["(fn [x] {:pre [(pos? x)]} x)" "introduce-let" "{:pre" "unused"]
+           ["(defn safety-f ([bar] (let [a 1] a 2)))" "expand-let" "(let" "unused"]]]
+    (is (= source (refactor-at source command marker [name])) (str command " " source))))
+
+(deftest function-refactors-preserve-captures-and-variadic-arguments-test
+  (doseq [[source command marker]
+          [["((fn [x] (+ x 1)) 4)" "demote-fn" "(fn"]
+           ["((fn [x & xs] [x xs]) 1 2 3)" "demote-fn" "(fn"]
+           ["((fn named [x] (+ x 1)) 4)" "demote-fn" "(fn"]
+           ["((fn [x] ;; kept\n (+ x 1)) 4)" "demote-fn" "(fn"]
+           ["(#(+ %1 %2) 4 5)" "promote-fn" "#("]
+           ["(#(do (inc %) (dec %)) 4)" "promote-fn" "#("]
+           ["(#(vector %&) 4 5)" "promote-fn" "#("]
+           ["((fn [x] (+ x 1)) 4)" "promote-fn" "(fn"]
+           ["(let [a 5] ((fn [x] (+ a x)) 4))" "promote-fn" "(fn"]
+           ["(let [a 5] ((fn [x & xs] [a x xs]) 1 2 3))" "promote-fn" "(fn"]
+           ["(let [a 5] ((fn ([x] (+ a x)) ([x y] (+ a x y))) 4 3))" "promote-fn" "(fn"]]]
+    (let [result (refactor-at source command marker ["safety-promoted"])]
+      (is (not= source result) (str command " " source))
+      (is (= (evaluate source) (evaluate result)) result))))
+
+(deftest function-promotion-preserves-loop-closure-cells-test
+  (doseq [source
+          ["(mapv (fn [f] (f)) (loop [x 0 fs []] (if (< x 3) (recur (inc x) (conj fs (fn [& _] x))) fs)))"
+           "(let [fs (atom [])] (dotimes [x 3] (swap! fs conj (fn ([] x) ([y] (+ x y))))) (mapv (fn [f] (f)) @fs))"]]
+    (let [marker (if (str/includes? source "(fn [&") "(fn [&" "(fn ([]")
+          result (refactor-at source "promote-fn" marker ["safety-loop-promoted"])]
+      (is (= [3 3 3] (evaluate source)))
+      (is (= source result)))))
+
+(deftest collection-cycle-repairs-odd-map-without-creating-one-test
+  (let [source "{some-fun 1 2}"
+        result (refactor-at source "cycle-coll" "{" [])]
+    (is (= "[some-fun 1 2]" result))
+    (is (empty? (:diagnostics (syntax/parse result)))))
+  (is (= "(some-fun 1 2)" (refactor-at "(some-fun 1 2)" "change-coll" "(" ["map"]))))
 
 (defn- inline [source marker]
   (apply-edits source (lsp/refactor-edits source (analyze source)
