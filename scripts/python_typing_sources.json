@@ -1,0 +1,7 @@
+[
+  {"provider":"typing","repo":"python/typing","revision":"dc0a8a924c99c6d6ab70f5dc4708e8e4017386ae","directory":"python-typing","paths":["conformance/","LICENSE"]},
+  {"provider":"pyright","repo":"microsoft/pyright","revision":"eb175addd4ebf25a6c0c5301b3f2cfae7d0c6618","directory":"microsoft-pyright","oracle_version":"1.1.414","paths":["packages/pyright-internal/src/tests/","LICENSE"]},
+  {"provider":"mypy","repo":"python/mypy","revision":"e576c204a29a5a5567d5374aae93f61762c691b2","directory":"python-mypy","oracle_version":"2.4.0","paths":["test-data/unit/","mypy/test/data.py","mypy/test/config.py","LICENSE"]},
+  {"provider":"pyrefly","repo":"facebook/pyrefly","revision":"2f1c6328b3949f76162f76b92d81dafa9097eec4","directory":"facebook-pyrefly","oracle_version":"1.3.2","paths":["pyrefly/lib/test/","test/","LICENSE"]},
+  {"provider":"ty","repo":"astral-sh/ruff","revision":"0692804812c61094835ee52a3e933fc119d3e3fa","directory":"astral-sh-ruff","oracle_version":"0.0.84","paths":["crates/ty_python_semantic/resources/","crates/ty_python_semantic/tests/","crates/ty_test/","LICENSE"]}
+]

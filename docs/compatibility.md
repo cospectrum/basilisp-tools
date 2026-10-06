@@ -58,8 +58,13 @@ Formatter tests include Basilisp's source corpus. The
 [public-project audit](public-project-audit.md) selects 968 source files from 44
 repositories. CI exercises pinned nREPL and Flask projects and runs calc's own
 tests before and after formatting, alongside executable generated projects.
-Python integration tests use NumPy, Requests with type stubs, and Pydantic. The
-[workflow](../.github/workflows/ci.yml) and [Nix lockfile](../flake.lock) record
+Python integration tests use NumPy, Requests with type stubs, and Pydantic.
+The [Python typing audit](python-typing-compatibility.md) adapts pinned fixtures
+from typing, Pyright, mypy, Pyrefly, and ty. The
+[ML audit](python-ml-audit.md) exercises real Torch and ONNX programs, upstream
+Torch expressions, and generated training and inference projects. CI checks a
+fully resolved typing subset and the reviewed ML coverage limits on every push.
+The [workflow](../.github/workflows/ci.yml) and [Nix lockfile](../flake.lock) record
 the exact reference versions.
 
 ```sh

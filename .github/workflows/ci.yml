@@ -100,6 +100,53 @@ jobs:
           path: ${{ runner.temp }}/blt-public-reports/
           if-no-files-found: warn
 
+  python-interop:
+    name: Validate Python and ML interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - name: Install pinned CPU ML packages
+        run: |
+          nix develop --no-update-lock-file --command uv venv "$RUNNER_TEMP/blt-ml"
+          nix develop --no-update-lock-file --command uv pip install --python "$RUNNER_TEMP/blt-ml/bin/python" --index-url https://download.pytorch.org/whl/cpu torch==2.14.1
+          nix develop --no-update-lock-file --command uv pip install --python "$RUNNER_TEMP/blt-ml/bin/python" onnx==1.23.2 numpy==2.5.3 basilisp==0.5.1
+      - name: Validate real ML programs and reviewed typing limits
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_ml_packages.py --python "$RUNNER_TEMP/blt-ml/bin/python" --baseline scripts/ml_typing_baseline.json --output "$RUNNER_TEMP/blt-python-reports/ml.json"
+      - name: Exercise generated training and inference projects
+        run: |
+          nix develop --no-update-lock-file --command uv run --locked python scripts/generate_ml_projects.py --output "$RUNNER_TEMP/blt-ml-generated" --size 16
+          nix develop --no-update-lock-file --command uv run --locked python scripts/check_ml_packages.py --python "$RUNNER_TEMP/blt-ml/bin/python" --manifest "$RUNNER_TEMP/blt-ml-generated/cases.json" --case-timeout 600 --output "$RUNNER_TEMP/blt-python-reports/generated.json"
+      - name: Fetch and inventory pinned Python typing fixtures
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_python_typing.py --corpus "$RUNNER_TEMP/blt-typing" --provider typing --fetch --inventory-only --output "$RUNNER_TEMP/blt-python-reports/typing-inventory.json"
+      - name: Compare upstream constructor and generic contracts
+        run: |
+          for fixture in dataclasses_kwonly dataclasses_transform_class dataclasses_transform_field generics_basic; do
+            nix develop --no-update-lock-file --command uv run --locked python scripts/check_python_typing.py --corpus "$RUNNER_TEMP/blt-typing" --provider typing --fixture "$fixture.py" --require-resolved --output "$RUNNER_TEMP/blt-python-reports/$fixture.json"
+          done
+          nix develop --no-update-lock-file --command uv run --locked python - "$RUNNER_TEMP/blt-python-reports" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          expected = {"dataclasses_kwonly": 17, "dataclasses_transform_class": 8,
+                      "dataclasses_transform_field": 5, "generics_basic": 6}
+          for name, count in expected.items():
+              report = json.loads((Path(sys.argv[1]) / (name + ".json")).read_text())
+              assert report["counts"].get("passed", 0) == count, (name, report["counts"])
+              assert not any(report["counts"].get(key, 0) for key in ("unknown", "failed", "error")), (name, report["counts"])
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: python-interop-reports
+          path: ${{ runner.temp }}/blt-python-reports/
+          if-no-files-found: warn
+
   compatibility:
     name: Compare with upstream tools
     runs-on: ubuntu-24.04

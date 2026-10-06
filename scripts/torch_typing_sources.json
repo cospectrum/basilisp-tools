@@ -1,0 +1,127 @@
+{
+  "repository": "https://github.com/pytorch/pytorch",
+  "release": "v2.14.1",
+  "directory": "test/typing",
+  "files": [
+    {
+      "path": "pass/arithmetic_ops.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/arithmetic_ops.py",
+      "sha256": "4a878a60bd6f81b9acc070d46eb1c6aa57ba67b5fdff9295c25d1c968a426cb4"
+    },
+    {
+      "path": "pass/creation_ops.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/creation_ops.py",
+      "sha256": "eb80fa7e19905d7598bf81a914ec5cdb4e1502c1c6f171ad7a13217abc90636c"
+    },
+    {
+      "path": "pass/cuda_steam.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/cuda_steam.py",
+      "sha256": "aea8bfca92e3d85893ccd69e3eca449efb1d5b61fac2a73bd9352e538ed32b12"
+    },
+    {
+      "path": "pass/disabled_jit.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/disabled_jit.py",
+      "sha256": "85c96d1e8c5676f4e91671a5cc097cf7a9004ce896db1aed6c4b5b796125bf0c"
+    },
+    {
+      "path": "pass/distributions.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/distributions.py",
+      "sha256": "00c69c3138718f976592d8fd327457bd8dd9ebbdcd2038cdb81e89b6833fe0fc"
+    },
+    {
+      "path": "pass/dynamo_utils.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/dynamo_utils.py",
+      "sha256": "b3bc4a920cc47134a9adf06d5e79dfc9416560b6a94682c603894f10c0d494c3"
+    },
+    {
+      "path": "pass/math_ops.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/math_ops.py",
+      "sha256": "2a54505c5c919513b7d27e5dfa96c26526a2c0749710338d3d8e4ad8862480de"
+    },
+    {
+      "path": "pass/torch_size.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/pass/torch_size.py",
+      "sha256": "13dda6abb176d71dbeb837529cddc4c0e49c4eed0dccb8925c3e87c0d8275e64"
+    },
+    {
+      "path": "fail/arithmetic_ops.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/fail/arithmetic_ops.py",
+      "sha256": "0307259fe6f39175392bf20a59e833bdb65bbc630d9dc25278d2482c870ff20c"
+    },
+    {
+      "path": "fail/creation_ops.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/fail/creation_ops.py",
+      "sha256": "9cdb950245a809571419e13010e9bb039776f6bab61543db38cc949cde35c251"
+    },
+    {
+      "path": "fail/disabled_bitwise_ops.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/fail/disabled_bitwise_ops.py",
+      "sha256": "7fd23c791c3cd07f5434f84d07a820ffe36421f7e3966b19e72019afee8b0e61"
+    },
+    {
+      "path": "fail/random.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/fail/random.py",
+      "sha256": "79aa7b05f1a21140bfd61c1ab7b10cd03a2979b050be5cb8aa05a55c094851ef"
+    },
+    {
+      "path": "fail/torch_size.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/fail/torch_size.py",
+      "sha256": "c68093397747e29cd57124693dd20770f5f7c5e75293b8ba7fcfd0d12ce85bd1"
+    },
+    {
+      "path": "reveal/module_list.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/module_list.py",
+      "sha256": "f7af158a4eb93b161c64275ddcb0ccf473b647fb8384e365aa1c20b2f1d959f1"
+    },
+    {
+      "path": "reveal/namedtuple.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/namedtuple.py",
+      "sha256": "7a988d06595dff95a4eb230ef5d6b389ef0c962b694f8ccd374c19f4ff2cd0d7"
+    },
+    {
+      "path": "reveal/opt_size.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/opt_size.py",
+      "sha256": "5e08fa35d50098fc557f4994499e23efb9c6dfefea6481e4dcef2f8cd44e477e"
+    },
+    {
+      "path": "reveal/size.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/size.py",
+      "sha256": "6250294c448333638398c7512ca77db8b0c178d1ad10df4c051798e41908a7ff"
+    },
+    {
+      "path": "reveal/tensor_constructors.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/tensor_constructors.py",
+      "sha256": "854c00c90f6507c086c4124ee7febb58ac657ea7d2a7faf89326d120d77d7675"
+    },
+    {
+      "path": "reveal/tensor_copy.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/tensor_copy.py",
+      "sha256": "504ea4e7a2154c1d2b470b2350ade1859655d4ad8ff7a14738b6e46a2eb62588"
+    },
+    {
+      "path": "reveal/tensor_sampling.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/tensor_sampling.py",
+      "sha256": "15ad05bd68fcbae4087191fc5622d8e5c91bdaab66bb48ea7665ff4f152fcb6e"
+    },
+    {
+      "path": "reveal/torch_optim.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/reveal/torch_optim.py",
+      "sha256": "4237d55233e91a4178cb1cbcd09173d9801e0499e1d977c654e2dbe6dbdb4f9f"
+    }
+  ],
+  "runtime_driver": {
+    "path": "test_python_operators.py",
+    "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/typing/test_python_operators.py",
+    "sha256": "c927b82c6ebb51a806329203a67692724cedea9f9664ef58c8b1bf995ed602d5"
+  },
+  "license": {
+    "path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/LICENSE",
+    "sha256": "bd018feef8825e88181c84eb7e3aa4eafb8f08a20d9fd6ef948569610c4a3e43"
+  },
+  "typing_driver": {
+    "path": "test_typing.py",
+    "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/test_typing.py",
+    "sha256": "618e603e63c3920c870f5473e6849186a77763ec64d5fb3c2549db2617accf51"
+  }
+}

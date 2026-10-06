@@ -1,0 +1,3495 @@
+{
+  "schema_version": 1,
+  "scope": "CPU ML consumer programs and adapted Torch release typing expressions; unknowns remain failures.",
+  "source": {
+    "baseline_commit": "4240b2edf7b37560c69916830004a999f1a95dff",
+    "candidate_commit": "f21a456cbb3974ac532602cbd19fa9878a1daad6",
+    "baseline_sha256": {
+      "analyzer.lpy": "50eda308732b94ba285565af91607748d9726709bfe1b4c8cb92c8eddc4fa3e1",
+      "python.lpy": "0244720dd2ef5490b84e8a2d602b3db1f594bef99cdc8a6d6146f88161234619",
+      "_inspect.py": "f3ddbd8a89a438324b71a9603680f34056c7041a034486c116d40d65b20db1f2"
+    },
+    "candidate_sha256": {
+      "analyzer.lpy": "8b135422e27ad1db2421be4596ad112378de0397b5febff9029b170eecc1c6c9",
+      "python.lpy": "e3385c41b4617e81950ac50b66e6c4372e09784fd11387576c685d3045145c93",
+      "_inspect.py": "9c933a5b6eba421c7797d79800785372f6863b67039f7ffff7973dd3d275ff31"
+    }
+  },
+  "reproduction_harness_sha256": {
+    "scripts/check_ml_packages.py": "489ff7473e9acd7b5f2a1dec0f3030cb76bcb0aaac90b15309380683c6d32be0",
+    "scripts/check_torch_upstream.py": "dc87af0ddb027a596064293334ee220ae7569a77cbf8d4e1fa58c90f4db40613",
+    "scripts/generate_ml_projects.py": "ec4f7d7d00b05b8070763bb24c5b576aebf777790a7c3ccbaaa96f5a5f36a49e"
+  },
+  "environment": {
+    "python": "3.13.2 (main, Feb 12 2025, 14:59:08) [Clang 19.1.6 ]",
+    "platform": "darwin",
+    "versions": {
+      "torch": "2.14.1",
+      "onnx": "1.23.2",
+      "numpy": "2.5.3",
+      "basilisp": "0.5.1"
+    },
+    "device": "CPU",
+    "audit_python_timeout_seconds": 30
+  },
+  "ml_packages": {
+    "baseline": {
+      "cases": 35,
+      "positive_cases": 22,
+      "negative_cases": 13,
+      "failed_cases": 21,
+      "unresolved_signatures": 9,
+      "unresolved_returns": 9,
+      "positive_diagnostic_cases": 0,
+      "missed_negative_cases": 10,
+      "unresolved_member_cases": 11
+    },
+    "candidate": {
+      "cases": 35,
+      "positive_cases": 22,
+      "negative_cases": 13,
+      "failed_cases": 3,
+      "unresolved_signatures": 0,
+      "unresolved_returns": 0,
+      "positive_diagnostic_cases": 0,
+      "missed_negative_cases": 2,
+      "unresolved_member_cases": 1
+    },
+    "same_sources": true,
+    "strict_audit_passed": false,
+    "reviewed_baseline_gate_passed": true,
+    "reviewed_baseline": {
+      "path": "scripts/ml_typing_baseline.json",
+      "sha256": "0e65eb2da19ea09a1ce54753204f07a1fb7dc877c05136ac321ce9e461427e8a",
+      "allowed_failures": [
+        {
+          "case": "distribution-multivariate",
+          "reason": "Result member metadata was not resolved",
+          "explanation": "MultivariateNormal.covariance_matrix uses a custom lazy_property descriptor. Its Tensor receiver type is not recovered, so the subsequent numel member remains unknown despite valid native execution."
+        },
+        {
+          "case": "onnx-model-bad-graph",
+          "reason": "Known invalid argument was not diagnosed",
+          "explanation": "The GraphProto annotation resolves through generated protobuf stubs without enough nominal dispatch evidence to reject a string. Native make_model rejects that string."
+        },
+        {
+          "case": "onnx-array-bad-value",
+          "reason": "Known invalid argument was not diagnosed",
+          "explanation": "The ndarray stub reference does not prove nominal incompatibility with a Python list. Native numpy_helper.from_array rejects the list."
+        }
+      ]
+    },
+    "cases": [
+      {
+        "name": "tensor",
+        "source_sha256": "96787d0f1f0aa9d4df8ab7ba9a15c2ff98d5ebd30176d9a9152dabef14bfa409",
+        "source_bytes": 101,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "factory-device",
+        "source_sha256": "7d0a75cc6cf0dd7f48fa5f39e2c2d67b89302b8bea5531927c8b46453b5dfc4a",
+        "source_bytes": 124,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-method",
+        "source_sha256": "ab9b92f99e78caaf1c0f421ef0ed36ac6e1717b3b02c47899138002445c285fa",
+        "source_bytes": 93,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-to",
+        "source_sha256": "e81e29a77293e972255afb0c1d39b93049af0c243439838101cc9f983090cd8c",
+        "source_bytes": 126,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-add",
+        "source_sha256": "cf257d94e41043de781c078625391e8d4dc4ab6bafe61263f35f539e71df3a4c",
+        "source_bytes": 110,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-matmul",
+        "source_sha256": "9a394ff936103fc51c83e5e44885d3956d1c91c448da27af9ae002f9ff19b679",
+        "source_bytes": 108,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "24",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-native-add",
+        "source_sha256": "546be1d951e24995f6932a2d4c420037e824b2359fdb7b8d1b39d317945d6d3d",
+        "source_bytes": 97,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "4",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-native-sub",
+        "source_sha256": "9c9ee486bc2b8579390b3c3caa70a2da65aef5ef77ced822630e6fa6e03a5e89",
+        "source_bytes": 97,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "0",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-native-mul",
+        "source_sha256": "1472ca91c448dbc48c61afff4aeb01d7db28e20e165504a79c94f2fdf181b29e",
+        "source_bytes": 97,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "2",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "nn-linear",
+        "source_sha256": "79e379e0651d8e82301c5e44dbc1f774713e5545a66ffa293d01af609311a0d3",
+        "source_bytes": 110,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true
+        },
+        "native": {
+          "value": "2",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "nn-functional",
+        "source_sha256": "be0b64e83cecc6d6d4e44dbca489b251ec06a492c22275c6035311ca524ddaad",
+        "source_bytes": 142,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "5",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "optimizer",
+        "source_sha256": "c888d5d6fd9e9573e5002b68694936aa7fa5a949f3721d9945847be7baf8ce31",
+        "source_bytes": 217,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "1",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "training-step",
+        "source_sha256": "95693f50a2f8c84690dcaebab8e49f0bb5891dff4894bc0ef7f2e7a61cd73a91",
+        "source_bytes": 279,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "4",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "data-loader",
+        "source_sha256": "abb6e6aadc4d0ba135776e52f2b45ae933aaab679c37429f69165f79dce70e76",
+        "source_bytes": 220,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true
+        },
+        "native": {
+          "value": "4",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "no-grad",
+        "source_sha256": "04a5e29baace86235222fc6093ada3770a640061bd30efc55c1270888ce61918",
+        "source_bytes": 102,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "2",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-array",
+        "source_sha256": "d238f89d638b281052e8f24872ee7ea76c9086ba6a71502388e9e671dd9b14e0",
+        "source_bytes": 173,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-node",
+        "source_sha256": "c125dd8bf2da1af17ef7e47aa1ad2e3d564b91adf055cd419ab2e54eee11f337",
+        "source_bytes": 120,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "\"Add\"",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-graph",
+        "source_sha256": "6a87eccee93966655e870a61a9419f1ac19d95e5a3040bd19c1b0929cd242654",
+        "source_bytes": 526,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "\"identity\"",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-reference",
+        "source_sha256": "8775bcfba0696208517ff22668294b03b9d015076f88b87340928a8b1273cbba",
+        "source_bytes": 332,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "10",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-size",
+        "source_sha256": "f83a31ac0953a24a331a94f6a6ad153ca9d3391bc7069c42d3e0d1064096f8c2",
+        "source_bytes": 84,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "distribution-normal",
+        "source_sha256": "684c5de69ae92d640468ee394585dc7fca7536cb572511d2a95db24d4a1c2dc4",
+        "source_bytes": 134,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "0",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "distribution-multivariate",
+        "source_sha256": "4efe8659fa3be0d34989feb94ce5d20ce8b42e91d17a87827023f28db8e89648",
+        "source_bytes": 200,
+        "failures": [
+          "Result member metadata was not resolved"
+        ],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": false
+        },
+        "native": {
+          "value": "4",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-missing-argument",
+        "source_sha256": "4bc8d42e5cb29bfede81eb5f537dcf6ae394853a1c4e5b45a4426b16502ff521",
+        "source_bytes": 71,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "tensor() missing 1 required positional arguments: \"data\""
+        },
+        "findings": [
+          [
+            {
+              "start": 56,
+              "col": 1,
+              "type": "invalid-arity",
+              "end": 70,
+              "end-col": 15,
+              "message": "Missing required Python argument 'data'",
+              "filename": "tensor_missing_argument.lpy",
+              "row": 2,
+              "level": "error",
+              "end-row": 2
+            }
+          ],
+          [
+            {
+              "start": 56,
+              "col": 1,
+              "type": "invalid-arity",
+              "end": 70,
+              "end-col": 15,
+              "message": "Missing required Python argument 'data'",
+              "filename": "tensor_missing_argument.lpy",
+              "row": 2,
+              "level": "error",
+              "end-row": 2
+            }
+          ]
+        ]
+      },
+      {
+        "name": "tensor-bad-size",
+        "source_sha256": "9ab37bfa4e649c07148b25b5147bd7e82aeebbfb0fb20f984dfb201fa9c789b8",
+        "source_bytes": 67,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "ones(): argument 'size' (position 1) must be tuple of ints, not str"
+        },
+        "findings": [
+          [
+            {
+              "type": "type-mismatch",
+              "row": 2,
+              "end": 66,
+              "col": 1,
+              "end-row": 2,
+              "message": "No Python signature accepts argument types (Literal['bad'])",
+              "level": "error",
+              "start": 48,
+              "filename": "tensor_bad_size.lpy",
+              "end-col": 19
+            }
+          ],
+          [
+            {
+              "type": "type-mismatch",
+              "row": 2,
+              "end": 66,
+              "col": 1,
+              "end-row": 2,
+              "message": "No Python signature accepts argument types (Literal['bad'])",
+              "level": "error",
+              "start": 48,
+              "filename": "tensor_bad_size.lpy",
+              "end-col": 19
+            }
+          ]
+        ]
+      },
+      {
+        "name": "tensor-bad-operand",
+        "source_sha256": "b4c4a6df59f582be2536e01aeb0fddf6cd955337519914ae688f028beefdb8a1",
+        "source_bytes": 84,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "add(): argument 'other' (position 2) must be Tensor, not str"
+        },
+        "findings": [
+          [
+            {
+              "end-row": 2,
+              "end": 83,
+              "type": "type-mismatch",
+              "message": "No Python signature accepts argument types (torch._tensor.Tensor, Literal['bad'])",
+              "end-col": 33,
+              "level": "error",
+              "start": 51,
+              "col": 1,
+              "filename": "tensor_bad_operand.lpy",
+              "row": 2
+            }
+          ],
+          [
+            {
+              "end-row": 2,
+              "end": 83,
+              "type": "type-mismatch",
+              "message": "No Python signature accepts argument types (torch._tensor.Tensor, Literal['bad'])",
+              "end-col": 33,
+              "level": "error",
+              "start": 51,
+              "col": 1,
+              "filename": "tensor_bad_operand.lpy",
+              "row": 2
+            }
+          ]
+        ]
+      },
+      {
+        "name": "linear-bad-size",
+        "source_sha256": "07508f36054b39929d98cf4e6f06b4834f0523a620b00cb0b5ee74e098da6c78",
+        "source_bytes": 78,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "empty(): argument 'size' failed to unpack the object at pos 2 with error \"type must be tuple of ints,but got str\""
+        },
+        "findings": [
+          [
+            {
+              "start": 58,
+              "end-row": 2,
+              "message": "No Python signature accepts argument types (Literal['bad'], Literal[2])",
+              "col": 1,
+              "end-col": 20,
+              "row": 2,
+              "filename": "linear_bad_size.lpy",
+              "level": "error",
+              "type": "type-mismatch",
+              "end": 77
+            }
+          ],
+          [
+            {
+              "start": 58,
+              "end-row": 2,
+              "message": "No Python signature accepts argument types (Literal['bad'], Literal[2])",
+              "col": 1,
+              "end-col": 20,
+              "row": 2,
+              "filename": "linear_bad_size.lpy",
+              "level": "error",
+              "type": "type-mismatch",
+              "end": 77
+            }
+          ]
+        ]
+      },
+      {
+        "name": "functional-missing-input",
+        "source_sha256": "c1b085878b70b1297b9e4656c986edb5a42405a15e724f69d408adf8b022870a",
+        "source_bytes": 104,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "relu() missing 1 required positional argument: 'input'"
+        },
+        "findings": [
+          [
+            {
+              "start": 86,
+              "level": "error",
+              "end-row": 2,
+              "col": 1,
+              "message": "Missing required Python argument 'input'",
+              "end-col": 18,
+              "end": 103,
+              "filename": "functional_missing_input.lpy",
+              "row": 2,
+              "type": "invalid-arity"
+            }
+          ],
+          [
+            {
+              "start": 86,
+              "level": "error",
+              "end-row": 2,
+              "col": 1,
+              "message": "Missing required Python argument 'input'",
+              "end-col": 18,
+              "end": 103,
+              "filename": "functional_missing_input.lpy",
+              "row": 2,
+              "type": "invalid-arity"
+            }
+          ]
+        ]
+      },
+      {
+        "name": "onnx-node-bad-name",
+        "source_sha256": "acfc189d8d482b02624c99dd772df281bfadb42dda4755e214d5b4711b6b8103",
+        "source_bytes": 104,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "bad argument type for built-in operation"
+        },
+        "findings": [
+          [
+            {
+              "level": "error",
+              "end-col": 36,
+              "message": "No Python signature accepts argument types (Literal[42], list[Any], list[Any])",
+              "end-row": 2,
+              "filename": "onnx_node_bad_name.lpy",
+              "end": 103,
+              "col": 1,
+              "start": 68,
+              "type": "type-mismatch",
+              "row": 2
+            }
+          ],
+          [
+            {
+              "level": "error",
+              "end-col": 36,
+              "message": "No Python signature accepts argument types (Literal[42], list[Any], list[Any])",
+              "end-row": 2,
+              "filename": "onnx_node_bad_name.lpy",
+              "end": 103,
+              "col": 1,
+              "start": 68,
+              "type": "type-mismatch",
+              "row": 2
+            }
+          ]
+        ]
+      },
+      {
+        "name": "onnx-model-bad-graph",
+        "source_sha256": "8949b89a22ca2891e8ad38779d867f9ed23be38cfdc1d9a1a57d72a391bb7004",
+        "source_bytes": 96,
+        "failures": [
+          "Known invalid argument was not diagnosed"
+        ],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "Parameter to CopyFrom() must be instance of same class: expected <class 'onnx.onnx_ml_pb2.GraphProto'> got <class 'str'>."
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-array-bad-value",
+        "source_sha256": "50b62216b13de0275f9d00d8cd9170cababbd21499b2ce8a8450690b07e1e41c",
+        "source_bytes": 106,
+        "failures": [
+          "Known invalid argument was not diagnosed"
+        ],
+        "coverage": {},
+        "native": {
+          "exception": "AttributeError",
+          "message": "'list' object has no attribute 'shape'"
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "tensor-bad-dtype",
+        "source_sha256": "f03abb20d4c23f0907e906168eaeeb08d1b7870b42a9ebaecf955476b0df77b4",
+        "source_bytes": 90,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "tensor(): argument 'dtype' must be torch.dtype, not str"
+        },
+        "findings": [
+          [
+            {
+              "filename": "tensor_bad_dtype.lpy",
+              "col": 1,
+              "start": 49,
+              "row": 2,
+              "end-row": 2,
+              "level": "error",
+              "end": 89,
+              "message": "No Python signature accepts argument types (list[int], dtype=Literal['int32'])",
+              "end-col": 41,
+              "type": "type-mismatch"
+            }
+          ],
+          [
+            {
+              "filename": "tensor_bad_dtype.lpy",
+              "col": 1,
+              "start": 49,
+              "row": 2,
+              "end-row": 2,
+              "level": "error",
+              "end": 89,
+              "message": "No Python signature accepts argument types (list[int], dtype=Literal['int32'])",
+              "end-col": 41,
+              "type": "type-mismatch"
+            }
+          ]
+        ]
+      },
+      {
+        "name": "ones-bad-dtype",
+        "source_sha256": "84e0db9fe65500d7e7d00bb55c7a3800957a13c336fb28b41375f167089539b6",
+        "source_bytes": 80,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "ones(): argument 'dtype' must be torch.dtype, not str"
+        },
+        "findings": [
+          [
+            {
+              "type": "type-mismatch",
+              "end": 79,
+              "row": 2,
+              "end-col": 33,
+              "filename": "ones_bad_dtype.lpy",
+              "message": "No Python signature accepts argument types (Literal[3], dtype=Literal['int32'])",
+              "end-row": 2,
+              "level": "error",
+              "start": 47,
+              "col": 1
+            }
+          ],
+          [
+            {
+              "type": "type-mismatch",
+              "end": 79,
+              "row": 2,
+              "end-col": 33,
+              "filename": "ones_bad_dtype.lpy",
+              "message": "No Python signature accepts argument types (Literal[3], dtype=Literal['int32'])",
+              "end-row": 2,
+              "level": "error",
+              "start": 47,
+              "col": 1
+            }
+          ]
+        ]
+      },
+      {
+        "name": "zeros-bad-dtype",
+        "source_sha256": "32ed8b5fe3420dcbd8a96516370486b628d0bf500d43aca9d2178e95252b16c3",
+        "source_bytes": 82,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "zeros(): argument 'dtype' must be torch.dtype, not str"
+        },
+        "findings": [
+          [
+            {
+              "filename": "zeros_bad_dtype.lpy",
+              "message": "No Python signature accepts argument types (Literal[3], dtype=Literal['int32'])",
+              "end-row": 2,
+              "row": 2,
+              "col": 1,
+              "end-col": 34,
+              "level": "error",
+              "type": "type-mismatch",
+              "start": 48,
+              "end": 81
+            }
+          ],
+          [
+            {
+              "filename": "zeros_bad_dtype.lpy",
+              "message": "No Python signature accepts argument types (Literal[3], dtype=Literal['int32'])",
+              "end-row": 2,
+              "row": 2,
+              "col": 1,
+              "end-col": 34,
+              "level": "error",
+              "type": "type-mismatch",
+              "start": 48,
+              "end": 81
+            }
+          ]
+        ]
+      },
+      {
+        "name": "rng-bad-state",
+        "source_sha256": "7225f5dda383f27ec96bded1b162637655375a3796e05dbcad466cc635cab84a",
+        "source_bytes": 80,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "expected a torch.ByteTensor, but got list"
+        },
+        "findings": [
+          [
+            {
+              "end-col": 34,
+              "message": "No Python signature accepts argument types (list[int])",
+              "type": "type-mismatch",
+              "filename": "rng_bad_state.lpy",
+              "level": "error",
+              "start": 46,
+              "end": 79,
+              "col": 1,
+              "end-row": 2,
+              "row": 2
+            }
+          ],
+          [
+            {
+              "end-col": 34,
+              "message": "No Python signature accepts argument types (list[int])",
+              "type": "type-mismatch",
+              "filename": "rng_bad_state.lpy",
+              "level": "error",
+              "start": 46,
+              "end": 79,
+              "col": 1,
+              "end-row": 2,
+              "row": 2
+            }
+          ]
+        ]
+      },
+      {
+        "name": "size-bad-add",
+        "source_sha256": "2037a29ab9a4b88223b0e9403f44cf4474703bade6a37820bc916483430ab2a1",
+        "source_bytes": 86,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "torch.Size() takes an iterable of 'int' (item 3 is 'str')"
+        },
+        "findings": [
+          [
+            {
+              "end-row": 2,
+              "end": 84,
+              "start": 73,
+              "row": 2,
+              "type": "type-mismatch",
+              "col": 29,
+              "level": "error",
+              "message": "No Python signature accepts argument types (tuple[Literal['foo']])",
+              "end-col": 40,
+              "filename": "size_bad_add.lpy"
+            }
+          ],
+          [
+            {
+              "end-row": 2,
+              "end": 84,
+              "start": 73,
+              "row": 2,
+              "type": "type-mismatch",
+              "col": 29,
+              "level": "error",
+              "message": "No Python signature accepts argument types (tuple[Literal['foo']])",
+              "end-col": 40,
+              "filename": "size_bad_add.lpy"
+            }
+          ]
+        ]
+      }
+    ],
+    "evidence": [
+      {
+        "filename": "ml-baseline-complete.json",
+        "sha256": "9d69ebf17525d29ed1d37a05628ad610ccd657f6e3b19fc5222eb72a9fa7d12b"
+      },
+      {
+        "filename": "ml-final.json",
+        "sha256": "a2c7f12d583e7bc94993175f0355d43f08b1feba682d74cfce212090898d2a4d"
+      },
+      {
+        "filename": "ml-baseline-validation.json",
+        "sha256": "954a19a1e73bd15ba5a72d9c5673f0c55a441839ab613958046bb8ebad5c8a20"
+      }
+    ]
+  },
+  "torch_upstream": {
+    "repository": "https://github.com/pytorch/pytorch",
+    "release": "v2.14.1",
+    "scope": {
+      "selected_files": [
+        "pass/arithmetic_ops.py",
+        "pass/creation_ops.py",
+        "pass/cuda_steam.py",
+        "pass/disabled_jit.py",
+        "pass/distributions.py",
+        "pass/dynamo_utils.py",
+        "pass/math_ops.py",
+        "pass/torch_size.py",
+        "fail/arithmetic_ops.py",
+        "fail/creation_ops.py",
+        "fail/disabled_bitwise_ops.py",
+        "fail/random.py",
+        "fail/torch_size.py",
+        "reveal/module_list.py",
+        "reveal/namedtuple.py",
+        "reveal/opt_size.py",
+        "reveal/size.py",
+        "reveal/tensor_constructors.py",
+        "reveal/tensor_copy.py",
+        "reveal/tensor_sampling.py",
+        "reveal/torch_optim.py",
+        "runtime_operators.py"
+      ],
+      "available_files": [
+        "pass/arithmetic_ops.py",
+        "pass/creation_ops.py",
+        "pass/cuda_steam.py",
+        "pass/disabled_jit.py",
+        "pass/distributions.py",
+        "pass/dynamo_utils.py",
+        "pass/math_ops.py",
+        "pass/torch_size.py",
+        "fail/arithmetic_ops.py",
+        "fail/creation_ops.py",
+        "fail/disabled_bitwise_ops.py",
+        "fail/random.py",
+        "fail/torch_size.py",
+        "reveal/module_list.py",
+        "reveal/namedtuple.py",
+        "reveal/opt_size.py",
+        "reveal/size.py",
+        "reveal/tensor_constructors.py",
+        "reveal/tensor_copy.py",
+        "reveal/tensor_sampling.py",
+        "reveal/torch_optim.py",
+        "runtime_operators.py"
+      ],
+      "complete_inventory_selected": true,
+      "boundary": "Translated consumer expressions and explicit narrowing branches; original Python fixtures retained."
+    },
+    "same_adapted_sources": true,
+    "manifest_used_sha256": "b6a632184206cdf196cd71bdb0f7aa5cc7981d152cd6b077d4f46a6ee047e6f7",
+    "current_manifest": {
+      "path": "scripts/torch_typing_sources.json",
+      "sha256": "ceab49d23bab6b57db465ef15e66bee41426650af993fb0cbd659296f8a7c641"
+    },
+    "provenance_note": "The official typing driver was added as provenance after the full replay started. The exact original manifest digest is retained; inventory/hash verification covered the final manifest without another full replay.",
+    "license": {
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/LICENSE",
+      "sha256": "bd018feef8825e88181c84eb7e3aa4eafb8f08a20d9fd6ef948569610c4a3e43"
+    },
+    "typing_driver": {
+      "path": "test_typing.py",
+      "url": "https://raw.githubusercontent.com/pytorch/pytorch/v2.14.1/test/test_typing.py",
+      "sha256": "618e603e63c3920c870f5473e6849186a77763ec64d5fb3c2549db2617accf51"
+    },
+    "extra_disabled_files": [
+      "pass/disabled_jit.py",
+      "fail/disabled_bitwise_ops.py"
+    ],
+    "runtime_rejected_without_explicit_negative_oracle": {
+      "upstream_examples": 46,
+      "operator_matrix": 76,
+      "note": "Explicit static type assertions remain checked separately; runtime rejection does not itself prove a static type error."
+    },
+    "baseline": {
+      "files": 22,
+      "statements": 1028,
+      "adapted": 969,
+      "unadapted": 0,
+      "native_valid_positives": 837,
+      "native_rejected_negatives": 10,
+      "native_rejected_upstream_positives": 122,
+      "native_accepted_upstream_negatives": 0,
+      "positive_diagnostic_cases": 10,
+      "negative_misses": 10,
+      "inferred_type_assertions": 550,
+      "unresolved_type_assertions": 509,
+      "incorrect_type_assertions": 4,
+      "upstream_type_assertions_disagree_runtime": 12,
+      "runtime_type_mismatches": 0,
+      "native_rejected_type_assertions": 44,
+      "native_rejected_unresolved_type_assertions": 44,
+      "native_rejected_type_mismatches": 0,
+      "native_rejected_assertion_diagnostics": 2,
+      "analysis_failures": 0,
+      "analysis_internal_failures": 0,
+      "unattributed_diagnostics": 0,
+      "runtime_adapter_mismatches": 0,
+      "unexercised_python_functions": 1
+    },
+    "candidate": {
+      "files": 22,
+      "statements": 1028,
+      "adapted": 969,
+      "unadapted": 0,
+      "native_valid_positives": 837,
+      "native_rejected_negatives": 10,
+      "native_rejected_upstream_positives": 122,
+      "native_accepted_upstream_negatives": 0,
+      "positive_diagnostic_cases": 0,
+      "negative_misses": 5,
+      "inferred_type_assertions": 550,
+      "unresolved_type_assertions": 362,
+      "incorrect_type_assertions": 3,
+      "upstream_type_assertions_disagree_runtime": 12,
+      "runtime_type_mismatches": 0,
+      "native_rejected_type_assertions": 44,
+      "native_rejected_unresolved_type_assertions": 42,
+      "native_rejected_type_mismatches": 0,
+      "native_rejected_assertion_diagnostics": 0,
+      "analysis_failures": 0,
+      "analysis_internal_failures": 0,
+      "unattributed_diagnostics": 0,
+      "runtime_adapter_mismatches": 0,
+      "unexercised_python_functions": 1
+    },
+    "runtime_disagreement_assertions": {
+      "total": 12,
+      "candidate_concrete": 0,
+      "candidate_unknown": 12,
+      "note": "No concrete inferred result is validated for these rows; all remain included in unresolved_type_assertions."
+    },
+    "strict_audit_passed": false,
+    "files": [
+      {
+        "filename": "pass/arithmetic_ops.py",
+        "upstream_sha256": "4a878a60bd6f81b9acc070d46eb1c6aa57ba67b5fdff9295c25d1c968a426cb4",
+        "adapted_source_sha256": "3746d6058b78a4e87d3931113e559d80e2a3e9537cc18e8085f595e5da6dee88",
+        "baseline": {
+          "files": 1,
+          "statements": 251,
+          "adapted": 246,
+          "unadapted": 0,
+          "native_valid_positives": 202,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 44,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 10,
+          "negative_misses": 0,
+          "inferred_type_assertions": 200,
+          "unresolved_type_assertions": 194,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 12,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 44,
+          "native_rejected_unresolved_type_assertions": 44,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 2,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 251,
+          "adapted": 246,
+          "unadapted": 0,
+          "native_valid_positives": 202,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 44,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 200,
+          "unresolved_type_assertions": 150,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 12,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 44,
+          "native_rejected_unresolved_type_assertions": 42,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "pass/creation_ops.py",
+        "upstream_sha256": "eb80fa7e19905d7598bf81a914ec5cdb4e1502c1c6f171ad7a13217abc90636c",
+        "adapted_source_sha256": "f988b3350b2873d46222150fde89533d863edc931f4aa1af2f15b60352901e45",
+        "baseline": {
+          "files": 1,
+          "statements": 71,
+          "adapted": 65,
+          "unadapted": 0,
+          "native_valid_positives": 65,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 1,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 71,
+          "adapted": 65,
+          "unadapted": 0,
+          "native_valid_positives": 65,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 1,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "pass/cuda_steam.py",
+        "upstream_sha256": "aea8bfca92e3d85893ccd69e3eca449efb1d5b61fac2a73bd9352e538ed32b12",
+        "adapted_source_sha256": "be12b79912a570fef29f21bc28687ac8882dc2b15afc40790481e13aadd64b2b",
+        "baseline": {
+          "files": 1,
+          "statements": 2,
+          "adapted": 0,
+          "unadapted": 0,
+          "native_valid_positives": 0,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 1
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 2,
+          "adapted": 0,
+          "unadapted": 0,
+          "native_valid_positives": 0,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 1
+        }
+      },
+      {
+        "filename": "pass/disabled_jit.py",
+        "upstream_sha256": "85c96d1e8c5676f4e91671a5cc097cf7a9004ce896db1aed6c4b5b796125bf0c",
+        "adapted_source_sha256": "e0ec4a08ee67b4fc3d99dac6ed3727944679607dfe7e1a3c9313aed9749ae6ac",
+        "baseline": {
+          "files": 1,
+          "statements": 16,
+          "adapted": 7,
+          "unadapted": 0,
+          "native_valid_positives": 6,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 1,
+          "inferred_type_assertions": 4,
+          "unresolved_type_assertions": 4,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 16,
+          "adapted": 7,
+          "unadapted": 0,
+          "native_valid_positives": 6,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 1,
+          "inferred_type_assertions": 4,
+          "unresolved_type_assertions": 4,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "pass/distributions.py",
+        "upstream_sha256": "00c69c3138718f976592d8fd327457bd8dd9ebbdcd2038cdb81e89b6833fe0fc",
+        "adapted_source_sha256": "451773c50e753dd6a052f59f02dc89f74595a0b1615142b098cc8487076ea497",
+        "baseline": {
+          "files": 1,
+          "statements": 7,
+          "adapted": 4,
+          "unadapted": 0,
+          "native_valid_positives": 4,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 2,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 1,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 7,
+          "adapted": 4,
+          "unadapted": 0,
+          "native_valid_positives": 4,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 2,
+          "unresolved_type_assertions": 1,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "pass/dynamo_utils.py",
+        "upstream_sha256": "b3bc4a920cc47134a9adf06d5e79dfc9416560b6a94682c603894f10c0d494c3",
+        "adapted_source_sha256": "20e16ad1c9824ceb09b4f2e4c4d19769256b75723fb3c32044c2f84059f9284e",
+        "baseline": {
+          "files": 1,
+          "statements": 8,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 3,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 3,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 3,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 8,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 3,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 3,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 3,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "pass/math_ops.py",
+        "upstream_sha256": "2a54505c5c919513b7d27e5dfa96c26526a2c0749710338d3d8e4ad8862480de",
+        "adapted_source_sha256": "7b43c8c10642a48a1ed1a54f1c32a84a487314e2aa05e3968f87855bdd755430",
+        "baseline": {
+          "files": 1,
+          "statements": 163,
+          "adapted": 161,
+          "unadapted": 0,
+          "native_valid_positives": 159,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 2,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 163,
+          "adapted": 161,
+          "unadapted": 0,
+          "native_valid_positives": 159,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 2,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "pass/torch_size.py",
+        "upstream_sha256": "13dda6abb176d71dbeb837529cddc4c0e49c4eed0dccb8925c3e87c0d8275e64",
+        "adapted_source_sha256": "95b1e02f01568c6db8eadf1647a3b330d5652bc579cdd1e5f051a3563be1fa89",
+        "baseline": {
+          "files": 1,
+          "statements": 28,
+          "adapted": 25,
+          "unadapted": 0,
+          "native_valid_positives": 25,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 18,
+          "unresolved_type_assertions": 18,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 28,
+          "adapted": 25,
+          "unadapted": 0,
+          "native_valid_positives": 25,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 18,
+          "unresolved_type_assertions": 10,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "fail/arithmetic_ops.py",
+        "upstream_sha256": "0307259fe6f39175392bf20a59e833bdb65bbc630d9dc25278d2482c870ff20c",
+        "adapted_source_sha256": "eabf2cc19b1cf42294cddc11a6fbfc4679115bdf550a2bd88d9d8c6a13229b94",
+        "baseline": {
+          "files": 1,
+          "statements": 7,
+          "adapted": 4,
+          "unadapted": 0,
+          "native_valid_positives": 1,
+          "native_rejected_negatives": 3,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 3,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 7,
+          "adapted": 4,
+          "unadapted": 0,
+          "native_valid_positives": 1,
+          "native_rejected_negatives": 3,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 3,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "fail/creation_ops.py",
+        "upstream_sha256": "9cdb950245a809571419e13010e9bb039776f6bab61543db38cc949cde35c251",
+        "adapted_source_sha256": "19b3855f6f37a7dbde72aeac52bd8eef350c1c7756a303672a599f4e3c6e37c8",
+        "baseline": {
+          "files": 1,
+          "statements": 4,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 0,
+          "native_rejected_negatives": 3,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 3,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 4,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 0,
+          "native_rejected_negatives": 3,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "fail/disabled_bitwise_ops.py",
+        "upstream_sha256": "7fd23c791c3cd07f5434f84d07a820ffe36421f7e3966b19e72019afee8b0e61",
+        "adapted_source_sha256": "d4b7d4ce43b77415ab15333c4fda78a46841cb217a7a8f7c6c9ba11f794c4196",
+        "baseline": {
+          "files": 1,
+          "statements": 4,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 2,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 1,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 4,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 2,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 1,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "fail/random.py",
+        "upstream_sha256": "79aa7b05f1a21140bfd61c1ab7b10cd03a2979b050be5cb8aa05a55c094851ef",
+        "adapted_source_sha256": "6171552351e7c43d80ec36c495b52d5818b36e9553cef053365c68fc2328cb28",
+        "baseline": {
+          "files": 1,
+          "statements": 2,
+          "adapted": 1,
+          "unadapted": 0,
+          "native_valid_positives": 0,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 1,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 2,
+          "adapted": 1,
+          "unadapted": 0,
+          "native_valid_positives": 0,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "fail/torch_size.py",
+        "upstream_sha256": "c68093397747e29cd57124693dd20770f5f7c5e75293b8ba7fcfd0d12ce85bd1",
+        "adapted_source_sha256": "5e158653d69341413fc7c97c5e37a569da77e2b3905f30943476391458486ff2",
+        "baseline": {
+          "files": 1,
+          "statements": 3,
+          "adapted": 2,
+          "unadapted": 0,
+          "native_valid_positives": 1,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 1,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 3,
+          "adapted": 2,
+          "unadapted": 0,
+          "native_valid_positives": 1,
+          "native_rejected_negatives": 1,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 0,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/module_list.py",
+        "upstream_sha256": "f7af158a4eb93b161c64275ddcb0ccf473b647fb8384e365aa1c20b2f1d959f1",
+        "adapted_source_sha256": "708e5c86283cb08615e58265b9e4461351b7cfb2bea7a140e0de9013c1a7a73a",
+        "baseline": {
+          "files": 1,
+          "statements": 6,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 3,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 1,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 6,
+          "adapted": 3,
+          "unadapted": 0,
+          "native_valid_positives": 3,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 1,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/namedtuple.py",
+        "upstream_sha256": "7a988d06595dff95a4eb230ef5d6b389ef0c962b694f8ccd374c19f4ff2cd0d7",
+        "adapted_source_sha256": "09199e1c5f3748aa8af49a13cbb4327b76f4c6f65cf7a24aa20b1a7e69c96aee",
+        "baseline": {
+          "files": 1,
+          "statements": 11,
+          "adapted": 10,
+          "unadapted": 0,
+          "native_valid_positives": 10,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 1,
+          "unresolved_type_assertions": 1,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 11,
+          "adapted": 10,
+          "unadapted": 0,
+          "native_valid_positives": 10,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 1,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/opt_size.py",
+        "upstream_sha256": "5e08fa35d50098fc557f4994499e23efb9c6dfefea6481e4dcef2f8cd44e477e",
+        "adapted_source_sha256": "a5a4328f936f79bbf09533715b9622fdf46f00a5b38efaf07862f7ec10abfa49",
+        "baseline": {
+          "files": 1,
+          "statements": 9,
+          "adapted": 8,
+          "unadapted": 0,
+          "native_valid_positives": 8,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 4,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 9,
+          "adapted": 8,
+          "unadapted": 0,
+          "native_valid_positives": 8,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 4,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/size.py",
+        "upstream_sha256": "6250294c448333638398c7512ca77db8b0c178d1ad10df4c051798e41908a7ff",
+        "adapted_source_sha256": "82b640236d65f454287b009ac5b67259f17fc89183529d362f6f9254951f2b9b",
+        "baseline": {
+          "files": 1,
+          "statements": 8,
+          "adapted": 7,
+          "unadapted": 0,
+          "native_valid_positives": 7,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 3,
+          "unresolved_type_assertions": 3,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 8,
+          "adapted": 7,
+          "unadapted": 0,
+          "native_valid_positives": 7,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 3,
+          "unresolved_type_assertions": 3,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/tensor_constructors.py",
+        "upstream_sha256": "854c00c90f6507c086c4124ee7febb58ac657ea7d2a7faf89326d120d77d7675",
+        "adapted_source_sha256": "d0a4acd5da6952d751e8d5b59781b7fa010849af16db4fb6f512e6573f40d75d",
+        "baseline": {
+          "files": 1,
+          "statements": 67,
+          "adapted": 61,
+          "unadapted": 0,
+          "native_valid_positives": 61,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 46,
+          "unresolved_type_assertions": 46,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 67,
+          "adapted": 61,
+          "unadapted": 0,
+          "native_valid_positives": 61,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 46,
+          "unresolved_type_assertions": 5,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/tensor_copy.py",
+        "upstream_sha256": "504ea4e7a2154c1d2b470b2350ade1859655d4ad8ff7a14738b6e46a2eb62588",
+        "adapted_source_sha256": "dbbdba535957335e7a49b550b159c9872fcf7819c1de26da01967dc86e6f7ca5",
+        "baseline": {
+          "files": 1,
+          "statements": 9,
+          "adapted": 8,
+          "unadapted": 0,
+          "native_valid_positives": 8,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 4,
+          "unresolved_type_assertions": 4,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 9,
+          "adapted": 8,
+          "unadapted": 0,
+          "native_valid_positives": 8,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 4,
+          "unresolved_type_assertions": 1,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/tensor_sampling.py",
+        "upstream_sha256": "15ad05bd68fcbae4087191fc5622d8e5c91bdaab66bb48ea7665ff4f152fcb6e",
+        "adapted_source_sha256": "d8adde6ce542e6d7629fea17c2fc8e93d8fad6d7c23d12f17327cb43f30234ea",
+        "baseline": {
+          "files": 1,
+          "statements": 27,
+          "adapted": 26,
+          "unadapted": 0,
+          "native_valid_positives": 26,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 21,
+          "unresolved_type_assertions": 15,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 27,
+          "adapted": 26,
+          "unadapted": 0,
+          "native_valid_positives": 26,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 21,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "reveal/torch_optim.py",
+        "upstream_sha256": "4237d55233e91a4178cb1cbcd09173d9801e0499e1d977c654e2dbe6dbdb4f9f",
+        "adapted_source_sha256": "0283a21b6d48f4f12e3ce602c1ec4d98db9c4a7aa29b63bd58ba92ab80b128fd",
+        "baseline": {
+          "files": 1,
+          "statements": 8,
+          "adapted": 6,
+          "unadapted": 0,
+          "native_valid_positives": 6,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 2,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 8,
+          "adapted": 6,
+          "unadapted": 0,
+          "native_valid_positives": 6,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 0,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 2,
+          "unresolved_type_assertions": 0,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      },
+      {
+        "filename": "runtime_operators.py",
+        "upstream_sha256": "3d937a3ea14c6d40e3a97d98a53120cdcb251d0fe2dedc461ea5ab43aeaddbd1",
+        "adapted_source_sha256": "692d1be72cc11816523f11d0b104955744c82637ef9ea359c2c6f5c6bcf7a4cb",
+        "baseline": {
+          "files": 1,
+          "statements": 317,
+          "adapted": 316,
+          "unadapted": 0,
+          "native_valid_positives": 240,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 76,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 240,
+          "unresolved_type_assertions": 224,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        },
+        "candidate": {
+          "files": 1,
+          "statements": 317,
+          "adapted": 316,
+          "unadapted": 0,
+          "native_valid_positives": 240,
+          "native_rejected_negatives": 0,
+          "native_rejected_upstream_positives": 76,
+          "native_accepted_upstream_negatives": 0,
+          "positive_diagnostic_cases": 0,
+          "negative_misses": 0,
+          "inferred_type_assertions": 240,
+          "unresolved_type_assertions": 188,
+          "incorrect_type_assertions": 0,
+          "upstream_type_assertions_disagree_runtime": 0,
+          "runtime_type_mismatches": 0,
+          "native_rejected_type_assertions": 0,
+          "native_rejected_unresolved_type_assertions": 0,
+          "native_rejected_type_mismatches": 0,
+          "native_rejected_assertion_diagnostics": 0,
+          "analysis_failures": 0,
+          "analysis_internal_failures": 0,
+          "unattributed_diagnostics": 0,
+          "runtime_adapter_mismatches": 0,
+          "unexercised_python_functions": 0
+        }
+      }
+    ],
+    "missed_negatives": [
+      {
+        "filename": "pass/disabled_jit.py",
+        "line": 40,
+        "python": "assert_never(jit.script(nn.Linear))",
+        "native_exception": {
+          "filename": "pass/disabled_jit.py",
+          "line": 40,
+          "status": "exception",
+          "exception": "RuntimeError",
+          "message": "Type '<class 'torch.nn.modules.linear.Linear'>' cannot be compiled since it inherits from nn.Module, pass an instance instead",
+          "python": {
+            "status": "exception",
+            "exception": "RuntimeError",
+            "message": "Type '<class 'torch.nn.modules.linear.Linear'>' cannot be compiled since it inherits from nn.Module, pass an instance instead"
+          },
+          "runtime_parity": true
+        }
+      },
+      {
+        "filename": "fail/arithmetic_ops.py",
+        "line": 12,
+        "python": "FLOAT & TENSOR",
+        "native_exception": {
+          "filename": "fail/arithmetic_ops.py",
+          "line": 12,
+          "status": "exception",
+          "exception": "NotImplementedError",
+          "message": "\"bitwise_and_cpu\" not implemented for 'Float'",
+          "python": {
+            "status": "exception",
+            "exception": "NotImplementedError",
+            "message": "\"bitwise_and_cpu\" not implemented for 'Float'"
+          },
+          "runtime_parity": true
+        }
+      },
+      {
+        "filename": "fail/arithmetic_ops.py",
+        "line": 13,
+        "python": "FLOAT | TENSOR",
+        "native_exception": {
+          "filename": "fail/arithmetic_ops.py",
+          "line": 13,
+          "status": "exception",
+          "exception": "NotImplementedError",
+          "message": "\"bitwise_or_cpu\" not implemented for 'Float'",
+          "python": {
+            "status": "exception",
+            "exception": "NotImplementedError",
+            "message": "\"bitwise_or_cpu\" not implemented for 'Float'"
+          },
+          "runtime_parity": true
+        }
+      },
+      {
+        "filename": "fail/arithmetic_ops.py",
+        "line": 14,
+        "python": "FLOAT ^ TENSOR",
+        "native_exception": {
+          "filename": "fail/arithmetic_ops.py",
+          "line": 14,
+          "status": "exception",
+          "exception": "NotImplementedError",
+          "message": "\"bitwise_xor_cpu\" not implemented for 'Float'",
+          "python": {
+            "status": "exception",
+            "exception": "NotImplementedError",
+            "message": "\"bitwise_xor_cpu\" not implemented for 'Float'"
+          },
+          "runtime_parity": true
+        }
+      },
+      {
+        "filename": "fail/disabled_bitwise_ops.py",
+        "line": 10,
+        "python": "i | a",
+        "native_exception": {
+          "filename": "fail/disabled_bitwise_ops.py",
+          "line": 10,
+          "status": "exception",
+          "exception": "NotImplementedError",
+          "message": "\"bitwise_or_cpu\" not implemented for 'Double'",
+          "python": {
+            "status": "exception",
+            "exception": "NotImplementedError",
+            "message": "\"bitwise_or_cpu\" not implemented for 'Double'"
+          },
+          "runtime_parity": true
+        }
+      }
+    ],
+    "type_mismatches": [
+      {
+        "filename": "pass/dynamo_utils.py",
+        "line": 9,
+        "python": "assert_type(x, str | int)",
+        "expected_type": "str | int",
+        "inferred": [
+          {
+            "path": [
+              "object"
+            ],
+            "module": "builtins"
+          }
+        ],
+        "type_assertion": {
+          "concrete": true,
+          "matches_expected": false,
+          "upstream_runtime_agrees": true,
+          "matches_runtime_result": false
+        }
+      },
+      {
+        "filename": "pass/dynamo_utils.py",
+        "line": 12,
+        "python": "assert_type(x, list[Any] | tuple[Any, ...])",
+        "expected_type": "list[Any] | tuple[Any, ...]",
+        "inferred": [
+          {
+            "path": [
+              "object"
+            ],
+            "module": "builtins"
+          }
+        ],
+        "type_assertion": {
+          "concrete": true,
+          "matches_expected": false,
+          "upstream_runtime_agrees": true,
+          "matches_runtime_result": false
+        }
+      },
+      {
+        "filename": "pass/dynamo_utils.py",
+        "line": 19,
+        "python": "assert_type(x, list[int] | tuple[int, ...])",
+        "expected_type": "list[int] | tuple[int, ...]",
+        "inferred": [
+          {
+            "union": [
+              {
+                "path": [
+                  "list"
+                ],
+                "arguments": [
+                  {
+                    "path": [
+                      "int"
+                    ],
+                    "module": "builtins"
+                  }
+                ],
+                "module": "builtins"
+              },
+              {
+                "path": [
+                  "tuple"
+                ],
+                "arguments": [
+                  {
+                    "path": [
+                      "int"
+                    ],
+                    "module": "builtins"
+                  },
+                  {
+                    "ellipsis?": true
+                  }
+                ],
+                "module": "builtins"
+              },
+              {
+                "path": [
+                  "str"
+                ],
+                "module": "builtins"
+              }
+            ]
+          }
+        ],
+        "type_assertion": {
+          "concrete": true,
+          "matches_expected": false,
+          "upstream_runtime_agrees": true,
+          "matches_runtime_result": true
+        }
+      }
+    ],
+    "unexercised_functions": [
+      {
+        "filename": "pass/cuda_steam.py",
+        "line": 4,
+        "python": "def foo(x: torch.Tensor) -> None:\n    stream = torch.cuda.current_stream()\n    x.record_stream(stream)",
+        "reason": "CUDA stream body needs accelerator hardware"
+      }
+    ],
+    "evidence": [
+      {
+        "filename": "torch-upstream-baseline-complete.json",
+        "sha256": "608ab321103a9eee8287508c9795e26e2efd7a8b41d6473e40d6910e92c59a21"
+      },
+      {
+        "filename": "torch-upstream-final.json",
+        "sha256": "fab6f4d1a644b7ecc64f21ff397068c8c90f330094416e163cb68b8dbcd91078"
+      },
+      {
+        "filename": "torch-manifest-used-in-final-run.json",
+        "sha256": "b6a632184206cdf196cd71bdb0f7aa5cc7981d152cd6b077d4f46a6ee047e6f7"
+      },
+      {
+        "filename": "torch-final-manifest-inventory.json",
+        "sha256": "4b2e52ffd5ed38d52e37dca27368a1ec8383ab478acc6a0587272174adc622ee"
+      }
+    ]
+  },
+  "generated_ci16": {
+    "passed": true,
+    "summary": {
+      "cases": 4,
+      "positive_cases": 2,
+      "negative_cases": 2,
+      "failed_cases": 0,
+      "unresolved_signatures": 0,
+      "unresolved_returns": 0,
+      "positive_diagnostic_cases": 0,
+      "missed_negative_cases": 0,
+      "unresolved_member_cases": 0
+    },
+    "inventory": [
+      {
+        "filename": "torch_large.lpy",
+        "blocks": 16,
+        "bytes": 5403,
+        "lines": 178,
+        "sha256": "a3137956fbc5e5a6fafc5a008f17a4eb9bb333e1f1b8266a82fe193ae4c76745"
+      },
+      {
+        "filename": "onnx_large.lpy",
+        "blocks": 16,
+        "bytes": 10724,
+        "lines": 194,
+        "sha256": "3d58012e8fe6cc5dde366f47280498c7a38c75b67d46f2746c033e745318e3bc"
+      },
+      {
+        "filename": "torch_large_negative.lpy",
+        "blocks": 16,
+        "bytes": 5257,
+        "lines": 178,
+        "sha256": "49f32f0e46a5858889bae22072328a3d3159b58810a29f9adb33beec1caa6b7c"
+      },
+      {
+        "filename": "onnx_large_negative.lpy",
+        "blocks": 16,
+        "bytes": 10567,
+        "lines": 194,
+        "sha256": "de9ba264fb6f08355e4ddc5d3a02a2fe729b891bc86014915d97e32cdcc56865"
+      }
+    ],
+    "cases": [
+      {
+        "name": "torch-large",
+        "source_sha256": "a3137956fbc5e5a6fafc5a008f17a4eb9bb333e1f1b8266a82fe193ae4c76745",
+        "source_bytes": 5403,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "64",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-large",
+        "source_sha256": "3d58012e8fe6cc5dde366f47280498c7a38c75b67d46f2746c033e745318e3bc",
+        "source_bytes": 10724,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "96",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "torch-large-negative",
+        "source_sha256": "49f32f0e46a5858889bae22072328a3d3159b58810a29f9adb33beec1caa6b7c",
+        "source_bytes": 5257,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "tensor() missing 1 required positional arguments: \"data\""
+        },
+        "findings": [
+          [
+            {
+              "level": "error",
+              "message": "Missing required Python argument 'data'",
+              "start": 5242,
+              "end": 5256,
+              "end-row": 178,
+              "row": 178,
+              "type": "invalid-arity",
+              "end-col": 15,
+              "filename": "torch_large_negative.lpy",
+              "col": 1
+            }
+          ],
+          [
+            {
+              "level": "error",
+              "message": "Missing required Python argument 'data'",
+              "start": 5242,
+              "end": 5256,
+              "end-row": 178,
+              "row": 178,
+              "type": "invalid-arity",
+              "end-col": 15,
+              "filename": "torch_large_negative.lpy",
+              "col": 1
+            }
+          ]
+        ]
+      },
+      {
+        "name": "onnx-large-negative",
+        "source_sha256": "de9ba264fb6f08355e4ddc5d3a02a2fe729b891bc86014915d97e32cdcc56865",
+        "source_bytes": 10567,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "bad argument type for built-in operation"
+        },
+        "findings": [
+          [
+            {
+              "end": 10566,
+              "start": 10531,
+              "end-row": 194,
+              "type": "type-mismatch",
+              "level": "error",
+              "filename": "onnx_large_negative.lpy",
+              "message": "No Python signature accepts argument types (Literal[42], list[Any], list[Any])",
+              "row": 194,
+              "end-col": 36,
+              "col": 1
+            }
+          ],
+          [
+            {
+              "end": 10566,
+              "start": 10531,
+              "end-row": 194,
+              "type": "type-mismatch",
+              "level": "error",
+              "filename": "onnx_large_negative.lpy",
+              "message": "No Python signature accepts argument types (Literal[42], list[Any], list[Any])",
+              "row": 194,
+              "end-col": 36,
+              "col": 1
+            }
+          ]
+        ]
+      }
+    ],
+    "evidence": {
+      "filename": "generated-ml-ci16.json",
+      "sha256": "3b83cf1f184e4d8e3a88cab8ddd243fc2ce81b02b910496ea83a21a27b311faf"
+    }
+  },
+  "lsp_integration": {
+    "commit": "f21a456cbb3974ac532602cbd19fa9878a1daad6",
+    "passed": true,
+    "positive_diagnostics": [],
+    "hover_present": {
+      "torch/ones": true,
+      ".sum": true,
+      "helper/make_node": true
+    },
+    "negative_diagnostics": [
+      {
+        "range": {
+          "start": {
+            "line": 4,
+            "character": 0
+          },
+          "end": {
+            "line": 4,
+            "character": 14
+          }
+        },
+        "message": "Missing required Python argument 'data'",
+        "severity": 1,
+        "code": "invalid-arity",
+        "source": "blt",
+        "tags": []
+      }
+    ],
+    "repaired_diagnostics": [],
+    "note": "Manual end-to-end probe with the ML interpreter. Concurrent-load timings are excluded from performance claims.",
+    "evidence": {
+      "filename": "ml-lsp/results.json",
+      "sha256": "10d66d2740ecd98fabff8e66cd72d5e074c4a96bbb39a933ba9e7efa98bd6a68"
+    }
+  },
+  "guard_revalidation": {
+    "passed": true,
+    "method": "Re-evaluated every preserved full finding list with the final fail-closed guard; no native or analyzer executions repeated.",
+    "harness_sha256": {
+      "check_ml_packages.py": "489ff7473e9acd7b5f2a1dec0f3030cb76bcb0aaac90b15309380683c6d32be0",
+      "check_torch_upstream.py": "dc87af0ddb027a596064293334ee220ae7569a77cbf8d4e1fa58c90f4db40613"
+    },
+    "reports": [
+      {
+        "filename": "ml-baseline-complete.json",
+        "sha256": "9d69ebf17525d29ed1d37a05628ad610ccd657f6e3b19fc5222eb72a9fa7d12b",
+        "cases": 35,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "ml-final.json",
+        "sha256": "a2c7f12d583e7bc94993175f0355d43f08b1feba682d74cfce212090898d2a4d",
+        "cases": 35,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "generated-ml-ci16.json",
+        "sha256": "3b83cf1f184e4d8e3a88cab8ddd243fc2ce81b02b910496ea83a21a27b311faf",
+        "cases": 4,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "ml-final-benchmark-0-baseline.json",
+        "sha256": "46f6c6712667e7bbe8c7a713029775cccfc6e769e0c2a0a99bb00e28821511ae",
+        "cases": 2,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "ml-final-benchmark-1-candidate.json",
+        "sha256": "718d4608e1306fcfe086d9b9c2c64ca4c5007d41ab0c1f70dd516ae889e69e85",
+        "cases": 2,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "ml-final-benchmark-2-candidate.json",
+        "sha256": "acbd3638c1f8bd3937a2d296f6276a7e27dd254c1829b29cb006cd26e55bd580",
+        "cases": 2,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "ml-final-benchmark-3-baseline.json",
+        "sha256": "1db8b3dc907ba52a0187fb85ce971713febb2c6c77b0202908804423838ff639",
+        "cases": 2,
+        "internal_findings": 0,
+        "changed_failures": []
+      },
+      {
+        "filename": "torch-upstream-baseline-complete.json",
+        "sha256": "608ab321103a9eee8287508c9795e26e2efd7a8b41d6473e40d6910e92c59a21",
+        "files": 22,
+        "internal_findings": 0,
+        "changed_counts": {}
+      },
+      {
+        "filename": "torch-upstream-final.json",
+        "sha256": "fab6f4d1a644b7ecc64f21ff397068c8c90f330094416e163cb68b8dbcd91078",
+        "files": 22,
+        "internal_findings": 0,
+        "changed_counts": {}
+      }
+    ]
+  },
+  "performance": {
+    "order": [
+      "baseline",
+      "candidate",
+      "candidate",
+      "baseline"
+    ],
+    "samples": [
+      {
+        "order_index": 0,
+        "snapshot": "baseline",
+        "case": "torch-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 25.1989317080006,
+        "parent_cpu_seconds": 17.478612000000002,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [
+          "Result member metadata was not resolved"
+        ],
+        "raw_report": "ml-final-benchmark-0-baseline.json"
+      },
+      {
+        "order_index": 0,
+        "snapshot": "baseline",
+        "case": "torch-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 15.950936375069432,
+        "parent_cpu_seconds": 15.950861,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [
+          "Result member metadata was not resolved"
+        ],
+        "raw_report": "ml-final-benchmark-0-baseline.json"
+      },
+      {
+        "order_index": 0,
+        "snapshot": "baseline",
+        "case": "onnx-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 47.07247912499588,
+        "parent_cpu_seconds": 44.622452,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-0-baseline.json"
+      },
+      {
+        "order_index": 0,
+        "snapshot": "baseline",
+        "case": "onnx-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 43.953779249917716,
+        "parent_cpu_seconds": 43.951116,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-0-baseline.json"
+      },
+      {
+        "order_index": 1,
+        "snapshot": "candidate",
+        "case": "torch-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 42.83768087497447,
+        "parent_cpu_seconds": 22.048277,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-1-candidate.json"
+      },
+      {
+        "order_index": 1,
+        "snapshot": "candidate",
+        "case": "torch-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 20.20041975006461,
+        "parent_cpu_seconds": 20.199691999999995,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-1-candidate.json"
+      },
+      {
+        "order_index": 1,
+        "snapshot": "candidate",
+        "case": "onnx-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 47.55321320903022,
+        "parent_cpu_seconds": 42.926717000000004,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-1-candidate.json"
+      },
+      {
+        "order_index": 1,
+        "snapshot": "candidate",
+        "case": "onnx-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 42.47292833297979,
+        "parent_cpu_seconds": 42.471553,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-1-candidate.json"
+      },
+      {
+        "order_index": 2,
+        "snapshot": "candidate",
+        "case": "torch-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 42.76343645795714,
+        "parent_cpu_seconds": 21.940193,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-2-candidate.json"
+      },
+      {
+        "order_index": 2,
+        "snapshot": "candidate",
+        "case": "torch-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 19.975241707987152,
+        "parent_cpu_seconds": 19.974725000000003,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-2-candidate.json"
+      },
+      {
+        "order_index": 2,
+        "snapshot": "candidate",
+        "case": "onnx-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 47.637074000085704,
+        "parent_cpu_seconds": 43.072378,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-2-candidate.json"
+      },
+      {
+        "order_index": 2,
+        "snapshot": "candidate",
+        "case": "onnx-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 42.55176704097539,
+        "parent_cpu_seconds": 42.550823,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-2-candidate.json"
+      },
+      {
+        "order_index": 3,
+        "snapshot": "baseline",
+        "case": "torch-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 24.80405641696416,
+        "parent_cpu_seconds": 17.068837000000002,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [
+          "Result member metadata was not resolved"
+        ],
+        "raw_report": "ml-final-benchmark-3-baseline.json"
+      },
+      {
+        "order_index": 3,
+        "snapshot": "baseline",
+        "case": "torch-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 16.14932820899412,
+        "parent_cpu_seconds": 16.148760999999997,
+        "source_bytes": 42531,
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [
+          "Result member metadata was not resolved"
+        ],
+        "raw_report": "ml-final-benchmark-3-baseline.json"
+      },
+      {
+        "order_index": 3,
+        "snapshot": "baseline",
+        "case": "onnx-large",
+        "iteration": 0,
+        "cache": "cold inspection",
+        "wall_seconds": 47.6138609170448,
+        "parent_cpu_seconds": 45.095563,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-3-baseline.json"
+      },
+      {
+        "order_index": 3,
+        "snapshot": "baseline",
+        "case": "onnx-large",
+        "iteration": 1,
+        "cache": "warm inspection",
+        "wall_seconds": 44.460242208093405,
+        "parent_cpu_seconds": 44.458911,
+        "source_bytes": 84840,
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "audit_failures": [],
+        "raw_report": "ml-final-benchmark-3-baseline.json"
+      }
+    ],
+    "scope": "128-block original generated sources; native execution verified before analysis. Host startup and analyzer module loading excluded; first run includes inspection startup, later runs reuse inspection cache. Parent CPU excludes worker child CPU. Compiler/filesystem caches are already warm from correctness audits.",
+    "repeats_per_sample": 2,
+    "input_inventory": [
+      {
+        "filename": "torch_large.lpy",
+        "blocks": 128,
+        "bytes": 42531,
+        "lines": 1410,
+        "sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d"
+      },
+      {
+        "filename": "onnx_large.lpy",
+        "blocks": 128,
+        "bytes": 84840,
+        "lines": 1538,
+        "sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a"
+      },
+      {
+        "filename": "torch_large_negative.lpy",
+        "blocks": 128,
+        "bytes": 41125,
+        "lines": 1410,
+        "sha256": "7b9764fb83b66214474551f33ec1713de555173ca343bdd0a8e8a60eadb28ea5"
+      },
+      {
+        "filename": "onnx_large_negative.lpy",
+        "blocks": 128,
+        "bytes": 83199,
+        "lines": 1538,
+        "sha256": "c725f396ed88a6ad8eaf0cef1bc80b3cbdf6835ff5acffff59f0bb039459f518"
+      }
+    ],
+    "source_hashes": {
+      "baseline": {
+        "analyzer.lpy": "50eda308732b94ba285565af91607748d9726709bfe1b4c8cb92c8eddc4fa3e1",
+        "python.lpy": "0244720dd2ef5490b84e8a2d602b3db1f594bef99cdc8a6d6146f88161234619",
+        "_inspect.py": "f3ddbd8a89a438324b71a9603680f34056c7041a034486c116d40d65b20db1f2"
+      },
+      "candidate": {
+        "analyzer.lpy": "8b135422e27ad1db2421be4596ad112378de0397b5febff9029b170eecc1c6c9",
+        "python.lpy": "e3385c41b4617e81950ac50b66e6c4372e09784fd11387576c685d3045145c93",
+        "_inspect.py": "9c933a5b6eba421c7797d79800785372f6863b67039f7ffff7973dd3d275ff31"
+      }
+    },
+    "medians": {
+      "torch-large": {
+        "baseline": {
+          "cold inspection": {
+            "samples": 2,
+            "wall_seconds": 25.00149406248238,
+            "parent_cpu_seconds": 17.2737245
+          },
+          "warm inspection": {
+            "samples": 2,
+            "wall_seconds": 16.050132292031776,
+            "parent_cpu_seconds": 16.049811
+          }
+        },
+        "candidate": {
+          "cold inspection": {
+            "samples": 2,
+            "wall_seconds": 42.800558666465804,
+            "parent_cpu_seconds": 21.994235
+          },
+          "warm inspection": {
+            "samples": 2,
+            "wall_seconds": 20.08783072902588,
+            "parent_cpu_seconds": 20.0872085
+          }
+        }
+      },
+      "onnx-large": {
+        "baseline": {
+          "cold inspection": {
+            "samples": 2,
+            "wall_seconds": 47.34317002102034,
+            "parent_cpu_seconds": 44.859007500000004
+          },
+          "warm inspection": {
+            "samples": 2,
+            "wall_seconds": 44.20701072900556,
+            "parent_cpu_seconds": 44.2050135
+          }
+        },
+        "candidate": {
+          "cold inspection": {
+            "samples": 2,
+            "wall_seconds": 47.59514360455796,
+            "parent_cpu_seconds": 42.999547500000006
+          },
+          "warm inspection": {
+            "samples": 2,
+            "wall_seconds": 42.51234768697759,
+            "parent_cpu_seconds": 42.511188000000004
+          }
+        }
+      }
+    },
+    "evidence": {
+      "filename": "ml-final-benchmark.json",
+      "sha256": "85efa2cdea5221a36b6376b74cf39213eaafb5a4f8e1980928d7864faa4f2653"
+    },
+    "completed": true,
+    "harness_sha256": "494ac2d32344b599b0deea530e0a7e1863454f3e4b8c3916239b03242a0e1efc"
+  },
+  "optimization_only_observation": {
+    "scope": "Earlier isolated call preparation/unpacking change, same analyzer and worker on each side; predates final structural-summary and per-analysis memo optimizations.",
+    "limitation": "One cold and one warm Torch128 observation per snapshot; exploratory, not the final ABBA comparison.",
+    "samples": [
+      {
+        "case": "torch-large",
+        "snapshot": "context",
+        "runs": [
+          {
+            "seconds": 45.330507957958616,
+            "cpu": 24.919631,
+            "findings": []
+          },
+          {
+            "seconds": 23.29573341703508,
+            "cpu": 23.294614999999997,
+            "findings": []
+          }
+        ],
+        "source_sha256": {
+          "analyzer.lpy": "c5f8d20a8283fd2aafcca4c25e3268ea2ee34d1d0a11f695429bfed74a74cf2d",
+          "python.lpy": "7614db90f3d48529f8684c79ce612202ce0d0894027211032da94eaeba95aedf",
+          "_inspect.py": "a005bc6d486f1de306aacaa8cb7d663fdfe8a2ea0dda334e3505cc86d7c85a44"
+        }
+      },
+      {
+        "case": "torch-large",
+        "snapshot": "optimized",
+        "runs": [
+          {
+            "seconds": 44.64417908305768,
+            "cpu": 23.930052,
+            "findings": []
+          },
+          {
+            "seconds": 22.023437374969944,
+            "cpu": 22.022660000000002,
+            "findings": []
+          }
+        ],
+        "source_sha256": {
+          "analyzer.lpy": "c5f8d20a8283fd2aafcca4c25e3268ea2ee34d1d0a11f695429bfed74a74cf2d",
+          "python.lpy": "a4d77eaca79556b8ef629bb93fce294a87a2fe46c6e35edc88b861822a915081",
+          "_inspect.py": "a005bc6d486f1de306aacaa8cb7d663fdfe8a2ea0dda334e3505cc86d7c85a44"
+        }
+      }
+    ],
+    "evidence": {
+      "filename": "milestone3-bridge/large-project-comparison.json",
+      "sha256": "01d747263ef1843066285f2004118056722337d49dd8d32bb0e391816ad18a82"
+    }
+  },
+  "evidence_note": "Raw artifact filenames and hashes identify local audit captures; they are not published download links. Reproduction commands and pinned inputs are in docs/python-ml-audit.md and scripts/.",
+  "default_timeout_probe": {
+    "python_timeout_seconds": 5,
+    "summary": {
+      "cases": 1,
+      "positive_cases": 1,
+      "negative_cases": 0,
+      "failed_cases": 0,
+      "unresolved_signatures": 0,
+      "unresolved_returns": 0,
+      "positive_diagnostic_cases": 0,
+      "missed_negative_cases": 0,
+      "unresolved_member_cases": 0
+    },
+    "cases": [
+      {
+        "name": "tensor",
+        "source_sha256": "96787d0f1f0aa9d4df8ab7ba9a15c2ff98d5ebd30176d9a9152dabef14bfa409",
+        "source_bytes": 101,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "6",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      }
+    ],
+    "evidence": {
+      "filename": "ml-final-default-timeout.json",
+      "sha256": "4824d89b4d426194722cdaa06ab92c505ba67ea16f8231fe06a315acf74f3554"
+    }
+  },
+  "generated128": {
+    "passed": true,
+    "inventory": [
+      {
+        "filename": "torch_large.lpy",
+        "blocks": 128,
+        "bytes": 42531,
+        "lines": 1410,
+        "sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d"
+      },
+      {
+        "filename": "onnx_large.lpy",
+        "blocks": 128,
+        "bytes": 84840,
+        "lines": 1538,
+        "sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a"
+      },
+      {
+        "filename": "torch_large_negative.lpy",
+        "blocks": 128,
+        "bytes": 41125,
+        "lines": 1410,
+        "sha256": "7b9764fb83b66214474551f33ec1713de555173ca343bdd0a8e8a60eadb28ea5"
+      },
+      {
+        "filename": "onnx_large_negative.lpy",
+        "blocks": 128,
+        "bytes": 83199,
+        "lines": 1538,
+        "sha256": "c725f396ed88a6ad8eaf0cef1bc80b3cbdf6835ff5acffff59f0bb039459f518"
+      }
+    ],
+    "cases": [
+      {
+        "name": "torch-large",
+        "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+        "source_bytes": 42531,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "512",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "onnx-large",
+        "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+        "source_bytes": 84840,
+        "failures": [],
+        "coverage": {
+          "symbol_known": true,
+          "signature_resolved": true,
+          "return_resolved": true,
+          "members_resolved": true
+        },
+        "native": {
+          "value": "768",
+          "exception": null
+        },
+        "findings": [
+          [],
+          []
+        ]
+      },
+      {
+        "name": "torch-large-negative",
+        "source_sha256": "7b9764fb83b66214474551f33ec1713de555173ca343bdd0a8e8a60eadb28ea5",
+        "source_bytes": 41125,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "tensor() missing 1 required positional arguments: \"data\""
+        },
+        "findings": [
+          [
+            {
+              "message": "Missing required Python argument 'data'",
+              "end-col": 15,
+              "type": "invalid-arity",
+              "col": 1,
+              "end-row": 1410,
+              "row": 1410,
+              "filename": "torch_large_negative.lpy",
+              "start": 41110,
+              "level": "error",
+              "end": 41124
+            }
+          ]
+        ]
+      },
+      {
+        "name": "onnx-large-negative",
+        "source_sha256": "c725f396ed88a6ad8eaf0cef1bc80b3cbdf6835ff5acffff59f0bb039459f518",
+        "source_bytes": 83199,
+        "failures": [],
+        "coverage": {},
+        "native": {
+          "exception": "TypeError",
+          "message": "bad argument type for built-in operation"
+        },
+        "findings": [
+          [
+            {
+              "message": "No Python signature accepts argument types (Literal[42], list[Any], list[Any])",
+              "row": 1538,
+              "col": 1,
+              "type": "type-mismatch",
+              "end": 83198,
+              "end-row": 1538,
+              "level": "error",
+              "start": 83163,
+              "filename": "onnx_large_negative.lpy",
+              "end-col": 36
+            }
+          ]
+        ]
+      }
+    ],
+    "note": "Positive correctness from the completed first candidate benchmark sample; negative variants from a separate guarded run against the identical frozen production source.",
+    "evidence": [
+      {
+        "filename": "ml-final-benchmark-1-candidate.json",
+        "sha256": "718d4608e1306fcfe086d9b9c2c64ca4c5007d41ab0c1f70dd516ae889e69e85"
+      },
+      {
+        "filename": "generated-ml-final-negative128.json",
+        "sha256": "478db2419a1ba17d2c52968408dc7b21ace28fce8eec4d5fb198ec5e3f2cd61a"
+      }
+    ]
+  }
+}
