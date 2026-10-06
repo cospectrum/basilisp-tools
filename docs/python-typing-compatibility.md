@@ -138,17 +138,17 @@ executed interoperability assertions.
 | --- | ---: | ---: |
 | Exact matches | 3,881 | 3,949 |
 | Differences requiring review | 1,810 | 1,406 |
-| Unknown contracts or types | 7,625 | 7,968 |
-| Explicit exclusions | 76,950 | 76,950 |
+| Unknown contracts or types | 7,615 | 7,958 |
+| Explicit exclusions | 76,960 | 76,960 |
 | Replay-error assertion rows | 7 | 0 |
 
 | Provider | Fixtures | Exact matches before → after | Remaining differences | Unknown | Excluded |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | typing | 152 | 335 → 347 | 59 | 384 | 1,910 |
-| Pyright | 1,375 | 866 → 883 | 303 | 1,934 | 6,531 |
-| mypy | 8,327 | 678 → 684 | 234 | 648 | 25,451 |
-| Pyrefly | 5,136 | 856 → 873 | 237 | 1,536 | 11,127 |
-| ty | 6,812 | 1,146 → 1,162 | 573 | 3,466 | 31,931 |
+| Pyright | 1,375 | 866 → 883 | 303 | 1,932 | 6,533 |
+| mypy | 8,327 | 678 → 684 | 234 | 647 | 25,452 |
+| Pyrefly | 5,136 | 856 → 873 | 237 | 1,533 | 11,130 |
+| ty | 6,812 | 1,146 → 1,162 | 573 | 3,462 | 31,935 |
 
 There are 102 difference-to-match transitions, 11 unknown-to-match transitions,
 and two error-to-match transitions. Separately, 314 differences and five
@@ -167,32 +167,20 @@ The nine newly missed negatives remain visible in the artifact, including
 secondary initializer checks after mixed constructor branches. No remaining
 full-corpus difference is a baseline allowance or a passing assertion.
 
-Each provider uses the same frozen adapter, fixture content, and oracle on both
-engines. Mypy and Pyrefly were replayed after corrections to configuration and
-Rust invocation inventory; the artifact records the two adapter segments
-separately. The candidate snapshot contains the static typing implementation
-in `f21a456`. A subsequent runtime-only native-stub reexport safety fix changed
-the production worker hash; that delta and its separate native validation are
-recorded. Fixture dependency execution is disabled, so this static replay does
-not exercise that changed runtime path. Audit timings were collected under
-concurrent load and are not performance measurements.
+All five providers use the same frozen adapter, fixture content, and oracle on
+both engines. The candidate source snapshot exactly matches `f21a456`, including
+the final native-stub safety fixes. Source and adapter hashes are unchanged
+throughout each run. Fixture dependency execution is disabled. Audit timings
+were collected under concurrent load and are not performance measurements.
 
-The historical reports retained expression-row findings, but did not retain the
-whole document's findings. Their zero candidate error-row count therefore does
-not prove zero inspection failures: a static metadata worker failure on the
-namespace row could have been omitted. Direct analyzer exceptions were recorded,
-because this replay calls the analyzer without the CLI's exception-to-finding
-wrapper. The current harness retains all document findings and makes syntax,
-file, internal-analysis, and Python-inspection failures fatal before checking
-any expression, including expected-invalid calls. The historical differential
-One fixture failure can mark several assertions as errors. The historical
-counts above retain this evidence limitation; they are not a complete audit of
-document-level failures.
-Scanning the retained findings also found ten repeated-keyword syntax
-diagnostics per engine classified as unknown. The current adapter explicitly
-excludes those transformations, as described above.
-A full comparison using the guarded adapter and exact `f21a456` production
-sources is being repeated. Its results are not included in the table above.
+The candidate replay analyzes 13,313 assertions across 4,351 fixtures and retains
+each completed analysis's whole-document findings. Syntax, file,
+internal-analysis, and Python-inspection failures are fatal before checking any
+expression, including expected-invalid calls. The candidate has zero fatal
+document findings and zero replay-error fixtures. The baseline's seven error
+assertion rows come from two fixtures raising `TypeError` on unhashable metadata;
+one fixture failure can affect several assertions. Neither engine's counts omit
+namespace-row inspection failures.
 
 CI checks four typing fixtures with 36 resolved assertions: 26 valid calls and
 10 rejected calls. It requires the exact fixture counts 17, 8, 5, and 6 for
