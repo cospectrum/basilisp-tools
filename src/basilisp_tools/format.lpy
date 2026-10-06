@@ -27,7 +27,7 @@
   ;; Match cljfmt's UTF-16 columns; syntax offsets remain Unicode code points.
   (if (.isascii s) (python/len s)
       (op/floordiv (python/len (.encode s "utf-16-le" "surrogatepass")) 2)))
-(defn- spaces [n] (op/mul " " (max 0 n)))
+(defn- spaces [n] (op/mul " " n))
 (defn- newline? [s] (boolean (re/search "[\r\n]" s)))
 (defn- bare [n]
   (if (op/eq :metadata (:kind n)) (recur (last (node-forms n))) n))
@@ -708,7 +708,7 @@
                   value (if (op/eq :newline (:kind node)) "\n" (:text node))]
               (if (gap? previous)
                 (op/setitem result -1 (assoc previous :text (str (:text previous) value)))
-                (.append result (assoc node :kind :gap :text value))))
+                (.append result (-> node (assoc :kind :gap) (assoc :text value)))))
             (.append result node))
           (recur (python/next items nil)))
         (vec result)))))
@@ -728,25 +728,26 @@
              (let [before (get xs (- n 3)) gap (get xs (- n 2))]
                (if (op/eq :comment (:kind before))
                  (assoc xs (- n 2) (leaf :gap (or (some-> (re/search "\r\n|\r|\n" (:text gap)) .group) "\n")))
-                 (conj (vec (take (- n 2) xs)) (last xs)))) xs)]
-    (loop [result [] cursor 0 form-index 0]
-      (if-let [n (get xs cursor)]
-        (let [previous (peek result)
+                 (conj (vec (take (- n 2) xs)) (last xs)))) xs)
+        result #py []]
+    (loop [cursor 0 form-index 0]
+      (when-let [n (get xs cursor)]
+        (let [previous (when (pos? (python/len result)) (op/getitem result -1))
               split? (and (op/eq :map (:kind node)) (:split-keypairs-over-multiple-lines? opts)
-                          (form? n) (pos? form-index) (even? form-index))
-              result (cond
-                       (and split? (not (and (gap? previous) (newline? (:text previous)))))
-                       (if (gap? previous)
-                         (conj (pop result) (leaf :gap (str (:text previous) "\n")))
-                         (conj result (leaf :gap "\n")))
-                       (and (:insert-missing-whitespace? opts)
-                            previous (not (gap? previous))
-                            (or (and (form? previous) (form? n))
-                                (and (op/eq :discard (:kind previous)) (form? n))))
-                       (conj result (leaf :gap " "))
-                       :else result)]
-          (recur (conj result n) (inc cursor) (+ form-index (if (form? n) 1 0))))
-        result))))
+                          (form? n) (pos? form-index) (even? form-index))]
+          (cond
+            (and split? (not (and (gap? previous) (newline? (:text previous)))))
+            (if (gap? previous)
+              (op/setitem result -1 (leaf :gap (str (:text previous) "\n")))
+              (.append result (leaf :gap "\n")))
+            (and (:insert-missing-whitespace? opts)
+                 previous (not (gap? previous))
+                 (or (and (form? previous) (form? n))
+                     (and (op/eq :discard (:kind previous)) (form? n))))
+            (.append result (leaf :gap " ")))
+          (.append result n)
+          (recur (inc cursor) (+ form-index (if (form? n) 1 0))))))
+    (vec result)))
 
 (defn- conditional-opening-index [node]
   (when (and (#{:reader-conditional :reader-splice} (:kind node))
@@ -861,8 +862,8 @@
 (defn- indentation-candidates [frames]
   (let [candidates #py [] depth-count (count frames)]
     (loop [depth 0]
-      (when (< depth depth-count)
-        (let [ancestor (nth frames (- depth-count depth 1))
+      (when (op/lt depth depth-count)
+        (let [ancestor (nth frames (dec (- depth-count depth)))
               entries (python/iter (or (:rules ancestor) []))]
           (loop [entry (python/next entries nil)]
             (when entry

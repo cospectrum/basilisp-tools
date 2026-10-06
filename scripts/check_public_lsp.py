@@ -289,7 +289,7 @@ def cache_snapshot(path):
 
 
 
-def unresolved_symbol_policy(root, filename, source, settings):
+def diagnostic_policy(root, filename, source, settings, linter):
     """Only waive the probe when an applicable global disable is confirmed."""
     import importlib
 
@@ -308,7 +308,7 @@ def unresolved_symbol_policy(root, filename, source, settings):
         options["config-dir"] = str(root / configured)
     config = checker.load_config(to_lisp(options))
     level = config.get(kw("linters"), {}).get(
-        kw("unresolved-symbol"), {}
+        kw(linter), {}
     ).get(kw("level"))
     # Do not infer a global override through namespace groups or source metadata.
     # Such a project needs a targeted investigation, rather than a waived failure.
@@ -322,8 +322,12 @@ def unresolved_symbol_policy(root, filename, source, settings):
     }
 
 
+def unresolved_symbol_policy(root, filename, source, settings):
+    return diagnostic_policy(root, filename, source, settings, "unresolved-symbol")
+
+
 def diagnostic_edit_probes(client, root, filename, source, settings, report, verify):
-    """Check configured semantic diagnostics and an unconditional syntax edit."""
+    """Check diagnostic edits and exact UTF-16 ranges under project settings."""
     uri = filename.as_uri()
     suffix = '\n(def blt-audit-emoji "😀")\nblt-audit-missing\n'
     client.send(
@@ -411,12 +415,51 @@ def diagnostic_edit_probes(client, root, filename, source, settings, report, ver
         if diagnostic.get("code") == "syntax"
         and diagnostic.get("range", {}).get("start", {}).get("line") == error_start["line"]
     ]
-    verify("edit introduces syntax error", bool(syntax_errors))
-    verify(
-        "syntax diagnostic range uses UTF-16",
-        any(diagnostic.get("range") == {"start": error_start, "end": error_end}
-            for diagnostic in syntax_errors),
-    )
+    syntax_policy = {"disabled": False}
+    if not syntax_errors:
+        try:
+            syntax_policy = diagnostic_policy(root, filename, source, settings, "syntax")
+        except Exception as error:  # noqa: BLE001 - Failure to resolve is not a waiver.
+            syntax_policy = {"disabled": False, "error": repr(error)}
+        report["observations"]["syntax_policy"] = syntax_policy
+    if syntax_policy["disabled"]:
+        report["observations"].setdefault("skipped_probes", []).append({
+            "name": "syntax diagnostic introduction and repair",
+            "reason": "Resolved project configuration disables :syntax globally.",
+            "configuration": syntax_policy,
+        })
+        verify("disabled syntax setting honored", not syntax_errors)
+        # An enabled unused-value warning spans the quoted astral character.
+        # Its end column also distinguishes UTF-16 from code-point offsets.
+        emoji_start = len(repaired) + invalid_suffix.index('"😀"')
+        emoji_range = {
+            "start": at(uri, invalid, emoji_start)["position"],
+            "end": at(uri, invalid, emoji_start + len('"😀"'))["position"],
+        }
+        emoji_warnings = [
+            diagnostic for diagnostic in broken
+            if diagnostic.get("code") == "unused-value"
+            and '"😀"' in diagnostic.get("message", "")
+            and diagnostic.get("range", {}).get("start", {}).get("line") == error_start["line"]
+        ]
+        if emoji_warnings:
+            verify(
+                "enabled diagnostic range uses UTF-16",
+                any(diagnostic.get("range") == emoji_range for diagnostic in emoji_warnings),
+            )
+        else:
+            report["observations"]["skipped_probes"].append({
+                "name": "diagnostic range uses UTF-16",
+                "reason": "Syntax diagnostics are disabled and no enabled diagnostic spans the emoji probe.",
+                "configuration": syntax_policy,
+            })
+    else:
+        verify("edit introduces syntax error", bool(syntax_errors))
+        verify(
+            "syntax diagnostic range uses UTF-16",
+            any(diagnostic.get("range") == {"start": error_start, "end": error_end}
+                for diagnostic in syntax_errors),
+        )
     client.send(
         "textDocument/didChange",
         {
@@ -429,7 +472,8 @@ def diagnostic_edit_probes(client, root, filename, source, settings, report, ver
     )
     syntax_repaired = client.diagnostics(uri, 5)
     verify(
-        "edit repairs introduced syntax error",
+        "disabled syntax setting remains honored after repair" if syntax_policy["disabled"]
+        else "edit repairs introduced syntax error",
         not any(
             diagnostic.get("code") == "syntax"
             and diagnostic.get("range", {}).get("start", {}).get("line", -1) >= error_start["line"]
@@ -442,6 +486,25 @@ def diagnostic_edit_probes(client, root, filename, source, settings, report, ver
         "syntax": broken,
         "syntax_repaired": syntax_repaired,
     }
+
+
+def server_failure(diagnostic):
+    # Checker exceptions can be surfaced as syntax findings. They are tool
+    # failures, unlike genuine syntax errors in the checked-out project.
+    return diagnostic.get("code") == "configuration" or str(
+        diagnostic.get("message", "")
+    ).startswith("Analysis failed:")
+
+
+def check_published_failures(published, report, verify):
+    failures = [
+        {"uri": item["uri"], "version": item.get("version"), "diagnostic": diagnostic}
+        for item in published
+        for diagnostic in item["diagnostics"]
+        if server_failure(diagnostic)
+    ]
+    report["observations"]["server_failures"] = failures
+    verify("no background server/configuration failures", not failures)
 
 
 def audit(
@@ -533,7 +596,7 @@ def audit(
         )
         verify(
             "no server/configuration failure",
-            all(d.get("code") != "configuration" for d in original_diagnostics),
+            not any(server_failure(d) for d in original_diagnostics),
         )
         symbols = client.request(
             "textDocument/documentSymbol", {"textDocument": {"uri": uri}}
@@ -645,6 +708,9 @@ def audit(
             "Python method hover",
             bool(python_hover) and "read_text" in str(python_hover),
         )
+    except KeyboardInterrupt:
+        report["error"] = "Interrupted before the audit completed"
+        raise
     except Exception as error:  # noqa: BLE001 - Preserve failures and audit the next project.
         report["error"] = repr(error)
     finally:
@@ -671,14 +737,7 @@ def audit(
             }
             for item in published
         ]
-        verify(
-            "no background configuration failures",
-            not any(
-                d.get("code") == "configuration"
-                for item in published
-                for d in item["diagnostics"]
-            ),
-        )
+        check_published_failures(published, report, verify)
         output.write_text(json.dumps(report, indent=2))
         print(
             json.dumps(

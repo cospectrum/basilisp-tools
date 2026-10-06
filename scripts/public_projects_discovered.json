@@ -1,0 +1,81 @@
+[
+  {
+    "repo": "ikappaki/issue-bastest",
+    "sha": "b3c6eabd7a6995e7804f9172514c0f79acc118c0",
+    "files": [
+      "tests/bastest/issue_test.lpy"
+    ],
+    "lsp_file": "tests/bastest/issue_test.lpy"
+  },
+  {
+    "repo": "Pinrichou/Basilisp-pyxel",
+    "sha": "a3946d7412f766c65c33710a3ab1aaccf796e536",
+    "files": [
+      "src/basilisp_pyxel/demo.lpy",
+      "src/basilisp_pyxel/nrepl.lpy"
+    ],
+    "lsp_file": "src/basilisp_pyxel/demo.lpy"
+  },
+  {
+    "repo": "BjoernSchilberg/basilisp_pyxel",
+    "sha": "f51915190e939a76efa83c4837d3240cca268869",
+    "files": [
+      "bline.lpy",
+      "circle.lpy",
+      "draw-chunked-line-vary-y.lpy",
+      "draw-recursive-circles.lpy"
+    ],
+    "lsp_file": "bline.lpy"
+  },
+  {
+    "repo": "ikappaki/basilex-basilib",
+    "sha": "72eb3cb91cb4265eac69f3921b22459e507ad1c6",
+    "files": [
+      "src/basilib/core.lpy"
+    ],
+    "lsp_file": "src/basilib/core.lpy"
+  },
+  {
+    "repo": "ikappaki/basilisp-issue-1069",
+    "sha": "e3bd60b1ca9b09fbfcd85b2a5ae2020d2e765a96",
+    "files": [
+      "tests/issuetests/issue_test.lpy"
+    ],
+    "lsp_file": "tests/issuetests/issue_test.lpy"
+  },
+  {
+    "repo": "ikappaki/basilex-python-lib",
+    "sha": "374844e060959600e4f954c667be942428f8bbe7",
+    "files": [
+      "src/basilex_python_lib/utils.lpy"
+    ],
+    "lsp_file": "src/basilex_python_lib/utils.lpy"
+  },
+  {
+    "repo": "ikappaki/issue-bas-test-startdir",
+    "sha": "ce68afaf9bc3a97ac434a41b0c91448b20d5faaa",
+    "files": [
+      "src/issue_bas_test_startdir/dummy.lpy",
+      "test1/a/test1_test.lpy",
+      "test2/a/test2_test.lpy"
+    ],
+    "lsp_file": "test1/a/test1_test.lpy"
+  },
+  {
+    "repo": "bmorphism/world",
+    "sha": "a9735f4418b8ffc1402c8b4c80991ee8615d4eb3",
+    "files": [
+      "dialects/world_event.lpy",
+      "dialects/world_identity.lpy"
+    ],
+    "lsp_file": "dialects/world_event.lpy"
+  },
+  {
+    "repo": "dpom/mynixpkgs",
+    "sha": "313f89139a2750eb7fd5228704340fc7286f20f1",
+    "files": [
+      "templates/lpyproj/src/lpyproj/core.lpy"
+    ],
+    "lsp_file": "templates/lpyproj/src/lpyproj/core.lpy"
+  }
+]

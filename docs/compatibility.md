@@ -55,8 +55,10 @@ See [Formatting](formatting.md), [Checking](checking.md), and
 
 CI runs on macOS and Linux, checks blt's own source, and tests the installed wheel.
 Formatter tests include Basilisp's source corpus. The
-[public-project audit](public-project-audit.md) covers ten repositories and
-executable generated projects. Python integration tests use NumPy, Requests with type stubs, and Pydantic. The
+[public-project audit](public-project-audit.md) selects 968 source files from 44
+repositories. CI exercises pinned nREPL and Flask projects and runs calc's own
+tests before and after formatting, alongside executable generated projects.
+Python integration tests use NumPy, Requests with type stubs, and Pydantic. The
 [workflow](../.github/workflows/ci.yml) and [Nix lockfile](../flake.lock) record
 the exact reference versions.
 

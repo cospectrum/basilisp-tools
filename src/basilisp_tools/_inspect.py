@@ -903,7 +903,8 @@ def runtime_member(name, value, depth=1, owner=None):
             for base in reversed(class_attribute(value, "__mro__")):
                 for key, child in tuple(class_attribute(base, "__dict__").items()):
                     if not key.startswith("_") or key in ("__getitem__", "__iter__", "__next__", "__call__",
-                                                          "__enter__", "__exit__", "__aenter__", "__anext__"):
+                                                          "__enter__", "__exit__", "__aenter__", "__anext__",
+                                                          "__truediv__", "__rtruediv__"):
                         members[key] = substitute_types(safe_member(key, child, depth=0, owner=value),
                                                         generic_bindings)
                 annotations = runtime_class_annotations(base)

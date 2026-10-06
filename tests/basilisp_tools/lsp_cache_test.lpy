@@ -2,6 +2,7 @@
   (:require [basilisp.test :refer [deftest is]]
             [basilisp-tools.lsp]
             [basilisp-tools.cache :as cache]
+            [basilisp-tools.syntax :as syntax]
             [basilisp-tools.regex :as regex])
   (:import [datetime] [decimal] [fractions] [json] [pathlib] [re] [sys] [tempfile] [uuid]
            [pygls.workspace :as workspace] [unittest.mock :as mock]))
@@ -17,6 +18,25 @@
     {:temporary temporary :root root
      :options {:workspace-root (str root) :python-executable sys/executable
                :python-paths [(str root)] :python-inspection? false}}))
+
+(deftest binding-ancestor-path-preserves-reader-and-metadata-structure-test
+  (doseq [source ["(let [^int x 1 {:keys [y] :as value} {}] [x y value])"
+                  "#?(:lpy (defn f [x] x) :clj (defrecord T [x]))"
+                  "(defprotocol P (method [this ^int x]))\n(deftype T [x] P (method [this y] (+ x y)))"
+                  "^:private #'sample/value\n#_ (ignored form)\n#:sample{:x [@x #(+ % 1)]}"]]
+    (let [doc (document (pathlib/Path "/tmp") source)
+          parsed (syntax/parse source)
+          nodes (vec (syntax/nodes (:root parsed)))
+          state (atom {:declaration-cache (atom {(.-uri doc) {:source source :info {:parsed parsed}}})})
+          ancestors (internal 'binding-ancestors)]
+      ;; Exhaustive traversal defines the expected ordered ancestors, including
+      ;; reader wrappers and token boundaries. The fast path only follows children.
+      (doseq [offset (range (inc (count source)))]
+        (is (= (filterv #(and (<= (:start %) offset) (< offset (:end %))) nodes)
+               (ancestors state doc offset))
+            (str "ancestor path at " offset " in " source)))
+      (let [changed (document (pathlib/Path "/tmp") "(let [{:keys [x]} {}] x)")]
+        (is (= (syntax/parse (.-source changed)) ((internal 'document-tree) state changed)))))))
 
 (deftest cache-preserves-analysis-data-types-test
   (let [encode cache/encode decode cache/decode

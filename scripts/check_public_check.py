@@ -202,10 +202,18 @@ def main():
                 run["counts"] = dict(
                     collections.Counter(f["type"] for f in payload["findings"])
                 )
+                run["file_failures"] = [
+                    finding for finding in payload["findings"]
+                    if finding.get("type") == "file"
+                    or finding.get("message", "").startswith("Analysis failed:")
+                ]
                 run["valid"] = (
                     not run["timeout"] and run["exit"] in {0, 2, 3}
                     and payload["summary"]["files"] == len(files)
+                    and not run["file_failures"]
                 )
+                if run["file_failures"]:
+                    run["error"] = "Checker could not analyze every selected source file"
                 findings = json.dumps(payload["findings"], sort_keys=True)
                 if baseline is None:
                     baseline = findings

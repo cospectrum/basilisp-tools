@@ -2,9 +2,12 @@
 
 import importlib.util
 import io
+import json
 import queue
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 harness_path = Path(__file__).resolve().parents[1] / "scripts" / "check_public_lsp.py"
 spec = importlib.util.spec_from_file_location("_blt_lsp_audit", harness_path)
@@ -233,3 +236,103 @@ def test_missing_diagnostic_is_not_waived_without_confirmed_disable(tmp_path, mo
     )
     assert not assertions["edit introduces unresolved symbol"]
     assert "bad config" in report["observations"]["unresolved_symbol_policy"]["error"]
+
+
+@pytest.mark.parametrize("end_character,valid", [(8, True), (7, False)])
+def test_disabled_syntax_checks_enabled_emoji_diagnostic_range(tmp_path, monkeypatch, end_character, valid):
+    evidence = {"disabled": True, "resolved_level": "off"}
+    monkeypatch.setattr(harness, "diagnostic_policy", lambda *args: evidence)
+    client = diagnostic_probe_client()
+    original = client.diagnostics
+    warning = {
+        "code": "unused-value", "message": 'Unused value: "😀"',
+        "range": {"start": {"line": 5, "character": 4},
+                  "end": {"line": 5, "character": end_character}},
+    }
+    client.diagnostics = lambda uri, version: [warning] if version == 4 else original(uri, version)
+    report, assertions = run_diagnostic_probes(client, tmp_path)
+    assert assertions["disabled syntax setting honored"]
+    assert assertions["enabled diagnostic range uses UTF-16"] == valid
+    assert "edit introduces syntax error" not in assertions
+    assert "edit repairs introduced syntax error" not in assertions
+    assert report["observations"]["skipped_probes"] == [{
+        "name": "syntax diagnostic introduction and repair",
+        "reason": "Resolved project configuration disables :syntax globally.",
+        "configuration": evidence,
+    }]
+
+
+def test_disabled_syntax_without_emoji_diagnostic_records_unrun_range_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "diagnostic_policy", lambda *args: {"disabled": True})
+    client = diagnostic_probe_client()
+    original = client.diagnostics
+    client.diagnostics = lambda uri, version: [] if version == 4 else original(uri, version)
+    report, assertions = run_diagnostic_probes(client, tmp_path)
+    assert all(assertions.values())
+    assert not any("UTF-16" in label for label in assertions)
+    assert report["observations"]["skipped_probes"][1]["name"] == "diagnostic range uses UTF-16"
+
+
+def test_missing_syntax_diagnostic_requires_confirmed_global_disable(tmp_path, monkeypatch):
+    client = diagnostic_probe_client()
+    original = client.diagnostics
+    client.diagnostics = lambda uri, version: [] if version == 4 else original(uri, version)
+    monkeypatch.setattr(harness, "diagnostic_policy", lambda *args: {
+        "disabled": False, "scoped_override_requires_review": True,
+    })
+    report, assertions = run_diagnostic_probes(client, tmp_path)
+    assert not assertions["edit introduces syntax error"]
+    assert not assertions["syntax diagnostic range uses UTF-16"]
+    assert "skipped_probes" not in report["observations"]
+
+
+def test_diagnostic_policy_resolves_the_specific_linter_and_rejects_scoped_overrides(tmp_path):
+    directory = tmp_path / ".clj-kondo"
+    directory.mkdir()
+    (directory / "config.edn").write_text('{:linters {:syntax {:level :off}}}')
+    filename = tmp_path / "demo.lpy"
+    assert harness.diagnostic_policy(tmp_path, filename, "(ns demo)", {}, "syntax")["disabled"]
+    assert not harness.unresolved_symbol_policy(tmp_path, filename, "(ns demo)", {})["disabled"]
+    assert not harness.diagnostic_policy(
+        tmp_path, filename, "(ns ^{:clj-kondo/config {}} demo)", {}, "syntax",
+    )["disabled"]
+
+
+def test_internal_analysis_failures_fail_the_audit_and_preserve_evidence():
+    failure = {"code": "syntax", "message": "Analysis failed: maximum recursion depth exceeded"}
+    report = {"observations": {}, "assertions": []}
+    published = [{
+        "uri": "file:///project/background.lpy", "version": 4,
+        "diagnostics": [failure],
+    }]
+    harness.check_published_failures(
+        published, report,
+        lambda name, condition: report["assertions"].append({"name": name, "passed": condition}),
+    )
+    assert not harness.successful(report)
+    assert report["observations"]["server_failures"] == [{
+        "uri": "file:///project/background.lpy", "version": 4, "diagnostic": failure,
+    }]
+    assert harness.server_failure({"code": "configuration", "message": "Invalid option"})
+    assert not harness.server_failure({"code": "syntax", "message": "Unexpected closing delimiter"})
+    assert not harness.server_failure({"code": "unresolved-symbol", "message": "Unresolved symbol: absent"})
+
+
+def test_interrupted_audit_is_saved_as_a_failure(tmp_path, monkeypatch):
+    stopped = []
+    def interrupt(*args):
+        raise KeyboardInterrupt
+    client = SimpleNamespace(
+        request=interrupt, stop=lambda: stopped.append(True),
+        process=SimpleNamespace(returncode=0), timings=[], process_metrics={}, transcript=[],
+    )
+    monkeypatch.setattr(harness, "Client", lambda *args, **kwargs: client)
+    filename = tmp_path / "demo.lpy"
+    filename.write_text("(ns demo)")
+    output = tmp_path / "report.json"
+    with pytest.raises(KeyboardInterrupt):
+        harness.audit(tmp_path, filename, output)
+    report = json.loads(output.read_text())
+    assert stopped == [True]
+    assert not harness.successful(report)
+    assert report["error"] == "Interrupted before the audit completed"

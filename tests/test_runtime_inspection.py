@@ -333,3 +333,19 @@ class Unrelated:
         assert not info["instance-method?"]
         assert "parameters" not in info and "signature" not in info
     assert "property_accessors" not in sys.modules
+
+
+def test_division_operator_metadata_does_not_execute_methods(worker):
+    class Dividable:
+        def __truediv__(self, other: str) -> str:
+            raise AssertionError("operator executed")
+
+        def __rtruediv__(self, other: int) -> int:
+            raise AssertionError("operator executed")
+
+    metadata = worker.runtime_member("Dividable", Dividable)
+    for name, expected in [("__truediv__", "str"), ("__rtruediv__", "int")]:
+        method = metadata["members"][name]
+        assert method["kind"] == "function"
+        assert method["parameters"][1]["type-path"] == [expected]
+        assert method["type-path"] == [expected]

@@ -199,6 +199,7 @@ def main() -> int:
             "repo": project["repo"],
             "sha": revision,
             "files": len(files),
+            "selected_files": files,
             "source_dialects": sorted({source_dialect(path) for path in files}),
             "bytes": 0,
             "runs": [],
@@ -229,8 +230,9 @@ def main() -> int:
                 for index in range(args.repeat)
             ]
             for label, flags in stages:
-                targets = files if "files" in project else ["."]
-                command = [str(executable), "format", *flags, *targets]
+                # Explicit paths bypass project discovery filters, so every
+                # selected source participates even when it is unchanged.
+                command = [str(executable), "format", *flags, *files]
                 run = {"stage": label, "command": command}
                 run.update(run_command(command, target, args.timeout))
                 report["runs"].append(run)

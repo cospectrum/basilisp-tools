@@ -221,6 +221,44 @@
                                       (assoc (at uri 1 25) :newName "value")) [:error :code])))
       (finally (stop! c) (.cleanup temp)))))
 
+(deftest local-references-and-rename-do-not-wait-for-unrelated-analysis-test
+  (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
+        bootstrap (.joinpath root "blocked_workspace.py")
+        marker (.joinpath root "workspace-blocked")
+        _ (.write_text (.joinpath root "unrelated.lpy") "(ns unrelated)\n(def other 1)")
+        _ (.write_text bootstrap
+                       (str "import sys, time\nfrom pathlib import Path\n"
+                            "from basilisp_tools.cli import main\nimport basilisp_tools.lsp as lsp\n"
+                            "original = lsp.analyze_document\n"
+                            "def blocked_workspace(document, *args):\n"
+                            "    if document.uri.endswith('/unrelated.lpy'):\n"
+                            "        Path('workspace-blocked').write_text('waiting')\n"
+                            "        time.sleep(60)\n"
+                            "    return original(document, *args)\n"
+                            "lsp.analyze_document = blocked_workspace\n"
+                            "sys.argv = ['blt', 'lsp']\nmain()\n"))
+        c (client root nil [sys/executable (str bootstrap)])
+        uri (.as_uri (.joinpath root "local.lpy"))
+        source "(ns local)\n(let [x 1] x)"]
+    (try
+      (initialize! c root)
+      (open! c uri source)
+      (loop [attempt 0]
+        (when (and (not (.exists marker)) (< attempt 100))
+          (time/sleep 0.02) (recur (inc attempt))))
+      (is (.exists marker) "Whole-workspace analysis is deliberately blocked")
+      (let [references (result! c "textDocument/references"
+                                (assoc (at uri 1 11) :context {:includeDeclaration true}))]
+        (is (= #{6 11} (set (map #(get-in % [:range :start :character]) references))))
+        (is (every? #(= uri (:uri %)) references)))
+      (let [edit (result! c "textDocument/rename" (assoc (at uri 1 11) :newName "value"))
+            documents (:documentChanges edit)
+            edits (:edits (first documents))]
+        (is (= [uri] (mapv #(get-in % [:textDocument :uri]) documents)))
+        (is (= #{6 11} (set (map #(get-in % [:range :start :character]) edits))))
+        (is (every? #(= "value" (:newText %)) edits)))
+      (finally (stop! c) (.cleanup temp)))))
+
 (deftest python-instance-method-completion-test
   (let [temp (tempfile/TemporaryDirectory) root (pathlib/Path (.-name temp))
         uri (.as_uri (.joinpath root "methods.lpy")) c (client root)

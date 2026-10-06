@@ -1,0 +1,165 @@
+(ns basilisp-tools.analyzer-public-projects-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp.pprint :as pprint]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [sys]))
+
+(defn- findings [source]
+  (:findings (analyzer/analyze source {:python-options {:python-inspection? false}})))
+
+(deftest core-definitions-do-not-shadow-their-own-namespace
+  (doseq [source ["(ns basilisp.core) (def first (fn [xs] xs))"
+                  "(in-ns 'basilisp.core) (def first (fn [xs] xs))"
+                  "(ns basilisp.core) (defn / [x] x)"]]
+    (is (empty? (filter #(#{:redefined-var :syntax} (:type %)) (findings source)))))
+  (is (= 1 (count (filter #(= :redefined-var (:type %))
+                          (findings "(ns basilisp.core) (def first 1) (def first 2)")))))
+  (is (= 1 (count (filter #(= :redefined-var (:type %))
+                          (findings "(ns example) (def first 1)"))))))
+
+(deftest print-length-loop-binds-locals-and-supports-recur
+  (let [source "(ns example (:require [basilisp.pprint :as pp]))
+                (pp/print-length-loop [xs [1 2]]
+                  (when (seq xs) (recur (next xs))))"]
+    (is (empty? (filter #(#{:unresolved-symbol :unexpected-recur :invalid-arity} (:type %))
+                        (findings source)))))
+  (is (= :done (pprint/print-length-loop [xs [1 2]]
+                                         (if (seq xs) (recur (next xs)) :done)))))
+
+(deftest nil-threading-does-not-pass-nil-to-skipped-calls
+  (doseq [source ["(some-> {:a 3} :b inc)"
+                  "(some->> {:a 3} :b (- 7))"
+                  "(let [s (if (rand-nth [true false]) nil \"hello\")] (some-> s count inc))"]]
+    (is (empty? (filter #(= :type-mismatch (:type %)) (findings source)))))
+  (is (nil? (some-> {:a 3} :b inc)))
+  (is (nil? (some->> {:a 3} :b (- 7))))
+  (is (empty? (filter #(= :constant-condition (:type %))
+                      (findings "(defn f [value] (if (some-> value inc) :yes :no))")))))
+
+(deftest qualified-name-guards-prove-a-non-nil-namespace
+  (is (empty? (filter #(= :type-mismatch (:type %))
+                      (findings "(defn f [sym] (when (qualified-symbol? sym)
+                                 (basilisp.lang.util/munge (namespace sym))))"))))
+  (is (= "example" (namespace 'example/value))))
+
+(deftest qualified-current-namespace-refs-resolve-to-the-original-var
+  (let [source "(ns example (:require [basilisp.string :refer [upper-case]]))
+                [(example/inc 1) (example/upper-case \"text\")]"
+        result (analyzer/analyze source {:python-options {:python-inspection? false}})
+        usages (set (map #(select-keys % [:ns :name]) (:var-usages result)))]
+    (is (empty? (filter #(#{:unresolved-var :unused-referred-var :unused-namespace} (:type %))
+                        (:findings result))))
+    (is (contains? usages {:ns "basilisp.core" :name "inc"}))
+    (is (contains? usages {:ns "basilisp.string" :name "upper-case"})))
+  (is (empty? (filter #(#{:unresolved-var :unused-referred-var :unused-namespace} (:type %))
+                      (findings "(ns example (:require [clojure.string :refer [upper-case]]))
+                                  (example/upper-case \"x\")"))))
+  (let [unused (filter #(= :unused-namespace (:type %))
+                       (findings "(ns example (:require [clojure.string :refer [upper-case]]
+                                                       [basilisp.string :as other]))
+                                  (example/upper-case \"x\")"))]
+    (is (= ["namespace basilisp.string is required but never used"] (mapv :message unused))))
+  (binding [*1 42]
+    (is (= 42 basilisp-tools.analyzer-public-projects-test/*1)))
+  (is (seq (filter #(= :invalid-arity (:type %))
+                   (findings "(ns example) (example/inc)"))))
+  (is (seq (filter #(= :unresolved-var (:type %))
+                   (findings "(ns example (:refer-basilisp :exclude [inc])) (example/inc 1)"))))
+  (is (empty? (filter #(= :unused-namespace (:type %))
+                      (findings "(ns example (:require [clojure.string :as str])) (str/upper-case \"x\")")))))
+
+(deftest typed-map-lookup-retains-missing-key-results
+  (doseq [source ["(def allowed {:known #{:a}})
+                  (defn f [key] (when-not (get allowed key) :missing))"
+                  "(def allowed {:known #{:a}})
+                  (defn f [key] (when (get allowed key false) :present))"]]
+    (is (empty? (filter #(= :constant-condition (:type %)) (findings source)))))
+  (is (nil? (get {:known #{:a}} :absent)))
+  (is (false? (get {:known #{:a}} :absent false))))
+
+(deftest string-ordering-uses-the-native-string-contract
+  (doseq [source ["(< \"a\" \"b\")" "(<= \"09:00\" \"12:00\" \"16:00\")"
+                  "(> \"b\" \"a\")" "(>= \"2026-10-07\" \"2026-10-06\")"]]
+    (is (true? (load-string source)))
+    (is (empty? (findings source))))
+  (doseq [source ["(< \"a\" 1)" "(<= 1 \"a\")" "(> \"b\" nil)" "(>= false \"a\")"]]
+    (is (thrown? python/TypeError (load-string source)))
+    (is (some #(= :type-mismatch (:type %)) (findings source)))))
+
+(deftest division-with-an-uninspected-receiver-retains-unknown-results
+  (is (= "projects/ops/worker.py" (str (/ (pathlib/Path ".") "projects" "ops" "worker.py"))))
+  (is (empty? (findings "(ns example (:import pathlib))
+                         (let [root (.resolve (pathlib/Path \".\"))]
+                           (/ root \"projects\" \"ops\" \"worker.py\"))")))
+  (is (empty? (filter #(= :constant-condition (:type %))
+                      (findings "(defn f [value] (if (/ value 2) :yes :no))"))))
+  (is (empty? (filter #(= :type-mismatch (:type %))
+                      (findings "(defn f [value selected?] (/ (if selected? value 1) \"child\"))"))))
+  (is (= 1/2 (/ 2)))
+  (is (= 2 (/ 24 3 4)))
+  (doseq [source ["(/ \"x\")" "(/ 1 \"x\")" "(/ \"x\" 2)" "(/ 8 2 \"x\")"]]
+    (is (thrown? python/TypeError (load-string source)))
+    (is (some #(= :type-mismatch (:type %)) (findings source)))))
+
+(deftest typed-python-division-preserves-operator-contracts
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (py/create-cache)
+        options {:python-options {:python-paths [(str root)] :python-inspection? false :python-cache cache}}
+        prefix "(ns blt-public-division (:import [divisionfixture :as d])) "]
+    (try
+      (.write_text (.joinpath root "divisionfixture.py")
+                   (str "from pathlib import Path\n"
+                        "class Joiner:\n"
+                        "    def __init__(self, value: str): self.value = Path(value)\n"
+                        "    def __truediv__(self, other: str) -> 'Joiner': return Joiner(str(self.value / other))\n"
+                        "    def __rtruediv__(self, other: str) -> 'Joiner': return Joiner(str(other / self.value))\n"
+                        "    def text(self) -> str: return str(self.value)\n"
+                        "class Base:\n"
+                        "    def __truediv__(self, other: 'Base') -> str: return 'forward'\n"
+                        "class Child(Base):\n"
+                        "    def __rtruediv__(self, other: Base) -> int: return 2\n"
+                        "class ReverseBase:\n"
+                        "    def __truediv__(self, other: 'ReverseBase') -> int: return 1\n"
+                        "class ReverseChild(ReverseBase):\n"
+                        "    def __rtruediv__(self, other: ReverseBase) -> str: return 'reflected'\n"
+                        "def require_int(value: int) -> int: return value + 1\n"
+                        "def require_str(value: str) -> str: return value.upper()\n"))
+      ;; A local signature supplies contracts unavailable from unannotated stdlib methods.
+      (.write_text (.joinpath root "pathlib.pyi")
+                   (str "class Path:\n"
+                        "    def __init__(self, value: str): ...\n"
+                        "    def resolve(self) -> 'Path': ...\n"
+                        "    def __truediv__(self, other: str) -> 'Path': ...\n"
+                        "    def __rtruediv__(self, other: str) -> 'Path': ...\n"))
+      (.insert sys/path 0 (str root))
+      (doseq [[body valid?]
+              [["(/ (.resolve (pathlib/Path \".\")) \"child\" \"leaf\")" true]
+               ["(/ \"base\" (pathlib/Path \"child\"))" true]
+               ["(/ (pathlib/Path \"base\") 2)" false]]]
+        (let [source (str "(ns blt-public-path-division (:import pathlib)) " body)
+              errors (filter #(= :type-mismatch (:type %)) (:findings (analyzer/analyze source options)))]
+          (if valid?
+            (do (is (instance? pathlib/PurePath (load-string source))) (is (empty? errors)))
+            (do (is (thrown? python/TypeError (load-string source))) (is (= 1 (count errors)))))))
+      (doseq [[body expected]
+              [["(.text (/ (d/Joiner \"base\") \"child\" \"leaf\"))" "base/child/leaf"]
+               ["(.text (/ \"base\" (d/Joiner \"child\")))" "base/child"]
+               ["(inc (/ (d/Base) (d/Child)))" 3]
+               ["(d/require-int (/ (d/Base) (d/Child)))" 3]
+               ["(d/require-str (/ (d/ReverseBase) (d/ReverseChild)))" "REFLECTED"]]]
+        (let [source (str prefix body)]
+          (is (= expected (load-string source)))
+          (is (empty? (:findings (analyzer/analyze source options))))))
+      (doseq [body ["(/ (d/Joiner \"base\") 2)" "(/ 2 (d/Joiner \"child\"))"
+                    "(/ (d/Joiner \"base\") \"child\" 2)"
+                    "(defn f [^d/Joiner value] (/ value 2)) (f (d/Joiner \"base\"))"]]
+        (let [source (str prefix body)]
+          (is (thrown? python/TypeError (load-string source)))
+          (is (= [:type-mismatch] (mapv :type (:findings (analyzer/analyze source options)))))))
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules "divisionfixture" nil)
+        (py/stop-cache! cache)
+        (.cleanup temporary)))))

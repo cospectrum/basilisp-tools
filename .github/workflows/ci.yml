@@ -72,6 +72,34 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  public-projects:
+    name: Validate public projects
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+      - name: Fetch pinned public sources
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/fetch_public_projects.py "$RUNNER_TEMP/blt-public" --source-only --project basilisp-flask --project basilisp-nrepl-async --project calc
+      - name: Check formatter preservation and idempotence
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_public_format.py --corpus "$RUNNER_TEMP/blt-public" --project basilisp-flask --project basilisp-nrepl-async --report "$RUNNER_TEMP/blt-public-reports/format.json"
+      - name: Check public sources and retain diagnostics
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_public_check.py --corpus "$RUNNER_TEMP/blt-public" --project basilisp-flask --project basilisp-nrepl-async --no-python-inspection --output "$RUNNER_TEMP/blt-public-reports/check"
+      - name: Exercise public LSP workspaces
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_public_lsp.py --corpus "$RUNNER_TEMP/blt-public" --project basilisp-flask --project basilisp-nrepl-async --request-timeout 180 --diagnostic-timeout 180 --output "$RUNNER_TEMP/blt-public-reports/lsp"
+      - name: Run upstream calc tests before and after formatting
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_public_runtime.py --corpus "$RUNNER_TEMP/blt-public" --output "$RUNNER_TEMP/blt-public-reports/runtime"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: public-project-reports
+          path: ${{ runner.temp }}/blt-public-reports/
+          if-no-files-found: warn
+
   compatibility:
     name: Compare with upstream tools
     runs-on: ubuntu-24.04

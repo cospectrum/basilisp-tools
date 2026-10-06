@@ -32,3 +32,21 @@
            (errors (analyze "(def f (fn [x] x)) (f 1) (def f (fn [] 2)) (f 1)" config))))
     (is (= [:invalid-arity]
            (errors (analyze "(def f (fn [x] x)) (def f) (f)" config))))))
+
+(deftest shallow-tests-retain-declarations-without-walking-test-bodies
+  (doseq [[source config]
+          [["(ns example (:require [basilisp.test :refer [deftest]]))
+             (deftest ^{:doc \"A test\"} sample (inc) missing)" {}]
+           ["(ns example (:require [custom.tests :as tests]))
+             (tests/check ^{:doc \"A test\"} sample (inc) missing)"
+            {:lint-as {'custom.tests/check 'basilisp.test/deftest}}]]]
+    (let [full (analyze source config)
+          definition (get-in full [:definitions "sample"])]
+      (is (= #{:invalid-arity :unresolved-symbol} (set (errors full))))
+      (is (= "sample" (:name definition)))
+      (is (= "A test" (:doc definition)))
+      (doseq [shallow shallow-configurations
+              :let [result (analyze source (merge config shallow))]]
+        (is (empty? (errors result)))
+        (is (= definition (get-in result [:definitions "sample"])))
+        (is (not-any? #(#{"inc" "missing"} (:name %)) (:var-usages result)))))))

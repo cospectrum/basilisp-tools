@@ -484,9 +484,7 @@
               (let [node (unwrap node) kind (:kind node)]
                 (when (seq (:children node))
                   (let [xs (forms node)
-                        raw (when (op/eq :list kind) (token (first xs)))
-                        head (when raw (last (str/split raw #"/")))
-                        initializer? (initializing-definition? head (rest xs))]
+                        raw (when (op/eq :list kind) (token (first xs)))]
                     (cond
                       (#{:quote :var-quote :discard} kind) nil
                       (op/eq :syntax-quote kind) (doseq [child xs] (scan child (inc quoted)))
@@ -497,9 +495,11 @@
                       (and (op/eq :tagged kind) (not= "#py" (:text (first (:children node))))) nil
                       :else
                       (do
-                        (when (and (zero? quoted) initializer? (not (contains? roots (:start node)))
+                        (when (and raw (zero? quoted) (not (contains? roots (:start node)))
                                    (op/eq :symbol (:kind (unwrap (second xs)))))
-                          (swap! uncertain into (initialized-var-names head (rest xs))))
+                          (let [head (if (op/contains raw "/") (last (str/split raw #"/")) raw)]
+                            (when (initializing-definition? head (rest xs))
+                              (swap! uncertain into (initialized-var-names head (rest xs))))))
                         (doseq [child xs] (scan child quoted))))))))]
       (scan root 0))
     {:root-initializations roots :uncertain-initializations @uncertain}))
@@ -1045,6 +1045,18 @@
           (when-let [parent (python-import state (subs prefix 0 dot))]
             (update parent :path (fnil conj []) (subs prefix (inc dot))))))))
 
+(defn- referred-var-info [ctx name]
+  (let [state @(:state ctx)
+        referred (get-in state [:refers name])
+        core-name (get-in state [:core-renamed name] name)
+        core? (and (or (contains? (:core-renamed state) name)
+                       (not (contains? (:core-excluded state) core-name)))
+                   (or (nil? (:core-only state)) (contains? (:core-only state) core-name)))]
+    (or (when referred
+          (or (get (namespace-definitions ctx (:ns referred)) (:name referred))
+              {:name (:name referred) :ns (:ns referred) :unknown true}))
+        (when core? (get @core-definitions core-name)))))
+
 (defn- resolve-symbol! [ctx env node]
   (let [name (token node) state @(:state ctx)
         local (get (:locals env) name)
@@ -1069,7 +1081,11 @@
                          (contains? (get-in state [:opts :project]) ns-name))
             defs (if (= ns-name (:namespace state)) (:definitions state)
                      (when known-ns (namespace-definitions ctx ns-name)))
-            info (get defs member)]
+            referred-info (when (and (= ns-name (:namespace state)) (not (contains? defs member)))
+                            (referred-var-info ctx member))
+            info (or (get defs member) referred-info)
+            origin-ns (or (:ns referred-info) ns-name)
+            origin-name (or (:name referred-info) member)]
         (cond
           (op/eq prefix "python") (python-reference! ctx node "builtins" member)
           imported (python-reference! ctx node (:name imported)
@@ -1089,15 +1105,20 @@
               (when (get-in state [:requires ns-name :alias-only])
                 (finding! ctx node :aliased-namespace-var-usage
                           (str "Namespace only aliased but wasn't loaded: " ns-name)))
-              (mark-namespace! ctx ns-name)
+              (if-let [referred (when (and (= ns-name (:namespace state))
+                                           (not (contains? defs member)))
+                                  (get-in state [:refers member]))]
+                (do (mark-namespace! ctx (:ns referred))
+                    (swap! (:state ctx) update :used-refers conj member))
+                (mark-namespace! ctx origin-ns))
               (when (and (contains? (:aliases state) prefix)
                          (some #(and (= ns-name (:ns %)) (= member (:name %))) (vals (:refers state))))
                 (finding! ctx (assoc (or (:call-node env) node) :no-end true) :aliased-referred-var
                           (str "Var " member " is referred but used via alias: " prefix)))
-              (when-not (= [ns-name member] [(:ns (:caller env)) (:name (:caller env))])
-                (swap! (:state ctx) update :used-vars conj [ns-name member]))
+              (when-not (= [origin-ns origin-name] [(:ns (:caller env)) (:name (:caller env))])
+                (swap! (:state ctx) update :used-vars conj [origin-ns origin-name]))
               (emit! ctx :var-usages (merge (loc ctx node)
-                                            {:name member :ns ns-name :from (:namespace state) :definition info}))
+                                            {:name origin-name :ns origin-ns :from (:namespace state) :definition info}))
               (when (and defs (nil? info) (not (:quiet env))
                          (not (excluded? ctx :unresolved-var (str ns-name "/" member))))
                 (finding! ctx node :unresolved-var (str "Unresolved var: " prefix "/" member)))
@@ -1117,14 +1138,7 @@
         (python-reference! ctx node (:name entry) (:member entry)))
       :else
       (let [referred (get-in state [:refers name])
-            core-name (get-in state [:core-renamed name] name)
-            core? (and (or (contains? (:core-renamed state) name)
-                           (not (contains? (:core-excluded state) core-name)))
-                       (or (nil? (:core-only state)) (contains? (:core-only state) core-name)))
-            info (or (get-in state [:definitions name])
-                     (when referred (or (get (namespace-definitions ctx (:ns referred)) (:name referred))
-                                        {:name (:name referred) :ns (:ns referred) :unknown true}))
-                     (when core? (get @core-definitions core-name)))]
+            info (or (get-in state [:definitions name]) (referred-var-info ctx name))]
         (cond
           info
           (do (lint-reference! ctx env node info)
@@ -1943,11 +1957,13 @@
     (if (and (op/eq :keyword (:kind transform)) (some? (:parameter transform)))
       (keyword-value (nth values (:parameter transform) nil)) result)))
 
-(defn- string-arithmetic-spec [name values]
+(defn- string-operation-spec [name values]
   (when-let [index (first (keep-indexed #(when (#{:string :char} (:tag %2)) %1) values))]
     (case name
       "+" {:args (vec (repeat (count values) :string)) :ret :string}
       "*" {:args (mapv #(if (= index %) :string :int) (range (count values))) :ret :string}
+      ("<" ">" "<=" ">=") (when (every? #(compatible-tag? (:tag %) :string) values)
+                            {:args (vec (repeat (count values) :string)) :ret :boolean})
       nil)))
 
 (defn- function-spec [ctx info n values]
@@ -1964,7 +1980,8 @@
                        (get-in info [:parameter-tags :varargs])))]
     (or arity (when inferred {:args inferred})
         (when (op/eq "basilisp.core" (:ns info))
-          (or (string-arithmetic-spec (:name info) values) (core-spec (:name info) n)))
+          (or (when (and (op/eq "/" (:name info)) (> n 1)) {:python-division? true})
+              (string-operation-spec (:name info) values) (core-spec (:name info) n)))
         (shared-type-signatures (:ns info) (:name info) n))))
 (declare lint-extra-types! merge-values)
 
@@ -1979,10 +1996,51 @@
         integers #{:int :pos-int :nat-int :neg-int :long :short :byte}
         scalar (into integers [:double :float])]
     (cond
-      (string-arithmetic-spec function values) (tagged :string)
+      (string-operation-spec function values) (tagged :string)
       (and (op/ne "/" function) (every? integers tags)) (assoc (tagged :int) :diagnostic-tag :number)
       (and (seq tags) (every? scalar tags) (some #{:double :float} tags)) (assoc (tagged :double) :diagnostic-tag :number)
       :else (tagged :number))))
+
+(defn- division-step! [ctx left-node left right-node right]
+  (let [options (get-in @(:state ctx) [:opts :python-options] {})
+        calls (keep (fn [[receiver argument argument-node method-name]]
+                      ;; Lisp scalar tags already describe numeric division. Python
+                      ;; objects can instead provide an annotated operator contract.
+                      (when (and (:python-type receiver)
+                                 (or (nil? (:tag receiver)) (#{:any :truthy} (:tag receiver))))
+                        (let [member (py/inspect-member (:python-type receiver) method-name options)]
+                          (when (op/eq :function (:kind member))
+                            {:member member :argument argument :node argument-node
+                             :signatures (py/call-signatures member [(:python-type argument)] {} options)}))))
+                    [[left right right-node "__truediv__"] [right left left-node "__rtruediv__"]])
+        accepted (filter #(seq (:signatures %)) calls)]
+    (cond
+      (seq accepted)
+      ;; Reflected subclass methods can take precedence over forward methods.
+      ;; Differing results stay unknown when signatures do not prove dispatch.
+      (let [types (mapv #(py/call-result (:member %) [(:python-type (:argument %))]
+                                         {} options (:signatures %)) accepted)]
+        (when (and (every? some? types) (apply = types)) (python-value (first types))))
+      (seq calls)
+      (let [{:keys [argument node]} (first calls)]
+        (finding! ctx node :type-mismatch
+                  (str "No Python signature accepts argument types (" (py/type-label (:python-type argument)) ")"))
+        nil)
+      (every? (fn [value]
+                (let [tag (:tag value)]
+                  (and tag (not-any? #{:any :truthy} (if (set? tag) tag [tag]))))) [left right])
+      (do (check-value-spec! ctx left-node left :number nil)
+          (check-value-spec! ctx right-node right :number nil)
+          (arithmetic-value "/" [left right]))
+      ;; An unknown operand may overload division, including reflected division;
+      ;; neither a numeric result nor a numeric-only argument contract is proven.
+      :else nil)))
+
+(defn- division-value! [ctx args values]
+  (loop [left-node (first args) value (first values) remaining (map vector (rest args) (rest values))]
+    (if-let [[right-node right] (first remaining)]
+      (recur right-node (division-step! ctx left-node value right-node right) (rest remaining))
+      value)))
 
 (defn- check-function-argument! [ctx _node info args values]
   (when (op/eq "basilisp.core" (:ns info))
@@ -2011,7 +2069,8 @@
   (check-function-argument! ctx node info args values)
   (let [spec (function-spec ctx info (count args) values)
         specs (when (valid-arity? info (count args)) (:args spec))
-        expected (expanded-specs ctx node specs args)]
+        expected (expanded-specs ctx node specs args)
+        division (when (:python-division? spec) (division-value! ctx args values))]
     (when (and (op/eq "basilisp.string" (:ns info)) (#{"replace" "replace-first"} (:name info))
                (#{:string :char} (:tag (second values)))
                (:tag (nth values 2 nil))
@@ -2040,6 +2099,7 @@
                  (op/ne :any (:tag (first values))))
         (finding! ctx node :not-empty? "Use (seq x) instead of (not (empty? x)) when x is a seq")))
     (cond
+      (:python-division? spec) division
       (and (op/eq "basilisp.test" (:ns info)) (op/eq "compose-fixtures" (:name info))) (tagged :fn)
       (:macro info) nil
       (and (op/eq "basilisp.set" (:ns info)) (= 1 (count values))
@@ -2087,12 +2147,15 @@
       (and (op/eq "not-empty" (:name info)) (op/eq "basilisp.core" (:ns info)))
       (merge-values [(first values) (tagged :nil)])
       (and (op/eq "namespace" (:name info)) (op/eq "basilisp.core" (:ns info)))
-      (python-value {:module "builtins" :path ["str"] :nullable? true})
+      (python-value (cond-> {:module "builtins" :path ["str"]}
+                      (not (:qualified-name? (first values))) (assoc :nullable? true)))
       (and (op/eq "basilisp.core" (:ns info)) (#{"get" "nth" "aget"} (:name info)) (:python-type (first values)))
       (when-let [type (py/element-type (:python-type (first values))
                                        (first (constant-data ctx (second args)))
                                        (get-in @(:state ctx) [:opts :python-options] {}))]
-        (python-value type))
+        (if (op/eq "get" (:name info))
+          (merge-values [(python-value type) (or (nth values 2 nil) (tagged :nil))])
+          (python-value type)))
       (:ret spec) (spec-value (:ret spec))
       :else (function-return info values))))
 
@@ -2181,7 +2244,9 @@
         variants (remove #(and (op/eq "builtins" (:module %)) (= ["NoneType"] (:path %))) (:union type))]
     (cond-> value
       type (assoc :python-type (if (:union type) (py/union-type variants) (dissoc type :nullable?)))
-      (set? (:tag value)) (assoc :tag (disj (:tag value) :nil)))))
+      (set? (:tag value)) (assoc :tag (disj (:tag value) :nil))
+      (and (keyword? (:tag value)) (= "nilable" (namespace (:tag value))))
+      (assoc :tag (keyword (name (:tag value)))))))
 
 (defn- value-tags [value]
   (let [tag (:tag value)]
@@ -2225,6 +2290,7 @@
         tags {"string?" :string "number?" :number "integer?" :int "int?" :int "float?" :double
               "map?" :map "vector?" :vector "set?" :set "seq?" :seq "list?" :list
               "keyword?" :keyword "symbol?" :symbol "boolean?" :boolean "fn?" :fn
+              "qualified-symbol?" :symbol "qualified-keyword?" :keyword
               "nil?" :nil}
         tag (get tags name)
         class-node (when (op/eq "isinstance" name) (nth xs 2 nil))
@@ -2243,7 +2309,9 @@
                    (and value (op/eq "not" name)) nil
                    (and value (#{"some?" "nil?"} name))
                    (if (= truthy? (op/eq "some?" name)) (nonnil-value value) (merge value (tagged :nil)))
-                   (and value tag truthy?) (merge value (tagged tag))
+                   (and value tag truthy?)
+                   (cond-> (merge value (tagged tag))
+                     (#{"qualified-symbol?" "qualified-keyword?"} name) (assoc :qualified-name? true))
                    (and value class-module truthy?)
                    (merge (dissoc value :tag) (python-value {:module class-module :path (python-path (last class-parts))}))
                    (and value class-module (not truthy?))
@@ -2403,14 +2471,24 @@
 
 (defn- walk-thread! [ctx env args]
   (let [initial (walk! ctx env (first args))
-        doto? (op/eq "doto" (:name (:call-identity ctx)))
-        last? (contains? #{"->>" "some->>"} (:name (:call-identity ctx)))]
+        name (:name (:call-identity ctx))
+        doto? (op/eq "doto" name)
+        last? (contains? #{"->>" "some->>"} name)
+        conditional? (contains? #{"some->" "some->>"} name)]
     (loop [steps (rest args) value initial previous (first args)]
       (if-let [step (first steps)]
         (let [call (if (op/eq :list (:kind step)) step
                        (assoc step :kind :list :text nil :children [step]))
-              result (walk-call! ctx (assoc env :thread-target {:value value :node previous :last? last?}) call 1)]
-          (recur (rest steps) (if doto? initial result) step))
+              nil-input? (and conditional? (= #{:nil} (value-tags value)))
+              input (if nil-input? (tagged :any) (if conditional? (nonnil-value value) value))
+              result (walk-call! ctx (assoc env :thread-target {:value input :node previous :last? last?}) call 1)
+              result (cond
+                       doto? initial
+                       nil-input? value
+                       (and conditional? (compatible-tag? :nil (:tag value)))
+                       (merge-values [result (tagged :nil)])
+                       :else result)]
+          (recur (rest steps) result step))
         value))))
 
 (defn- walk-comprehension! [ctx env node]
@@ -2591,6 +2669,7 @@
                (or (get (if (= ns-name (:namespace state)) (:definitions state)
                             (when-not (python-import state prefix)
                               (namespace-definitions ctx ns-name))) member)
+                   (when (= ns-name (:namespace state)) (referred-var-info ctx member))
                    {:name member :ns ns-name}))
       (contains? (:definitions state) raw) (get-in state [:definitions raw])
       (contains? (:refers state) raw)
@@ -2609,6 +2688,7 @@
       (and (symbol? lint-as)
            (#{"clojure.core" "basilisp.core" "clojure.test" "basilisp.test" "clj-kondo.lint-as"} (namespace lint-as)))
       (basilisp.core/name lint-as)
+      (and (op/eq "basilisp.pprint" (:ns identity)) (op/eq "print-length-loop" (:name identity))) "loop"
       (#{"basilisp.core" "basilisp.test"} (:ns identity)) (:name identity)
       :else nil)))
 
@@ -3112,33 +3192,38 @@
     (when (and (#{"cond->" "cond->>"} name) (seq args) (odd? (count (rest args))))
       (finding! ctx node :invalid-arity (str name " requires even number of clauses")))))
 
+(def ^:private registered-definition-heads
+  #{"def" "defonce" "defn" "defn-" "defasync" "defmacro" "defmacro-" "defmulti"
+    "defprotocol" "definterface" "deftype" "defrecord"})
+
 (defn- register-definition! [ctx node head args]
-  (let [target (first args) name (token target) state @(:state ctx)
-        category (cond (#{"defn" "defn-" "defasync" "defmacro" "defmacro-"} head) :function
-                       (#{"defprotocol" "definterface" "deftype" "defrecord"} head) :type)
-        conditional? (some #{"basilisp.core/if" "basilisp.core/if-not" "basilisp.core/case" "basilisp.core/cond"}
-                           (rest (:callstack ctx)))]
-    (when (and name (= :symbol (:kind (unwrap target)))
-               (#{"def" "defonce" "defn" "defn-" "defasync" "defmacro" "defmacro-" "defmulti"
-                  "defprotocol" "definterface" "deftype" "defrecord"} head))
-      (when (and category (linter-enabled? ctx :var-same-name-except-case))
-        (let [clashes (sort (keep (fn [[previous kind]]
-                                    (when (and (= category kind) (not= name previous)
-                                               (= (str/lower-case name) (str/lower-case previous))) previous))
-                                  (:case-definitions state)))]
-          (when (seq clashes)
-            (finding! ctx node :var-same-name-except-case
-                      (str "Var name " name " differs only in case from: " (str/join ", " clashes))))))
-      (when-not (or conditional? (:no-warn-on-redef (node-metadata target)))
-        (let [referred (or (get-in state [:refers name])
-                           (when-not (contains? (:core-excluded state) name) (get @core-definitions name)))]
-          (cond
-            (contains? (:seen-definitions state) name)
-            (finding! ctx node :redefined-var (str "redefined var #'" (current-ns ctx) "/" name))
-            referred
-            (finding! ctx node :redefined-var (str name " already refers to #'" (:ns referred) "/" (:name referred))))))
-      (when-not conditional? (swap! (:state ctx) update :seen-definitions conj name))
-      (when category (swap! (:state ctx) assoc-in [:case-definitions name] category)))))
+  (when (contains? registered-definition-heads head)
+    (let [target (first args) name (token target) state @(:state ctx)
+          category (cond (#{"defn" "defn-" "defasync" "defmacro" "defmacro-"} head) :function
+                         (#{"defprotocol" "definterface" "deftype" "defrecord"} head) :type)
+          conditional? (some #{"basilisp.core/if" "basilisp.core/if-not" "basilisp.core/case" "basilisp.core/cond"}
+                             (rest (:callstack ctx)))]
+      (when (and name (= :symbol (:kind (unwrap target))))
+        (when (and category (linter-enabled? ctx :var-same-name-except-case))
+          (let [clashes (sort (keep (fn [[previous kind]]
+                                      (when (and (= category kind) (not= name previous)
+                                                 (= (str/lower-case name) (str/lower-case previous))) previous))
+                                    (:case-definitions state)))]
+            (when (seq clashes)
+              (finding! ctx node :var-same-name-except-case
+                        (str "Var name " name " differs only in case from: " (str/join ", " clashes))))))
+        (when-not (or conditional? (:no-warn-on-redef (node-metadata target)))
+          (let [referred (or (get-in state [:refers name])
+                             (when-not (or (= "basilisp.core" (current-ns ctx))
+                                           (contains? (:core-excluded state) name))
+                               (get @core-definitions name)))]
+            (cond
+              (contains? (:seen-definitions state) name)
+              (finding! ctx node :redefined-var (str "redefined var #'" (current-ns ctx) "/" name))
+              referred
+              (finding! ctx node :redefined-var (str name " already refers to #'" (:ns referred) "/" (:name referred))))))
+        (when-not conditional? (swap! (:state ctx) update :seen-definitions conj name))
+        (when category (swap! (:state ctx) assoc-in [:case-definitions name] category))))))
 
 (defn- walk-list-form! [ctx env node]
   (let [[head & args] (forms node)
@@ -3147,7 +3232,7 @@
         _ (when definition?
             (doseq [target (if (= "declare" name) args (take 1 args))
                     :let [raw (token target) parts (when raw (str/split raw #"/" 2))]
-                    :when (and (> (count parts) 1)
+                    :when (and (> (count parts) 1) (seq (first parts))
                                (not= (get-in @(:state ctx) [:aliases (first parts)] (first parts)) (current-ns ctx)))]
               (finding! ctx (unwrap target) :syntax (str "Invalid var name: " raw))))
         args (cond (= "declare" name) (mapv local-definition-node args)
@@ -3403,7 +3488,10 @@
           (walk! ctx (assoc env :ignore-fn-args ignore-args) (first tail))
           (walk-body! ctx env (rest tail)))
         (op/eq dispatch-value "deftest")
-        (do (walk-body! ctx env (rest args)) (tagged :var))
+        (do (when-not (or (get-in (context-config ctx) [:analysis :var-definitions :shallow])
+                          (get-in (context-config ctx) [:output :analysis :var-definitions :shallow]))
+              (walk-body! ctx env (rest args)))
+            (tagged :var))
         (op/eq dispatch-value "testing")
         (do (walk! ctx env (first args)) (walk-statements! ctx env (rest args)))
         (#{"apply-method" "apply-method-kw"} dispatch-value)

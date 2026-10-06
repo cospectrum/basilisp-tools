@@ -1172,6 +1172,13 @@
        (recur (rest uris) (assoc result uri (await (analyzed! state uri))))
        result))))
 
+(defasync ^:private reference-analyses! [state uri analysis identity]
+  ;; Lexical bindings cannot have occurrences in another document. Waiting for
+  ;; unrelated files here delays local navigation and rename on large projects.
+  (if (= :local (first identity))
+    {uri analysis}
+    (await (all-analyses! state uri))))
+
 (defn- mapcatv [f coll]
   ;; Consume each document's results before advancing, including empty results.
   ;; Nested lazy comprehensions otherwise retain a stack frame per document.
@@ -1217,22 +1224,33 @@
   (if (or (:macro definition) (seq (:arglists definition)))
     (.-Function lsp/SymbolKind) (.-Variable lsp/SymbolKind)))
 
-(defn- map-binding? [document definition]
-  (let [offset (:start definition)
-        ancestors (filter #(and (<= (:start %) offset) (< offset (:end %)))
-                          (syntax/nodes (:root (syntax/parse (.-source document)))))
+(defn- document-tree [state document]
+  ;; Declaration indexing already parsed this exact source snapshot. Retain the
+  ;; source check for guards that examine a different document during a rename.
+  (let [prior (some-> (:declaration-cache @state) deref (get (.-uri document)))
+        parsed (when (= (.-source document) (:source prior)) (get-in prior [:info :parsed]))]
+    (or parsed (syntax/parse (.-source document)))))
+
+(defn- binding-ancestors [state document offset]
+  (let [contains-offset? #(and (<= (:start %) offset) (< offset (:end %)))]
+    (loop [node (:root (document-tree state document)) ancestors []]
+      (if (and node (contains-offset? node))
+        (recur (first (filter contains-offset? (:children node))) (conj ancestors node))
+        ancestors))))
+
+(defn- map-binding? [state document definition]
+  (let [ancestors (binding-ancestors state document (:start definition))
         list-start (:start (last (filter #(= :list (:kind %)) ancestors)) -1)]
     ;; Map destructuring may encode keyword names and :or defaults. Renaming its
     ;; token alone would silently change the lookup key, so decline the edit.
     (some #(and (= :map (:kind %)) (> (:start %) list-start)) ancestors)))
 
-(defn- type-or-protocol-binding? [document definition]
-  (let [offset (:start definition)]
-    (some (fn [node]
-            (when (and (= :list (:kind node)) (<= (:start node) offset) (< offset (:end node)))
-              (contains? #{"defrecord" "deftype" "defprotocol"}
-                         (last (str/split (or (:text (first (syntax/forms node))) "") #"/")))))
-          (syntax/nodes (:root (syntax/parse (.-source document)))))))
+(defn- type-or-protocol-binding? [state document definition]
+  (some (fn [node]
+          (when (= :list (:kind node))
+            (contains? #{"defrecord" "deftype" "defprotocol"}
+                       (last (str/split (or (:text (first (syntax/forms node))) "") #"/")))))
+        (binding-ancestors state document (:start definition))))
 
 (defn- editable-definition? [state analysis item]
   (when-let [definition (definition-of analysis item)]
@@ -1248,8 +1266,8 @@
                             (= (:filename definition) (:filename %))
                             (not= (:name definition) (:name %)))
                       (vals (get-in @state [:project-caches (root-for state (.-uri document)) :project (:ns definition)]))))
-           (not (type-or-protocol-binding? document definition))
-           (not (and (:id definition) (map-binding? document definition)))))))
+           (not (type-or-protocol-binding? state document definition))
+           (not (and (:id definition) (map-binding? state document definition)))))))
 
 (defn- name-span [document item]
   ;; A qualified use edits only the name, leaving its namespace alias intact.
@@ -1542,8 +1560,8 @@
              :let [definition (first (filter #(= (:start finding) (:start %)) (:locals analysis)))
                    name (:name definition)
                    replacement (str "_" name)]
-             :when (and definition (valid-name? name) (not (map-binding? document definition))
-                        (not (type-or-protocol-binding? document definition))
+             :when (and definition (valid-name? name) (not (map-binding? state document definition))
+                        (not (type-or-protocol-binding? state document definition))
                         (not (some #(= replacement (:text %))
                                    (syntax/nodes (:root (syntax/parse (.-source document)))))))]
          (lsp/CodeAction
@@ -4725,11 +4743,11 @@
                     (location state (definition-of analysis item))))))
      (feature lsp/TEXT_DOCUMENT_REFERENCES
               (fn ^:async handler [params]
-                (let [{:keys [item uri]} (await (query! state params))]
+                (let [{:keys [item uri analysis]} (await (query! state params))]
                   (python/list
                    (keep (fn [[_uri entry]] (location state entry))
                          (when-let [identity (identity-of item)]
-                           (occurrences (await (all-analyses! state uri)) identity
+                           (occurrences (await (reference-analyses! state uri analysis identity)) identity
                                         (.-include_declaration (.-context params)))))))))
      (feature lsp/TEXT_DOCUMENT_PREPARE_RENAME
               (fn ^:async handler [params]
@@ -4744,7 +4762,7 @@
                   (when-not (and identity (editable-definition? state analysis item) (valid-name? name))
                     (failure "Only resolved Basilisp bindings can be renamed to an unqualified symbol."))
                   (let [generation (:generation @state)
-                        analyses (await (all-analyses! state uri))
+                        analyses (await (reference-analyses! state uri analysis identity))
                         matches (occurrences analyses identity true)
                         uris (set (map first matches))]
                     (doseq [[_uri analysis] analyses]
