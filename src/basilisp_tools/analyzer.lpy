@@ -1966,6 +1966,14 @@
                             {:args (vec (repeat (count values) :string)) :ret :boolean})
       nil)))
 
+(def ^:private python-operators
+  {"+" ["__add__" "__radd__"] "-" ["__sub__" "__rsub__"]
+   "*" ["__mul__" "__rmul__"] "/" ["__truediv__" "__rtruediv__"]})
+
+(defn- python-operator-receiver? [value]
+  (let [tag (:tag value)]
+    (or (nil? tag) (some #{:any :truthy} (if (set? tag) tag [tag])))))
+
 (defn- function-spec [ctx info n values]
   (let [config (context-config ctx)
         fq (when (:ns info) (str (:ns info) "/" (:name info)))
@@ -1980,7 +1988,9 @@
                        (get-in info [:parameter-tags :varargs])))]
     (or arity (when inferred {:args inferred})
         (when (op/eq "basilisp.core" (:ns info))
-          (or (when (and (op/eq "/" (:name info)) (> n 1)) {:python-division? true})
+          (or (when (and (> n 1) (contains? python-operators (:name info))
+                         (or (op/eq "/" (:name info)) (some python-operator-receiver? values)))
+                {:python-operator (:name info)})
               (string-operation-spec (:name info) values) (core-spec (:name info) n)))
         (shared-type-signatures (:ns info) (:name info) n))))
 (declare lint-extra-types! merge-values)
@@ -2001,26 +2011,34 @@
       (and (seq tags) (every? scalar tags) (some #{:double :float} tags)) (assoc (tagged :double) :diagnostic-tag :number)
       :else (tagged :number))))
 
-(defn- division-step! [ctx left-node left right-node right]
+(defn- python-operator-step! [ctx operator left-node left right-node right]
   (let [options (get-in @(:state ctx) [:opts :python-options] {})
+        [forward reflected] (get python-operators operator)
         calls (keep (fn [[receiver argument argument-node method-name]]
-                      ;; Lisp scalar tags already describe numeric division. Python
+                      ;; Lisp scalar tags already describe arithmetic. Python
                       ;; objects can instead provide an annotated operator contract.
-                      (when (and (:python-type receiver)
-                                 (or (nil? (:tag receiver)) (#{:any :truthy} (:tag receiver))))
-                        (let [member (py/inspect-member (:python-type receiver) method-name options)]
-                          (when (op/eq :function (:kind member))
+                      (when (python-operator-receiver? receiver)
+                        (let [member (when (:python-type receiver)
+                                       (py/inspect-member (:python-type receiver) method-name options))]
+                          (when (or member (not (:python-type receiver)))
                             {:member member :argument argument :node argument-node
-                             :signatures (py/call-signatures member [(:python-type argument)] {} options)}))))
-                    [[left right right-node "__truediv__"] [right left left-node "__rtruediv__"]])
+                             :signatures (when (op/eq :function (:kind member))
+                                           (py/call-signatures member [(:python-type argument)] {} options))}))))
+                    [[left right right-node forward] [right left left-node reflected]])
         accepted (filter #(seq (:signatures %)) calls)]
     (cond
+      ;; An unresolved reflected method can change both acceptance and result.
+      (some #(op/ne :function (get-in % [:member :kind])) calls) nil
       (seq accepted)
       ;; Reflected subclass methods can take precedence over forward methods.
       ;; Differing results stay unknown when signatures do not prove dispatch.
       (let [types (mapv #(py/call-result (:member %) [(:python-type (:argument %))]
                                          {} options (:signatures %)) accepted)]
-        (when (and (every? some? types) (apply = types)) (python-value (first types))))
+        (when (and (every? some? types)
+                   (every? #(or (= (first types) %)
+                                (and (true? (py/type-compatible? (first types) % options))
+                                     (true? (py/type-compatible? % (first types) options)))) (rest types)))
+          (python-value (first types))))
       (seq calls)
       (let [{:keys [argument node]} (first calls)]
         (finding! ctx node :type-mismatch
@@ -2029,17 +2047,18 @@
       (every? (fn [value]
                 (let [tag (:tag value)]
                   (and tag (not-any? #{:any :truthy} (if (set? tag) tag [tag]))))) [left right])
-      (do (check-value-spec! ctx left-node left :number nil)
-          (check-value-spec! ctx right-node right :number nil)
-          (arithmetic-value "/" [left right]))
-      ;; An unknown operand may overload division, including reflected division;
+      (let [spec (or (string-operation-spec operator [left right]) {:args [:number :number]})]
+        (doseq [[node value expected] (map vector [left-node right-node] [left right] (:args spec))]
+          (check-value-spec! ctx node value expected nil))
+        (arithmetic-value operator [left right]))
+      ;; An unknown operand may overload arithmetic, including reflected methods;
       ;; neither a numeric result nor a numeric-only argument contract is proven.
       :else nil)))
 
-(defn- division-value! [ctx args values]
+(defn- python-operator-value! [ctx operator args values]
   (loop [left-node (first args) value (first values) remaining (map vector (rest args) (rest values))]
     (if-let [[right-node right] (first remaining)]
-      (recur right-node (division-step! ctx left-node value right-node right) (rest remaining))
+      (recur right-node (python-operator-step! ctx operator left-node value right-node right) (rest remaining))
       value)))
 
 (defn- check-function-argument! [ctx _node info args values]
@@ -2070,7 +2089,7 @@
   (let [spec (function-spec ctx info (count args) values)
         specs (when (valid-arity? info (count args)) (:args spec))
         expected (expanded-specs ctx node specs args)
-        division (when (:python-division? spec) (division-value! ctx args values))]
+        operator-value (when-let [operator (:python-operator spec)] (python-operator-value! ctx operator args values))]
     (when (and (op/eq "basilisp.string" (:ns info)) (#{"replace" "replace-first"} (:name info))
                (#{:string :char} (:tag (second values)))
                (:tag (nth values 2 nil))
@@ -2099,7 +2118,7 @@
                  (op/ne :any (:tag (first values))))
         (finding! ctx node :not-empty? "Use (seq x) instead of (not (empty? x)) when x is a seq")))
     (cond
-      (:python-division? spec) division
+      (:python-operator spec) operator-value
       (and (op/eq "basilisp.test" (:ns info)) (op/eq "compose-fixtures" (:name info))) (tagged :fn)
       (:macro info) nil
       (and (op/eq "basilisp.set" (:ns info)) (= 1 (count values))
@@ -3858,7 +3877,8 @@
   ([source {:keys [filename] :or {filename "<stdin>"} :as opts}]
    (binding [*node-cache* (or *node-cache* #py {0 (python/dict) 1 (python/dict) 2 (python/dict)})
              *reader-features* (or *reader-features* (configured-reader-features (:python-options opts)))]
-     (let [declared (or (:declarations opts) (declarations source opts))]
+     (let [opts (update opts :python-options py/comparison-options)
+           declared (or (:declarations opts) (declarations source opts))]
        (if (and (not (:namespace-section? opts))
                 (> (count (keep namespace-form (forms (:root (:parsed declared))))) 1))
          (analyze-namespace-sections source opts (:parsed declared))

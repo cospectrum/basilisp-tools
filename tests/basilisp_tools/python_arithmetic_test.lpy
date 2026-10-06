@@ -1,0 +1,72 @@
+(ns basilisp-tools.python-arithmetic-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [sys]))
+
+(deftest complete-runtime-classes-prove-absent-exported-operators
+  (let [cache (py/create-cache) options {:python-cache cache}]
+    (try
+      (let [tuple (py/inspect-path "builtins" ["tuple"] options)]
+        (is (= :known (:status tuple)))
+        (is (:members-complete? tuple))
+        (is (= :function (:kind (py/resolve-member tuple "__add__"))))
+        (is (nil? (py/resolve-member tuple "__radd__")))
+        (is (= :unknown (:status (py/resolve-member tuple "__not_exported__"))))
+        (is (= :unknown (:status (py/resolve-member (assoc tuple :members-complete? false) "__radd__"))))
+        (is (= :unknown (:status (py/resolve-member (assoc tuple :kind :module) "__radd__")))))
+      (finally (py/stop-cache! cache)))))
+
+(deftest python-arithmetic-preserves-native-operator-contracts
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (py/create-cache)
+        options {:python-options {:python-paths [(str root)] :python-inspection? false :python-cache cache}}
+        prefix "(ns blt-python-arithmetic (:import [arithmetic_fixture :as a])) "]
+    (try
+      (.write_text (.joinpath root "arithmetic_fixture.py")
+                   (str "class Number:\n"
+                        "    def __init__(self, value: int): self.value = value\n"
+                        "    def amount(self) -> int: return self.value\n"
+                        (apply str (for [[name expression] [["add" "self.value + other"]
+                                                            ["radd" "other + self.value"]
+                                                            ["sub" "self.value - other"]
+                                                            ["rsub" "other - self.value"]
+                                                            ["mul" "self.value * other"]
+                                                            ["rmul" "other * self.value"]]]
+                                     (str "    def __" name "__(self, other: int) -> 'Number': return Number(" expression ")\n")))
+                        "class Text:\n"
+                        "    def __add__(self, other: str) -> str: return 'base' + other\n"
+                        "    def __radd__(self, other: str) -> str: return other + 'base'\n"
+                        "class Base:\n"
+                        "    def __add__(self, other: 'Base') -> str: return 'forward'\n"
+                        "class Child(Base):\n"
+                        "    def __radd__(self, other: Base) -> int: return 2\n"))
+      (.insert sys/path 0 (str root))
+      (doseq [[body expected]
+              [["(.amount (+ (a/Number 4) true))" 5]
+               ["(.amount (+ true (a/Number 4)))" 5]
+               ["(.amount (- (a/Number 4) true))" 3]
+               ["(.amount (- true (a/Number 4)))" -3]
+               ["(.amount (* (a/Number 4) true))" 4]
+               ["(.amount (* true (a/Number 4)))" 4]
+               ["(.amount (+ (a/Number 4) true 2))" 7]
+               ["(.upper (+ (a/Text) \"child\" \"leaf\"))" "BASECHILDLEAF"]
+               ["(.upper (+ \"child\" (a/Text)))" "CHILDBASE"]
+               ["(inc (+ (a/Base) (a/Child)))" 3]]]
+        (let [source (str prefix body)]
+          (is (= expected (load-string source)))
+          (is (empty? (:findings (analyzer/analyze source options))))))
+      (doseq [body ["(+ (a/Number 4) \"bad\")" "(- \"bad\" (a/Number 4))"
+                    "(inc (+ (a/Text) \"child\"))"]]
+        (let [source (str prefix body)]
+          (is (thrown? python/TypeError (load-string source)))
+          (is (= [:type-mismatch] (mapv :type (:findings (analyzer/analyze source options)))))))
+      (doseq [body ["(defn f [value] (+ (a/Number 4) value))"
+                    "(defn f [value] (inc (+ value (a/Text))))"]]
+        (is (empty? (:findings (analyzer/analyze (str prefix body) options)))))
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules "arithmetic_fixture" nil)
+        (py/stop-cache! cache)
+        (.cleanup temporary)))))

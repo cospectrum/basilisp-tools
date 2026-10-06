@@ -338,7 +338,8 @@ class Unrelated:
     assert "property_accessors" not in sys.modules
 
 
-def test_division_operator_metadata_does_not_execute_methods(worker):
+@pytest.mark.parametrize("operator", ["truediv", "add", "sub", "mul"])
+def test_arithmetic_operator_metadata_does_not_execute_methods(worker, operator):
     class Dividable:
         def __truediv__(self, other: str) -> str:
             raise AssertionError("operator executed")
@@ -346,8 +347,10 @@ def test_division_operator_metadata_does_not_execute_methods(worker):
         def __rtruediv__(self, other: int) -> int:
             raise AssertionError("operator executed")
 
+    setattr(Dividable, f"__{operator}__", Dividable.__truediv__)
+    setattr(Dividable, f"__r{operator}__", Dividable.__rtruediv__)
     metadata = worker.runtime_member("Dividable", Dividable)
-    for name, expected in [("__truediv__", "str"), ("__rtruediv__", "int")]:
+    for name, expected in [(f"__{operator}__", "str"), (f"__r{operator}__", "int")]:
         method = metadata["members"][name]
         assert method["kind"] == "function"
         assert method["parameters"][1]["type-path"] == [expected]

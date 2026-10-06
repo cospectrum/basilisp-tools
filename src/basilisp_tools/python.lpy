@@ -27,6 +27,11 @@
   []
   (atom (with-meta {} {:generation 0 :processes (.InspectionProcesses worker-runtime)})))
 
+(defn comparison-options
+  "Attach a fresh comparison memo for one analysis. Do not retain it between analyses."
+  [opts]
+  (assoc opts ::type-comparisons (atom {})))
+
 (def ^:private cache (create-cache))
 (def ^:private cache-limit 256)
 
@@ -199,13 +204,17 @@
   ([module] (inspect-module module {}))
   ([module opts] (get (inspect-modules [module] opts) module)))
 
+(def ^:private inspected-operators
+  #{"__add__" "__radd__" "__sub__" "__rsub__" "__mul__" "__rmul__" "__truediv__" "__rtruediv__"})
+
 (defn resolve-member
   "Return member metadata, nil for a certainly missing member, or :unknown.
 
   Dynamic modules/classes and unavailable metadata never imply absence."
   [metadata member]
   (or (get (:members metadata) member)
-      (when (or (.startswith member "_")
+      (when (or (and (.startswith member "_")
+                     (not (and (= :class (:kind metadata)) (contains? inspected-operators member))))
                 (not= :known (:status metadata))
                 (not (:members-complete? metadata)))
         (unknown member "dynamic-or-unavailable"))))
@@ -401,13 +410,13 @@
     (not= (count (:arguments actual)) (count (:arguments expected))) false
     :else (every-compatible (map invariant-compatible? (:arguments actual) (:arguments expected)))))
 
-(defn- generic-compatible? [actual expected invariant?]
+(defn- generic-compatible? [actual expected invariant? compare]
   (cond
     (empty? expected) true
     (or (empty? actual) (not= (count actual) (count expected))) nil
     invariant?
     (every-compatible (map invariant-compatible? actual expected))
-    :else (every-compatible (map type-compatible? actual expected))))
+    :else (every-compatible (map compare actual expected))))
 
 (defn- collection-arguments [actual expected]
   (let [kind (first (:path actual)) target (first (:path expected))]
@@ -424,21 +433,21 @@
 
 (defn- basic-type-compatible?
   "Conservative assignability: true, false, or nil when static evidence is insufficient."
-  [actual expected]
+  [actual expected compare opts]
   (cond
     (or (nil? actual) (nil? expected) (:any? actual) (:any? expected)) nil
     (= actual expected) true
     (:never? actual) true
     (:never? expected) false
     (:typevar expected) (cond
-                          (:constraints expected) (any-compatible (map #(type-compatible? actual %) (:constraints expected)))
-                          (:bound expected) (type-compatible? actual (:bound expected))
+                          (:constraints expected) (any-compatible (map #(compare actual %) (:constraints expected)))
+                          (:bound expected) (compare actual (:bound expected))
                           :else nil)
-    (:typevar actual) (when (:bound actual) (type-compatible? (:bound actual) expected))
+    (:typevar actual) (when (:bound actual) (compare (:bound actual) expected))
     (or (:union actual) (:nullable? actual))
-    (every-compatible (map #(type-compatible? % expected) (variants actual)))
+    (every-compatible (map #(compare % expected) (variants actual)))
     (or (:union expected) (:nullable? expected))
-    (any-compatible (map #(type-compatible? actual %) (variants expected)))
+    (any-compatible (map #(compare actual %) (variants expected)))
     (:literal-values expected)
     (when (contains? actual :literal-values)
       (every? (fn [value]
@@ -447,17 +456,23 @@
     (and (= "builtins" (:module expected)) (= ["object"] (:path expected))) true
     (and (= "collections.abc" (:module actual)) (= ["Callable"] (:path actual))
          (= "collections.abc" (:module expected)) (= ["Callable"] (:path expected)))
-    (callable-compatible? actual expected {})
+    (callable-compatible? actual expected opts)
     (or (:parameter-list? actual) (:parameter-list? expected) (:ellipsis? actual) (:ellipsis? expected)) nil
     (and (= (:module actual) (:module expected)) (= (:path actual) (:path expected)))
-    (if (and (= "builtins" (:module expected)) (= ["tuple"] (:path expected))
-             (contains? actual :arguments) (contains? expected :arguments)
-             (not-any? #(or (:unpack? %) (:ellipsis? %)) (concat (:arguments actual) (:arguments expected)))
-             (not= (count (:arguments actual)) (count (:arguments expected))))
-      false
+    (cond
+      (and (= "builtins" (:module expected)) (= ["tuple"] (:path expected))
+           (contains? actual :arguments) (= 2 (count (:arguments expected)))
+           (:ellipsis? (second (:arguments expected)))
+           (not-any? #(or (:unpack? %) (:ellipsis? %)) (:arguments actual)))
+      (every-compatible (map #(compare % (first (:arguments expected))) (:arguments actual)))
+      (and (= "builtins" (:module expected)) (= ["tuple"] (:path expected))
+           (contains? actual :arguments) (contains? expected :arguments)
+           (not-any? #(or (:unpack? %) (:ellipsis? %)) (concat (:arguments actual) (:arguments expected)))
+           (not= (count (:arguments actual)) (count (:arguments expected)))) false
+      :else
       (generic-compatible? (:arguments actual) (:arguments expected)
                            (and (= "builtins" (:module expected))
-                                (contains? #{"list" "dict" "set"} (first (:path expected))))))
+                                (contains? #{"list" "dict" "set"} (first (:path expected)))) compare))
     (get persistent-collection-bases [(:module actual) (first (:path actual))])
     (let [bases (get persistent-collection-bases [(:module actual) (first (:path actual))])]
       (cond
@@ -466,7 +481,7 @@
              (contains? #{"Iterable" "Iterator" "Sequence" "MutableSequence" "Mapping" "MutableMapping"
                           "Set" "MutableSet" "Collection" "Sized" "Container"} (first (:path expected))))
         (if (contains? bases (first (:path expected)))
-          (generic-compatible? (collection-arguments actual expected) (:arguments expected) false)
+          (generic-compatible? (collection-arguments actual expected) (:arguments expected) false compare)
           false)
         :else nil))
     (and (= "builtins" (:module actual)) (= "builtins" (:module expected)))
@@ -487,15 +502,15 @@
       (when-let [accepted (get known e)]
         (if (contains? accepted a)
           (generic-compatible? (collection-arguments actual expected) (:arguments expected)
-                               (contains? #{"MutableSequence" "MutableMapping" "MutableSet"} e))
+                               (contains? #{"MutableSequence" "MutableMapping" "MutableSet"} e) compare)
           false)))
     :else nil))
 
 (defn type-compatible?
   "Conservative assignability, optionally resolving class inheritance and protocols."
-  ([actual expected] (basic-type-compatible? actual expected))
+  ([actual expected] (basic-type-compatible? actual expected type-compatible? {}))
   ([actual expected opts]
-   (let [result (basic-type-compatible? actual expected)]
+   (let [result (basic-type-compatible? actual expected type-compatible? {})]
      (if (some? result)
        result
        (let [comparisons (or (::type-comparisons opts) (atom {}))
@@ -507,7 +522,10 @@
          (if (= ::unseen cached)
            (do
              (swap! comparisons assoc key ::pending)
-             (let [result (structural-compatible? actual expected opts)]
+             (let [resolved (basic-type-compatible? actual expected
+                                                    #(type-compatible? %1 %2 opts) opts)
+                   result (if (some? resolved) resolved
+                              (structural-compatible? actual expected opts))]
                (swap! comparisons assoc key result)
                result))
            (when (not= ::pending cached) cached)))))))
@@ -878,7 +896,8 @@
           ;; every method on large classes such as numpy.ndarray.
           summary (fn [type]
                     (some-> (inspect-path (:module type) (:path type) opts)
-                            (dissoc :members)
+                            (select-keys (into type-keys [:status :kind :bases :type-parameters
+                                                          :typed-dict? :typed-dict-fields :protocol? :nominal?]))
                             (specialize type)))
           a (summary actual)
           e (summary expected)
@@ -1006,116 +1025,147 @@
 
 (declare infer-bindings)
 
-(defn- infer-arguments [bindings expected actual]
-  (let [packs (vec (keep-indexed #(when (and (:unpack? %2) (:variadic? %2)) %1) expected))]
-    (cond
-      (or (> (count packs) 1)
-          (and (seq packs) (some #(or (:unpack? %) (:ellipsis? %)) actual))) bindings
-      (seq packs)
-      (let [pack-index (first packs)
-            suffix (- (count expected) pack-index 1)
-            end (- (count actual) suffix)]
-        (if (< end pack-index)
-          bindings
-          (let [pack (get expected pack-index)
-                captured (subvec (vec actual) pack-index end)
-                previous (get bindings (:typevar pack))
-                inferred (cond
-                           (nil? previous) {:type-pack? true :arguments captured}
-                           (= (count (:arguments previous)) (count captured))
-                           {:type-pack? true :arguments (mapv #(union-type [%1 %2]) (:arguments previous) captured)}
-                           :else previous)
-                bindings (assoc bindings (:typevar pack) inferred)
-                pairs (concat (map vector (take pack-index expected) (take pack-index actual))
-                              (map vector (drop (inc pack-index) expected) (drop end actual)))]
-            (reduce (fn [result [e a]] (infer-bindings result e a)) bindings pairs))))
-      :else
-      (reduce (fn [result [e a]] (infer-bindings result e a)) bindings (map vector expected actual)))))
+(defn- infer-arguments
+  ([bindings expected actual] (infer-arguments bindings expected actual false))
+  ([bindings expected actual upper?]
+   (let [packs (vec (keep-indexed #(when (and (:unpack? %2) (:variadic? %2)) %1) expected))]
+     (cond
+       (or (> (count packs) 1)
+           (and (seq packs) (some #(or (:unpack? %) (:ellipsis? %)) actual))) bindings
+       (seq packs)
+       (let [pack-index (first packs)
+             suffix (- (count expected) pack-index 1)
+             end (- (count actual) suffix)]
+         (if (< end pack-index)
+           bindings
+           (let [pack (get expected pack-index)
+                 captured (subvec (vec actual) pack-index end)
+                 previous (get bindings (:typevar pack))
+                 inferred (cond
+                            (nil? previous) {:type-pack? true :arguments captured}
+                            (= (count (:arguments previous)) (count captured))
+                            {:type-pack? true :arguments (mapv #(union-type [%1 %2]) (:arguments previous) captured)}
+                            :else previous)
+                 bindings (assoc bindings (:typevar pack) inferred)
+                 pairs (concat (map vector (take pack-index expected) (take pack-index actual))
+                               (map vector (drop (inc pack-index) expected) (drop end actual)))]
+             (reduce (fn [result [e a]] (infer-bindings result e a upper?)) bindings pairs))))
+       :else
+       (reduce (fn [result [e a]] (infer-bindings result e a upper?)) bindings (map vector expected actual))))))
 
-(defn- infer-bindings [bindings expected actual]
-  (cond
-    (or (nil? expected) (nil? actual) (:any? actual) (:parameter-part expected)
-        (and (:unpack? expected) (:variadic? expected))) bindings
-    (and (= "typing" (:module expected)) (= ["Concatenate"] (:path expected))
-         (:parameter-list? actual))
-    (let [prefix (vec (butlast (:arguments expected)))
-          parameters (callable-parameters actual)
-          fixed (take (count prefix) parameters)]
-      (if (or (nil? parameters) (< (count parameters) (count prefix))
-              (some #(not (contains? #{:positional-only :positional-or-keyword} (:kind %))) fixed))
-        bindings
-        (infer-bindings
-         (infer-arguments bindings prefix (mapv return-type fixed))
-         (last (:arguments expected))
-         (parameter-list (drop (count prefix) parameters)))))
-    (:typevar expected)
-    (let [name (:typevar expected)
-          constraint (first (filter #(true? (type-compatible? actual %)) (:constraints expected)))
-          inferred (or constraint (dissoc actual :literal-values))
-          previous (get bindings name)]
-      (assoc bindings name
-             (cond
-               (and previous (seq (:constraints expected)) (not= previous inferred)) {:never? true}
-               previous (or (union-type [previous inferred]) previous)
-               :else inferred)))
-    (:union expected)
-    (let [candidate (first (filter #(not (false? (type-compatible? actual %))) (:union expected)))]
-      (if candidate (infer-bindings bindings candidate actual) bindings))
-    (and (seq (:arguments expected)) (contains? actual :arguments))
-    (infer-arguments bindings (:arguments expected) (:arguments actual))
-    :else bindings))
+(defn- narrow-binding [candidate upper-bounds]
+  ;; Retain every callback constraint so a later, narrower candidate can resolve
+  ;; an earlier unknown intersection without depending on argument order.
+  (or (first (filter (fn [candidate]
+                       (every? #(true? (type-compatible? candidate %)) upper-bounds))
+                     (cons candidate upper-bounds)))
+      {:any? true}))
+
+(defn- infer-bindings
+  ([bindings expected actual] (infer-bindings bindings expected actual false))
+  ([bindings expected actual upper?]
+   (cond
+     (or (nil? expected) (nil? actual) (:any? actual) (:parameter-part expected)
+         (and (:unpack? expected) (:variadic? expected))) bindings
+     (and (callable-ref? expected) (callable-ref? actual)
+          (= 2 (count (:arguments expected))) (= 2 (count (:arguments actual))))
+     (let [[expected-parameters expected-result] (:arguments expected)
+           [actual-parameters actual-result] (:arguments actual)]
+       (infer-bindings
+        (infer-bindings bindings expected-parameters actual-parameters (not upper?))
+        expected-result actual-result upper?))
+     (and (= "typing" (:module expected)) (= ["Concatenate"] (:path expected))
+          (:parameter-list? actual))
+     (let [prefix (vec (butlast (:arguments expected)))
+           parameters (callable-parameters actual)
+           fixed (take (count prefix) parameters)]
+       (if (or (nil? parameters) (< (count parameters) (count prefix))
+               (some #(not (contains? #{:positional-only :positional-or-keyword} (:kind %))) fixed))
+         bindings
+         (infer-bindings
+          (infer-arguments bindings prefix (mapv return-type fixed) upper?)
+          (last (:arguments expected))
+          (parameter-list (drop (count prefix) parameters)) upper?)))
+     (:typevar expected)
+     (let [name (:typevar expected)
+           constraint (first (filter #(true? (type-compatible? actual %)) (:constraints expected)))
+           upper? (and upper? (not (:parameter-spec? expected)) (not (:variadic? expected))
+                       (empty? (:constraints expected)))
+           inferred (if upper? actual (or constraint (dissoc actual :literal-values)))
+           previous (get bindings name)
+           upper-bounds (get-in (meta bindings) [::upper-bounds name])
+           upper-bounds (if upper?
+                          (vec (distinct (cond-> (conj (vec upper-bounds) inferred)
+                                           (:bound expected) (conj (:bound expected)))))
+                          upper-bounds)
+           inferred (cond
+                      (and previous (seq (:constraints expected)) (not= previous inferred)) {:never? true}
+                      (and previous (not upper?)) (or (union-type [previous inferred]) previous)
+                      :else inferred)
+           value (if (seq upper-bounds) (narrow-binding inferred upper-bounds) inferred)
+           bindings (if (seq upper-bounds)
+                      (with-meta bindings (assoc-in (meta bindings) [::upper-bounds name] upper-bounds))
+                      bindings)]
+       (assoc bindings name value))
+     (:union expected)
+     (let [candidate (first (filter #(not (false? (type-compatible? actual %))) (:union expected)))]
+       (if candidate (infer-bindings bindings candidate actual upper?) bindings))
+     (and (seq (:arguments expected)) (contains? actual :arguments))
+     (infer-arguments bindings (:arguments expected) (:arguments actual) upper?)
+     :else bindings)))
 
 (defn- unpacked-call-signature
   "Expand a single typed *args pack using supplied positions, without evaluating annotations."
   [signature positional-types]
   (let [parameters (:parameters signature)
         varargs (first (filter #(= :var-positional (:kind %)) parameters))
-        annotation (return-type varargs)
-        pattern (when (:unpack? annotation)
-                  (cond
-                    (:variadic? annotation) [annotation]
-                    (and (= "builtins" (:module annotation)) (= ["tuple"] (:path annotation)))
-                    (:arguments annotation)))
-        fixed (count (filter #(contains? #{:positional-only :positional-or-keyword} (:kind %)) parameters))
-        supplied (vec (drop fixed positional-types))
-        packs (filter #(and (:unpack? %) (:variadic? %)) pattern)
-        homogeneous? (and (= 2 (count pattern)) (:ellipsis? (second pattern)))
-        known? (and (some? pattern) (<= (count packs) 1)
-                    (not-any? #(and (:unpack? %) (not (:variadic? %))) pattern)
-                    (or homogeneous? (not-any? :ellipsis? pattern)))
-        minimum (if homogeneous? 0 (- (count pattern) (count packs)))]
-    (cond
-      (not (:unpack? annotation)) {:signature signature :bindings {}}
-      (not known?)
-      {:signature (assoc signature :parameters
-                         (mapv #(if (= :var-positional (:kind %))
-                                  (apply dissoc % type-keys) %) parameters))
-       :bindings {}}
-      (< (count supplied) minimum)
-      {:signature signature :bindings {}
-       :arity-error (str "Expected at least " (+ fixed minimum) " positional arguments for unpacked Python parameters, received "
-                         (count positional-types))}
-      (and (empty? packs) (not homogeneous?) (> (count supplied) (count pattern)))
-      {:signature signature :bindings {}
-       :arity-error (str "Expected at most " (+ fixed (count pattern)) " positional arguments for unpacked Python parameters, received "
-                         (count positional-types))}
-      :else
-      (let [bindings (if (seq packs)
-                       (select-keys (infer-arguments {} pattern supplied) (map :typevar packs)) {})
-            expanded (if homogeneous?
-                       (vec (repeat (count supplied) (first pattern)))
-                       (vec (mapcat (fn [type]
-                                      (if-let [pack (and (:unpack? type) (get bindings (:typevar type)))]
-                                        (:arguments pack) [type])) pattern)))
-            replacements (mapv (fn [index type]
-                                 (merge {:name (str "*" (:name varargs) index)
-                                         :kind :positional-only :required? true}
-                                        (type-metadata type)))
-                               (range (count expanded)) expanded)
-            parameters (vec (mapcat #(if (= :var-positional (:kind %)) replacements [%]) parameters))]
-        {:signature (assoc signature :parameters parameters
-                           :signature (signature-text parameters (:return-type signature)))
-         :bindings bindings}))))
+        annotation (return-type varargs)]
+    (if-not (:unpack? annotation)
+      {:signature signature :bindings {}}
+      (let [pattern (when (:unpack? annotation)
+                      (cond
+                        (:variadic? annotation) [annotation]
+                        (and (= "builtins" (:module annotation)) (= ["tuple"] (:path annotation)))
+                        (:arguments annotation)))
+            fixed (count (filter #(contains? #{:positional-only :positional-or-keyword} (:kind %)) parameters))
+            supplied (vec (drop fixed positional-types))
+            packs (filter #(and (:unpack? %) (:variadic? %)) pattern)
+            homogeneous? (and (= 2 (count pattern)) (:ellipsis? (second pattern)))
+            known? (and (some? pattern) (<= (count packs) 1)
+                        (not-any? #(and (:unpack? %) (not (:variadic? %))) pattern)
+                        (or homogeneous? (not-any? :ellipsis? pattern)))
+            minimum (if homogeneous? 0 (- (count pattern) (count packs)))]
+        (cond
+          (not known?)
+          {:signature (assoc signature :parameters
+                             (mapv #(if (= :var-positional (:kind %))
+                                      (apply dissoc % type-keys) %) parameters))
+           :bindings {}}
+          (< (count supplied) minimum)
+          {:signature signature :bindings {}
+           :arity-error (str "Expected at least " (+ fixed minimum) " positional arguments for unpacked Python parameters, received "
+                             (count positional-types))}
+          (and (empty? packs) (not homogeneous?) (> (count supplied) (count pattern)))
+          {:signature signature :bindings {}
+           :arity-error (str "Expected at most " (+ fixed (count pattern)) " positional arguments for unpacked Python parameters, received "
+                             (count positional-types))}
+          :else
+          (let [bindings (if (seq packs)
+                           (select-keys (infer-arguments {} pattern supplied) (map :typevar packs)) {})
+                expanded (if homogeneous?
+                           (vec (repeat (count supplied) (first pattern)))
+                           (vec (mapcat (fn [type]
+                                          (if-let [pack (and (:unpack? type) (get bindings (:typevar type)))]
+                                            (:arguments pack) [type])) pattern)))
+                replacements (mapv (fn [index type]
+                                     (merge {:name (str "*" (:name varargs) index)
+                                             :kind :positional-only :required? true}
+                                            (type-metadata type)))
+                                   (range (count expanded)) expanded)
+                parameters (vec (mapcat #(if (= :var-positional (:kind %)) replacements [%]) parameters))]
+            {:signature (assoc signature :parameters parameters
+                               :signature (signature-text parameters (:return-type signature)))
+             :bindings bindings}))))))
 
 (defn- callable-argument-branches [positional-types keyword-types]
   (reduce
@@ -1141,29 +1191,33 @@
                           (select-call-signatures metadata positional keyword opts))) branches))
       (vec
        (keep (fn [original]
-               (when-not (seq (check-call original (count positional-types) (keys keyword-types)))
-                 (let [prepared (unpacked-call-signature original positional-types)
-                       signature (:signature prepared)
-                       pairs (vec (argument-pairs signature positional-types keyword-types opts))
-                       bindings (reduce (fn [result [expected actual]]
-                                          (infer-bindings result expected actual)) (:bindings prepared) pairs)
-                       specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
-                       unchanged? (identical? specialized signature)
-                       specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types opts))
-                       comparisons (map (fn [[expected actual fresh?]]
-                                          (let [result (argument-compatible? actual expected fresh? opts)
-                                                substituted (substitute-type expected bindings)]
-                                            (if (or (false? result) (= expected substituted))
-                                              result
-                                              (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
-                   (when-not (or (and (not unchanged?)
-                                      (some (fn [[expected actual fresh?]]
-                                              (and (not (:parameter-part expected))
-                                                   (false? (argument-compatible? actual expected fresh? opts)))) pairs))
-                                 (some false? comparisons)
-                                 (and (not (identical? original specialized))
-                                      (seq (check-call specialized (count positional-types) (keys keyword-types)))))
-                     (assoc specialized :type-match? (every-compatible comparisons))))))
+               (let [prepared (unpacked-call-signature original positional-types)
+                     signature (:signature prepared)
+                     valid? (if (seq (:union-members original))
+                              (not (seq (check-call original (count positional-types) (keys keyword-types))))
+                              (and (not (:arity-error prepared))
+                                   (not (seq (check-single-call signature (count positional-types) (keys keyword-types))))))]
+                 (when valid?
+                   (let [pairs (vec (argument-pairs signature positional-types keyword-types opts))
+                         bindings (reduce (fn [result [expected actual]]
+                                            (infer-bindings result expected actual)) (:bindings prepared) pairs)
+                         specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
+                         unchanged? (identical? specialized signature)
+                         specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types opts))
+                         comparisons (map (fn [[expected actual fresh?]]
+                                            (let [result (argument-compatible? actual expected fresh? opts)
+                                                  substituted (substitute-type expected bindings)]
+                                              (if (or (false? result) (= expected substituted))
+                                                result
+                                                (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
+                     (when-not (or (and (not unchanged?)
+                                        (some (fn [[expected actual fresh?]]
+                                                (and (not (:parameter-part expected))
+                                                     (false? (argument-compatible? actual expected fresh? opts)))) pairs))
+                                   (some false? comparisons)
+                                   (and (not (identical? original specialized))
+                                        (seq (check-call specialized (count positional-types) (keys keyword-types)))))
+                       (assoc specialized :type-match? (every-compatible comparisons)))))))
              signatures)))))
 
 (defn- expand-arguments [positional-types keyword-types]
@@ -1226,7 +1280,8 @@
     (str base (when (:nullable? type) " | None"))))
 
 (defn- call-return-type [metadata]
-  (let [type (return-type metadata)]
+  (let [type (return-type (if (contains? metadata :constructor-return)
+                            (:constructor-return metadata) metadata))]
     (cond
       (:context-manager? metadata)
       {:module "contextlib"

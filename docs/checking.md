@@ -112,6 +112,10 @@ variadic type parameters preserve information through higher-order calls. Known
 types also flow through bindings, returns, common builtins, threaded calls, and
 supported asynchronous or context-manager operations.
 
+Arithmetic with Python objects consults annotated forward and reflected
+`+`, `-`, `*`, and `/` methods. This preserves tensor results for subsequent
+member calls. If dispatch or the result cannot be established, it stays unknown.
+
 Overload checking accounts for unions accepted across multiple signatures.
 Equivalent union and literal spellings do not make mutable containers
 incompatible; genuinely different element types still respect invariance.
@@ -119,12 +123,22 @@ When an unknown decorator may replace a function, its original return type and
 type guards are not assumed to describe the replacement. `typing.no_type_check`
 ignores parameter and return annotations while preserving known argument binding.
 
+Dataclass constructors account for inherited fields, defaults, aliases, and
+disabled fields. An annotated `__new__` or metaclass `__call__` that returns
+another type determines the constructor's result without changing the identity
+of the class object.
+
 Fresh nested `#py` containers are checked against the expected parameter type;
 references to existing mutable containers keep their original constraints.
 Installed extension modules can gain signatures and return types from shipped
 stubs, including `TYPE_CHECKING` reexports and inherited native methods. Private
 type aliases are read from source without executing those files. This supplies
 metadata for APIs such as Torch tensor factories and methods.
+
+Large packages can need more than the default five-second inspection budget on
+their first import. For a Torch/ONNX environment, use
+`blt check --python .venv/bin/python --python-timeout 30 src`; the same timeout
+option is available for `blt lsp`.
 
 Custom descriptors use declared getter results when available. Unbound generic
 descriptor results remain unknown. Definite builtin-to-class mismatches are

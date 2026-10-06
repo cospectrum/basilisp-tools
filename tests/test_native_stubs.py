@@ -24,6 +24,7 @@ def worker():
 @pytest.mark.parametrize("declaration", [
     "from ._native import *",
     "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from ._native import log",
+    "if unknown_loader_condition:\n    from ._native import log\nelse:\n    from ._native import log",
 ])
 def test_native_reexports_gain_call_contracts_without_importing_stubs(worker, tmp_path, monkeypatch, declaration):
     package = tmp_path / "native_contracts"
@@ -51,6 +52,135 @@ def test_native_reexports_gain_call_contracts_without_importing_stubs(worker, tm
     assert worker._runtime_inspector.get() is None
 
 
+def test_ambiguous_conditional_stub_reexports_do_not_supply_contracts(worker, tmp_path, monkeypatch):
+    source = tmp_path / "conditional_native.py"
+    source.write_text("if unknown_condition:\n    from native_a import log\nelse:\n    from native_b import log\n")
+    (tmp_path / "native_a.pyi").write_text("def log(value: int) -> int: ...\n")
+    (tmp_path / "native_b.pyi").write_text("def log(value: str) -> str: ...\n")
+    module = types.ModuleType("conditional_native")
+    module.__file__, module.log = str(source), math.log
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    result = worker.inspect_module(module.__name__, [], True, worker.StaticInspector([], [str(tmp_path)]))
+    assert "parameters" not in result["members"]["log"]
+    assert "type-path" not in result["members"]["log"]
+
+
+@pytest.mark.parametrize("replacement", [
+    "log = fallback",
+    "first = log = fallback",
+    "first, (log, last) = values",
+    "log += fallback",
+    "del log",
+    "def log(value): pass",
+    "def unrelated(value=(log := fallback)): pass",
+    "class log: pass",
+    "import replacement as log",
+    "from unavailable import log",
+    "from unavailable import *",
+    "if later_condition:\n    log = fallback",
+    "if (log := fallback):\n    pass",
+    "try:\n    log = fallback\nexcept Exception:\n    pass",
+    "for log in values:\n    pass",
+])
+def test_conditional_stub_reexports_drop_overwritten_names(worker, tmp_path, monkeypatch, replacement):
+    source = tmp_path / "conditional_overwrite.py"
+    source.write_text("if loader:\n    from native_a import log\nelse:\n    from native_a import log\n"
+                      + "".join("    " + line + "\n" for line in replacement.splitlines()))
+    (tmp_path / "native_a.pyi").write_text("def log(value: str) -> str: ...\n")
+    module = types.ModuleType("conditional_overwrite")
+    module.__file__, module.log = str(source), math.log
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    result = worker.inspect_module(module.__name__, [], True, worker.StaticInspector([], [str(tmp_path)]))
+    assert "parameters" not in result["members"]["log"]
+    assert "type-path" not in result["members"]["log"]
+    assert math.log(1.5) > 0
+
+
+@pytest.mark.parametrize("replacement", ["log = fallback", "from unavailable import log", "del log"])
+def test_later_ambiguous_branch_invalidates_earlier_stub_export(worker, tmp_path, monkeypatch, replacement):
+    source = tmp_path / "later_overwrite.py"
+    source.write_text("from native_a import log\nif later_condition:\n    " + replacement + "\n")
+    (tmp_path / "native_a.pyi").write_text("def log(value: str) -> str: ...\n")
+    module = types.ModuleType("later_overwrite")
+    module.__file__, module.log = str(source), math.log
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    inspector = worker.StaticInspector([], [str(tmp_path)])
+    assert "log" not in worker.runtime_stub_exports(module, inspector)
+
+
+@pytest.mark.parametrize("statement", [
+    "unrelated = fallback",
+    "def unrelated():\n    log = fallback",
+    "if later_condition:\n    unrelated = fallback",
+])
+def test_unrelated_writes_preserve_proven_stub_export(worker, tmp_path, monkeypatch, statement):
+    source = tmp_path / "unrelated_write.py"
+    source.write_text("from native_a import log\n" + statement + "\n")
+    (tmp_path / "native_a.pyi").write_text("def log(value: float) -> float: ...\n")
+    module = types.ModuleType("unrelated_write")
+    module.__file__, module.log = str(source), math.log
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    inspector = worker.StaticInspector([], [str(tmp_path)])
+    assert worker.runtime_stub_exports(module, inspector)["log"]["parameters"][0]["type-path"] == ["float"]
+
+
+@pytest.mark.parametrize("exports,preserved", [(["other"], True), (("other",), True), (["log"], False)])
+def test_loaded_star_export_invalidates_only_explicit_names(worker, tmp_path, monkeypatch, exports, preserved):
+    source = tmp_path / "star_reexports.py"
+    source.write_text("from native_a import log\nfrom loaded_star import *\n")
+    (tmp_path / "native_a.pyi").write_text("def log(value: float) -> float: ...\n")
+    imported = types.ModuleType("loaded_star")
+    imported.__all__ = exports
+    module = types.ModuleType("star_reexports")
+    module.__file__ = str(source)
+    monkeypatch.setitem(sys.modules, imported.__name__, imported)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    inspector = worker.StaticInspector([], [str(tmp_path)])
+    assert ("log" in worker.runtime_stub_exports(module, inspector)) is preserved
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_loaded_star_export_without_all_uses_only_static_namespace(worker, tmp_path, monkeypatch, dynamic):
+    source = tmp_path / "star_namespace.py"
+    source.write_text("from native_a import log\nfrom loaded_namespace import *\n")
+    (tmp_path / "native_a.pyi").write_text("def log(value: float) -> float: ...\n")
+    imported = types.ModuleType("loaded_namespace")
+    imported.other = 1
+    accessed = []
+    if dynamic:
+        def getter(name):
+            accessed.append(name)
+            raise AssertionError("module getter must not execute")
+        imported.__getattr__ = getter
+    module = types.ModuleType("star_namespace")
+    module.__file__ = str(source)
+    monkeypatch.setitem(sys.modules, imported.__name__, imported)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    inspector = worker.StaticInspector([], [str(tmp_path)])
+    assert ("log" in worker.runtime_stub_exports(module, inspector)) is (not dynamic)
+    assert accessed == []
+
+
+def test_custom_star_all_is_not_iterated(worker, tmp_path, monkeypatch):
+    source = tmp_path / "star_custom.py"
+    source.write_text("from native_a import log\nfrom loaded_custom import *\n")
+    (tmp_path / "native_a.pyi").write_text("def log(value: float) -> float: ...\n")
+    accessed = []
+    class Exports(list):
+        def __iter__(self):
+            accessed.append(True)
+            raise AssertionError("custom __all__ must not execute")
+    imported = types.ModuleType("loaded_custom")
+    imported.__all__ = Exports(["other"])
+    module = types.ModuleType("star_custom")
+    module.__file__ = str(source)
+    monkeypatch.setitem(sys.modules, imported.__name__, imported)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    inspector = worker.StaticInspector([], [str(tmp_path)])
+    assert "log" not in worker.runtime_stub_exports(module, inspector)
+    assert accessed == []
+
+
 def test_stub_aliases_do_not_replace_known_runtime_binding(worker, tmp_path, monkeypatch):
     source = tmp_path / "stub_aliases.py"
     source.write_text("from declarations import logarithm as log, factorial\n")
@@ -66,6 +196,51 @@ def test_stub_aliases_do_not_replace_known_runtime_binding(worker, tmp_path, mon
     assert info["log"]["type-path"] == ["float"]
     assert len(info["factorial"]["parameters"]) == 1
     assert info["factorial"]["parameters"][0]["kind"] == "positional-only"
+
+
+def test_native_class_reexports_fill_matching_parameter_annotations(worker, tmp_path, monkeypatch):
+    source = tmp_path / "datetime.py"
+    source.write_text("from native_clock import datetime\n")
+    stub = tmp_path / "native_clock.pyi"
+    stub.write_text("from datetime import timedelta\nclass datetime:\n"
+                    "    def __add__(self, other: timedelta, /) -> datetime: ...\n")
+    module = types.ModuleType("datetime")
+    module.__file__ = str(source)
+    module.datetime = datetime.datetime
+    monkeypatch.setitem(sys.modules, "datetime", module)
+    inspector = worker.StaticInspector([], [str(tmp_path)])
+    token = worker._runtime_inspector.set(inspector)
+    try:
+        info = worker.runtime_member("datetime", datetime.datetime)
+        member = info["members"]["__add__"]
+        assert member["parameters"][1]["name"] == "value"
+        assert member["parameters"][1]["kind"] == "positional-only"
+        assert member["parameters"][1]["type-path"] == ["timedelta"]
+        assert member["type-path"] == ["datetime"]
+        assert worker.runtime_stub_exports(module, inspector) is inspector.stub_exports["datetime"]
+    finally:
+        worker._runtime_inspector.reset(token)
+    assert datetime.datetime(2026, 1, 1) + datetime.timedelta(days=1) == datetime.datetime(2026, 1, 2)
+    with pytest.raises(TypeError):
+        datetime.datetime(2026, 1, 1) + "bad"
+    assert str(stub) in inspector.dependencies
+    assert "native_clock" not in sys.modules
+
+
+def test_native_parameter_annotations_require_matching_binding_layout(worker):
+    native = {"status": "known", "kind": "function", "name": "f",
+              "parameters": [{"name": "value", "kind": "positional-only", "required?": False}]}
+    parameter = {"name": "value", "kind": "positional-only", "required?": True,
+                 "type-module": "builtins", "type-path": ["int"], "annotation": "int"}
+    declared = {"status": "known", "kind": "function", "name": "f", "parameters": [parameter]}
+    result = worker.supplement_stub(native, declared)
+    assert result["parameters"][0]["type-path"] == ["int"]
+    assert result["parameters"][0]["required?"] is False
+    assert "type-path" not in native["parameters"][0]
+    for parameters in [[{**parameter, "kind": "keyword-only"}], [parameter, parameter]]:
+        assert worker.supplement_stub(native, {**declared, "parameters": parameters}) == native
+    typed = {**native, "parameters": [{**native["parameters"][0], "type-module": "builtins", "type-path": ["str"]}]}
+    assert worker.supplement_stub(typed, declared) == typed
 
 
 def test_native_base_methods_and_fields_use_stubs_but_python_overrides_win(worker, tmp_path):

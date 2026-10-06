@@ -1,0 +1,104 @@
+(ns basilisp-tools.python-union-context-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile]))
+
+(defn- ref [module name] {:module module :path [name]})
+
+(defn- generic [module name & arguments]
+  (assoc (ref module name) :arguments (vec arguments)))
+
+(deftest fixed-tuples-check-every-homogeneous-element
+  (let [integer (ref "builtins" "int")
+        text (ref "builtins" "str")
+        expected (generic "builtins" "tuple" integer {:ellipsis? true})]
+    (doseq [[arguments result] [[[] true]
+                                [[integer] true]
+                                [[integer integer] true]
+                                [[(ref "builtins" "bool")] true]
+                                [[text] false]
+                                [[integer text] false]
+                                [[nil] nil]
+                                [[{:unpack? true :variadic? true :typevar "Ts"}] nil]]]
+      (let [actual (assoc (ref "builtins" "tuple") :arguments arguments)]
+        (is (= result (py/type-compatible? actual expected {})) (str arguments))))))
+
+(deftest compound-types-retain-runtime-inheritance-evidence
+  (let [cache (py/create-cache)
+        opts (py/comparison-options {:cache cache})
+        text (ref "builtins" "str")
+        integer (ref "builtins" "int")
+        date (ref "datetime" "date")
+        datetime (ref "datetime" "datetime")
+        either {:union [integer date]}]
+    (try
+      (is (nil? (py/type-compatible? datetime date (assoc opts :python-type-depth 12))))
+      (is (true? (py/type-compatible? datetime date opts)))
+      (is (nil? (py/type-compatible? datetime date (assoc opts :python-type-depth 12))))
+      (doseq [expected [either (assoc date :nullable? true)
+                        {:typevar "T" :bound date}
+                        {:typevar "T" :constraints [integer date]}]]
+        (is (false? (py/type-compatible? text expected opts))))
+      (is (false? (py/type-compatible? {:union [text integer]} either opts)))
+      (is (true? (py/type-compatible? datetime either opts)))
+      (is (true? (py/type-compatible? (assoc datetime :nullable? true)
+                                      (assoc date :nullable? true) opts)))
+      (is (true? (py/type-compatible? {:typevar "T" :bound datetime} date opts)))
+      (is (false? (py/type-compatible? text (generic "collections.abc" "Sequence" either) opts)))
+      (is (true? (py/type-compatible? (generic "builtins" "tuple" datetime)
+                                      (generic "builtins" "tuple" date) opts)))
+      (is (true? (py/type-compatible? (generic "builtins" "list" datetime)
+                                      (generic "collections.abc" "Sequence" date) opts)))
+      (is (true? (py/type-compatible? (generic "builtins" "dict" text datetime)
+                                      (generic "collections.abc" "Mapping" text date) opts)))
+      ;; Read-only covariance must not change the contract of mutable aliases.
+      (doseq [expected [(generic "builtins" "list" date)
+                        (generic "collections.abc" "MutableSequence" date)]]
+        (is (false? (py/type-compatible? (generic "builtins" "list" datetime) expected opts))))
+      ;; ABC virtual membership and unresolved branches cannot prove rejection.
+      (is (nil? (py/type-compatible? integer {:union [date (ref "numbers" "Integral")]} opts)))
+      (is (nil? (py/type-compatible? (generic "builtins" "list" integer)
+                                     (generic "collections.abc" "Sequence" (ref "numbers" "Integral")) opts)))
+      (is (nil? (py/type-compatible? text {:union [date {:any? true}]} opts)))
+      (is (nil? (py/type-compatible? nil either opts)))
+      (is (nil? (py/type-compatible? {:any? true} either opts)))
+      ;; The metadata-free API retains its conservative behavior.
+      (is (nil? (py/type-compatible? text either)))
+      (finally (py/stop-cache! cache)))))
+
+(deftest union-and-generic-python-calls-use-the-selected-inspector
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        cache (py/create-cache)
+        opts {:python-options {:python-paths [(str root)] :cache cache}}]
+    (try
+      (.write_text (.joinpath root "union_contracts.pyi")
+                   (str "from datetime import date, datetime\n"
+                        "from collections.abc import Sequence\n"
+                        "from numbers import Integral\n"
+                        "from typing import TypeVar\n"
+                        "T = TypeVar('T', bound=date)\n"
+                        "U = TypeVar('U', int, date)\n"
+                        "def union(value: int | date) -> None: ...\n"
+                        "def bound(value: T) -> None: ...\n"
+                        "def constrained(value: U) -> None: ...\n"
+                        "def sequence(value: Sequence[int | date]) -> None: ...\n"
+                        "def subclass() -> datetime: ...\n"
+                        "def uncertain(value: date | Integral) -> None: ...\n")
+                   ** :encoding "utf-8")
+      (doseq [[expression valid?]
+              [["(m/union \"bad\")" false]
+               ["(m/bound \"bad\")" false]
+               ["(m/constrained \"bad\")" false]
+               ["(m/sequence \"bad\")" false]
+               ["(m/union 1)" true]
+               ["(m/union (m/subclass))" true]
+               ["(m/sequence #py [(m/subclass) 1])" true]
+               ["(m/uncertain 1)" true]]]
+        (let [result (analyzer/analyze (str "(ns union-context (:import [union_contracts :as m])) " expression) opts)
+              errors (filter #(= :type-mismatch (:type %)) (:findings result))]
+          (is (= valid? (empty? errors)) (str expression " " errors))))
+      (finally
+        (py/stop-cache! cache)
+        (.cleanup temporary)))))

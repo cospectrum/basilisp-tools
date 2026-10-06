@@ -865,6 +865,93 @@ def pydantic_parameters(value):
     return params
 
 
+def runtime_constructor_class(reference):
+    value = sys.modules.get(reference.get("type-module"))
+    for name in reference.get("type-path", []):
+        value = (vars(value).get(name) if type(value) is types.ModuleType else
+                 static_class_member(value, name) if is_class(value) else None)
+    return value if is_class(value) else None
+
+
+def runtime_constructor_instance(reference, owner):
+    if reference.get("type-self?"):
+        return True
+    if reference.get("typevar"):
+        return runtime_constructor_instance(reference.get("type-bound", {}), owner)
+    if reference.get("type-union"):
+        return all(runtime_constructor_instance(branch, owner) for branch in reference["type-union"])
+    identity = runtime_type(owner)
+    if (reference.get("type-module"), reference.get("type-path")) == (identity.get("type-module"), identity.get("type-path")):
+        return True
+    value = runtime_constructor_class(reference)
+    return is_class(value) and any(base is owner for base in class_attribute(value, "__mro__"))
+
+
+def runtime_constructor(value):
+    """Inspect only raw constructor functions, preserving the class object's type."""
+    def method_info(raw):
+        if type(raw) is staticmethod:
+            raw = raw.__func__
+        return runtime_member("constructor", raw, depth=0, owner=value) if type(raw) is types.FunctionType else {}
+
+    def foreign_result(method):
+        result = type_fields(method)
+        parameters = method.get("parameters", [])
+        if result.get("typevar") and parameters:
+            receiver = parameters[0]
+            if (receiver.get("type-module") == "builtins" and receiver.get("type-path") == ["type"]
+                    and result["typevar"] in find_typevars(receiver)):
+                return None
+        return result if result and not runtime_constructor_instance(result, value) else None
+
+    def bound_contract(method, result):
+        contract = {}
+        if "parameters" in method:
+            contract["parameters"] = method["parameters"][1:]
+            contract["signature"] = signature_text(contract["parameters"], method.get("return-type"))
+        if method.get("overloads"):
+            identity = runtime_type(value)
+            contract["overloads"] = [{**signature, **identity, "parameters": signature["parameters"][1:],
+                                      **({"constructor-return": type_fields(signature)} if result else {}),
+                                      "instance-method?": False}
+                                     for signature in method["overloads"] if "parameters" in signature]
+        if result:
+            contract["constructor-return"] = result
+        return contract
+
+    meta_call = static_class_member(type(value), "__call__")
+    if meta_call is not type.__dict__["__call__"]:
+        if type(meta_call) is not types.FunctionType:
+            return {"constructor-return": {"type-any?": True}}
+        meta_info = method_info(meta_call)
+        if not type_fields(meta_info):
+            # An untyped/custom metaclass may replace construction entirely.
+            return {"constructor-return": {"type-any?": True}}
+        meta_result = foreign_result(meta_info)
+        if meta_result:
+            return bound_contract(meta_info, meta_result)
+    new_info = method_info(static_class_member(value, "__new__"))
+    new_result = foreign_result(new_info)
+    if new_result:
+        return bound_contract(new_info, new_result)
+    contract = runtime_signature(value)
+    if type(value) is not type:
+        method = method_info(static_class_member(value, "__init__")) or new_info
+        contract = bound_contract(method, None)
+    result = type_fields(new_info)
+    identity = runtime_type(value)
+    if (result and not result.get("type-self?") and not result.get("typevar")
+            and (result.get("type-arguments") or (result.get("type-module"), result.get("type-path"))
+                 != (identity.get("type-module"), identity.get("type-path")))):
+        contract["constructor-return"] = result
+        returned = runtime_constructor_class(result)
+        if (returned is None or static_class_member(returned, "__init__")
+                is not static_class_member(value, "__init__")):
+            for key in ("parameters", "signature", "overloads"):
+                contract.pop(key, None)
+    return contract
+
+
 def runtime_member(name, value, depth=1, owner=None):
     result = {"status": "known", "name": name}
     ignore_annotations = (exact_type(value, (types.FunctionType, functools._lru_cache_wrapper))
@@ -898,8 +985,9 @@ def runtime_member(name, value, depth=1, owner=None):
         return result
     if is_class(value):
         result.update(kind="class", **{"return-type": annotation(value)})
-        result.update(runtime_signature(value))
-        # Constructors produce their class regardless of an __init__ -> None annotation.
+        contract = runtime_constructor(value)
+        result.update({key: item for key, item in contract.items() if key not in TYPE_KEYS})
+        # The class object and the result of calling it have separate identities.
         result["return-type"] = annotation(value)
         result.update(runtime_type(value))
         result.update(runtime_source_location(value))
@@ -946,7 +1034,8 @@ def runtime_member(name, value, depth=1, owner=None):
                 for key, child in tuple(class_attribute(base, "__dict__").items()):
                     if not key.startswith("_") or key in ("__getitem__", "__iter__", "__next__", "__call__",
                                                           "__enter__", "__exit__", "__aenter__", "__anext__",
-                                                          "__truediv__", "__rtruediv__"):
+                                                          "__truediv__", "__rtruediv__", "__add__", "__radd__",
+                                                          "__sub__", "__rsub__", "__mul__", "__rmul__"):
                         member = safe_member(key, child, depth=0, owner=value)
                         if native_member(child):
                             member = supplement_stub(member, declared.get(key))
@@ -1103,6 +1192,7 @@ class StaticInspector:
         self.dependencies = {}
         self.source_packages = set()
         self.paths = {}
+        self.stub_exports = {}
         self.variables = {}
         self.stub_inspector = None
         self.stub_paths = {}
@@ -1237,8 +1327,11 @@ class StaticModule:
         self.is_stub = path.suffix == ".pyi"
         self.exports = None
         self.transforms = {}
+        self.function_declarations = {}
         self.collect(tree.body)
         for declaration in tree.body:
+            if isinstance(declaration, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.function_declarations.setdefault(declaration.name, []).append(declaration)
             if isinstance(declaration, (ast.FunctionDef, ast.ClassDef)):
                 for decorator in declaration.decorator_list:
                     if isinstance(decorator, ast.Call) and expr_text(decorator.func).split(".")[-1] == "dataclass_transform":
@@ -1358,6 +1451,15 @@ class StaticModule:
             info["type-default"] = self.reference(node.default_value)
         return info
 
+    def annotation_name(self, node):
+        text = expr_text(node) or ""
+        parts = text.split(".")
+        if parts[0] in self.aliases:
+            module, path = self.aliases[parts[0]]
+            if module in ("typing", "typing_extensions", "dataclasses"):
+                return (path + parts[1:])[-1] if path or len(parts) > 1 else ""
+        return parts[-1]
+
     def reference(self, node, owner=(), seen=()):
         if node is None or len(seen) > 24:
             return {}
@@ -1382,7 +1484,7 @@ class StaticModule:
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
             return union_type([self.reference(n, owner, seen) for n in (node.left, node.right)])
         if isinstance(node, ast.Subscript):
-            base = expr_text(node.value).split(".")[-1]
+            base = self.annotation_name(node.value)
             args = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
             if base == "Unpack":
                 return {**self.reference(args[0], owner, seen), "unpack?": True}
@@ -1430,6 +1532,8 @@ class StaticModule:
             return {}
         parts = text.split(".")
         name = parts[0]
+        if name in self.aliases and self.annotation_name(node) == "ClassVar":
+            return {"type-any?": True}
         if name == "Self" or text in ("typing.Self", "typing_extensions.Self"):
             return {"type-module": self.name, "type-path": list(owner), "type-self?": True} if owner else {}
         if name in self.typevars:
@@ -1600,6 +1704,52 @@ class StaticModule:
             info["instance-method?"] = False
         return info
 
+    def constructor_instance(self, reference, owner, seen=()):
+        """Whether a declared result is an instance of the constructed class."""
+        if reference.get("type-self?"):
+            return True
+        if reference.get("typevar"):
+            return self.constructor_instance(reference.get("type-bound", {}), owner, seen)
+        if reference.get("type-union"):
+            return all(self.constructor_instance(branch, owner, seen) for branch in reference["type-union"])
+        path = tuple(reference.get("type-path", []))
+        if reference.get("type-module") != self.name or path in seen:
+            return False
+        if path == owner:
+            return True
+        declaration = self.classes.get(path)
+        return bool(declaration and any(self.constructor_instance(self.reference(base, path[:-1]), owner, seen + (path,))
+                                        for base in declaration.bases))
+
+    def constructor_override(self, method, owner):
+        """Retain explicit non-instance results without changing class identity."""
+        result = type_fields(method)
+        parameters = method.get("parameters", [])
+        if result.get("typevar") and parameters:
+            # A metaclass __call__(cls: type[T]) -> T returns the class being called.
+            receiver = parameters[0]
+            if (receiver.get("type-module") == "builtins" and receiver.get("type-path") == ["type"]
+                    and result["typevar"] in find_typevars(receiver)):
+                return None
+        return result if result and not self.constructor_instance(result, owner) else None
+
+    def constructor_init_overridden(self, reference, owner, seen=()):
+        """A declared subclass may initialize differently from the called class."""
+        if reference.get("type-union"):
+            return any(self.constructor_init_overridden(branch, owner, seen) for branch in reference["type-union"])
+        path = tuple(reference.get("type-path", []))
+        if reference.get("type-module") == self.name and path == owner:
+            return False
+        declaration = self.classes.get(path) if reference.get("type-module") == self.name else None
+        if declaration is None or path in seen or declaration.decorator_list:
+            return True
+        if any((isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__init__")
+               or (isinstance(node, ast.Name) and node.id == "__init__" and isinstance(node.ctx, ast.Store))
+               for statement in declaration.body for node in ast.walk(statement)):
+            return True
+        return any(self.constructor_init_overridden(self.reference(base, path[:-1]), owner, seen + (path,))
+                   for base in declaration.bases)
+
     def class_info(self, owner):
         if owner in self.class_results:
             return self.class_results[owner]
@@ -1614,17 +1764,21 @@ class StaticModule:
             children = {}
             bases = []
             inherited_parameters = None
+            dataclass_bases = []
+            metaclass = None
             unresolved_bases = []
             transform = next((self.transforms[name] for name in self.decorators(node) if name in self.transforms), {})
             for keyword in node.keywords:
                 if keyword.arg == "metaclass":
                     transform = self.transforms.get(expr_text(keyword.value).split(".")[-1], transform)
+                    metaclass = self.reference(keyword.value, owner[:-1])
             for base in node.bases:
                 ref = self.reference(base, owner[:-1])
                 if ref:
                     bases.append(ref)
                     base_info = self.resolve(ref.get("type-module"), ref.get("type-path", []))
                     if base_info:
+                        metaclass = metaclass or base_info.get("metaclass")
                         if base_info.get("dataclass-transform?"):
                             transform = {key: value for key, value in base_info.items() if key.startswith("dataclass-")}
                         bindings = bind_type_parameters(base_info.get("type-parameters", []),
@@ -1632,6 +1786,7 @@ class StaticModule:
                         bindings["__Self__"] = {"type-module": self.name, "type-path": list(owner), "type-self?": True}
                         base_info = self.inspector.substitute(base_info, bindings)
                         children = {**base_info.get("members", {}), **children}
+                        dataclass_bases.append(base_info.get("dataclass-fields", []))
                         if inherited_parameters is None and "parameters" in base_info:
                             inherited_parameters = base_info["parameters"]
                     elif ref.get("type-module") not in ("typing", "typing_extensions"):
@@ -1657,6 +1812,8 @@ class StaticModule:
                     "members": children, "members-complete?": False, "bases": bases,
                     "unresolved-bases": unresolved_bases}
             info.update(self.transforms.get(node.name, {}))
+            if metaclass:
+                info["metaclass"] = metaclass
             if transform:
                 info.update(transform)
             variable_names = []
@@ -1689,24 +1846,67 @@ class StaticModule:
             model = model or any((self.resolve(ref.get("type-module"), ref.get("type-path", [])) or {}).get("pydantic-model?")
                                  for ref in bases)
             constructor = own.get("__init__") or own.get("__new__")
+            constructor_return = None
+            result_from_constructor = False
+            meta_info = self.resolve(metaclass.get("type-module"), metaclass.get("type-path", [])) if metaclass else None
+            meta_call = (meta_info or {}).get("members", {}).get("__call__", {})
+            new_method = children.get("__new__", {})
+            meta_return = self.constructor_override(meta_call, owner)
+            new_return = self.constructor_override(new_method, owner)
+            if meta_call and (meta_call.get("kind") != "function" or meta_call.get("signature-unknown?")
+                              or not type_fields(meta_call)):
+                constructor = {"signature-unknown?": True}
+                constructor_return = {"type-any?": True}
+            elif meta_return:
+                constructor = meta_call
+                constructor_return = meta_return
+                result_from_constructor = True
+            elif new_return:
+                constructor = new_method
+                constructor_return = new_return
+                result_from_constructor = True
+            else:
+                declared_new = type_fields(new_method)
+                if (declared_new and not declared_new.get("type-self?") and not declared_new.get("typevar")
+                        and (declared_new.get("type-arguments")
+                             or (declared_new.get("type-module"), declared_new.get("type-path")) != (self.name, list(owner)))):
+                    # A subclass or specialized result still invokes __init__,
+                    # but its declared result is more specific than the owner.
+                    constructor_return = declared_new
+                    if self.constructor_init_overridden(declared_new, owner):
+                        constructor = {"signature-unknown?": True}
+            dataclass = "dataclass" in self.decorators(node) or bool(transform)
+            if dataclass:
+                inherited_fields = {}
+                for fields in reversed(dataclass_bases):
+                    inherited_fields.update({field.get("dataclass-field-name", field["name"]): field for field in fields})
+                info["dataclass-fields"] = self.dataclass_parameters(node, list(inherited_fields.values()), transform, include_disabled=True)
             if model:
                 info["pydantic-model?"] = True
             if constructor:
+                if constructor_return:
+                    info["constructor-return"] = constructor_return
                 if "parameters" in constructor:
                     params = constructor["parameters"][1:]
-                    info.update(parameters=params, signature=signature_text(params, info["return-type"]))
+                    result_method = constructor if result_from_constructor else new_method
+                    label = result_method.get("return-type") if constructor_return else info["return-type"]
+                    info.update(parameters=params, signature=signature_text(params, label))
                 if constructor.get("overloads"):
                     info["overloads"] = [
                         {**sig, "parameters": sig["parameters"][1:],
                          "signature": signature_text(sig["parameters"][1:], info["return-type"]),
                          "return-type": info["return-type"], "type-module": self.name,
-                         "type-path": list(owner), "instance-method?": False}
+                         "type-path": list(owner), "instance-method?": False,
+                         **({"constructor-return": type_fields(sig) if result_from_constructor else constructor_return}
+                            if constructor_return else {})}
                         for sig in constructor["overloads"] if "parameters" in sig]
             elif model:
                 params = self.model_parameters(node, inherited_parameters or [])
                 info.update(parameters=params, signature=signature_text(params, info["return-type"]))
-            elif "dataclass" in self.decorators(node) or transform:
-                params = self.dataclass_parameters(node, inherited_parameters or [], transform)
+            elif dataclass:
+                params = self.dataclass_parameters(node, list(inherited_fields.values()), transform)
+                if params is None:
+                    params = inherited_parameters or []
                 info.update(parameters=params, signature=signature_text(params, info["return-type"]))
             elif inherited_parameters is not None:
                 info.update(parameters=inherited_parameters,
@@ -1715,7 +1915,7 @@ class StaticModule:
                 info.update(parameters=[], signature=signature_text([], info["return-type"]))
             if (self.decorators(node) - {"dataclass", "dataclass_transform", "final", "runtime_checkable"}
                     - self.no_type_check_decorators(node)) and not transform:
-                for key in ("parameters", "signature", "overloads"):
+                for key in ("parameters", "signature", "overloads", "constructor-return"):
                     info.pop(key, None)
             if "TypedDict" in base_names or any(child.get("typed-dict?") for child in
                     [self.resolve(b.get("type-module"), b.get("type-path", [])) or {} for b in bases]):
@@ -1784,7 +1984,47 @@ class StaticModule:
         info["typed-dict?"] = True
         info["typed-dict-fields"] = fields
 
-    def dataclass_parameters(self, node, inherited, transform=None):
+    def field_defaults(self, call):
+        """Read field-specifier defaults; ambiguous overloads contribute only common values."""
+        name = expr_text(call.func).split(".")[-1]
+        declarations = self.function_declarations.get(name, [])
+        overloads = [node for node in declarations if "overload" in self.decorators(node)]
+        candidates = []
+        supplied = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+        for declaration in overloads or declarations:
+            positional = list(declaration.args.posonlyargs) + list(declaration.args.args)
+            defaults = [None] * (len(positional) - len(declaration.args.defaults)) + list(declaration.args.defaults)
+            arguments = positional + list(declaration.args.kwonlyargs)
+            defaults += list(declaration.args.kw_defaults)
+            if len(call.args) > len(positional) and declaration.args.vararg is None:
+                continue
+            values = dict(supplied)
+            values.update({argument.arg: value for argument, value in zip(positional, call.args)})
+            if any(argument.arg not in values and default is None
+                   for argument, default in zip(arguments, defaults)):
+                continue
+            incompatible = False
+            result = {}
+            for argument, default in zip(arguments, defaults):
+                value = values.get(argument.arg)
+                expected = self.reference(argument.annotation) if argument.annotation else {}
+                if value is not None and expected.get("type-path") == ["NoneType"] and not (
+                        isinstance(value, ast.Constant) and value.value is None):
+                    incompatible = True
+                    break
+                literal = expected.get("literal-values", [])
+                if value is None and len(literal) == 1:
+                    result[argument.arg] = ast.Constant(value=literal[0])
+                elif value is None and isinstance(default, ast.Constant):
+                    result[argument.arg] = default
+            if not incompatible:
+                candidates.append(result)
+        if not candidates:
+            return {}
+        return {name: value for name, value in candidates[0].items()
+                if all(name in other and expr_text(other[name]) == expr_text(value) for other in candidates[1:])}
+
+    def dataclass_parameters(self, node, inherited, transform=None, include_disabled=False):
         transform = transform or {}
         options = {"kw_only": transform.get("dataclass-kw-only?", False)}
         field_specifiers = {"field"} | set(transform.get("dataclass-field-specifiers", []))
@@ -1793,9 +2033,9 @@ class StaticModule:
                 options.update({kw.arg: kw.value.value for kw in deco.keywords if isinstance(kw.value, ast.Constant)})
             elif transform and isinstance(deco, ast.Call):
                 options.update({kw.arg: kw.value.value for kw in deco.keywords if isinstance(kw.value, ast.Constant)})
-        if options.get("init") is False:
-            return inherited
-        params = {p["name"]: p for p in inherited}
+        if options.get("init") is False and not include_disabled:
+            return None
+        params = {p.get("dataclass-field-name", p["name"]): p for p in inherited}
         kw_only = options.get("kw_only", False)
         for field in node.body:
             if not isinstance(field, ast.AnnAssign) or not isinstance(field.target, ast.Name):
@@ -1804,26 +2044,37 @@ class StaticModule:
             if hint.split(".")[-1] == "KW_ONLY":
                 kw_only = True
                 continue
-            if hint.split("[")[0].split(".")[-1] == "ClassVar":
+            marker = field.annotation.value if isinstance(field.annotation, ast.Subscript) else field.annotation
+            if self.annotation_name(marker) == "ClassVar":
+                params.pop(field.target.id, None)
                 continue
             field_options = {}
             default = field.value is not None
+            # Field defaults are inherited, including attributes supplied by object.
+            if field.value is None and (field.target.id in vars(object)
+                    or field.target.id in params and not params[field.target.id].get("required?", True)):
+                default = True
             if isinstance(field.value, ast.Call) and expr_text(field.value.func).split(".")[-1] in field_specifiers:
-                field_options = {kw.arg: kw.value for kw in field.value.keywords}
-                if isinstance(field_options.get("init"), ast.Constant) and field_options["init"].value is False:
-                    continue
-                default = "default" in field_options or "default_factory" in field_options
+                field_options = self.field_defaults(field.value) if transform else {}
+                field_options.update({kw.arg: kw.value for kw in field.value.keywords})
+                default = any(keyword.arg in {"default", "default_factory"} for keyword in field.value.keywords)
             keyword = field_options.get("kw_only")
             keyword = keyword.value if isinstance(keyword, ast.Constant) else kw_only
             name = field.target.id
             alias = field_options.get("alias")
             if transform and isinstance(alias, ast.Constant) and isinstance(alias.value, str):
                 name = alias.value
+            init = field_options.get("init")
             params[field.target.id] = {
+                "dataclass-field-name": field.target.id,
+                "dataclass-init?": not (isinstance(init, ast.Constant) and init.value is False),
                 "name": name, "kind": "keyword-only" if keyword else "positional-or-keyword",
                 "required?": not default, "annotation": hint,
                 **self.reference(field.annotation, (node.name,))}
-        return sorted(params.values(), key=lambda item: item["kind"] == "keyword-only")
+        values = [parameter if include_disabled else {key: value for key, value in parameter.items() if not key.startswith("dataclass-")}
+                  for parameter in params.values()
+                  if include_disabled or parameter.get("dataclass-init?", True)]
+        return sorted(values, key=lambda item: item["kind"] == "keyword-only")
 
     def members(self, body, owner=()):
         members = {}
@@ -1880,8 +2131,31 @@ class StaticModule:
                         ref = runtime_type(type(node.value.value))
                     if isinstance(node.value, ast.Call) and not ref:
                         factory = expr_text(node.value.func).split(".")[-1]
-                        ref = self.reference(node.value if factory in ("TypeVar", "NewType") else node.value.func, owner)
-                        returns = expr_text(node.value.func)
+                        called = members.get(node.value.func.id, {}) if isinstance(node.value.func, ast.Name) else {}
+                        if called.get("kind") == "function":
+                            # This propagates a declared value type, not proof that the call is valid.
+                            # Generic, overloaded, async and generator calls require call-site inference.
+                            if (factory not in overloads and not find_typevars(called)
+                                    and not any(called.get(key) for key in ("async?", "generator?", "signature-unknown?"))):
+                                ref = type_fields(called)
+                                returns = called.get("return-type")
+                        elif factory in ("TypeVar", "NewType"):
+                            ref = self.reference(node.value, owner)
+                            returns = expr_text(node.value.func)
+                        else:
+                            candidate = self.reference(node.value.func, owner)
+                            declaration = self.resolve(candidate.get("type-module"), candidate.get("type-path", [])) or {}
+                            path = candidate.get("type-path", [])
+                            builtin_class = (candidate.get("type-module") == "builtins" and len(path) == 1
+                                             and type(vars(sys.modules["builtins"]).get(path[0])) is type)
+                            if called.get("kind") == "class" or declaration.get("kind") == "class" or builtin_class:
+                                constructor = called or declaration
+                                if "constructor-return" in constructor:
+                                    if not constructor.get("overloads") and not find_typevars(constructor):
+                                        ref = constructor["constructor-return"]
+                                else:
+                                    ref = candidate
+                                    returns = expr_text(node.value.func)
                     if isinstance(node.value, ast.Subscript) and not ref:
                         ref = self.reference(node.value, owner)
                         returns = expr_text(node.value)
@@ -1979,6 +2253,21 @@ def supplement_stub(runtime, declared):
     if runtime.get("kind") == "function" and declared.get("kind") != "function":
         return runtime
     if runtime.get("kind") == "function" and ("parameters" in runtime or runtime.get("overloads")):
+        actual, expected = runtime.get("parameters"), declared.get("parameters")
+        if (actual is not None and expected is not None
+                and not runtime.get("overloads") and not declared.get("overloads")
+                and len(actual) == len(expected)
+                and all(left["kind"] == right["kind"]
+                        and (left["kind"] == "positional-only" or left["name"] == right["name"])
+                        for left, right in zip(actual, expected))):
+            # Preserve native binding names, kinds and defaults. Only fill
+            # missing annotations when the two binding layouts agree.
+            parameters = [{**left, **type_fields(right), "annotation": right.get("annotation")}
+                          if not type_fields(left) and type_fields(right) else left
+                          for left, right in zip(actual, expected)]
+            if parameters != actual:
+                runtime = {**runtime, "parameters": parameters,
+                           "signature": signature_text(parameters, runtime.get("return-type"))}
         if not type_fields(runtime) and not declared.get("overloads") and type_fields(declared):
             runtime = {**runtime, **type_fields(declared), "return-type": declared.get("return-type")}
             if "parameters" in runtime:
@@ -1996,6 +2285,10 @@ def runtime_stub_class(value):
     if type(module) is not str or type(name) is not str:
         return {}
     declared = inspector.stub_module(module)
+    if not declared:
+        loaded = sys.modules.get(module)
+        if type(loaded) is types.ModuleType:
+            declared = {"members": runtime_stub_exports(loaded, inspector)}
     for part in name.split("."):
         declared = declared.get("members", {}).get(part, {})
     return declared.get("members", {}) if declared.get("kind") == "class" else {}
@@ -2003,26 +2296,90 @@ def runtime_stub_class(value):
 
 def runtime_stub_exports(module, inspector):
     """Read explicit stub reexports, including declarations guarded by TYPE_CHECKING."""
-    context = source_context(vars(module).get("__name__"))
-    if context is None:
-        return {}
+    name = vars(module).get("__name__")
+    if name in inspector.stub_exports:
+        return inspector.stub_exports[name]
+    context = source_context(name)
     result = {}
+    inspector.stub_exports[name] = result
+    if context is None:
+        return result
 
-    def visit(body):
+    def written_names(node):
+        # Conservatively forget reexports when syntax can replace their binding.
+        # Function/class bodies have their own scope. Their headers may bind
+        # names through assignment expressions, but no expression is executed.
+        definition = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        if isinstance(node, ast.Import):
+            return {alias.asname or alias.name.split(".")[0] for alias in node.names}
+        if isinstance(node, ast.ImportFrom):
+            return None if any(alias.name == "*" for alias in node.names) else {
+                alias.asname or alias.name for alias in node.names}
+        names = {node.name} if definition else set()
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            names.add(node.name)
+        if isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        children = (child for field, value in ast.iter_fields(node) if field != "body"
+                    for child in (value if isinstance(value, list) else [value])
+                    if isinstance(child, ast.AST)) if definition else ast.iter_child_nodes(node)
+        for child in children:
+            extra = written_names(child)
+            if extra is None:
+                return None
+            names.update(extra)
+        return names
+
+    def visit(body, initial=None):
+        found = dict(initial or {})
         for node in body:
             if isinstance(node, ast.ImportFrom):
                 source = context.import_source(node)
-                if source:
-                    members = inspector.stub_module(source).get("members", {})
-                    for alias in node.names:
-                        if alias.name == "*":
-                            result.update(members)
-                        elif alias.name in members:
-                            result[alias.asname or alias.name] = members[alias.name]
-            elif isinstance(node, ast.If) and context.type_checking(node.test):
-                visit(node.body)
+                members = inspector.stub_module(source).get("members", {}) if source else {}
+                for alias in node.names:
+                    if alias.name == "*":
+                        # An unavailable star import may shadow any known name.
+                        if members:
+                            found.update(members)
+                        else:
+                            loaded = sys.modules.get(source)
+                            namespace = vars(loaded) if type(loaded) is types.ModuleType else {}
+                            exports = namespace.get("__all__")
+                            if exact_type(exports, (list, tuple)) and all(type(name) is str for name in exports):
+                                shadowed = exports
+                            elif namespace and "__all__" not in namespace and "__getattr__" not in namespace:
+                                shadowed = [name for name in namespace if not name.startswith("_")]
+                            else:
+                                shadowed = list(found)
+                            for name in shadowed:
+                                found.pop(name, None)
+                    else:
+                        name = alias.asname or alias.name
+                        found.pop(name, None)
+                        if alias.name in members:
+                            found[name] = members[alias.name]
+            elif isinstance(node, ast.If):
+                for name in written_names(node.test):
+                    found.pop(name, None)
+                if context.type_checking(node.test):
+                    found = visit(node.body, found)
+                else:
+                    left, right = visit(node.body, found), visit(node.orelse, found)
+                    # Retain only declarations that survive both branches,
+                    # including any earlier imports a branch may overwrite.
+                    found = {name: value for name, value in left.items() if right.get(name) is value}
+            else:
+                written = written_names(node)
+                if written is None:
+                    found.clear()
+                else:
+                    for name in written:
+                        found.pop(name, None)
+        return found
 
-    visit(context.tree.body)
+    result.update(visit(context.tree.body))
     return result
 
 
@@ -2153,8 +2510,9 @@ def metadata_decoder(keyword, persistent_map, vector):
         return keys[value]
     vector_keys = {"parameters", "overloads", "type-path", "target-path", "type-arguments",
                    "dependencies", "bases", "unresolved-bases", "type-union", "type-parameters", "type-constraints",
-                   "literal-values", "dataclass-field-specifiers", "package-paths"}
+                   "literal-values", "dataclass-field-specifiers", "dataclass-fields", "package-paths"}
     enum_keys = {"status", "kind", "inspection"}
+    type_vector_keys = {"type-arguments", "type-union", "type-parameters", "type-constraints", "bases"}
     type_shapes = {key: (bool if key.endswith("?") else list if key in vector_keys
                          or key == "literal-values" else str)
                    for key in TYPE_KEYS if key not in ("type-bound", "type-default")}
@@ -2173,7 +2531,15 @@ def metadata_decoder(keyword, persistent_map, vector):
             if key in ("members", "typed-dict-fields"):
                 value = persistent_map(value)
             elif key in vector_keys:
+                if key in type_vector_keys:
+                    # Recursive or unresolved annotations use {} as an unknown
+                    # type. Convert it only in type positions, preserving the
+                    # string keys of arbitrary module/member tables.
+                    value = [persistent_map(item) if type(item) is dict and not item else item
+                             for item in value]
                 value = vector(value)
+            elif key in ("type-bound", "type-default") and type(value) is dict and not value:
+                value = persistent_map(value)
             elif key in enum_keys and value is not None:
                 value = intern(value)
             result[intern(key)] = value
