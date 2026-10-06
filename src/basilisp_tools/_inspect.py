@@ -916,6 +916,11 @@ def runtime_member(name, value, depth=1, owner=None):
                 result["type-arguments"] = [{**param, **({"unpack?": True} if param.get("variadic?") else {})}
                                             for param in result["type-parameters"]]
         result["protocol?"] = class_dict.get("_is_protocol") is True
+        # ABC registration and custom instance checks can accept unrelated types.
+        result["nominal?"] = (all(static_class_member(type(value), name) is type.__dict__[name]
+                                  for name in ("__instancecheck__", "__subclasscheck__"))
+                              and not result["protocol?"]
+                              and "__required_keys__" not in class_dict)
         generic_bindings = {}
         original_bases = class_dict.get("__orig_bases__", ())
         result["bases"] = [runtime_type(base) for base in class_attribute(value, "__bases__")]
@@ -937,17 +942,21 @@ def runtime_member(name, value, depth=1, owner=None):
             members = {}
             # Bypass custom metaclass __dir__ and descriptor lookup.
             for base in reversed(class_attribute(value, "__mro__")):
+                declared = runtime_stub_class(base)
                 for key, child in tuple(class_attribute(base, "__dict__").items()):
                     if not key.startswith("_") or key in ("__getitem__", "__iter__", "__next__", "__call__",
                                                           "__enter__", "__exit__", "__aenter__", "__anext__",
                                                           "__truediv__", "__rtruediv__"):
-                        members[key] = substitute_types(safe_member(key, child, depth=0, owner=value),
-                                                        generic_bindings)
+                        member = safe_member(key, child, depth=0, owner=value)
+                        if native_member(child):
+                            member = supplement_stub(member, declared.get(key))
+                        members[key] = substitute_types(member, generic_bindings)
                 annotations = runtime_class_annotations(base)
                 if type(annotations) is dict:
                     for key, hint in annotations.items():
                         if type(key) is str and not key.startswith("_") and (
-                                key not in members or members[key].get("kind") == "variable"):
+                                key not in members or members[key].get("kind") == "variable"
+                                or type(class_attribute(base, "__dict__").get(key)) is types.MemberDescriptorType):
                             members[key] = {"status": "known", "name": key, "kind": "variable",
                                             "return-type": annotation(hint),
                                             **substitute_types(runtime_type(hint, class_attribute(base, "__module__"), base),
@@ -996,6 +1005,28 @@ def runtime_member(name, value, depth=1, owner=None):
             result["generator?"] = bool(value.__code__.co_flags & (inspect.CO_GENERATOR | inspect.CO_ASYNC_GENERATOR))
             result.update(filename=value.__code__.co_filename, row=value.__code__.co_firstlineno)
             result.update(runtime_source_location(value))
+    elif owner is not None and static_class_member(type(value), "__get__") is not None:
+        # Access returns the descriptor's value, not the descriptor object itself.
+        # An unbound generic result cannot be inferred from a runtime instance.
+        result["kind"] = "property"
+        getter = static_class_member(type(value), "__get__")
+        info = runtime_signature(getter, owner=type(value))
+        fields = type_fields(info)
+        if exact_type(value, (types.GetSetDescriptorType, types.MemberDescriptorType)):
+            # These builtin descriptors have fixed scalar results but no Python
+            # annotations. Identity checks exclude user classes with copied names.
+            for cls, names, result_type in (
+                    (int, {"real", "imag", "numerator", "denominator"}, int),
+                    (float, {"real", "imag"}, float),
+                    (complex, {"real", "imag"}, float),
+                    (range, {"start", "stop", "step"}, int)):
+                if value.__objclass__ is cls and value.__name__ in names:
+                    fields = runtime_type(result_type)
+                    info["return-type"] = annotation(result_type)
+                    break
+        if fields and not find_typevars(fields):
+            result.update(fields)
+            result["return-type"] = info.get("return-type")
     else:
         result.update(kind="variable", **{"return-type": annotation(type(value)), **runtime_type(type(value))})
     doc = (value.__doc__ if exact_type(value, CALLABLE_TYPES)
@@ -1073,6 +1104,56 @@ class StaticInspector:
         self.source_packages = set()
         self.paths = {}
         self.variables = {}
+        self.stub_inspector = None
+        self.stub_paths = {}
+        self.alias_contexts = {}
+        self.alias_results = {}
+        self.active_aliases = set()
+
+    def source_alias(self, module, path):
+        """Resolve a type alias without constructing every member of its package."""
+        key = (module, tuple(path))
+        if len(path) != 1 or key in self.active_aliases or len(self.active_aliases) >= 24:
+            return None
+        if key in self.alias_results:
+            return self.alias_results[key]
+        if module not in self.alias_contexts:
+            if len(self.alias_contexts) >= 64:
+                return None
+            self.alias_contexts[module] = None
+            filename = local_file(module, self.roots) or local_file(module, self.installed)
+            if filename is not None:
+                try:
+                    import tokenize
+                    self.dependency(filename)
+                    with tokenize.open(filename) as source:
+                        tree = ast.parse(source.read(), filename=str(filename), type_comments=True)
+                    self.alias_contexts[module] = StaticModule(self, module, filename, tree, aliases_only=True)
+                except (OSError, SyntaxError, UnicodeError, RecursionError):
+                    pass
+        context = self.alias_contexts[module]
+        if context is None or (path[0] not in context.aliases and path[0] not in context.alias_nodes):
+            self.alias_results[key] = None
+            return None
+        self.active_aliases.add(key)
+        try:
+            result = context.reference(ast.Name(id=path[0], ctx=ast.Load())) or None
+            self.alias_results[key] = result
+            return result
+        finally:
+            self.active_aliases.remove(key)
+
+    def stub_module(self, name):
+        """Keep native declarations independent of the runtime source graph budget."""
+        if name not in self.stub_paths:
+            self.stub_paths[name] = stub_file(name, self.installed)
+        if self.stub_paths[name] is None:
+            return {}
+        if self.stub_inspector is None:
+            self.stub_inspector = StaticInspector(self.roots, self.installed)
+        result = self.stub_inspector.module(name)
+        self.dependencies.update(self.stub_inspector.dependencies)
+        return result
 
     def type_variables(self, value):
         """Memoize variable use in finalized declarations shared by subclasses."""
@@ -1138,11 +1219,12 @@ class StaticInspector:
 
 
 class StaticModule:
-    def __init__(self, inspector, name, path, tree):
+    def __init__(self, inspector, name, path, tree, aliases_only=False):
         self.inspector = inspector
         self.name = name
         self.path = path
         self.tree = tree
+        self.aliases_only = aliases_only
         self.aliases = {}
         self.classes = {}
         self.class_results = {}
@@ -1169,9 +1251,10 @@ class StaticModule:
                             "dataclass-field-specifiers": [expr_text(item).split(".")[-1] for item in specifiers.elts]
                                                           if isinstance(specifiers, (ast.Tuple, ast.List)) else []}
 
-        for key, value in self.alias_nodes.items():
-            if isinstance(value, ast.Call) and expr_text(value.func).split(".")[-1] in ("TypeVar", "ParamSpec", "TypeVarTuple"):
-                self.typevars[key] = self.typevar_info(key, value)
+        if not aliases_only:
+            for key, value in self.alias_nodes.items():
+                if isinstance(value, ast.Call) and expr_text(value.func).split(".")[-1] in ("TypeVar", "ParamSpec", "TypeVarTuple"):
+                    self.typevars[key] = self.typevar_info(key, value)
 
     def import_source(self, node):
         if node.level:
@@ -1377,6 +1460,9 @@ class StaticModule:
                 value = self.resolve(module, full)
                 if value and type_fields(value):
                     return type_fields(value)
+                alias = self.inspector.source_alias(module, full) if self.is_stub or self.aliases_only else None
+                if alias:
+                    return alias
             return {"type-module": module, "type-path": full} if full else {}
         if tuple(parts) in self.classes:
             return {"type-module": self.name, "type-path": parts}
@@ -1398,7 +1484,7 @@ class StaticModule:
         return {}
 
     def resolve(self, module, path):
-        if not module:
+        if not module or self.aliases_only:
             return None
         if module == self.name and tuple(path) in self.classes:
             return self.class_info(tuple(path))
@@ -1880,6 +1966,66 @@ def static_module(name, path, inspector=None):
     return inspector.module(name, Path(path))
 
 
+def native_member(value):
+    return exact_type(value, (types.BuiltinFunctionType, types.MethodDescriptorType,
+                              types.WrapperDescriptorType, types.ClassMethodDescriptorType,
+                              types.GetSetDescriptorType, types.MemberDescriptorType))
+
+
+def supplement_stub(runtime, declared):
+    """Fill an unavailable native contract from its package's typing declaration."""
+    if not declared or declared.get("status") != "known":
+        return runtime
+    if runtime.get("kind") == "function" and declared.get("kind") != "function":
+        return runtime
+    if runtime.get("kind") == "function" and ("parameters" in runtime or runtime.get("overloads")):
+        if not type_fields(runtime) and not declared.get("overloads") and type_fields(declared):
+            runtime = {**runtime, **type_fields(declared), "return-type": declared.get("return-type")}
+            if "parameters" in runtime:
+                runtime["signature"] = signature_text(runtime["parameters"], runtime["return-type"])
+        return runtime
+    return {**runtime, **declared, "name": runtime["name"]}
+
+
+def runtime_stub_class(value):
+    inspector = _runtime_inspector.get()
+    if inspector is None:
+        return {}
+    module = class_attribute(value, "__module__")
+    name = class_attribute(value, "__qualname__")
+    if type(module) is not str or type(name) is not str:
+        return {}
+    declared = inspector.stub_module(module)
+    for part in name.split("."):
+        declared = declared.get("members", {}).get(part, {})
+    return declared.get("members", {}) if declared.get("kind") == "class" else {}
+
+
+def runtime_stub_exports(module, inspector):
+    """Read explicit stub reexports, including declarations guarded by TYPE_CHECKING."""
+    context = source_context(vars(module).get("__name__"))
+    if context is None:
+        return {}
+    result = {}
+
+    def visit(body):
+        for node in body:
+            if isinstance(node, ast.ImportFrom):
+                source = context.import_source(node)
+                if source:
+                    members = inspector.stub_module(source).get("members", {})
+                    for alias in node.names:
+                        if alias.name == "*":
+                            result.update(members)
+                        elif alias.name in members:
+                            result[alias.asname or alias.name] = members[alias.name]
+            elif isinstance(node, ast.If) and context.type_checking(node.test):
+                visit(node.body)
+
+    visit(context.tree.body)
+    return result
+
+
 def inspect_module(name, roots, enabled, inspector=None, skip_stubs=False):
     inspector = inspector or StaticInspector(roots, [p for p in sys.path if p])
     token = _runtime_inspector.set(inspector)
@@ -1926,6 +2072,13 @@ def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
             module = importlib.import_module(name)
         members = {key: safe_member(key, value) for key, value in tuple(vars(module).items())
                    if not key.startswith("_")}
+        native = {key for key, value in tuple(vars(module).items())
+                  if key in members and native_member(value)
+                  and "parameters" not in members[key] and not members[key].get("overloads")}
+        if native:
+            declared = runtime_stub_exports(module, inspector)
+            for key in native:
+                members[key] = supplement_stub(members[key], declared.get(key))
         source = vars(module).get("__file__")
         if "__getattr__" in vars(module) and source and source.endswith(".py"):
             # Lazy modules often declare their public imports under TYPE_CHECKING.

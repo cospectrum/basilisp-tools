@@ -1,0 +1,51 @@
+(ns basilisp-tools.python-nominal-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.python :as py])
+  (:import [unittest.mock :as mock]))
+
+(defn- ref [module name]
+  {:module module :path [name]})
+
+(deftest inspected-nominal-classes-reject-concrete-builtin-mismatches
+  (let [cache (py/create-cache)
+        opts {:cache cache}
+        date (ref "datetime" "date")
+        integral (ref "numbers" "Integral")]
+    (try
+      (doseq [name ["str" "list" "int" "bool"]]
+        (is (false? (py/type-compatible? (ref "builtins" name) date opts)) name))
+      (is (true? (py/type-compatible? (ref "datetime" "datetime") date opts)))
+      ;; object annotations describe arbitrary objects; ABC virtual membership
+      ;; cannot be inferred from a class's nominal bases alone.
+      (is (nil? (py/type-compatible? (ref "builtins" "object") date opts)))
+      (is (nil? (py/type-compatible? (ref "builtins" "int") integral opts)))
+      (is (nil? (py/type-compatible? nil date opts)))
+      (is (nil? (py/type-compatible? {:any? true} date opts)))
+      (finally (py/stop-cache! cache)))))
+
+(defn- class-info [module name bases]
+  {:status :known :kind :class :nominal? true
+   :type-module module :type-path [name] :bases bases})
+
+(deftest incomplete-metadata-and-custom-instance-checks-cannot-prove-rejection
+  (let [text (ref "builtins" "str")
+        expected (ref "target" "Required")
+        object (class-info "builtins" "object" [])
+        string (class-info "builtins" "str" [{:type-module "builtins" :type-path ["object"]}])
+        required (class-info "target" "Required" [{:type-module "builtins" :type-path ["object"]}])
+        compare (fn [actual-summary expected-summary]
+                  (let [inspect (fn [module path _opts]
+                                  (get {["builtins" ["str"]] actual-summary
+                                        ["builtins" ["object"]] object
+                                        ["target" ["Required"]] expected-summary}
+                                       [module path]))
+                        patch (mock/patch "basilisp_tools.python.inspect_path" ** :new inspect)]
+                    (.start patch)
+                    (try (py/type-compatible? text expected {}) (finally (.stop patch)))))]
+    (is (false? (compare string required)))
+    (is (nil? (compare string (assoc required :nominal? false))))
+    (is (nil? (compare string (dissoc required :nominal?))))
+    (is (nil? (compare (dissoc string :bases) required)))
+    (is (nil? (compare (assoc string :bases [{:type-module "unavailable" :type-path ["Base"]}]) required)))
+    ;; A reexport of object remains a valid supertype, even at the terminal base.
+    (is (true? (compare string object)))))

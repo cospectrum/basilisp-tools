@@ -865,6 +865,10 @@
             (any-compatible (map #(signature-compatible? % required opts) actuals)))
           expecteds))))
 
+(def ^:private concrete-builtins
+  #{"bool" "int" "float" "complex" "str" "bytes" "bytearray" "memoryview"
+    "list" "dict" "tuple" "set" "frozenset" "range" "NoneType"})
+
 (defn- structural-compatible? [actual expected opts]
   (when (and (:module actual) (:module expected)
              (not= [(:module actual) (:path actual)] [(:module expected) (:path expected)])
@@ -877,9 +881,14 @@
                             (dissoc :members)
                             (specialize type)))
           a (summary actual)
-          e (summary expected)]
+          e (summary expected)
+          a-class (when (= :class (:kind a)) (select-keys (return-type a) [:module :path]))
+          e-class (when (= :class (:kind e)) (select-keys (return-type e) [:module :path]))]
       (when (and (= :known (:status a)) (= :known (:status e)))
         (cond
+          (and (:module a-class) (seq (:path a-class)) (= a-class e-class))
+          ;; Reexports name the same class; keep the caller's type arguments.
+          (type-compatible? (merge actual a-class) (merge expected e-class))
           (:typed-dict? e)
           (when (:typed-dict? a)
             (every-compatible
@@ -901,19 +910,72 @@
                       :else (type-compatible? (return-type provided) (return-type member) opts))))
                 (remove (fn [[name _]] (contains? #{"__init__" "__new__" "__class_getitem__"} name)) (:members (inspect-type expected opts)))))
           :else
-          (let [results (map #(type-compatible? (return-type %) expected opts) (:bases a))]
-            (when (some true? results) true)))))))
+          (let [closed-nominal? (and (:nominal? a) (:nominal? e) a-class e-class
+                                     (= "builtins" (:module a-class))
+                                     (contains? concrete-builtins (first (:path a-class)))
+                                     (vector? (:bases a)))
+                object-type {:module "builtins" :path ["object"]}
+                results (map (fn [base]
+                               (let [type (return-type base)]
+                                 ;; object is a complete terminal ancestor, while
+                                 ;; an object-typed argument itself stays unknown.
+                                 (if (and closed-nominal? (= object-type type))
+                                   (= object-type e-class)
+                                   (type-compatible? type expected opts)))) (:bases a))]
+            (cond
+              (some true? results) true
+              (and closed-nominal? (every? false? results)) false
+              :else nil)))))))
+
+(defn- literal-tree? [value]
+  (and (map? value) (or (contains? value :items) (contains? value :entries))))
+
+(declare argument-compatible?)
+
+(defn- literal-compatible? [expected tree opts]
+  (let [arguments (:arguments expected)
+        tuple? (and (= "builtins" (:module expected)) (= ["tuple"] (:path expected)))
+        mapping? (or (and (= "builtins" (:module expected)) (= ["dict"] (:path expected)))
+                     (and (= "collections.abc" (:module expected))
+                          (contains? #{["Mapping"] ["MutableMapping"]} (:path expected))))
+        compare-child (fn [child expected]
+                        (argument-compatible? (:type child) expected (when (literal-tree? child) child) opts))]
+    (cond
+      (and tuple? (contains? expected :arguments))
+      (cond
+        (some :unpack? arguments) nil
+        (and (= 2 (count arguments)) (:ellipsis? (second arguments)))
+        (every-compatible (map #(compare-child % (first arguments)) (:items tree)))
+        (some :ellipsis? arguments) nil
+        (not= (count arguments) (count (:items tree))) false
+        :else (every-compatible (map compare-child (:items tree) arguments)))
+      (empty? arguments) true
+      mapping?
+      (when (= 2 (count arguments))
+        (every-compatible
+         (mapcat (fn [[key value]]
+                   [(compare-child key (first arguments)) (compare-child value (second arguments))])
+                 (:entries tree))))
+      (= 1 (count arguments))
+      (every-compatible
+       (map #(compare-child % (first arguments))
+            (if (contains? tree :entries) (map first (:entries tree)) (:items tree))))
+      :else nil)))
 
 (defn- argument-compatible? [actual expected fresh? opts]
   (cond
     (not fresh?) (type-compatible? actual expected opts)
     (or (:union expected) (:nullable? expected))
-    (any-compatible (map #(argument-compatible? actual % true opts) (variants expected)))
+    (any-compatible (map #(argument-compatible? actual % fresh? opts) (variants expected)))
     (:typevar expected)
     (cond
-      (:constraints expected) (any-compatible (map #(argument-compatible? actual % true opts) (:constraints expected)))
-      (:bound expected) (argument-compatible? actual (:bound expected) true opts)
+      (:constraints expected) (any-compatible (map #(argument-compatible? actual % fresh? opts) (:constraints expected)))
+      (:bound expected) (argument-compatible? actual (:bound expected) fresh? opts)
       :else (type-compatible? actual expected opts))
+    (and (literal-tree? fresh?)
+         (true? (type-compatible? (dissoc actual :arguments) (dissoc expected :arguments))))
+    ;; Only literal syntax owns its children. References retain ordinary variance.
+    (literal-compatible? expected fresh? opts)
     (and (= "builtins" (:module actual) (:module expected))
          (= (:path actual) (:path expected))
          (contains? #{["dict"] ["list"] ["set"]} (:path expected)))
@@ -935,10 +997,12 @@
     (concat
      (map-indexed (fn [index actual]
                     [(return-type (or (get positional index) varargs)) actual
-                     (contains? (get-in opts [:python-fresh-arguments :positional]) index)]) positional-types)
+                     (or (get-in opts [:python-fresh-values :positional index])
+                         (contains? (get-in opts [:python-fresh-arguments :positional]) index))]) positional-types)
      (map (fn [[name actual]]
             [(return-type (or (get by-name name) kwargs)) actual
-             (contains? (get-in opts [:python-fresh-arguments :keywords]) name)]) keyword-types))))
+             (or (get-in opts [:python-fresh-values :keywords name])
+                 (contains? (get-in opts [:python-fresh-arguments :keywords]) name))]) keyword-types))))
 
 (declare infer-bindings)
 

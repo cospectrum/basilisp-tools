@@ -1,0 +1,119 @@
+(ns basilisp-tools.python-fresh-container-test
+  (:require [basilisp.test :refer [deftest is]]
+            [basilisp-tools.analyzer :as analyzer]
+            [basilisp-tools.python :as py])
+  (:import [pathlib] [tempfile] [sys]))
+
+(def ^:private fixture-source
+  (str
+   "from typing import overload\n"
+   "\n"
+   "def nested(value: list[list[object]]) -> None:\n"
+   "    for inner in value: inner.append(object())\n"
+   "def nested_dict(value: dict[str, list[object]]) -> None:\n"
+   "    for inner in value.values(): inner.append(object())\n"
+   "def nested_tuple(value: tuple[list[object], list[object]]) -> None:\n"
+   "    for inner in value: inner.append(object())\n"
+   "def tuple_variadic(value: tuple[list[object], ...]) -> None:\n"
+   "    for inner in value: inner.append(object())\n"
+   "def deeper(value: list[tuple[list[object], ...]]) -> None:\n"
+   "    for row in value:\n"
+   "        for inner in row: inner.append(object())\n"
+   "def numbers(value: list[list[int]]) -> None: pass\n"
+   "def keyword(*, value: list[list[object]]) -> None: nested(value)\n"
+   "def ints_or_text(value: list[list[int]] | list[list[str]]) -> None: pass\n"
+   "@overload\n"
+   "def select(value: list[list[int]]) -> int: ...\n"
+   "@overload\n"
+   "def select(value: list[list[str]]) -> str: ...\n"
+   "def select(value): return value[0][0]\n"
+   "\n"
+   "from collections.abc import MutableSequence, MutableMapping\n"
+   "def mutable_sequence(value: MutableSequence[object]) -> None:\n"
+   "    value.append(object())\n"
+   "def nested_mutable_sequence(value: MutableSequence[list[object]]) -> None:\n"
+   "    for inner in value: inner.append(object())\n"
+   "def nested_mutable_mapping(value: MutableMapping[str, list[object]]) -> None:\n"
+   "    for inner in value.values(): inner.append(object())\n"))
+
+(def ^:private cases
+  [["list-of-lists" "(m/nested #py [#py [\"x\"]])" true]
+   ["thread-first-fresh" "(-> #py [#py [\"x\"]] m/nested)" true]
+   ["thread-last-fresh" "(->> #py [#py [\"x\"]] m/nested)" true]
+   ["aliased-outer" "(let [outer #py [#py [\"x\"]]] (m/nested outer))" false]
+   ["threaded-outer-alias" "(let [outer #py [#py [\"x\"]]] (-> outer m/nested))" false]
+   ["list-mixed-fresh-values" "(m/nested #py [#py [\"x\"] #py [1]])" true]
+   ["dict-fresh-value" "(m/nested-dict #py {\"x\" #py [\"y\"]})" true]
+   ["tuple-fixed" "(m/nested-tuple #py (#py [\"x\"] #py [1]))" true]
+   ["tuple-variadic" "(m/tuple-variadic #py (#py [\"x\"] #py [1] #py [true]))" true]
+   ["three-levels" "(m/deeper #py [#py (#py [\"x\"] #py [1])])" true]
+   ["keyword-fresh" "(m/keyword ** :value #py [#py [\"x\"]])" true]
+   ["empty-inner" "(m/nested #py [#py []])" true]
+   ["empty-outer" "(m/nested #py [])" true]
+   ["union-parameter" "(m/ints-or-text #py [#py [\"x\"]])" true]
+   ["union-no-mixed-branches" "(m/ints-or-text #py [#py [\"x\"] #py [1]])" false]
+   ["overload-result" "(.upper (m/select #py [#py [\"x\"]]))" true]
+   ["wrong-leaf" "(m/numbers #py [#py [\"x\"]])" false]
+   ["aliased-inner" "(let [inner #py [\"x\"]] (m/nested #py [inner]))" false]
+   ["one-aliased-inner" "(let [inner #py [\"x\"]] (m/nested #py [#py [1] inner]))" false]
+   ["dict-aliased-value" "(let [inner #py [\"x\"]] (m/nested-dict #py {\"x\" inner}))" false]
+   ["tuple-aliased-child" "(let [inner #py [\"x\"]] (m/nested-tuple #py (inner #py [1])))" false]
+   ["fresh-mutable-sequence" "(m/mutable-sequence #py [\"x\"])" true]
+   ["existing-mutable-sequence" "(let [items #py [\"x\"]] (m/mutable-sequence items))" false]
+   ["nested-mutable-sequence" "(m/nested-mutable-sequence #py [#py [\"x\"]])" true]
+   ["nested-mutable-mapping" "(m/nested-mutable-mapping #py {\"x\" #py [\"y\"]})" true]
+   ["existing-child-mutable-sequence" "(let [inner #py [\"x\"]] (m/nested-mutable-sequence #py [inner]))" false]
+   ["existing-child-mutable-mapping" "(let [inner #py [\"x\"]] (m/nested-mutable-mapping #py {\"x\" inner}))" false]])
+
+(deftest nested-python-literals-receive-context-without-widening-references
+  ;; Original minimized cases agree with ty, pyright, and mypy. Execute the
+  ;; accepted calls too; rejected alias cases protect against callee mutations.
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        module "blt_fresh_container_fixture"
+        cache (py/create-cache)
+        options {:python-options {:python-paths [(str root)] :python-inspection? false :python-cache cache}}
+        prefix (str "(ns blt-fresh-container-runtime (:import [" module " :as m])) ")]
+    (try
+      (.write_text (.joinpath root (str module ".py")) fixture-source ** :encoding "utf-8")
+      (.insert sys/path 0 (str root))
+      (doseq [[name expression accepted?] cases]
+        (let [source (str prefix expression)
+              findings (:findings (analyzer/analyze source options))]
+          (if accepted?
+            (do
+              (is (empty? findings) (str name " " findings))
+              (is (nil? (try (load-string source) nil (catch python/Exception error (str error)))) name))
+            (is (some #(= :type-mismatch (:type %)) findings) (str name " " findings)))))
+      (finally
+        (.remove sys/path (str root))
+        (.pop sys/modules module nil)
+        (py/stop-cache! cache)
+        (.cleanup temporary)))))
+
+(defn- list-of [element]
+  {:module "builtins" :path ["list"] :arguments [element]})
+
+(deftest literal-tree-keeps-unknown-children-and-tuple-shape-conservative
+  (let [object {:module "builtins" :path ["object"]}
+        text {:module "builtins" :path ["str"]}
+        actual (list-of nil)
+        expected (list-of (list-of object))
+        signature {:kind :function
+                   :parameters [{:name "value" :kind :positional-only :required? true
+                                 :type-module "builtins" :type-path ["list"]
+                                 :type-arguments (:arguments expected)}]}
+        tree {:type actual :items [{:type nil}]}
+        options {:python-fresh-values {:positional {0 tree}} :python-inspection? false}
+        matches (py/call-signatures signature [actual] {} options)
+        empty-tuple {:module "builtins" :path ["tuple"] :arguments []}
+        tuple-type {:module "builtins" :path ["tuple"] :arguments [text]}
+        tuple-signature {:kind :function
+                         :parameters [{:name "value" :kind :positional-only :required? true
+                                       :type-module "builtins" :type-path ["tuple"] :type-arguments []}]}]
+    (is (seq matches))
+    (is (every? #(nil? (:type-match? %)) matches))
+    (is (seq (py/call-signatures tuple-signature [empty-tuple] {}
+                                 {:python-fresh-values {:positional {0 {:type empty-tuple :items []}}}})))
+    (is (empty? (py/call-signatures tuple-signature [tuple-type] {}
+                                    {:python-fresh-values {:positional {0 {:type tuple-type :items [{:type text}]}}}})))))

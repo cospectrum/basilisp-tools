@@ -119,6 +119,18 @@ When an unknown decorator may replace a function, its original return type and
 type guards are not assumed to describe the replacement. `typing.no_type_check`
 ignores parameter and return annotations while preserving known argument binding.
 
+Fresh nested `#py` containers are checked against the expected parameter type;
+references to existing mutable containers keep their original constraints.
+Installed extension modules can gain signatures and return types from shipped
+stubs, including `TYPE_CHECKING` reexports and inherited native methods. Private
+type aliases are read from source without executing those files. This supplies
+metadata for APIs such as Torch tensor factories and methods.
+
+Custom descriptors use declared getter results when available. Unbound generic
+descriptor results remain unknown. Definite builtin-to-class mismatches are
+reported only when inspected inheritance and default Python subtype dispatch
+prove them; registered ABCs and custom instance checks remain conservative.
+
 Runtime inspection executes package import initialization code. The subprocess
 has a timeout and is not a security sandbox. The timeout covers an inspection
 batch; completed results are retained if a later module times out.

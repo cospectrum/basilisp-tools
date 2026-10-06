@@ -71,3 +71,33 @@
               errors (filter #(= :type-mismatch (:type %)) (:findings result))]
           (is (= valid? (empty? errors)) (str expression " " errors))))
       (finally (.cleanup temp)))))
+
+(deftest reexported-classes-compare-by-canonical-identity-with-original-arguments
+  (let [temporary (tempfile/TemporaryDirectory)
+        root (pathlib/Path (.-name temporary))
+        opts {:python-paths [(str root)] :python-inspection? false :cache (py/create-cache)}
+        ref (fn [module name] {:module module :path [name]})
+        generic (fn [module name argument] (assoc (ref module name) :arguments [argument]))]
+    (try
+      (.write_text (.joinpath root "identitymodels.pyi")
+                   (str "from typing import Generic, TypeVar\n"
+                        "T = TypeVar('T')\nclass Thing: ...\nclass Other: ...\n"
+                        "class Box(Generic[T]): ...\ndef make() -> Thing: ...\n")
+                   ** :encoding "utf-8")
+      (.write_text (.joinpath root "exports.pyi")
+                   "from identitymodels import Thing as PublicThing, Box as PublicBox, make as public_make\n"
+                   ** :encoding "utf-8")
+      (is (true? (py/type-compatible? (ref "exports" "PublicThing") (ref "identitymodels" "Thing") opts)))
+      (is (true? (py/type-compatible? (ref "identitymodels" "Thing") (ref "exports" "PublicThing") opts)))
+      (is (true? (py/type-compatible? (generic "exports" "PublicBox" int-type)
+                                      (generic "identitymodels" "Box" int-type) opts)))
+      (is (false? (py/type-compatible? (generic "exports" "PublicBox" int-type)
+                                       (generic "identitymodels" "Box" str-type) opts)))
+      (is (nil? (py/type-compatible? (generic "exports" "PublicBox" nil)
+                                     (generic "identitymodels" "Box" str-type) opts)))
+      ;; A function's return annotation cannot prove that it is a class alias.
+      (is (nil? (py/type-compatible? (ref "exports" "public_make") (ref "identitymodels" "Thing") opts)))
+      (is (nil? (py/type-compatible? (ref "identitymodels" "Other") (ref "identitymodels" "Thing") opts)))
+      (finally
+        (py/stop-cache! (:cache opts))
+        (.cleanup temporary)))))

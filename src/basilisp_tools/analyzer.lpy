@@ -2188,7 +2188,13 @@
     (or (:fresh-python-container? node)
         (and (op/eq :tagged (:kind node))
              (op/eq "#py" (:text (first (:children node))))
-             (#{:map :vector :set} (:kind (first (forms node))))))))
+             (#{:map :vector :list :set} (:kind (first (forms node))))))))
+
+(defn- python-literal-value [node value]
+  ;; References to earlier literals are existing mutable values at this call.
+  (if (fresh-python-container? node)
+    (or (:python-literal-value value) {:type (:python-type value)})
+    {:type (:python-type value)}))
 
 (defn- python-call-value [ctx node member args values injected]
   (let [{:keys [positional keywords valid?]} (python-arguments ctx node args)
@@ -2204,9 +2210,16 @@
         fresh-positional (into #{} (keep-indexed #(when (fresh-python-container? %2) %1) supplied-nodes))
         fresh-keywords (into #{} (keep (fn [[name value]] (when (fresh-python-container? value) name))
                                        (map vector keywords (take-nth 2 (drop (+ positional 2) args)))))
-        options (cond-> (dissoc (get-in @(:state ctx) [:opts :python-options] {}) :python-fresh-arguments)
+        fresh-values {:positional (into {} (map (fn [index]
+                                                  [index (python-literal-value (get supplied-nodes index) (get supplied index))]) fresh-positional))
+                      :keywords (into {} (keep (fn [[name argument value]]
+                                                 (when (contains? fresh-keywords name)
+                                                   [name (python-literal-value argument value)]))
+                                               (map vector keywords (take-nth 2 (drop (+ positional 2) args)) keyword-values)))}
+        options (cond-> (dissoc (get-in @(:state ctx) [:opts :python-options] {}) :python-fresh-arguments :python-fresh-values)
                   (or (seq fresh-positional) (seq fresh-keywords))
-                  (assoc :python-fresh-arguments {:positional fresh-positional :keywords fresh-keywords}))
+                  (assoc :python-fresh-arguments {:positional fresh-positional :keywords fresh-keywords}
+                         :python-fresh-values fresh-values))
         problems (when valid? (py/check-call member (count supplied) keywords))
         candidates (when (and valid? (empty? problems)) (py/call-signatures member positional-types keyword-types options))]
     (when (and (:type-guard member) (not (:async? member)))
@@ -3658,8 +3671,13 @@
                                       "dict" [(py/widen-literals (py/union-type (take-nth 2 types)))
                                               (py/widen-literals (py/union-type (take-nth 2 (rest types))))]
                                       "tuple" types
-                                      [(py/widen-literals (py/union-type types))])]
-                      {:python-type {:module "builtins" :path [type] :arguments arguments}}))
+                                      [(py/widen-literals (py/union-type types))])
+                          inferred {:module "builtins" :path [type] :arguments arguments}
+                          items (mapv python-literal-value (forms value) values)]
+                      {:python-type inferred
+                       :python-literal-value (assoc {:type inferred}
+                                                    (if (op/eq "dict" type) :entries :items)
+                                                    (if (op/eq "dict" type) (mapv vec (partition 2 items)) items))}))
                 (walk! (assoc ctx :config config) env value)))
             ;; A custom data reader can return code referencing lexical locals.
             ;; Keep usage information, but its resulting value is unknown.
