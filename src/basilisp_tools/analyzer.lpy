@@ -154,6 +154,7 @@
                   (python/next (basilisp.lang.reader/read-str raw))))
       :string (let [raw (syntax/text node)]
                 (if (neg? (.find raw "\\")) (subs raw 1 (dec (count raw))) (python/next (basilisp.lang.reader/read-str raw))))
+      :bytes (python/next (basilisp.lang.reader/read-str (syntax/text node)))
       (:symbolic-number :character) (edn/read-string (syntax/text node))
       :map (into {} (map (fn [[k v]] [(config-data k) (config-data v)]) (partition 2 xs)))
       :vector (mapv config-data xs)
@@ -399,7 +400,7 @@
       (or found (metadata-entry-node target key)))))
 
 (def ^:private value-keys
-  [:python-type :python-member :python-module :python-path :return-info :return-by-arity
+  [:python-type :python-member :python-module :python-path :python-specialized? :python-bytes :return-info :return-by-arity
    :tag :diagnostic-tag :parameter-tags :arglists :fixed-arities :varargs-min-arity :discard-args?])
 
 (defn- definition [parsed filename ns-name node name-node tail macro? private?]
@@ -917,7 +918,7 @@
               nil))
           (finding! ctx clause :unknown-ns-option (str "Unknown ns option: " (syntax/text clause))))))))
 
-(declare walk-body! bind-pattern! walk-call! walk-thread! walk-list-form! dispatch-name call-context python-return python-value tagged nonnil-value)
+(declare walk-body! bind-pattern! walk-call! walk-thread! walk-list-form! dispatch-name call-context python-return python-value tagged nonnil-value python-deprecated!)
 
 (defn- excluded? [ctx type value]
   (let [config (context-config ctx)
@@ -976,7 +977,7 @@
   (let [path (when member-name (python-path member-name))
         module (python-module ctx module-name)
         munged (when (and member-name (= 1 (count path))) [(util/munge member-name)])
-        preferred (when munged (py/resolve-member module (first munged)))
+        preferred (when munged (get (:members module) (first munged)))
         path (if preferred munged path)
         reexport? (or (:target-module preferred)
                       (and (:target preferred) (not (:members preferred))))
@@ -996,7 +997,9 @@
       (finding! ctx node :unresolved-namespace (str "Unresolved namespace " module-name ". Are you missing an import?"))
       (and member-name (op/eq :known (:status module)) (nil? member))
       (finding! ctx node :unresolved-symbol (str "Unresolved symbol: " module-name "/" member-name)))
-    (when member (python-member-value module-name (or path []) member))))
+    (when member
+      (python-deprecated! ctx node member)
+      (python-member-value module-name (or path []) member))))
 
 (defn- lint-reference! [ctx env node info]
   (when (and info (:ns info) (:name info))
@@ -2034,6 +2037,9 @@
       ;; Differing results stay unknown when signatures do not prove dispatch.
       (let [types (mapv #(py/call-result (:member %) [(:python-type (:argument %))]
                                          {} options (:signatures %)) accepted)]
+        (when (= 1 (count accepted))
+          (let [call (first accepted)]
+            (python-deprecated! ctx (:node call) (:member call))))
         (when (and (every? some? types)
                    (every? #(or (= (first types) %)
                                 (and (true? (py/type-compatible? (first types) % options))
@@ -2082,6 +2088,8 @@
                         (callable-collection (assoc value :name label)
                                              (if (keyword? (:tag value))
                                                (str/capitalize (basilisp.core/name (:tag value))) label)) arity))))))
+
+(declare python-index-value!)
 
 (defn- lint-types! [ctx node info args values]
   (lint-extra-types! ctx node info args values)
@@ -2168,7 +2176,10 @@
       (and (op/eq "namespace" (:name info)) (op/eq "basilisp.core" (:ns info)))
       (python-value (cond-> {:module "builtins" :path ["str"]}
                       (not (:qualified-name? (first values))) (assoc :nullable? true)))
-      (and (op/eq "basilisp.core" (:ns info)) (#{"get" "nth" "aget"} (:name info)) (:python-type (first values)))
+      (and (op/eq "basilisp.core" (:ns info)) (op/eq "aget" (:name info)) (>= (count values) 2))
+      (reduce (fn [receiver [argument value]] (python-index-value! ctx node receiver argument value))
+              (first values) (map vector (rest args) (rest values)))
+      (and (op/eq "basilisp.core" (:ns info)) (#{"get" "nth"} (:name info)) (:python-type (first values)))
       (when-let [type (py/element-type (:python-type (first values))
                                        (first (constant-data ctx (second args)))
                                        (get-in @(:state ctx) [:opts :python-options] {}))]
@@ -2215,6 +2226,15 @@
     (or (:python-literal-value value) {:type (:python-type value)})
     {:type (:python-type value)}))
 
+(defn- python-deprecated! [ctx node member]
+  (when-let [message (:deprecated member)]
+    (let [text (str "Python " (or (:name member) "member") " is deprecated"
+                    (when (string? message) (str ": " message)))
+          reported? (some #(and (= :deprecated-var (:type %)) (= text (:message %))
+                                (<= (:start node) (:start %)) (< (:start %) (:end node)))
+                          (:findings @(:state ctx)))]
+      (when-not reported? (finding! ctx node :deprecated-var text)))))
+
 (defn- python-call-value [ctx node member args values injected]
   (let [{:keys [positional keywords valid?]} (python-arguments ctx node args)
         supplied (vec (take positional values))
@@ -2241,6 +2261,9 @@
                          :python-fresh-values fresh-values))
         problems (when valid? (py/check-call member (count supplied) keywords))
         candidates (when (and valid? (empty? problems)) (py/call-signatures member positional-types keyword-types options))]
+    (python-deprecated! ctx node (or (when (:deprecated member) member)
+                                     (first (filter :type-match? candidates))
+                                     (when (every? :deprecated candidates) (first candidates))))
     (when (and (:type-guard member) (not (:async? member)))
       (swap! (:state ctx) assoc-in [:guard-calls (:start node)]
              {:guard (py/return-type (:type-guard member)) :type-is? (:type-is? member)}))
@@ -2258,6 +2281,79 @@
                                             (map (fn [[name type]] (str name "=" (py/type-label type))) keyword-types))) ")")))
     (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types options candidates))]
       (python-value type))))
+
+(defn- python-index-value! [ctx node receiver argument value]
+  (let [options (get-in @(:state ctx) [:opts :python-options] {})
+        type (:python-type receiver)
+        class? (and (= "builtins" (:module type)) (= ["type"] (:path type)))
+        builtin-sequence? (and (not class?) (= "builtins" (:module type))
+                               (contains? #{"list" "tuple" "str" "bytes" "bytearray" "range"} (first (:path type))))
+        class-type (when class? (first (:arguments type)))
+        owner (when class? (or (:python-member receiver) (py/inspect-type class-type options)))
+        metaclass (when (:metaclass owner) (py/inspect-type (:metaclass owner) options))
+        meta-getitem (get (:members metaclass) "__getitem__")
+        getitem (cond
+                  meta-getitem (py/bind-member meta-getitem)
+                  class? (get (:members owner) "__class_getitem__")
+                  (not builtin-sequence?) (py/inspect-member type "__getitem__" options))
+        key-type (:python-type value)
+        literal (when (= 1 (count (:literal-values key-type))) (first (:literal-values key-type)))
+        type-argument (fn [type] (when (and (= "builtins" (:module type)) (= ["type"] (:path type)))
+                                   (first (:arguments type))))
+        arguments (if (and (= "builtins" (:module key-type)) (= ["tuple"] (:path key-type)))
+                    (mapv type-argument (:arguments key-type)) [(type-argument key-type)])
+        builtin-generic? (and (= "builtins" (:module class-type))
+                              (contains? #{["list"] ["dict"] ["tuple"] ["set"] ["frozenset"] ["type"]} (:path class-type)))
+        generic? (and class? (not meta-getitem) (or builtin-generic? (seq (:type-parameters owner)))
+                      (seq arguments) (every? some? arguments))]
+    (cond
+      generic?
+      (let [specialized (assoc class-type :arguments arguments)
+            member (cond-> (py/specialize owner specialized)
+                     builtin-generic? (assoc :type-arguments arguments))]
+        (assoc (python-member-value (:python-module receiver) (:python-path receiver) member)
+               :python-specialized? true))
+      class?
+      (when getitem (python-call-value ctx node getitem [argument] [value] nil))
+      :else
+      (let [invalid-key? (and builtin-sequence? (= "builtins" (:module key-type))
+                              (contains? #{"str" "float" "complex" "NoneType" "list" "dict" "tuple" "set" "frozenset"}
+                                         (first (:path key-type))))
+            slice? (and builtin-sequence? (= "builtins" (:module key-type)) (= ["slice"] (:path key-type)))
+            fixed-size (cond
+                         (contains? receiver :python-bytes) (count (:python-bytes receiver))
+                         (and (= "builtins" (:module type)) (= ["tuple"] (:path type))
+                              (contains? type :arguments)
+                              (not-any? #(or (:ellipsis? %) (:unpack? %)) (:arguments type)))
+                         (count (:arguments type))
+                         (and (= "builtins" (:module type)) (#{["str"] ["bytes"]} (:path type))
+                              (= 1 (count (:literal-values type))))
+                         (python/len (first (:literal-values type))))
+            outside? (and (some? fixed-size) (python/isinstance literal python/int)
+                          (or (< literal (- fixed-size)) (>= literal fixed-size)))
+            byte-value (when (and (contains? receiver :python-bytes) (not outside?)
+                                  (python/isinstance literal python/int))
+                         (get (:python-bytes receiver) (python/int (if (neg? literal) (+ fixed-size literal) literal))))
+            result (when (and getitem (not builtin-sequence?))
+                     (python-call-value ctx node getitem [argument] [value] nil))]
+        (when invalid-key?
+          (finding! ctx argument :type-mismatch
+                    (str "Python sequence index must be an integer or slice, received: " (py/type-label key-type))))
+        (when outside?
+          (finding! ctx argument :type-mismatch
+                    (str "Python sequence index " literal " is out of range for length " fixed-size)))
+        (or (when (some? byte-value)
+              (python-value {:module "builtins" :path ["int"] :literal-values [byte-value]}))
+            result
+            (when-let [element (cond
+                                 (and slice? (= ["tuple"] (:path type))
+                                      (not-any? #(or (:ellipsis? %) (:unpack? %)) (:arguments type)))
+                                 (assoc type :arguments [(py/union-type (:arguments type)) {:ellipsis? true}])
+                                 slice? (dissoc type :literal-values)
+                                 (> (count (:literal-values key-type)) 1)
+                                 (py/union-type (map #(py/element-type type % options) (:literal-values key-type)))
+                                 :else (py/element-type type literal options))]
+              (python-value element)))))))
 
 (defn- merge-values [values]
   (let [known (filter some? values)
@@ -2397,11 +2493,13 @@
         member (when object
                  (if (and field? (op/eq "arities" member-name) (:arglists target))
                    {:kind :variable :type {:module "basilisp.lang.set" :path ["PersistentSet"]}}
-                   (if instance?
-                     (py/inspect-member object (util/munge member-name ** :allow_builtins true)
-                                        (get-in @(:state ctx) [:opts :python-options] {}))
-                     (py/inspect-path (:module object) (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))
-                                      (get-in @(:state ctx) [:opts :python-options] {})))))
+                   (if (:python-specialized? target)
+                     (py/resolve-member (:python-member target) (util/munge member-name ** :allow_builtins true))
+                     (if instance?
+                       (py/inspect-member object (util/munge member-name ** :allow_builtins true)
+                                          (get-in @(:state ctx) [:opts :python-options] {}))
+                       (py/inspect-path (:module object) (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))
+                                        (get-in @(:state ctx) [:opts :python-options] {}))))))
         values (mapv #(if (op/eq "**" (token %)) nil (walk! ctx (assoc env :tail? false) %)) arguments)]
     (when object
       (record-call! ctx env node head arguments member
@@ -2415,6 +2513,7 @@
         (finding! ctx head :unresolved-symbol (str "Unresolved Python member: " member-name))
         nil))
     (when member
+      (when field? (python-deprecated! ctx node member))
       (if field?
         (if (#{:function :class :module} (:kind member))
           (python-member-value (:module object)
@@ -3751,6 +3850,7 @@
                       :else :number)
                     :any)]
           (cond-> {:tag tag}
+            (op/eq :bytes dispatch-value) (assoc :python-bytes (vec literal))
             type (assoc :python-type
                         (cond-> type
                           (python/isinstance literal #py (python/str python/int python/bool))

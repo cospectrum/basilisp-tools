@@ -49,3 +49,21 @@
     (is (nil? (compare (assoc string :bases [{:type-module "unavailable" :type-path ["Base"]}]) required)))
     ;; A reexport of object remains a valid supertype, even at the terminal base.
     (is (true? (compare string object)))))
+
+(deftest proven-local-nominal-classes-use-complete-ancestry
+  (let [left (ref "local" "Left") right (ref "local" "Right")
+        base (class-info "local" "Base" [])
+        left-info (class-info "local" "Left" [{:type-module "local" :type-path ["Base"]}])
+        right-info (class-info "local" "Right" [])
+        compare (fn [a e]
+                  (let [patch (mock/patch "basilisp_tools.python.inspect_path"
+                                          ** :new (fn [module path _opts]
+                                                    (when (= "local" module)
+                                                      (get {["Left"] a ["Right"] e ["Base"] base} path))))]
+                    (.start patch)
+                    (try (py/type-compatible? left right {}) (finally (.stop patch)))))]
+    (is (false? (compare left-info right-info)))
+    (is (true? (compare left-info base)))
+    (is (nil? (compare left-info (dissoc right-info :nominal?))))
+    (is (nil? (compare (dissoc left-info :nominal?) right-info)))
+    (is (nil? (compare (assoc left-info :bases [{:type-module "missing" :type-path ["Base"]}]) right-info)))))

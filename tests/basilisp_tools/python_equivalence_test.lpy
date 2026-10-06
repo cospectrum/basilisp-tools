@@ -97,7 +97,8 @@
                                      (generic "identitymodels" "Box" str-type) opts)))
       ;; A function's return annotation cannot prove that it is a class alias.
       (is (nil? (py/type-compatible? (ref "exports" "public_make") (ref "identitymodels" "Thing") opts)))
-      (is (nil? (py/type-compatible? (ref "identitymodels" "Other") (ref "identitymodels" "Thing") opts)))
+      ;; Complete nominal metadata proves unrelated plain classes incompatible.
+      (is (false? (py/type-compatible? (ref "identitymodels" "Other") (ref "identitymodels" "Thing") opts)))
       (finally
         (py/stop-cache! (:cache opts))
         (.cleanup temporary)))))
