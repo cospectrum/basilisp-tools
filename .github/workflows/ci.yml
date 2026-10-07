@@ -144,14 +144,15 @@ jobs:
           paths = sorted({str(corpus / source["directory"] / item["path"])
                           for item in selection if item["provider"] == "pyright"})
           assert paths and all(Path(path).is_file() for path in paths)
-          command = [str(executable), "--outputjson", *paths]
+          python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+          command = [str(executable), "--outputjson", "--pythonversion", python_version, *paths]
           process = subprocess.run(command, capture_output=True, text=True, timeout=120)
           if process.returncode not in (0, 1):
               raise RuntimeError(process.stdout + process.stderr)
           report = json.loads(process.stdout)
           assert report["version"] == source["oracle_version"], report["version"]
           assert isinstance(report["generalDiagnostics"], list)
-          report["blt_invocation"] = {"command": command,
+          report["blt_invocation"] = {"command": command, "python_version": python_version,
                                       "selection_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
           output.write_text(json.dumps(report, indent=2) + "\n")
           PY

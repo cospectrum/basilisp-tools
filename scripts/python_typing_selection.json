@@ -232,5 +232,135 @@
       "negative_calls": 2,
       "return_assertions": 1
     }
+  },
+  {
+    "provider": "pyright",
+    "path": "packages/pyright-internal/src/tests/samples/lambda3.py",
+    "name": "lambda3.py",
+    "source_sha256": "12184c723112761218ed5fefdc0ea9dcc2071660a37271c769de8fe92fb3d62f",
+    "expected": {
+      "passed": 3,
+      "excluded": 0,
+      "positive_calls": 3,
+      "negative_calls": 0,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-overloading.test",
+    "name": "testOverloadUnionCallableSubtype",
+    "source_sha256": "ba9bcd60e835a6a91f239a552399bbb393099ce22fe452af2766b883a89746f8",
+    "expected": {
+      "passed": 3,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 2,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-protocols.test",
+    "name": "testProtocolGenericInference2",
+    "source_sha256": "2dbf9978982d931b98ed1c763bfdf66ae3dfd6d7fa791bda3a03fe5ee0178e38",
+    "expected": {
+      "passed": 1,
+      "excluded": 2,
+      "positive_calls": 0,
+      "negative_calls": 0,
+      "return_assertions": 1
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/dataclass_transform.rs",
+    "name": "test_factory",
+    "source_sha256": "3b725bdf2d846bd62a497b146ce6b9a48c5a78c6133a3afcf286a3c755d452ec",
+    "expected": {
+      "passed": 2,
+      "excluded": 1,
+      "positive_calls": 2,
+      "negative_calls": 0,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/dataclasses.rs",
+    "name": "test_inheritance",
+    "source_sha256": "3aa4bc5867c9a89a0ea4ed5fc763e1a370e4d30fc0cd60538397b540db973a29",
+    "expected": {
+      "passed": 3,
+      "excluded": 0,
+      "positive_calls": 3,
+      "negative_calls": 0,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/named_tuple.rs",
+    "name": "test_named_tuple_base_class_call_with_mixin",
+    "source_sha256": "9902328bdb5f26f265dd87fd44991ee38eb905cf9a28d899984a953379696f9b",
+    "expected": {
+      "passed": 3,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 0,
+      "return_assertions": 2
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/named_tuple.rs",
+    "name": "test_typing_namedtuple_adjacent_defaults",
+    "source_sha256": "0ce930b83aa9111ba693081a42542da9a386c36024f234cfa99deba6ab00d4f9",
+    "expected": {
+      "passed": 1,
+      "excluded": 1,
+      "positive_calls": 1,
+      "negative_calls": 0,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/call/callable_instance.md",
+    "name": "Callable instance / Call binding errors / Wrong argument type",
+    "source_sha256": "2bb87895e87df2391c90ef638b4f9f3b5976f0a354e5268fe47e2036716a6c1c",
+    "expected": {
+      "passed": 2,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/dataclasses/fields.md",
+    "name": "Dataclass fields / dataclass_transform field_specifiers",
+    "source_sha256": "d87203209b94f064155d32555aef16984b6979be610efc3ead3b3cd0b536b7c0",
+    "expected": {
+      "passed": 5,
+      "excluded": 7,
+      "positive_calls": 4,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/generics/legacy/callables.md",
+    "name": "Generic callables: Legacy syntax / Rejected overloaded callbacks preserve valid specializations",
+    "source_sha256": "6649d4dff7d0aba367755039a40e4a7ef0bd680d4fd133aa123c2d15f9dbb36b",
+    "expected": {
+      "passed": 4,
+      "excluded": 2,
+      "positive_calls": 0,
+      "negative_calls": 0,
+      "return_assertions": 4
+    }
   }
 ]

@@ -599,3 +599,123 @@ def test_missing_python_module_member_is_a_real_negative_oracle(harness, tmp_pat
     assert rows[0]['findings'][0]['message'] == 'Unresolved Python member: absent'
     assert rows[1]['findings'][0]['message'] == 'Unresolved Python member: other'
     assert rows[2]['findings'] == []
+
+
+def test_exception_group_scope_is_retained_as_unadapted(harness):
+    if not hasattr(ast, 'TryStar'):
+        pytest.skip('Exception groups require Python 3.11')
+    rows = harness.discover(source_fixture('try:\n    pass\nexcept* Exception as group:\n    reveal_type(group) # E: revealed type: ExceptionGroup[Exception]\n'))
+    row = next(row for row in rows if row['kind'] == 'return')
+    assert row['context'] == ['TryStar']
+    assert 'Lexical/control-flow context' in row['excluded']
+
+
+def test_source_name_proof_requires_closed_bindings(harness):
+    expression = ast.parse('unknown(value)', mode='eval').body
+    assert harness.source_name_symbols(expression, ast.parse('value = 1'), 'fixture', {'value'}, {}) == ['fixture/unknown']
+    assert harness.source_name_symbols(expression, ast.parse('from supplied import *'), 'fixture', set(), {}) == []
+    assert harness.source_name_symbols(expression, ast.parse('exec(text)'), 'fixture', set(), {}) == []
+    assert harness.source_name_symbols(expression, ast.parse('pass'), 'fixture', {'unknown'}, {'value': None}) == []
+    assert harness.source_name_symbols(ast.parse('__name__', mode='eval').body, ast.parse('pass'), 'fixture', set(), {}) == []
+
+
+def test_proven_source_name_errors_are_separate_from_call_errors(harness):
+    finding = {'type': ':unresolved-symbol', 'message': 'Unresolved symbol: fixture/missing'}
+    row = {'source_name_symbols': ['fixture/missing'], 'expected_error': True,
+           'expected_diagnostic_types': [harness.SOURCE_NAME_ERROR], 'findings': [finding]}
+    assert harness.diagnostic_status(row) == 'passed'
+    assert harness.SOURCE_NAME_ERROR not in harness.CALL_ERRORS
+    assert harness.diagnostic_status({**row, 'findings': [finding, {'type': ':unresolved-symbol', 'message': 'Unresolved symbol: local-bug'}]}) == 'error'
+    assert harness.diagnostic_status({**row, 'source_name_symbols': []}) == 'error'
+    assert harness.diagnostic_status({**row, 'expected_diagnostic_types': ['type-mismatch']}) is None
+
+
+def test_name_defined_suppression_preserves_unrelated_argument_diagnostics(harness, tmp_path):
+    import basilisp_tools
+    from basilisp.lang.keyword import keyword
+    from basilisp.lang.runtime import to_lisp
+    engine = importlib.import_module('basilisp_tools.analyzer'), importlib.import_module('basilisp_tools.python'), keyword, to_lisp
+    item = source_fixture('def f(x: int, y: int) -> int: ...\nf(missing, "bad") # type: ignore[name-defined]\n')
+    item['provider'] = 'mypy'
+    rows = harness.discover(item)
+    harness.replay(item, rows, tmp_path, engine)
+    row = rows[0]
+    assert row['status'] == 'failed', row
+    assert any(harness.finding_type(f) == 'type-mismatch' for f in row['findings'])
+    assert not any(harness.finding_type(f) in {'unknown-linter', 'redundant-ignore'} for f in row['findings'])
+
+
+def test_undefined_source_call_matches_only_name_resolution_oracle(harness, tmp_path):
+    import basilisp_tools
+    from basilisp.lang.keyword import keyword
+    from basilisp.lang.runtime import to_lisp
+    engine = importlib.import_module('basilisp_tools.analyzer'), importlib.import_module('basilisp_tools.python'), keyword, to_lisp
+    item = source_fixture('T = oops() # E:\n')
+    item['provider'] = 'pyrefly'
+    rows = harness.discover(item)
+    harness.replay(item, rows, tmp_path, engine)
+    row = rows[0]
+    assert row['status'] == 'passed', row
+    assert row['diagnostic_oracle_category'] == 'source-name-resolution'
+    assert row['expected_diagnostic_types'] == [harness.SOURCE_NAME_ERROR]
+    assert row['findings'][0]['message'].endswith('/oops')
+
+
+def test_oracle_python_version_must_match_replay(harness):
+    payload = {'blt_invocation': {'command': ['pyright', '--outputjson', '--pythonversion', '3.13']}}
+    assert harness.oracle_target(payload, '3.13')['matches_replay_python'] is True
+    with pytest.raises(ValueError, match='replay uses Python 3.10'):
+        harness.oracle_target(payload, '3.10')
+    payload['blt_invocation']['python_version'] = '3.14'
+    with pytest.raises(ValueError, match='metadata disagrees'):
+        harness.oracle_target(payload, '3.13')
+    assert harness.oracle_target({}, '3.13')['matches_replay_python'] is None
+
+
+def test_oracle_python_version_equal_spelling_is_checked(harness):
+    payload = {"blt_invocation": {"command": ["pyright", "--pythonversion=3.14"]}}
+    with pytest.raises(ValueError, match="targets Python 3.14"):
+        harness.oracle_target(payload, "3.13")
+
+
+def test_name_defined_ignore_keeps_unknown_call_unknown(harness, tmp_path):
+    import basilisp_tools
+    from basilisp.lang.keyword import keyword
+    from basilisp.lang.runtime import to_lisp
+    engine = importlib.import_module('basilisp_tools.analyzer'), importlib.import_module('basilisp_tools.python'), keyword, to_lisp
+    item = source_fixture("a = 'x'.foobar(missing) # type: ignore[name-defined, attr-defined]\n")
+    item['provider'] = 'mypy'
+    rows = harness.discover(item)
+    harness.replay(item, rows, tmp_path, engine)
+    row = rows[0]
+    assert row['status'] == 'unknown', row
+    assert row['findings'] == []
+    assert len(row['suppressed_findings']) == 1
+    assert row['suppressed_findings'][0]['message'].endswith('/missing')
+
+
+def test_consumer_metadata_uses_only_exact_known_python_call(harness):
+    target = {"kind": ":function", "status": ":known", "parameters": []}
+    fallback = {"kind": ":variable", "status": ":known"}
+    bridge = SimpleNamespace(inspect_path=lambda *args: fallback)
+    row = {"basilisp_start": 10, "basilisp_end": 21}
+    call = {"python": True, "start": 10, "end": 21, "definition": target}
+    invoke = lambda calls: harness.consumer_metadata(ast.parse("value()", mode="eval").body,
+                                                     "fixture", row, {"calls": calls}, bridge, {}, lambda x: x, {})
+    assert invoke([call]) == target
+    assert invoke([]) == fallback
+    assert invoke([{**call, "end": 20}]) == fallback
+    assert invoke([{**call, "python": False}]) == fallback
+    assert invoke([{**call, "definition": {**target, "status": "unknown"}}]) == fallback
+    assert invoke([{**call, "definition": {**target, "kind": "variable"}}]) == fallback
+    assert invoke([call, call]) == fallback
+
+
+def test_unknown_callable_does_not_gain_signature_from_its_return(harness):
+    row = {"basilisp_start": 10, "basilisp_end": 21}
+    unknown = {"kind": "variable", "status": "known", "type-module": "builtins", "type-path": ["bool"]}
+    bridge = SimpleNamespace(inspect_path=lambda *args: unknown)
+    result = {"calls": [{"python": True, "start": 10, "end": 21, "definition": unknown}]}
+    metadata = harness.consumer_metadata(ast.parse("value()", mode="eval").body,
+                                         "fixture", row, result, bridge, {}, lambda x: x, {})
+    assert not harness.signature_known(metadata)

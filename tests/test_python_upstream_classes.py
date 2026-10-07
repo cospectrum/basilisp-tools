@@ -266,10 +266,10 @@ def test_builtin_converters_preserve_generic_inputs(worker, tmp_path):
     info = inspect_source(worker, tmp_path, source)['C']
     for idx in (0, 2):
         assert info['parameters'][idx]['type-path'] == ['Iterable']
-        assert info['parameters'][idx]['type-arguments'] == [{'typevar': 'T'}]
+        assert info['parameters'][idx]['type-arguments'] == [{'typevar': 'T', 'type-variance': 'invariant'}]
     alternatives = info['parameters'][1]['type-union']
     assert [t['type-path'] for t in alternatives] == [['Mapping'], ['Iterable']]
-    assert alternatives[0]['type-arguments'][1] == {'typevar': 'T'}
+    assert alternatives[0]['type-arguments'][1] == {'typevar': 'T', 'type-variance': 'invariant'}
     assert info['members']['x']['type-path'] == ['set']
 
 

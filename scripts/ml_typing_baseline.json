@@ -5,16 +5,6 @@
       "case": "distribution-multivariate",
       "reason": "Result member metadata was not resolved",
       "explanation": "MultivariateNormal.covariance_matrix uses a custom lazy_property descriptor. Its Tensor receiver type is not recovered, so the subsequent numel member remains unknown despite valid native execution."
-    },
-    {
-      "case": "onnx-model-bad-graph",
-      "reason": "Known invalid argument was not diagnosed",
-      "explanation": "The GraphProto annotation resolves through generated protobuf stubs without enough nominal dispatch evidence to reject a string. Native make_model rejects that string."
-    },
-    {
-      "case": "onnx-array-bad-value",
-      "reason": "Known invalid argument was not diagnosed",
-      "explanation": "The ndarray stub reference does not prove nominal incompatibility with a Python list. Native numpy_helper.from_array rejects the list."
     }
   ]
 }

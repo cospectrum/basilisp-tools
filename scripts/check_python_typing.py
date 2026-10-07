@@ -28,6 +28,7 @@ from python_typing_corpus import fetch_source, fixtures
 DECLARATIONS = {"TypeVar", "TypeVarTuple", "ParamSpec", "NewType", "TypedDict", "NamedTuple", "type_check_only", "dataclass_transform"}
 ASSERTIONS = {"assert_type", "reveal_type"}
 CALL_ERRORS = {"invalid-arity", "type-mismatch", "unresolved-python-member"}
+SOURCE_NAME_ERROR = "unresolved-python-source-name"
 PYRIGHT_CALL_ERRORS = {"reportCallIssue", "reportArgumentType", "reportAttributeAccessIssue", "reportIndexIssue", "reportOperatorIssue"}
 SNAPSHOT_CALL_ERRORS = {
     "invalid-argument-type", "missing-argument", "too-many-positional-arguments",
@@ -37,6 +38,7 @@ SNAPSHOT_CALL_ERRORS = {
     "unsupported-operator", "deprecated",
 }
 SUPPRESSION_CODES = {
+    "name-defined": {SOURCE_NAME_ERROR},
     "arg-type": {"type-mismatch"}, "call-arg": {"invalid-arity"},
     "call-overload": {"type-mismatch", "invalid-arity"},
     "attr-defined": {"unresolved-python-member"}, "union-attr": {"unresolved-python-member"},
@@ -112,7 +114,7 @@ def suppressions(source, provider):
             if not match or match[1] not in {"type", provider}:
                 continue
             codes = [code.strip() for code in match[2].split(",")] if match[2] is not None else []
-            all_codes = CALL_ERRORS | {"deprecated-var"}
+            all_codes = CALL_ERRORS | {"deprecated-var", SOURCE_NAME_ERROR}
             if not codes:
                 ignored = all_codes
             elif provider == "pyrefly" and match[1] == "type":
@@ -355,7 +357,7 @@ def discover(item):
             context = []
             ancestor = parents.get(node)
             while ancestor and not isinstance(ancestor, ast.Module):
-                if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.For, ast.While, ast.Try, ast.With, ast.Match, ast.Lambda)):
+                if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.If, ast.For, ast.While, ast.Try, ast.With, ast.Match, ast.Lambda)) or type(ancestor).__name__ == "TryStar":
                     context.append(type(ancestor).__name__)
                 ancestor = parents.get(ancestor)
             row = {"file": filename, "line": node.lineno, "end_line": node.end_lineno, "column": node.col_offset,
@@ -633,6 +635,14 @@ def consumer_metadata(node, module, row, result, bridge, options, to_lisp, bindi
     """Resolve the translated consumer independently of its inferred return type."""
     if not isinstance(node, ast.Call):
         return None
+    calls = [call for call in result.get("calls", [])
+             if call.get("python") is True
+             and row.get("basilisp_start") is not None and row.get("basilisp_end") is not None
+             and call.get("start") == row["basilisp_start"] and call.get("end") == row["basilisp_end"]
+             and signature_known(call.get("definition"))
+             and call["definition"].get("kind", "").removeprefix(":") in {"function", "class"}]
+    if len(calls) == 1:
+        return calls[0]["definition"]
     if isinstance(node.func, ast.Name):
         target = bindings.get(node.func.id, module + "/" + node.func.id)
         if not isinstance(target, str):
@@ -765,16 +775,41 @@ def finding_type(finding):
     return kind
 
 
+def source_name_symbols(node, tree, module, bound, lexical_names):
+    """Find undeclared source names without trusting arbitrary adapted lexical errors."""
+    if any(isinstance(part, ast.ImportFrom) and any(alias.name == "*" for alias in part.names)
+           or isinstance(part, ast.Call) and isinstance(part.func, ast.Name)
+           and part.func.id in {"exec", "eval", "globals", "locals"}
+           for part in ast.walk(tree)):
+        return []
+    implicit = {"__name__", "__file__", "__spec__", "__loader__", "__package__", "__doc__",
+                "__cached__", "__builtins__", "__annotations__"}
+    declared = bound | set(dir(builtins)) | set(lexical_names) | implicit
+    missing = {part.id for part in ast.walk(node)
+               if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Load)
+               and part.id not in declared}
+    return [module + "/" + name for name in sorted(missing)]
+
+
+def row_finding_type(row, finding):
+    """Name-resolution checks require the source proof and exact generated symbol."""
+    kind = finding_type(finding)
+    if kind == "unresolved-symbol" and finding.get("message") in {
+            "Unresolved symbol: " + name for name in row.get("source_name_symbols", [])}:
+        return SOURCE_NAME_ERROR
+    return kind
+
+
 def diagnostic_status(row):
     """A concrete diagnostic overrides incomplete return/signature metadata."""
     findings = row.get("findings", [])
-    if any(finding_type(finding) == "unresolved-symbol" for finding in findings):
+    if any(row_finding_type(row, finding) == "unresolved-symbol" for finding in findings):
         return "error"
     if row.get("expected_error"):
         expected = row.get("expected_diagnostic_types", CALL_ERRORS)
-        if any(finding_type(finding) in expected for finding in findings):
+        if any(row_finding_type(row, finding) in expected for finding in findings):
             return "passed"
-    elif any(finding_type(finding) in CALL_ERRORS for finding in findings):
+    elif any(row_finding_type(row, finding) in CALL_ERRORS | {SOURCE_NAME_ERROR} for finding in findings):
         return "failed"
     return None
 
@@ -825,6 +860,14 @@ def replay(item, rows, working, engine):
             row["literal_bindings"] = {name: ast.unparse(value) for name, value in literals.items() if name in used}
             scope, context, locals_ = lexical_comprehension(row, module, {**bindings, **literals})
             expression = translate(node, module, scope)
+            row["source_name_symbols"] = source_name_symbols(node, tree, module, bound, locals_)
+            if row["source_name_symbols"] and row.get("expected_error"):
+                notes = row.get("markers", [])
+                name_expected = any("[name-defined]" in note or "is not defined" in note for note in notes)
+                unspecified = bool(notes) and all(re.fullmatch(r"E\s*:\s*", note) for note in notes)
+                if name_expected or unspecified:
+                    row["expected_diagnostic_types"] = [SOURCE_NAME_ERROR]
+                    row["diagnostic_oracle_category"] = "source-name-resolution"
             closing = ")" if context else ""
             if context:
                 row["lexical_names"] = {name: local.id for name, local in locals_.items()}
@@ -863,7 +906,7 @@ def replay(item, rows, working, engine):
             if row.get("suppression_directives"):
                 ignored = sorted({kind for directive in row["suppression_directives"]
                                   for kind in directive["diagnostics"]
-                                  if kind != "unresolved-python-member"})
+                                  if kind not in {"unresolved-python-member", SOURCE_NAME_ERROR}})
                 if ignored:
                     prefix = "#_{:clj-kondo/ignore [" + " ".join(":" + kind for kind in ignored) + "]} " + prefix
             offset = row.get("basilisp_context_offset", 0)
@@ -898,6 +941,10 @@ def replay(item, rows, working, engine):
                    for directive in row.get("suppression_directives", [])):
                 suppressed.extend(finding for finding in findings
                                   if finding_type(finding) == "unresolved-python-member")
+            if any(SOURCE_NAME_ERROR in directive["diagnostics"]
+                   for directive in row.get("suppression_directives", [])):
+                suppressed.extend(finding for finding in findings
+                                  if row_finding_type(row, finding) == SOURCE_NAME_ERROR)
             if suppressed:
                 row["suppressed_findings"] = suppressed
                 findings = [finding for finding in findings if finding not in suppressed]
@@ -987,6 +1034,29 @@ def validate_selection(report, selection):
     return failures
 
 
+def oracle_target(payload, host_version=None):
+    """Retain legacy oracle provenance and validate an explicitly pinned target."""
+    invocation = payload.get("blt_invocation", {})
+    command = invocation.get("command", [])
+    version = invocation.get("python_version")
+    targets = [argument.split("=", 1)[1] for argument in command if argument.startswith("--pythonversion=")]
+    for index, argument in enumerate(command):
+        if argument == "--pythonversion":
+            if index + 1 >= len(command):
+                raise ValueError("Pyright invocation lacks its --pythonversion value")
+            targets.append(command[index + 1])
+    for target in targets:
+        if version is not None and version != target:
+            raise ValueError("Pyright invocation target metadata disagrees with its command")
+        version = target
+    host = host_version or f"{sys.version_info.major}.{sys.version_info.minor}"
+    if version is not None and version != host:
+        raise ValueError(f"Pyright oracle targets Python {version}, but replay uses Python {host}")
+    return {"python_version": version, "matches_replay_python": True if version is not None else None,
+            "profile": ("Explicit matching Python target plus fixture directives; original TypeScript test-runner settings are not reproduced"
+                        if version is not None else "Pyright CLI defaults plus fixture directives; Python target is unverified and original TypeScript test-runner settings are not reproduced")}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus", required=True, type=Path)
@@ -1011,6 +1081,10 @@ def main():
     if args.pyright_oracle:
         oracle = collections.defaultdict(list)
         payload = json.loads(args.pyright_oracle.read_text())
+        try:
+            target = oracle_target(payload)
+        except ValueError as error:
+            parser.error(str(error))
         for diagnostic in payload["generalDiagnostics"]:
             oracle[diagnostic["file"]].append(diagnostic)
     engine = None
@@ -1032,7 +1106,7 @@ def main():
     if args.pyright_oracle:
         report["oracle"] = {"version": payload["version"], "summary": payload["summary"],
                             "sha256": hashlib.sha256(args.pyright_oracle.read_bytes()).hexdigest(),
-                            "profile": "Pyright CLI defaults plus fixture directives; original TypeScript test-runner settings are not reproduced"}
+                            **target}
         if "blt_invocation" in payload:
             report["oracle"]["invocation"] = payload["blt_invocation"]
     args.output.parent.mkdir(parents=True, exist_ok=True)

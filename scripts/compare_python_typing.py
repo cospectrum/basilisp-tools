@@ -8,7 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from check_python_typing import CALL_ERRORS, finding_type
+from check_python_typing import CALL_ERRORS, SOURCE_NAME_ERROR, row_finding_type
 
 
 def index(report):
@@ -26,10 +26,11 @@ def coverage(cases):
         "matched_positive_calls": sum(case["status"] == "passed" and case["kind"] == "call"
                                       and not case.get("expected_error") for case in cases),
         "matched_negative_calls": sum(case["status"] == "passed" and case.get("expected_error", False) for case in cases),
+        "matched_source_name_assertions": sum(case["status"] == "passed" and case.get("diagnostic_oracle_category") == "source-name-resolution" for case in cases),
         "matched_return_assertions": sum(case["status"] == "passed" and case["kind"] == "return"
                                          and not case.get("expected_error") for case in cases),
         "expected_valid_diagnostic_cases": sum(not case.get("expected_error", False) and case["status"] == "failed"
-                                               and any(finding_type(finding) in CALL_ERRORS
+                                               and any(row_finding_type(case, finding) in CALL_ERRORS | {SOURCE_NAME_ERROR}
                                                        for finding in case.get("findings", [])) for case in cases),
     }
 

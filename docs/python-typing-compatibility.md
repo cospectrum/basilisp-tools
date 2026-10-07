@@ -55,7 +55,7 @@ an independently executed native oracle. Install the version pinned in the
 manifest into an isolated environment, then run:
 
 ```sh
-pyright --outputjson \
+pyright --outputjson --pythonversion 3.13 \
   /tmp/python-typing-corpus/microsoft-pyright/packages/pyright-internal/src/tests/samples \
   > /tmp/pyright-native.json
 
@@ -66,7 +66,7 @@ python scripts/check_python_typing.py --corpus /tmp/python-typing-corpus \
 
 Native Pyright is expected to exit nonzero because the corpus contains invalid
 examples. The report records that oracle's version and source digest. Its profile
-is the CLI defaults plus in-file directives; the upstream TypeScript runner's
+uses an explicit Python target in CI plus in-file directives; the upstream TypeScript runner's
 per-test options are not reproduced. Diagnostics unrelated to the adapted call
 are excluded rather than treated as argument errors.
 
@@ -232,19 +232,41 @@ increased from 2.61 to 2.86 seconds for Torch and from 6.18 to 6.82 seconds for
 ONNX. The artifact retains cold and warm samples separately; this checkpoint
 adds checking coverage with a measured runtime cost.
 
-CI checks 90 resolved assertions. Four typing fixtures contribute 36 assertions:
+The [fourth comparison](data/python-typing-fourth.json) keeps another complete
+21,802-fixture pair against `bba2e8`, using one frozen adapter and an independently
+run Pyright oracle explicitly targeting Python 3.13. Initial exact matches rise
+from 5,085 to 5,207, while differences rise from 966 to 1,016 and unknown results
+fall from 7,370 to 7,198; both reports retain 77,581 exclusions and zero replay
+errors. These are the initial snapshots, including the regressions they exposed.
+The complete final replay reaches 5,262 exact matches, 950 differences and
+7,209 unknowns with the same exclusions and zero replay errors. The artifact
+keeps both full comparisons, all 86 initially introduced changes, subsequent
+whole-fixture repairs, and one additional missed NewType class-value rejection
+found by the final replay. It records all 12 remaining expected-valid diagnostic
+rows with native or typing-contract evidence; those reviews do not change their
+reported status. The broader corpus continues to contain applicable work; the
+strict CI selection is a regression gate, not a claim that all upstream suites
+pass.
+
+A quiet ABBA comparison on generated size-16 programs preserved findings and
+member metadata across all eight processes. Median warm analysis increased
+from 2.83 to 2.92 seconds for Torch and from 6.88 to 7.39 seconds for ONNX, a
+3.05% and 7.45% cost for this checkpoint. The artifact keeps every cold and warm
+timing sample, parent CPU measurement, output digest and source hash separately.
+
+CI checks 117 resolved assertions. Four typing fixtures contribute 36 assertions:
 26 valid calls and 10 rejected calls. It requires the exact fixture counts
 17, 8, 5, and 6 for
 `dataclasses_kwonly.py`, `dataclasses_transform_class.py`,
 `dataclasses_transform_field.py`, and `generics_basic.py`, respectively, with
 zero unknowns, differences, or replay errors.
 
-Eighteen additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 54
-resolved assertions, including 16 expected diagnostics for calls and assignments.
+Twenty-eight additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 81
+resolved assertions, including 20 expected diagnostics for calls and assignments.
 Their identities, source digests, positive/negative counts, return assertions,
-and 27 explicit exclusions are
+and 40 explicit exclusions are
 pinned in [`python_typing_selection.json`](../scripts/python_typing_selection.json).
-CI generates independent expectations for the five selected Pyright files using
+CI generates independent expectations for the six selected Pyright files using
 the pinned Pyright release. Missing, duplicate, or changed fixtures and newly
 unknown assertions fail the gate; exclusions never count as matches. Repeat it
 with `--selection scripts/python_typing_selection.json --require-resolved`,

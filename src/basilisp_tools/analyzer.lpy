@@ -2300,12 +2300,24 @@
     (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types options candidates))]
       (python-value type))))
 
+(defn- python-call-member [ctx value]
+  (let [member (:python-member value)
+        type (:python-type value)]
+    (or (when (#{:function :class} (:kind member)) member)
+        ;; Basilisp functions carry richer arity and body-flow contracts. Their
+        ;; Python Callable view is for arguments crossing the interop boundary.
+        (when-not (or (:fixed-arities value) (:varargs-min-arity value) (:arglists value))
+          (or (py/callable-metadata type)
+              (when (and (:module type) (not (.startswith (:module type) "basilisp.")))
+                (let [call (py/inspect-member type "__call__" (get-in @(:state ctx) [:opts :python-options] {}))]
+                  (if (= :function (:kind call)) call
+                      (py/callable-metadata (py/return-type call)))))))
+        member)))
+
 (defn- python-apply-keywords! [ctx node args values]
   (let [function (first values)
         mapping (last values)
-        options (get-in @(:state ctx) [:opts :python-options] {})
-        member (or (:python-member function)
-                   (when (:python-type function) (py/inspect-member (:python-type function) "__call__" options)))
+        member (python-call-member ctx function)
         known? (or (= :nil (:tag mapping)) (:map-closed? mapping))
         entries (when (:map-closed? mapping) (vec (:map-values mapping)))
         names (mapv (fn [[key _]]
@@ -2620,7 +2632,7 @@
          :python-assignment-class? class-target?}
         (or read-override descriptor? property?)
         (if field? read-value
-            (when-let [callable (:python-member read-value)]
+            (when-let [callable (python-call-member ctx read-value)]
               (python-call-value ctx node callable arguments values (when (pos? extra-positional) injected))))
         field?
         (if (#{:function :class :module} (:kind member))
@@ -2727,6 +2739,7 @@
       (let [thread (:thread-target env)
             env (dissoc env :thread-target)
             info (walk! ctx (assoc env :call-node node) head)
+            member (python-call-member ctx info)
             argument-env (cond-> (assoc env :tail? false) (:discard-args? info) (assoc :discarded-macro-argument? true))
             values (mapv #(if (op/eq "**" (token %)) nil (walk! ctx argument-env %)) args)
             typed-args (if thread (if (:last? thread) (conj (vec args) (:node thread)) (cons (:node thread) args)) args)
@@ -2736,10 +2749,10 @@
           (finding! ctx node :single-operand-comparison
                     (str "Single operand use of basilisp.core/" (:name info) " is always "
                          (if (op/eq "not=" (:name info)) "false" "true"))))
-        (record-call! ctx env node head args (or (:python-member info) info)
+        (record-call! ctx env node head args (or member info)
                       (merge {:implicit-arguments injected :arity (+ injected (count args))}
-                             (when (:python-member info) {:python true :ns (:python-module info)})))
-        (if-let [member (:python-member info)]
+                             (when member {:python true :ns (:python-module info)})))
+        (if member
           (let [result (python-call-value ctx node member args values thread)]
             (or (when-not thread (python-import-value ctx info args values)) result
                 (when (op/eq :class (:kind member))

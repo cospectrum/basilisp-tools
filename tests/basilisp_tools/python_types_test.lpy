@@ -77,7 +77,7 @@
             choose (bridge/inspect-path "models" ["choose"] opts)
             parse (bridge/inspect-path "models" ["parse"] opts)
             union {:union [int-type str-type]}]
-        (is (= {:typevar "T"} (bridge/return-type identity)))
+        (is (= {:typevar "T" :variance "invariant"} (bridge/return-type identity)))
         (is (= int-type (bridge/call-result identity [int-type] {})))
         (is (= str-type (bridge/call-result first [{:module "builtins" :path ["list"] :arguments [str-type]}] {})))
         (is (= str-type (bridge/call-result choose [int-type] {})))

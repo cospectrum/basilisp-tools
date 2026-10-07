@@ -15,6 +15,7 @@ import importlib.machinery
 import inspect
 import io
 import json
+import keyword
 import os
 import operator
 from pathlib import Path
@@ -122,7 +123,7 @@ def annotation(value):
 
 
 TYPE_KEYS = ("type-module", "type-path", "type-arguments", "type-union",
-             "typevar", "type-bound", "type-constraints", "type-default",
+             "typevar", "type-bound", "type-constraints", "type-default", "type-variance",
              "literal-values", "nullable?", "type-any?", "type-never?", "type-self?",
              "type-ellipsis?", "parameter-spec?", "variadic?", "unpack?", "parameter-part",
              "parameter-list?", "type-pack?")
@@ -352,6 +353,9 @@ def runtime_type(value, module=None, owner=None, depth=0, seen=frozenset()):
         return runtime_type(owner) if owner is not None else {}
     if exact_type(value, TYPE_PARAMETER_TYPES):
         result = {"typevar": value.__name__}
+        if type(value) in (TYPEVAR_TYPE, PARAMSPEC_TYPE) and not getattr(value, "__infer_variance__", False):
+            result["type-variance"] = ("covariant" if value.__covariant__ else
+                                       "contravariant" if value.__contravariant__ else "invariant")
         if type(value) is PARAMSPEC_TYPE:
             result["parameter-spec?"] = True
             return result
@@ -1104,6 +1108,38 @@ def runtime_constructor(value):
     return contract
 
 
+def runtime_class_identity(value):
+    """Read nominal dispatch and class identity without binding descriptors."""
+    namespace = class_attribute(value, "__dict__")
+    protocol = namespace.get("_is_protocol") is True
+    nominal = (all(static_class_member(type(value), name) is type.__dict__[name]
+                   for name in ("__instancecheck__", "__subclasscheck__"))
+               and not protocol
+               and static_class_member(value, "__class__") is object.__dict__["__class__"]
+               and "__required_keys__" not in namespace)
+    return {"status": "known", "kind": "class", "nominal?": nominal,
+            **runtime_type(value)}
+
+
+def supplement_stub_identities(declared, runtime):
+    """Keep stub contracts while adding independently proven runtime identities."""
+    if runtime.get("inspection") != "runtime-class-identities":
+        return declared
+    members = dict(declared.get("members", {}))
+    for name, info in members.items():
+        if info.get("kind") != "class":
+            continue
+        identity = runtime.get("members", {}).get(name)
+        if identity is not None:
+            fields = {key: identity[key] for key in ("type-module", "type-path", "nominal?")
+                      if key in identity}
+            members[name] = {**info, **fields}
+        elif name in runtime.get("bound-names", ()):
+            # A runtime factory/value is not evidence for the stub's nominal class.
+            members[name] = {**info, "nominal?": False}
+    return {**declared, "members": members}
+
+
 def runtime_member(name, value, depth=1, owner=None):
     result = {"status": "known", "name": name}
     ignore_annotations = (exact_type(value, (types.FunctionType, functools._lru_cache_wrapper))
@@ -1164,11 +1200,7 @@ def runtime_member(name, value, depth=1, owner=None):
                                             for param in result["type-parameters"]]
         result["protocol?"] = class_dict.get("_is_protocol") is True
         # ABC registration and custom instance checks can accept unrelated types.
-        result["nominal?"] = (all(static_class_member(type(value), name) is type.__dict__[name]
-                                  for name in ("__instancecheck__", "__subclasscheck__"))
-                              and not result["protocol?"]
-                              and static_class_member(value, "__class__") is object.__dict__["__class__"]
-                              and "__required_keys__" not in class_dict)
+        result["nominal?"] = runtime_class_identity(value)["nominal?"]
         generic_bindings = {}
         original_bases = class_dict.get("__orig_bases__", ())
         result["bases"] = [runtime_type(base) for base in class_attribute(value, "__bases__")]
@@ -1356,12 +1388,12 @@ def expr_text(node):
     return ast.unparse(node)
 
 
-def static_signature(node, drop_first=False, class_scope=False):
+def static_signature(node, drop_first=False, class_scope=False, legacy_positional=True):
     args = node.args
     positional = list(args.posonlyargs) + list(args.args)
     required = len(positional) - len(args.defaults)
     legacy = set()
-    if not (args.posonlyargs or args.kwonlyargs):
+    if legacy_positional and not (args.posonlyargs or args.kwonlyargs):
         for index, item in enumerate(positional):
             if item.arg.startswith("__") and not item.arg.endswith("__"):
                 legacy.add(index)
@@ -1385,7 +1417,7 @@ def static_signature(node, drop_first=False, class_scope=False):
     if args.kwarg:
         params.append({"name": args.kwarg.arg, "kind": "var-keyword",
                        "required?": False, "annotation": expr_text(args.kwarg.annotation)})
-    returns = expr_text(node.returns)
+    returns = expr_text(getattr(node, "returns", None))
     return {"parameters": params, "return-type": returns,
             "signature": signature_text(params, returns)}
 
@@ -1540,6 +1572,9 @@ class StaticModule:
         self.aliases = {}
         self.classes = {}
         self.class_results = {}
+        self.inherited_constructors = {}
+        self.namedtuple_fields = {}
+        self.rebound_class_aliases = set()
         self.active_classes = set()
         self.alias_nodes = {}
         self.final_values = {}
@@ -1630,12 +1665,44 @@ class StaticModule:
             return None
         parts = (expr_text(value.func) or "").split(".")
         module, path = self.aliases.get(parts[0], (None, []))
-        if module not in ("typing", "typing_extensions") or parts[0] in self.alias_nodes:
+        if (module not in ("typing", "typing_extensions", "collections") or parts[0] in self.alias_nodes
+                or (parts[0],) in self.classes or any(
+                    isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and statement.name == parts[0] for statement in self.tree.body)):
             return None
         factory = (path + parts[1:])[-1] if path or len(parts) > 1 else ""
         fields = value.args[1]
         pairs = []
-        if factory == "TypedDict" and isinstance(fields, ast.Dict):
+        defaults = 0
+        if module == "collections":
+            if factory != "namedtuple" or local_file("collections", self.inspector.roots):
+                return None
+            try:
+                names = ast.literal_eval(fields)
+            except (ValueError, TypeError):
+                return None
+            if isinstance(names, str):
+                names = names.replace(",", " ").split()
+            if not isinstance(names, (list, tuple)) or not all(isinstance(name, str) for name in names):
+                return None
+            options = {item.arg: item.value for item in value.keywords}
+            rename = self.static_value(options.get("rename")) if "rename" in options else False
+            if rename is UNKNOWN_VALUE or None in options:
+                return None
+            seen = set()
+            for index, field_name in enumerate(names):
+                if not field_name.isidentifier() or keyword.iskeyword(field_name) or field_name.startswith("_") or field_name in seen:
+                    if not rename:
+                        return None
+                    field_name = "_" + str(index)
+                seen.add(field_name)
+                # An untyped collections field carries no invented annotation.
+                pairs.append((field_name, ast.Constant(value=0)))
+            default = options.get("defaults")
+            if default is not None and not (isinstance(default, ast.Constant) and default.value is None):
+                defaults = len(default.elts) if isinstance(default, (ast.List, ast.Tuple)) and not any(
+                    isinstance(item, ast.Starred) for item in default.elts) else None
+        elif factory == "TypedDict" and isinstance(fields, ast.Dict):
             pairs = [(key.value, hint) for key, hint in zip(fields.keys, fields.values)
                      if isinstance(key, ast.Constant) and isinstance(key.value, str)]
         elif factory == "NamedTuple" and isinstance(fields, (ast.List, ast.Tuple)):
@@ -1649,8 +1716,13 @@ class StaticModule:
         body = [ast.copy_location(ast.AnnAssign(target=ast.Name(id=key, ctx=ast.Store()),
                                                annotation=hint, value=None, simple=1), source)
                 for key, hint in pairs]
+        if defaults:
+            for field in body[-defaults:]:
+                field.value = ast.Constant(value=None)
         result = ast.ClassDef(name=name, bases=[value.func],
                               keywords=value.keywords, body=body, decorator_list=[])
+        result._blt_namedtuple_factory = module == "collections"
+        result._blt_namedtuple_unknown_defaults = defaults is None
         return ast.fix_missing_locations(ast.copy_location(result, source))
 
     def type_checking(self, node):
@@ -1763,6 +1835,14 @@ class StaticModule:
             info["variadic?"] = True
         if isinstance(node, ast.Call):
             options = {kw.arg: kw.value for kw in node.keywords}
+            if factory in ("TypeVar", "ParamSpec"):
+                flags = {key: options.get(key, ast.Constant(False))
+                         for key in ("covariant", "contravariant", "infer_variance")}
+                if (all(isinstance(value, ast.Constant) and type(value.value) is bool for value in flags.values())
+                        and not flags["infer_variance"].value
+                        and not (flags["covariant"].value and flags["contravariant"].value)):
+                    info["type-variance"] = ("covariant" if flags["covariant"].value else
+                                             "contravariant" if flags["contravariant"].value else "invariant")
             if "bound" in options:
                 info["type-bound"] = self.reference(options["bound"], seen=(name,))
             if len(node.args) > 1:
@@ -1806,7 +1886,7 @@ class StaticModule:
             if base in ("TypeVar", "ParamSpec", "TypeVarTuple"):
                 name = node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else "T"
                 return self.typevar_info(name, node)
-            if base == "NewType" and len(node.args) > 1:
+            if self.annotation_name(node.func) == "NewType" and self.trusted_newtype(node, owner):
                 return self.reference(node.args[1], owner, seen)
             return {}
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
@@ -2045,18 +2125,19 @@ class StaticModule:
                 names.add(parts[-1])
         return names
 
-    def function(self, node, owner=(), known_decorators=()):
+    def function(self, node, owner=(), known_decorators=(), binding_decorators=None):
         decorators = self.decorators(node)
+        binding = decorators if binding_decorators is None else binding_decorators
         ignored = self.no_type_check_decorators(node)
         ignore_annotations = bool(ignored) or any(
             self.no_type_check_decorators(self.classes[owner[:length]])
             for length in range(1, len(owner) + 1) if owner[:length] in self.classes)
-        cls_method = "classmethod" in decorators or bool(
-            owner and node.name in {"__class_getitem__", "__init_subclass__"} and "staticmethod" not in decorators)
+        cls_method = "classmethod" in binding or bool(
+            owner and node.name in {"__class_getitem__", "__init_subclass__"} and "staticmethod" not in binding)
         prop = bool(decorators & {"property", "cached_property"})
         info = {**self.location(node, node.name), "kind": "property" if prop else "function",
                 "doc": (ast.get_docstring(node) or "")[:2000],
-                "instance-method?": bool(owner and not cls_method and "staticmethod" not in decorators
+                "instance-method?": bool(owner and not cls_method and "staticmethod" not in binding
                                          and node.name != "__new__")}
         info.update(self.transforms.get(node.name, {}))
         deprecated = self.deprecated(node)
@@ -2138,6 +2219,175 @@ class StaticModule:
         if prop:
             info["instance-method?"] = False
         return info
+
+    def lambda_function(self, node, reference, owner, name):
+        """Retain a lambda's actual argument binding under a Callable annotation."""
+        signature = static_signature(node, legacy_positional=False)
+        # Lambdas have concrete Python binding, without the historical typing
+        # convention for double-underscore positional-only function parameters.
+        class_name = owner[-1].lstrip("_") if owner else ""
+        if class_name:
+            for parameter in signature["parameters"]:
+                name_hint = parameter["name"]
+                if name_hint.startswith("__") and not name_hint.endswith("__"):
+                    parameter["name"] = "_" + class_name + name_hint
+        arguments = reference.get("type-arguments", [])
+        if len(arguments) == 2:
+            declared = arguments[0].get("type-arguments", [])
+            parameters = signature["parameters"]
+            if (arguments[0].get("parameter-list?") and len(declared) == len(parameters)
+                    and all(p["kind"] in ("positional-only", "positional-or-keyword") for p in parameters)):
+                for parameter, hint in zip(parameters, declared):
+                    parameter.update(type_fields(hint))
+            signature.update(type_fields(arguments[1]))
+        class_method = bool(owner and name in {"__class_getitem__", "__init_subclass__"})
+        if class_method:
+            signature["parameters"] = signature["parameters"][1:]
+        signature["signature"] = signature_text(signature["parameters"])
+        if any(self.no_type_check_decorators(self.classes[owner[:length]])
+               for length in range(1, len(owner) + 1) if owner[:length] in self.classes):
+            signature = {**unannotated_signature(signature), "annotations-ignored?": True}
+        return {**signature, "kind": "function",
+                "instance-method?": bool(owner and not class_method and name != "__new__")}
+
+    def factory_import_unchanged(self, value, name, module_name, factory_name):
+        """Require one earlier import and no visible replacement of its factory."""
+        position = (value.lineno, value.col_offset)
+        def before(node):
+            return (getattr(node, "lineno", value.lineno), getattr(node, "col_offset", value.col_offset)) < position
+        imports = []
+        for statement in self.tree.body:
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    bound = alias.asname or (alias.name.split(".")[0]
+                                             if isinstance(statement, ast.Import) else alias.name)
+                    if bound == name:
+                        imports.append(statement)
+                    if alias.name == "*" and before(statement):
+                        return False
+        if len(imports) != 1 or not before(imports[0]):
+            return False
+        def replaced(target):
+            if isinstance(target, ast.Name):
+                return target.id == name
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return any(replaced(item) for item in target.elts)
+            if not isinstance(target, ast.Attribute):
+                return False
+            parts = (expr_text(target) or "").split(".")
+            module, path = self.aliases.get(parts[0], (None, []))
+            return module == module_name and path + parts[1:] == [factory_name]
+        for statement in ast.walk(self.tree):
+            if not before(statement):
+                continue
+            if isinstance(statement, (ast.Assign, ast.Delete)):
+                if any(replaced(target) for target in statement.targets):
+                    return False
+            elif isinstance(statement, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and replaced(statement.target):
+                return False
+            elif (isinstance(statement, ast.Call) and expr_text(statement.func) in ("setattr", "delattr")
+                  and len(statement.args) >= 2 and isinstance(statement.args[1], ast.Constant)
+                  and statement.args[1].value == factory_name):
+                target = ast.Attribute(value=statement.args[0], attr=factory_name, ctx=ast.Load())
+                if replaced(target):
+                    return False
+        return True
+
+    def trusted_newtype(self, value, owner=()):
+        """Recognize only an unchanged typing factory, never a matching suffix."""
+        if (not isinstance(value, ast.Call) or len(value.args) != 2 or value.keywords
+                or not isinstance(value.args[0], ast.Constant) or type(value.args[0].value) is not str):
+            return False
+        parts = (expr_text(value.func) or "").split(".")
+        module, path = self.aliases.get(parts[0], (None, []))
+        if (module not in ("typing", "typing_extensions") or path + parts[1:] != ["NewType"]
+                or parts[0] in self.alias_nodes or parts[0] in self.function_declarations
+                or (parts[0],) in self.classes or local_file(module, self.inspector.roots)
+                or not self.factory_import_unchanged(value, parts[0], module, "NewType")):
+            return False
+        for length in range(1, len(owner) + 1):
+            declaration = self.classes.get(owner[:length])
+            for statement in self.active_statements(declaration.body) if declaration is not None else ():
+                if (statement.lineno, statement.col_offset) >= (value.lineno, value.col_offset):
+                    continue
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and statement.name == parts[0]:
+                    return False
+                if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    if any(isinstance(item, ast.Name) and item.id == parts[0]
+                           for target in targets for item in ast.walk(target)):
+                        return False
+                if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                    if any((alias.asname or alias.name.split(".")[0]) == parts[0] for alias in statement.names):
+                        return False
+        return True
+
+    def partial_function(self, value, owner, members, overloads):
+        """Retain proven functools.partial defaults when its annotation is narrower."""
+        if not isinstance(value, ast.Call) or not value.args:
+            return None
+        parts = (expr_text(value.func) or "").split(".")
+        module, path = self.aliases.get(parts[0], (None, []))
+        if (module != "functools" or path + parts[1:] != ["partial"]
+                or parts[0] in self.alias_nodes or parts[0] in self.function_declarations
+                or (parts[0],) in self.classes or (owner and parts[0] in members)
+                or local_file("functools", self.inspector.roots)
+                or not self.factory_import_unchanged(value, parts[0], "functools", "partial")):
+            return None
+        unknown = {"kind": "function", "instance-method?": False, "signature-unknown?": True}
+        target = value.args[0]
+        original = members.get(target.id, {}) if isinstance(target, ast.Name) else {}
+        if owner:
+            # Class partial descriptors changed after 3.13. Preserve uncertainty
+            # until their receiver insertion is represented independently.
+            if sys.version_info >= (3, 14):
+                return unknown
+            if (isinstance(target, ast.Name) and target.id not in members and target.id not in self.alias_nodes
+                    and target.id not in self.aliases and (target.id,) not in self.classes):
+                declarations = self.function_declarations.get(target.id, [])
+                if len(declarations) == 1 and declarations[0].lineno < value.lineno:
+                    original = self.function(declarations[0])
+        if (original.get("kind") != "function" or target.id in overloads
+                or "parameters" not in original or original.get("signature-unknown?")
+                or find_typevars(original)):
+            return unknown
+        parameters = original["parameters"]
+        if any(parameter["kind"] not in ("positional-only", "positional-or-keyword", "keyword-only")
+               for parameter in parameters):
+            return unknown
+        # Symbolic arguments could include a Placeholder or unpack a variable
+        # number of positions. Keep those bindings unknown without evaluating.
+        try:
+            for argument in value.args[1:]:
+                ast.literal_eval(argument)
+            for keyword in value.keywords:
+                if keyword.arg is None:
+                    return unknown
+                ast.literal_eval(keyword.value)
+        except (ValueError, TypeError):
+            return unknown
+        count = len(value.args) - 1
+        positional = [parameter for parameter in parameters if parameter["kind"] != "keyword-only"]
+        if count > len(positional):
+            return unknown
+        remaining = [dict(parameter) for parameter in parameters[count:]]
+        bound = {keyword.arg for keyword in value.keywords}
+        available = {parameter["name"] for parameter in remaining if parameter["kind"] != "positional-only"}
+        if not bound <= available:
+            return unknown
+        keyword_only = False
+        for parameter in remaining:
+            if parameter["name"] in bound:
+                parameter["required?"] = False
+                keyword_only = True
+            if keyword_only:
+                parameter["kind"] = "keyword-only"
+        result = {**original, "parameters": remaining, "instance-method?": False}
+        if any(self.no_type_check_decorators(self.classes[owner[:length]])
+               for length in range(1, len(owner) + 1) if owner[:length] in self.classes):
+            result = unannotated_signature(result)
+        result["signature"] = signature_text(result["parameters"], result.get("return-type"))
+        return result
 
     def constructor_instance(self, reference, owner, seen=()):
         """Whether a declared result is an instance of the constructed class."""
@@ -2282,6 +2532,8 @@ class StaticModule:
             children = {}
             bases = []
             inherited_parameters = None
+            inherited_constructor = None
+            self.inherited_constructors.pop(owner, None)
             dataclass_bases = []
             metaclass = None
             unresolved_bases = []
@@ -2290,8 +2542,14 @@ class StaticModule:
                 if keyword.arg == "metaclass":
                     transform = self.transforms.get(expr_text(keyword.value).split(".")[-1], transform)
                     metaclass = self.reference(keyword.value, owner[:-1])
-            for base in node.bases:
+            for index, base in enumerate(node.bases):
                 ref = self.reference(base, owner[:-1])
+                if not ref:
+                    factory = self.factory_class(owner[-1] + "Base", base, node)
+                    if factory is not None:
+                        generated = owner + ("$base" + str(index),)
+                        self.classes[generated] = factory
+                        ref = {"type-module": self.name, "type-path": list(generated)}
                 if ref:
                     bases.append(ref)
                     base_info = self.resolve(ref.get("type-module"), ref.get("type-path", []))
@@ -2307,6 +2565,8 @@ class StaticModule:
                         dataclass_bases.append(base_info.get("dataclass-fields", []))
                         if inherited_parameters is None and "parameters" in base_info:
                             inherited_parameters = base_info["parameters"]
+                            if ref.get("type-module") == self.name:
+                                inherited_constructor = tuple(ref.get("type-path", []))
                     elif (ref.get("type-module") not in ("typing", "typing_extensions")
                           and not (ref.get("type-module") == "_typing" and ref.get("type-path") == ["Generic"])
                           and not (ref.get("type-module") == "builtins" and len(ref.get("type-path", [])) == 1
@@ -2402,6 +2662,10 @@ class StaticModule:
                 constructor = new_method
                 constructor_return = new_return
                 result_from_constructor = True
+            elif new_method.get("signature-unknown?") and not constructor:
+                # A known slot with an unknown signature still masks later
+                # bases; their constructor cannot establish this call's arity.
+                constructor = {"signature-unknown?": True}
             else:
                 declared_new = type_fields(new_method)
                 if (declared_new and not declared_new.get("type-self?") and not declared_new.get("typevar")
@@ -2475,11 +2739,15 @@ class StaticModule:
                 constructor_return = None
                 result_from_constructor = False
             dataclass = "dataclass" in self.decorators(node) or bool(transform)
+            inherited_fields = {}
+            for fields in reversed(dataclass_bases):
+                inherited_fields.update({field.get("dataclass-field-name", field["name"]): field for field in fields})
             if dataclass:
-                inherited_fields = {}
-                for fields in reversed(dataclass_bases):
-                    inherited_fields.update({field.get("dataclass-field-name", field["name"]): field for field in fields})
                 info["dataclass-fields"] = self.dataclass_parameters(node, list(inherited_fields.values()), transform, include_disabled=True)
+            elif inherited_fields:
+                # Undecorated subclasses inherit __dataclass_fields__ without
+                # adding their own annotations to the generated constructor.
+                info["dataclass-fields"] = list(inherited_fields.values())
             if (dataclass and len(node.decorator_list) == 1 and not metaclass and not unresolved_bases
                     and "__setattr__" not in children):
                 decorator = node.decorator_list[0]
@@ -2521,7 +2789,9 @@ class StaticModule:
                 if params is None:
                     params = inherited_parameters or []
                 info.update(parameters=params, signature=signature_text(params, info["return-type"]))
-            elif inherited_parameters is not None:
+            elif inherited_parameters is not None and len(bases) == len(node.bases) and not unresolved_bases:
+                if inherited_constructor is not None:
+                    self.inherited_constructors[owner] = inherited_constructor
                 info.update(parameters=inherited_parameters,
                             signature=signature_text(inherited_parameters, info["return-type"]))
             elif not node.bases:
@@ -2597,15 +2867,24 @@ class StaticModule:
                    for ref in bases) or any(child.get("typed-dict?") for child in
                     [self.resolve(b.get("type-module"), b.get("type-path", [])) or {} for b in bases]):
                 self.typed_dict_info(info, node, bases)
-            elif any(ref.get("type-module") in ("typing", "typing_extensions") and ref.get("type-path") == ["NamedTuple"]
-                     for ref in bases):
+            elif getattr(node, "_blt_namedtuple_factory", False) or any(
+                    ref.get("type-module") in ("typing", "typing_extensions") and ref.get("type-path") == ["NamedTuple"]
+                    for ref in bases):
                 params = [{"name": field.target.id, "kind": "positional-or-keyword",
                            "required?": field.value is None, "annotation": expr_text(field.annotation),
                            **self.reference(field.annotation, owner)}
                           for field in self.active_statements(node.body) if isinstance(field, ast.AnnAssign)
                           and isinstance(field.target, ast.Name)]
+                if getattr(node, "_blt_namedtuple_factory", False):
+                    for parameter in params:
+                        parameter.update(annotation="Any", **{"type-any?": True})
+                        children[parameter["name"]].update({"return-type": "Any", "type-any?": True})
                 info.update(parameters=params, signature=signature_text(params, info["return-type"]))
                 info["named-tuple?"] = True
+                self.namedtuple_fields[owner] = params
+                if getattr(node, "_blt_namedtuple_unknown_defaults", False):
+                    info.pop("parameters", None)
+                    info.pop("signature", None)
             if dataclass or info.get("typed-dict?") or info.get("named-tuple?"):
                 if any(isinstance(statement, ast.If) and any(isinstance(item, ast.AnnAssign)
                        for item in ast.walk(statement)) for statement in self.active_statements(node.body)):
@@ -2613,6 +2892,8 @@ class StaticModule:
                     info.pop("parameters", None)
                     info.pop("signature", None)
                     info["signature-unknown?"] = True
+            if info.get("named-tuple?"):
+                self.namedtuple_new(info)
             info["nominal?"] = bool(not metaclass and not unresolved_bases and len(bases) == len(node.bases)
                                     and not node.decorator_list and not node.keywords
                                     and not info.get("protocol?") and not info.get("typed-dict?")
@@ -2869,7 +3150,8 @@ class StaticModule:
     def dataclass_parameters(self, node, inherited, transform=None, include_disabled=False):
         transform = transform or {}
         options = {"kw_only": transform.get("dataclass-kw-only?", False)}
-        field_specifiers = {"field"} | set(transform.get("dataclass-field-specifiers", []))
+        field_specifiers = set(transform.get("dataclass-field-specifiers", [])) if transform else {"field"}
+        default_keywords = {"default", "default_factory"} | ({"factory"} if transform else set())
         for deco in node.decorator_list:
             if isinstance(deco, ast.Call) and expr_text(deco.func).split(".")[-1] == "dataclass":
                 options.update({kw.arg: kw.value.value for kw in deco.keywords if isinstance(kw.value, ast.Constant)})
@@ -2899,7 +3181,7 @@ class StaticModule:
             if isinstance(field.value, ast.Call) and expr_text(field.value.func).split(".")[-1] in field_specifiers:
                 field_options = self.field_defaults(field.value) if transform else {}
                 field_options.update({kw.arg: kw.value for kw in field.value.keywords})
-                default = any(keyword.arg in {"default", "default_factory"} for keyword in field.value.keywords)
+                default = any(keyword.arg in default_keywords for keyword in field.value.keywords)
             keyword = field_options.get("kw_only")
             keyword = keyword.value if isinstance(keyword, ast.Constant) else kw_only
             name = field.target.id
@@ -2939,9 +3221,118 @@ class StaticModule:
             promoted.append(matches[0] if len(matches) == 1 else argument)
         return {**reference, "type-arguments": promoted} if promoted != arguments else reference
 
+    def forget_rebound_class(self, owner, members):
+        """Retain old contracts, but erase an identity no longer exported there."""
+        for name, info in members.items():
+            if (info.get("type-module") == self.name and info.get("type-path") == list(owner)
+                    and name in self.alias_nodes):
+                self.alias_nodes[name] = None
+                self.rebound_class_aliases.add(name)
+        changes = {}
+        def forget(value):
+            if not isinstance(value, (dict, list)):
+                return False
+            if id(value) in changes:
+                return changes[id(value)]
+            changes[id(value)] = False
+            changed = False
+            if isinstance(value, dict):
+                if value.get("type-module") == self.name and value.get("type-path") == list(owner):
+                    for key in (*TYPE_KEYS, "return-type"):
+                        value.pop(key, None)
+                    value["type-any?"] = True
+                    changed = True
+                for item in value.values():
+                    changed = forget(item) or changed
+                if changed and value.get("kind") == "class":
+                    value["nominal?"] = False
+                    value["class-members-complete?"] = False
+                    value["instance-members-complete?"] = False
+            else:
+                for item in value:
+                    changed = forget(item) or changed
+            changes[id(value)] = changed
+            return changed
+        for info in [*members.values(), *self.class_results.values()]:
+            forget(info)
+        self.inherited_constructors = {key: base for key, base in self.inherited_constructors.items()
+                                       if key != owner and base != owner}
+        self.namedtuple_fields.pop(owner, None)
+
+    def namedtuple_new(self, info):
+        """Expose the generated slot so an earlier tuple base masks later mixins."""
+        method = {"name": "__new__", "kind": "function", "instance-method?": False,
+                  "type-module": info["type-module"], "type-path": info["type-path"], "type-self?": True}
+        if "parameters" in info:
+            method["parameters"] = [{"name": "_cls", "kind": "positional-or-keyword", "required?": True},
+                                    *[dict(parameter) for parameter in info["parameters"]]]
+            method["signature"] = signature_text(method["parameters"], info.get("return-type"))
+        else:
+            method["signature-unknown?"] = True
+        info["members"]["__new__"] = method
+
+    def namedtuple_constructor_mutation(self, target, value, members):
+        """Track literal default counts, or forget a replaced constructor."""
+        replace_new = (isinstance(target, ast.Attribute) and target.attr == "__new__"
+                       and isinstance(target.value, ast.Name))
+        if not replace_new and not (isinstance(target, ast.Attribute) and target.attr == "__defaults__"
+                and isinstance(target.value, ast.Attribute) and target.value.attr == "__new__"
+                and isinstance(target.value.value, ast.Name)):
+            return
+        name = target.value.id if replace_new else target.value.value.id
+        info = members.get(name, {})
+        if info.get("type-module") != self.name or info.get("kind") != "class":
+            return
+        path = tuple(info.get("type-path", []))
+        target_path = path
+        seen = set()
+        while path in self.inherited_constructors and path not in seen:
+            seen.add(path)
+            path = self.inherited_constructors[path]
+        fields = self.namedtuple_fields.get(path)
+        if fields is None:
+            return
+        if replace_new:
+            path = target_path
+            count = None
+        elif isinstance(value, ast.Constant) and value.value is None:
+            count = 0
+        elif isinstance(value, ast.Tuple) and not any(isinstance(item, ast.Starred) for item in value.elts):
+            count = len(value.elts)
+        else:
+            count = None
+        affected = {path}
+        for _ in range(len(self.inherited_constructors)):
+            children = {child for child, base in self.inherited_constructors.items() if base in affected}
+            if children <= affected:
+                break
+            affected.update(children)
+        for candidate in [*members.values(), *self.class_results.values()]:
+            if candidate.get("type-module") != self.name or tuple(candidate.get("type-path", [])) not in affected:
+                continue
+            if count is None:
+                candidate.pop("parameters", None)
+                candidate.pop("signature", None)
+                if replace_new:
+                    candidate["constructor-return"] = {"type-any?": True}
+                    candidate["members"]["__new__"] = {"name": "__new__", "kind": "function",
+                        "instance-method?": False, "signature-unknown?": True, "type-any?": True}
+                else:
+                    self.namedtuple_new(candidate)
+            else:
+                parameters = [dict(parameter, **{"required?": index < len(fields) - count})
+                              for index, parameter in enumerate(fields)]
+                candidate.update(parameters=parameters, signature=signature_text(parameters, candidate.get("return-type")))
+                self.namedtuple_new(candidate)
+        if replace_new:
+            self.inherited_constructors.pop(path, None)
+            self.namedtuple_fields.pop(path, None)
+
     def members(self, body, owner=()):
         members = {}
         overloads = {}
+        overload_nodes = {}
+        implementations = {}
         declarations = {}
         complete = True
         for node in self.active_statements(body):
@@ -2979,11 +3370,24 @@ class StaticModule:
                     info["class-read-type"] = runtime_type(property)
                 if "overload" in self.decorators(node):
                     overloads.setdefault(node.name, []).append(info)
+                    overload_nodes.setdefault(node.name, []).append(node)
+                else:
+                    implementations[node.name] = node
                 members[node.name] = info
                 if node.name == "__getattr__":
                     complete = False
             elif isinstance(node, ast.ClassDef):
-                members[node.name] = self.class_info(owner + (node.name,))
+                path = owner + (node.name,)
+                previous = members.get(node.name, {})
+                if previous.get("type-module") == self.name and previous.get("type-path") == list(path):
+                    self.forget_rebound_class(path, members)
+                # A base binds to the class visible at this declaration, even
+                # when a later statement replaces the same exported name.
+                self.classes[path] = node
+                for cached in list(self.class_results):
+                    if cached[:len(path)] == path:
+                        self.class_results.pop(cached, None)
+                members[node.name] = self.class_info(path)
             elif hasattr(ast, "TypeAlias") and isinstance(node, ast.TypeAlias):
                 members[node.name.id] = {**self.location(node, node.name.id), "kind": "variable",
                                          "return-type": expr_text(node.value), "type-alias?": True,
@@ -2993,7 +3397,11 @@ class StaticModule:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
                     if not isinstance(target, ast.Name):
+                        if not owner:
+                            self.namedtuple_constructor_mutation(target, node.value, members)
                         continue
+                    if not owner and target.id in self.rebound_class_aliases:
+                        self.alias_nodes[target.id] = node.value
                     if not owner and (target.id,) in self.classes and isinstance(node.value, ast.Call):
                         members[target.id] = self.class_info((target.id,))
                         continue
@@ -3008,6 +3416,7 @@ class StaticModule:
                         except (SyntaxError, ValueError):
                             pass
                     assignment = dict(declarations.get(target.id, {}))
+                    new_type_factory = False
                     if isinstance(node, ast.AnnAssign) and not alias or getattr(node, "type_comment", None):
                         assignment["assignment-type"] = dict(ref) or {"type-any?": True}
                         if isinstance(node, ast.AnnAssign):
@@ -3027,12 +3436,18 @@ class StaticModule:
                             # This propagates a declared value type, not proof that the call is valid.
                             # Generic, overloaded, async and generator calls require call-site inference.
                             if (factory not in overloads and not find_typevars(called)
-                                    and not any(called.get(key) for key in ("async?", "generator?", "signature-unknown?"))):
+                                    and not any(called.get(key) for key in ("async?", "generator?"))
+                                    and (not called.get("signature-unknown?") or called.get("new-type-constructor?"))):
                                 ref = type_fields(called)
                                 returns = called.get("return-type")
-                        elif factory in ("TypeVar", "NewType"):
-                            ref = self.reference(node.value, owner)
-                            returns = expr_text(node.value.func)
+                        elif factory == "TypeVar" or self.annotation_name(node.value.func) == "NewType":
+                            new_type_factory = self.trusted_newtype(node.value, owner)
+                            if factory == "TypeVar" or new_type_factory:
+                                ref = self.reference(node.value, owner)
+                                returns = expr_text(node.value.func)
+                            else:
+                                ref = {"type-any?": True}
+                                returns = None
                         else:
                             candidate = self.reference(node.value.func, owner)
                             declaration = self.resolve(candidate.get("type-module"), candidate.get("type-path", [])) or {}
@@ -3062,6 +3477,8 @@ class StaticModule:
                     if isinstance(node.value, (ast.Name, ast.Attribute)):
                         alias_ref = self.reference(node.value, owner)
                         value = self.resolve(alias_ref.get("type-module"), alias_ref.get("type-path", [])) if alias_ref else None
+                        if isinstance(node.value, ast.Name) and members.get(node.value.id, {}).get("new-type-constructor?"):
+                            value = members[node.value.id]
                         if value:
                             members[target.id] = {**{key: item for key, item in value.items()
                                                         if key not in {"assignment-type", "read-only?", "class-read-only?", "instance-read-only?"}},
@@ -3074,6 +3491,19 @@ class StaticModule:
                         ref = {}
                     members[target.id] = {**self.location(node, target.id), "kind": "variable",
                                           "return-type": returns, **ref, **(form or {}), "name": target.id, **assignment}
+                    if new_type_factory:
+                        # NewType produces an identity constructor, not a base
+                        # instance. Its callable base describes the result only.
+                        members[target.id].update({"kind": "function", "instance-method?": False,
+                                                   "signature-unknown?": True, "new-type-constructor?": True})
+                    if (isinstance(node.value, ast.Lambda) and (not ref or
+                            ref.get("type-module") in ("typing", "collections.abc")
+                            and ref.get("type-path") == ["Callable"])):
+                        members[target.id] = {**self.location(node, target.id),
+                                              **self.lambda_function(node.value, ref, owner, target.id), **assignment}
+                    partial = self.partial_function(node.value, owner, members, overloads)
+                    if partial is not None:
+                        members[target.id] = {**partial, **self.location(node, target.id), **assignment}
                     if form:
                         members[target.id].update({"type-alias?": True, "alias-type": self.reference(node.value, owner)})
                     if alias or (isinstance(node.value, ast.Subscript) and find_typevars(ref)):
@@ -3118,6 +3548,14 @@ class StaticModule:
             members[name] = info
             if info.get("annotations-ignored?") or info.get("signature-unknown?"):
                 continue
+            implementation = implementations.get(name)
+            if owner and implementation is not None and not self.is_stub:
+                binding = self.decorators(implementation)
+                nodes = overload_nodes[name]
+                if any((self.decorators(node) ^ binding) & {"staticmethod", "classmethod"} for node in nodes):
+                    # Runtime binding follows the implementation, even when an
+                    # invalid overload declaration uses a different decorator.
+                    signatures = [self.function(node, owner, binding_decorators=binding) for node in nodes]
             info["overloads"] = signatures
             info.pop("parameters", None)
             info["signature"] = "\n".join(sig["signature"] for sig in signatures if "signature" in sig)
@@ -3293,16 +3731,42 @@ def runtime_stub_exports(module, inspector):
     return result
 
 
-def inspect_module(name, roots, enabled, inspector=None, skip_stubs=False):
+def inspect_module(name, roots, enabled, inspector=None, skip_stubs=False, class_identities=False):
     inspector = inspector or StaticInspector(roots, [p for p in sys.path if p])
     token = _runtime_inspector.set(inspector)
     try:
-        return _inspect_module(name, roots, enabled, inspector, skip_stubs)
+        return _inspect_module(name, roots, enabled, inspector, skip_stubs, class_identities)
     finally:
         _runtime_inspector.reset(token)
 
 
-def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
+def local_runtime_prefix(name, roots):
+    """Runtime enrichment must not traverse an analyzed project package."""
+    roots = [Path(root).resolve() for root in roots]
+    parts = name.split(".")
+    for index in range(1, len(parts) + 1):
+        prefix = ".".join(parts[:index])
+        if local_file(prefix, roots):
+            return True
+        module = sys.modules.get(prefix)
+        if prefix in sys.modules and type(module) is not types.ModuleType:
+            return True
+        if type(module) is types.ModuleType:
+            namespace = vars(module)
+            filename = namespace.get("__file__")
+            paths = [filename] if type(filename) is str else []
+            package_paths = namespace.get("__path__")
+            if "__path__" in namespace and (type(package_paths) not in (list, tuple)
+                    or any(type(path) is not str for path in package_paths)):
+                return True
+            if type(package_paths) in (list, tuple):
+                paths.extend(package_paths)
+            if any(Path(path).resolve().is_relative_to(root) for path in paths for root in roots):
+                return True
+    return False
+
+
+def _inspect_module(name, roots, enabled, inspector, skip_stubs=False, class_identities=False):
     if name == "python":
         name = "builtins"
     if name == "builtins" and not enabled:
@@ -3320,10 +3784,17 @@ def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
     path = local or (None if skip_stubs else stub_file(name, inspector.installed))
     if path is not None:
         result = static_module(name, path, inspector)
-        if local is None and enabled and result.get("partial-stub?"):
+        runtime_allowed = local is None and enabled and not local_runtime_prefix(name, roots)
+        if runtime_allowed and result.get("partial-stub?"):
             runtime = inspect_module(name, roots, enabled, inspector, skip_stubs=True)
             if runtime.get("status") == "known":
                 result = {**result, "members": {**runtime.get("members", {}), **result.get("members", {})}}
+        if runtime_allowed:
+            # Complete installed stubs cannot prove runtime metaclass behavior.
+            # Reuse the guarded import path, reading only class facts afterwards.
+            identities = inspect_module(name, roots, enabled, inspector,
+                                        skip_stubs=True, class_identities=True)
+            result = supplement_stub_identities(result, identities)
         return result
     if not enabled:
         if name in ("typing", "typing_extensions"):
@@ -3353,6 +3824,22 @@ def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
                 search = list(spec.submodule_search_locations or [])
         with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             module = importlib.import_module(name)
+        if class_identities:
+            if type(module) is not types.ModuleType:
+                return {"status": "unknown", "name": name, "reason": "dynamic-module-object"}
+            namespace = vars(module)
+            members = {key: runtime_class_identity(value) for key, value in tuple(namespace.items())
+                       if type(key) is str and is_class(value)}
+            origins = {name} | {info.get("type-module") for info in members.values()}
+            for origin in origins:
+                imported = sys.modules.get(origin)
+                filename = vars(imported).get("__file__") if type(imported) is types.ModuleType else None
+                if type(filename) is str and Path(filename).is_file():
+                    inspector.dependency(Path(filename))
+            return {"status": "known", "kind": "module", "name": name,
+                    "inspection": "runtime-class-identities",
+                    "bound-names": [key for key in namespace if type(key) is str],
+                    "members": members}
         members = {key: safe_member(key, value) for key, value in tuple(vars(module).items())
                    if not key.startswith("_")}
         annotations = vars(module).get("__annotations__", {})

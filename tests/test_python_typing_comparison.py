@@ -46,7 +46,7 @@ def test_negative_reveal_is_not_counted_as_a_matched_return(comparison):
     ]
     result = comparison.coverage(cases)
     assert result == {"matched_positive_calls": 1, "matched_negative_calls": 2,
-                      "matched_return_assertions": 1, "expected_valid_diagnostic_cases": 0}
+                      "matched_return_assertions": 1, "matched_source_name_assertions": 0, "expected_valid_diagnostic_cases": 0}
 
 
 @pytest.mark.parametrize("change", ["source", "oracle", "adapter", "missing", "duplicate", "concurrent", "unfinished"])
@@ -69,3 +69,15 @@ def test_changed_or_incomplete_evidence_cannot_be_compared(comparison, change):
         del after["source_hashes_end"]
     with pytest.raises(ValueError):
         comparison.compare(before, after)
+
+
+def test_source_name_oracle_coverage_is_separate_and_exact(comparison):
+    case = {"status": "passed", "kind": "call", "expected_error": True,
+            "diagnostic_oracle_category": "source-name-resolution"}
+    assert comparison.coverage([case])["matched_source_name_assertions"] == 1
+    case = {"status": "failed", "kind": "call", "expected_error": False,
+            "source_name_symbols": ["fixture/missing"],
+            "findings": [{"type": ":unresolved-symbol", "message": "Unresolved symbol: fixture/missing"}]}
+    assert comparison.coverage([case])["expected_valid_diagnostic_cases"] == 1
+    case["source_name_symbols"] = []
+    assert comparison.coverage([case])["expected_valid_diagnostic_cases"] == 0
