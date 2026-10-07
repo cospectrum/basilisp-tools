@@ -2278,6 +2278,10 @@
                          :python-fresh-values fresh-values))
         problems (when valid? (py/check-call member (count supplied) keywords))
         candidates (when (and valid? (empty? problems)) (py/call-signatures member positional-types keyword-types options))]
+    (when (seq (:abstract-allocation-members member))
+      (finding! ctx node :type-mismatch
+                (str "Cannot instantiate abstract Python class; unimplemented members: "
+                     (str/join ", " (:abstract-allocation-members member)))))
     (python-deprecated! ctx node (or (when (:deprecated member) member)
                                      (first (filter :type-match? candidates))
                                      (when (every? :deprecated candidates) (first candidates))))

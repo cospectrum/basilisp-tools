@@ -23,11 +23,11 @@ def test_ordered_defaults_follow_explicit_arguments(worker,tmp_path):
     assert [arg['type-path'] for arg in info['b']['type-arguments'][:2]]==[['int'],['int']]
     assert info['c']['type-arguments'][2]['type-arguments'][0]['type-path']==['float']
 
-def test_constructor_arguments_do_not_force_generic_defaults(worker,tmp_path):
+def test_constructor_inference_precedes_generic_default(worker,tmp_path):
     source=('from typing_extensions import Generic,TypeVar\nT=TypeVar("T",default=str)\n'
         'class C(Generic[T]):\n def __init__(self,value:T): pass\nx=C(1)\n')
     info=inspect_source(worker,tmp_path,source)['x']
-    assert not info.get('type-arguments')
+    assert info['type-arguments']==[{'type-module':'builtins','type-path':['int']}]
 
 def test_pack_defaults_and_explicit_empty_pack(worker,tmp_path):
     source=('from typing_extensions import Generic,TypeVar,TypeVarTuple,Unpack\n'

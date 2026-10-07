@@ -11,6 +11,8 @@ The source pins and released oracle versions are in
 fixtures live in the Ruff repository, where ty is developed. Source revisions
 and released checker versions are recorded separately: a current source snapshot
 can include cases added after the latest release.
+The [upstream license notices](data/python-typing-licenses/README.md) accompany
+the adapted fixtures and source excerpts retained in the audit evidence.
 
 The adapters inventory every fixture in the selected source trees:
 
@@ -254,17 +256,50 @@ from 2.83 to 2.92 seconds for Torch and from 6.88 to 7.39 seconds for ONNX, a
 3.05% and 7.45% cost for this checkpoint. The artifact keeps every cold and warm
 timing sample, parent CPU measurement, output digest and source hash separately.
 
-CI checks 117 resolved assertions. Four typing fixtures contribute 36 assertions:
+The [fifth comparison](data/python-typing-fifth.json) checks more abstract-class
+construction errors, distinguishes `NewType` factories from class values, and
+extends generic constructor, receiver, and callback-parameter inference. Its
+complete final replay against `87c47a6` reaches 5,293 exact matches, up from
+5,262, with 928 differences, 7,200 unknowns, 77,581 explicit exclusions, and zero
+replay errors. Both engines use the same frozen adapter, source fixtures, and
+Python 3.13 Pyright oracle.
+
+Twenty-four differences and eleven unknowns become matches. Four former matches
+become unknown: three protocol return-type assertions and one partial-function
+argument error. The partial loss is an avoidable scope-analysis limitation: a
+function parameter is confused with a module variable of the same name. That
+previously caught invalid call remains explicit follow-up work. The protocol
+cases also remain open; unknown results do not satisfy their assertions. Two new
+diagnostic differences reject abstract classes that the recorded native Python
+3.10 and 3.13 executions also reject. Those oracle disagreements retain their raw
+failure status.
+
+Constructor and partial-function inference now declines unproven contracts when
+visible mutation or alias escapes can change them. The evidence separates the
+initial candidate, rejected drafts, final safety repairs, and the complete final
+replay. It also records 2,128 passing tests on Python 3.13 and 2,120 passing tests
+with eight skips on Python 3.10, alongside package, public-project, compatibility,
+and ML validation on the exact final source. These gates do not turn the 928
+remaining corpus differences into accepted results.
+
+The final quiet ABBA run preserved findings and member metadata for both
+generated size-16 workloads. Median warm time was 2.804 → 2.789 seconds for Torch
+and 7.433 → 7.410 seconds for ONNX. These approximately 0.5% and 0.3% differences
+are effectively unchanged in this limited sample, not evidence of a speedup.
+The artifact retains every cold and warm sample, parent CPU time, workload and
+output digest, and exact source hashes.
+
+CI checks 133 resolved assertions. Four typing fixtures contribute 36 assertions:
 26 valid calls and 10 rejected calls. It requires the exact fixture counts
 17, 8, 5, and 6 for
 `dataclasses_kwonly.py`, `dataclasses_transform_class.py`,
 `dataclasses_transform_field.py`, and `generics_basic.py`, respectively, with
 zero unknowns, differences, or replay errors.
 
-Twenty-eight additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 81
-resolved assertions, including 20 expected diagnostics for calls and assignments.
+Thirty-eight additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 97
+resolved assertions, including 33 expected diagnostics for calls and assignments.
 Their identities, source digests, positive/negative counts, return assertions,
-and 40 explicit exclusions are
+and 42 explicit exclusions are
 pinned in [`python_typing_selection.json`](../scripts/python_typing_selection.json).
 CI generates independent expectations for the six selected Pyright files using
 the pinned Pyright release. Missing, duplicate, or changed fixtures and newly
@@ -276,13 +311,13 @@ The full audit remains failing and supplies a work inventory beyond these
 regression gates. Each comparison records its adapter hashes; comparisons across
 different adapter versions are not valid improvement counts.
 
-To repeat the comparison, prepare the pinned corpus and Pyright oracle as above,
-then run the current adapter on both source trees:
+To repeat the fifth comparison from this checkpoint, prepare the pinned corpus
+and Pyright oracle as above, then run the same adapter on its baseline and `HEAD`:
 
 ```sh
 mkdir -p /tmp/python-typing-before /tmp/python-typing-after
-git archive 4240b2e src | tar -x -C /tmp/python-typing-before
-git archive f21a456 src | tar -x -C /tmp/python-typing-after
+git archive 87c47a6 src | tar -x -C /tmp/python-typing-before
+git archive HEAD src | tar -x -C /tmp/python-typing-after
 
 PYTHONPATH=/tmp/python-typing-before/src .venv/bin/python \
   scripts/check_python_typing.py --corpus /tmp/python-typing-corpus \

@@ -362,5 +362,135 @@
       "negative_calls": 0,
       "return_assertions": 4
     }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testInstantiatingAbstractClass",
+    "source_sha256": "bbcd13210c67369ebf1ffc76f2b33c9e7118351f8cec21466136f7fe05e566a8",
+    "expected": {
+      "passed": 2,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testInstantiatingClassWithInheritedAbstractMethod",
+    "source_sha256": "0cd0f8db024c202de96d992373143ff67234351cfca77414250abda187067e25",
+    "expected": {
+      "passed": 1,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testInstantiatingClassWithInheritedAbstractMethodAndSuppression",
+    "source_sha256": "605e562cee98382be21cb2aa9af92a691597d2094626b48057d1d72b1043fdf8",
+    "expected": {
+      "passed": 1,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testInstantiatingAbstractClassWithMultipleBaseClasses",
+    "source_sha256": "75d4937c31119f9e246cf367fe6a79606d72ead4bcd3aebc957f1cf7b2a818a8",
+    "expected": {
+      "passed": 3,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 2,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testInstantiateClassWithReadOnlyAbstractProperty",
+    "source_sha256": "03b9dbd53219dcce83c5480bb174794cf90f603bfdf2b2a4a1e2c1ad0c491f7e",
+    "expected": {
+      "passed": 1,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testInstantiateClassWithReadWriteAbstractProperty",
+    "source_sha256": "e8ab19a83cd5f22df70738605929c182c60bf4dc273f994d5835252282fb52d4",
+    "expected": {
+      "passed": 1,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-abstract.test",
+    "name": "testNestedAbstractClass",
+    "source_sha256": "02ec033ecf215f9f311dfb7079b6c1d2f98238755cbb014674061d8a7c8971f7",
+    "expected": {
+      "passed": 2,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 2,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-newsemanal.test",
+    "name": "testNewAnalyzerClassPropertiesInAllScopes",
+    "source_sha256": "e2d9754ef212dbe4f2ce127a01b973fd3114e6cf5a1f3ba54fe073351a70ab83",
+    "expected": {
+      "passed": 1,
+      "excluded": 2,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/abstract_methods.rs",
+    "name": "test_metaclass_extends_abcmeta",
+    "source_sha256": "e3b1ff1837f3c311c3aa6b31e05a8f0fff98f261962ceb407bda16e66ed95095",
+    "expected": {
+      "passed": 1,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/abstract.md",
+    "name": "Tests regarding abstract classes / Slots and abstract properties in the MRO",
+    "source_sha256": "1991d8d33f02031cbe495872d1d7b6b49feb1a2298119f998e1104591ad3f857",
+    "expected": {
+      "passed": 3,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 2,
+      "return_assertions": 0
+    }
   }
 ]

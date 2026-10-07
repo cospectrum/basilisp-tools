@@ -1140,6 +1140,19 @@ def supplement_stub_identities(declared, runtime):
     return {**declared, "members": members}
 
 
+def runtime_abstract_allocation_members(value):
+    """Read CPython's actual abstract flag only for ordinary object allocation."""
+    abstract_flag = getattr(inspect, "TPFLAGS_IS_ABSTRACT", 0)
+    if (type(abstract_flag) is not int or not abstract_flag or "__flags__" not in type.__dict__
+            or static_class_member(type(value), "__call__") is not type.__dict__["__call__"]
+            or static_class_member(type(value), "__getattribute__") is not type.__dict__["__getattribute__"]
+            or static_class_member(value, "__new__") is not object.__dict__["__new__"]
+            or not class_attribute(value, "__flags__") & abstract_flag):
+        return []
+    names = static_class_member(value, "__abstractmethods__")
+    return sorted(names) if type(names) is frozenset and all(type(name) is str for name in names) else []
+
+
 def runtime_member(name, value, depth=1, owner=None):
     result = {"status": "known", "name": name}
     ignore_annotations = (exact_type(value, (types.FunctionType, functools._lru_cache_wrapper))
@@ -1180,6 +1193,9 @@ def runtime_member(name, value, depth=1, owner=None):
         return result
     if is_class(value):
         result.update(kind="class", **{"return-type": annotation(value)})
+        abstract_members = runtime_abstract_allocation_members(value)
+        if abstract_members:
+            result["abstract-allocation-members"] = abstract_members
         contract = runtime_constructor(value)
         result.update({key: item for key, item in contract.items() if key not in TYPE_KEYS})
         # The class object and the result of calling it have separate identities.
@@ -2250,8 +2266,86 @@ class StaticModule:
         return {**signature, "kind": "function",
                 "instance-method?": bool(owner and not class_method and name != "__new__")}
 
+    def module_import_identity_unchanged(self):
+        """Do not trust factory imports when their module cache can be replaced."""
+        cached = getattr(self, "_module_import_identity_unchanged", None)
+        if cached is not None:
+            return cached
+        system_names = set()
+        cache_names = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                system_names.update(alias.asname or "sys" for alias in node.names if alias.name == "sys")
+            elif isinstance(node, ast.ImportFrom) and node.module == "sys":
+                cache_names.update(alias.asname or alias.name for alias in node.names if alias.name in ("modules", "__dict__"))
+
+        def namespace(value):
+            if isinstance(value, ast.Name):
+                if value.id in cache_names:
+                    return "cache"
+                if value.id in system_names:
+                    return "sys"
+            elif isinstance(value, ast.Attribute) and value.attr in ("modules", "__dict__", "__getattribute__") and namespace(value.value) == "sys":
+                return "cache"
+            elif isinstance(value, ast.Call) and value.args and isinstance(value.args[0], ast.Constant):
+                parts = (expr_text(value.func) or "").split(".")
+                module, prefix = self.aliases.get(parts[0], (None, []))
+                importer = parts == ["__import__"] or (module, prefix + parts[1:]) in (
+                    ("builtins", ["__import__"]), ("importlib", ["import_module"]))
+                if importer and value.args[0].value == "sys":
+                    return "sys"
+            return None
+
+        assignments = [node for node in ast.walk(self.tree)
+                       if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and node.value is not None]
+        for _ in range(len(assignments)):
+            previous = len(system_names) + len(cache_names)
+            for node in assignments:
+                kind = namespace(node.value)
+                target_set = system_names if kind == "sys" else cache_names if kind == "cache" else None
+                if target_set is not None:
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    target_set.update(target.id for target in targets if isinstance(target, ast.Name))
+            if previous == len(system_names) + len(cache_names):
+                break
+        def exposes_system(value):
+            if namespace(value) == "sys":
+                return True
+            # Reading an ordinary sys attribute, especially version_info,
+            # does not expose the module object or its import cache.
+            if isinstance(value, ast.Attribute):
+                return False
+            return any(exposes_system(child) for child in ast.iter_child_nodes(value))
+
+        unchanged = True
+        for node in ast.walk(self.tree):
+            if namespace(node) == "cache":
+                unchanged = False
+                break
+            if isinstance(node, ast.Call):
+                parts = (expr_text(node.func) or "").split(".")
+                module, prefix = self.aliases.get(parts[0], (None, []))
+                name = (prefix + parts[1:]) if module == "builtins" else parts
+                if name and (name[-1] in ("eval", "exec")
+                             or name[-1] in ("globals", "locals", "vars") and not node.args and not node.keywords):
+                    unchanged = False
+                    break
+                arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+                if any(exposes_system(argument) for argument in arguments):
+                    unchanged = False
+                    break
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.Return, ast.Yield, ast.YieldFrom)):
+                value = getattr(node, "value", None)
+                if value is not None and exposes_system(value):
+                    unchanged = False
+                    break
+        self._module_import_identity_unchanged = unchanged
+        return unchanged
+
     def factory_import_unchanged(self, value, name, module_name, factory_name):
         """Require one earlier import and no visible replacement of its factory."""
+        if not self.module_import_identity_unchanged():
+            return False
         position = (value.lineno, value.col_offset)
         def before(node):
             return (getattr(node, "lineno", value.lineno), getattr(node, "col_offset", value.col_offset)) < position
@@ -2349,7 +2443,8 @@ class StaticModule:
                     original = self.function(declarations[0])
         if (original.get("kind") != "function" or target.id in overloads
                 or "parameters" not in original or original.get("signature-unknown?")
-                or find_typevars(original)):
+                or find_typevars(original)
+                or not self.function_signature_unchanged(target, original, value, allow_members=True, allow_accessors=True)):
             return unknown
         parameters = original["parameters"]
         if any(parameter["kind"] not in ("positional-only", "positional-or-keyword", "keyword-only")
@@ -2517,6 +2612,340 @@ class StaticModule:
         self._externally_mutable_classes = invalid
         return invalid
 
+    def abc_mutable_classes(self):
+        """A direct default-allocation call produces an instance, not a class alias."""
+        cached = getattr(self, "_abc_mutable_classes", None)
+        if cached is not None:
+            return cached
+        # Reflective namespace access can expose a class without a Name node,
+        # for example globals()["C"].__abstractmethods__ = frozenset().
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Call):
+                parts = (expr_text(node.func) or "").split(".")
+                imported = self.aliases.get(parts[0], (None, []))
+                name = (imported[1] + parts[1:]) if imported[0] == "builtins" else parts
+                if name and (name[-1] in ("eval", "exec")
+                             or name[-1] in ("globals", "locals", "vars") and not node.args and not node.keywords):
+                    self._abc_mutable_classes = set(self.classes)
+                    return self._abc_mutable_classes
+        names = {".".join(owner): {owner} for owner in self.classes}
+        assignments = [(target.id, node.value)
+                       for node in ast.walk(self.tree)
+                       if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and node.value is not None
+                       for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                       if isinstance(target, ast.Name)]
+        # Remember earlier aliases even if a later write rebinds the name.
+        # Such a write does not undo mutations made through the old alias.
+        for _ in range(len(assignments)):
+            changed = False
+            for name, value in assignments:
+                owners = names.get(expr_text(value), set())
+                previous = names.setdefault(name, set())
+                if not owners <= previous:
+                    previous.update(owners)
+                    changed = True
+            if not changed:
+                break
+        def references(node):
+            if isinstance(node, (ast.Name, ast.Attribute)) and names.get(expr_text(node)):
+                return names[expr_text(node)]
+            # Constructor proof separately excludes custom allocation. Passing
+            # the resulting instance cannot precede its abstract-allocation error.
+            children = ([*node.args, *(keyword.value for keyword in node.keywords)]
+                        if isinstance(node, ast.Call) and names.get(expr_text(node.func))
+                        else ast.iter_child_nodes(node))
+            return set().union(*(references(child) for child in children))
+        invalid = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                invalid.update(references(node.value))
+            elif isinstance(node, ast.Call):
+                for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                    invalid.update(references(argument))
+                if isinstance(node.func, ast.Attribute):
+                    invalid.update(references(node.func.value))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None and not names.get(expr_text(node.value)):
+                invalid.update(references(node.value))
+            elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
+                invalid.update(references(node.value))
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                invalid.update(references(node.iter))
+            elif isinstance(node, ast.Match):
+                invalid.update(references(node.subject))
+        pending = list(invalid)
+        while pending:
+            for base in self.classes[pending.pop()].bases:
+                parents = names.get(expr_text(base.value if isinstance(base, ast.Subscript) else base), set())
+                for parent in parents - invalid:
+                    invalid.add(parent)
+                    pending.append(parent)
+        self._abc_mutable_classes = invalid
+        return invalid
+
+    def abc_changed_namespaces(self):
+        """Visible standard-namespace mutation or escape invalidates native proof."""
+        cached = getattr(self, "_abc_changed_namespaces", None)
+        if cached is not None:
+            return cached
+        standard = {"abc", "typing", "typing_extensions", "builtins"}
+
+        def references(expression):
+            result = set()
+            for item in ast.walk(expression):
+                if isinstance(item, ast.Name) and item.id == "__builtins__":
+                    result.add("builtins")
+                elif isinstance(item, (ast.Name, ast.Attribute)):
+                    first = (expr_text(item) or "").split(".")[0]
+                    module, _ = self.aliases.get(first, (None, []))
+                    if module in standard:
+                        result.add(module)
+                elif isinstance(item, ast.Call) and item.args and isinstance(item.args[0], ast.Constant):
+                    parts = (expr_text(item.func) or "").split(".")
+                    module, prefix = self.aliases.get(parts[0], (None, []))
+                    target = prefix + parts[1:]
+                    importer = parts == ["__import__"] or (module, target) in (
+                        ("builtins", ["__import__"]), ("importlib", ["import_module"]))
+                    if importer and item.args[0].value in standard:
+                        result.add(item.args[0].value)
+            return result
+
+        changed = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Name) and node.id == "__builtins__":
+                changed.add("builtins")
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete, ast.NamedExpr)):
+                targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+                for target in targets:
+                    changed.update(references(target))
+                value = getattr(node, "value", None)
+                if value is not None:
+                    changed.update(references(value))
+            elif isinstance(node, ast.Call):
+                for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                    changed.update(references(argument))
+            elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
+                changed.update(references(node.value))
+        self._abc_changed_namespaces = changed
+        return changed
+
+    def trusted_abc_reference(self, value, owner=()):
+        """Resolve only unchanged standard imports at the declaration site."""
+        parts = (expr_text(value) or "").split(".")
+        module, path = self.aliases.get(parts[0], (None, []))
+        target = path + parts[1:]
+        if (module not in ("abc", "typing", "typing_extensions") or len(target) != 1
+                or local_file(module, self.inspector.roots)
+                or parts[0] in self.alias_nodes or parts[0] in self.function_declarations
+                or (parts[0],) in self.classes
+                or not self.factory_import_unchanged(value, parts[0], module, target[0])):
+            return None
+        watched = {module, "builtins"}
+        if module in ("typing", "typing_extensions") and target[0] == "Protocol":
+            watched.update(("abc", "typing", "typing_extensions"))
+        if watched & self.abc_changed_namespaces():
+            return None
+        for length in range(1, len(owner) + 1):
+            node = self.classes.get(owner[:length])
+            for statement in self.active_statements(node.body) if node is not None else ():
+                if (statement.lineno, statement.col_offset) >= (value.lineno, value.col_offset):
+                    continue
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and statement.name == parts[0]:
+                    return None
+                if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    if any(isinstance(item, ast.Name) and item.id == parts[0]
+                           for target in targets for item in ast.walk(target)):
+                        return None
+        return module, target[0]
+
+    def abc_metaclass(self, value, owner, active=()):
+        if not isinstance(value, (ast.Name, ast.Attribute)):
+            return False
+        if self.trusted_abc_reference(value, owner) == ("abc", "ABCMeta"):
+            return True
+        ref = self.reference(value, owner)
+        path = tuple(ref.get("type-path", ()))
+        node = self.classes.get(path) if ref.get("type-module") == self.name else None
+        if (node is None or path in active or len(active) > 12 or node.decorator_list
+                or node.keywords or path in self.abc_mutable_classes()):
+            return False
+        # Even an ordinary method's opaque decorator may install a descriptor
+        # whose __set_name__ changes metaclass dispatch during class creation.
+        for item in node.body:
+            if isinstance(item, ast.Pass) or isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant):
+                continue
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return False
+            if item.name.startswith("__") or item.name == "mro" or item.decorator_list:
+                return False
+            arguments = [*item.args.posonlyargs, *item.args.args, *item.args.kwonlyargs]
+            if item.args.vararg is not None:
+                arguments.append(item.args.vararg)
+            if item.args.kwarg is not None:
+                arguments.append(item.args.kwarg)
+            annotations = [item.returns, *(argument.annotation for argument in arguments)]
+            if any(annotation is not None and not isinstance(annotation, (ast.Name, ast.Constant))
+                   for annotation in annotations):
+                return False
+            try:
+                for value in [*item.args.defaults, *(value for value in item.args.kw_defaults if value is not None)]:
+                    ast.literal_eval(value)
+            except (TypeError, ValueError):
+                return False
+        return bool(node.bases) and all(self.abc_metaclass(base, path[:-1], active + (path,)) for base in node.bases)
+
+    def abc_own_members(self, node, owner):
+        """Track actual descriptor bindings; annotations alone do not bind names."""
+        members = {}
+        def member_name(name):
+            prefix = node.name.lstrip("_")
+            return "_" + prefix + name if prefix and name.startswith("__") and not name.endswith("__") else name
+        for statement in self.active_statements(node.body):
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                abstract = False
+                property_part = None
+                reused_property = False
+                for decorator in reversed(statement.decorator_list):
+                    if self.trusted_abc_reference(decorator, owner) == ("abc", "abstractmethod"):
+                        if property_part is not None:
+                            return None  # Reversed wrapper order is not executable Python.
+                        abstract = True
+                    elif self.trusted_abc_reference(decorator, owner) in (("abc", "abstractproperty"), ("abc", "abstractclassmethod"), ("abc", "abstractstaticmethod")):
+                        if property_part is not None:
+                            return None
+                        abstract = True
+                        property_part = "get" if self.trusted_abc_reference(decorator, owner)[1] == "abstractproperty" else "wrapped"
+                    elif (isinstance(decorator, ast.Name) and decorator.id in ("property", "classmethod", "staticmethod")
+                          and member_name(decorator.id) not in members
+                          and decorator.id not in self.alias_nodes and decorator.id not in self.aliases
+                          and (decorator.id,) not in self.classes and decorator.id not in self.function_declarations):
+                        property_part = "get" if decorator.id == "property" else "wrapped"
+                    elif (isinstance(decorator, ast.Attribute) and isinstance(decorator.value, ast.Name)
+                          and decorator.value.id == statement.name and decorator.attr in ("getter", "setter", "deleter")):
+                        property_part = {"getter": "get", "setter": "set", "deleter": "del"}[decorator.attr]
+                        reused_property = True
+                    else:
+                        return None
+                if property_part in ("get", "set", "del"):
+                    previous = members.get(member_name(statement.name), {}) if reused_property else {}
+                    if not isinstance(previous, dict):
+                        return None
+                    members[member_name(statement.name)] = {**previous, property_part: abstract}
+                else:
+                    members[member_name(statement.name)] = abstract
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                if statement.value is None:
+                    continue
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                if not all(isinstance(target, ast.Name) for target in targets):
+                    return None
+                try:
+                    literal = ast.literal_eval(statement.value)
+                except (TypeError, ValueError):
+                    return None
+                for target in targets:
+                    if target.id == "__slots__":
+                        slots = [literal] if isinstance(literal, str) else literal
+                        if not isinstance(slots, (tuple, list)) or not all(isinstance(slot, str) for slot in slots):
+                            return None
+                        for slot in slots:
+                            members[member_name(slot)] = False
+                    elif target.id in ("__abstractmethods__", "__new__", "__init_subclass__", "__class_getitem__"):
+                        return None
+                    else:
+                        members[member_name(target.id)] = False
+            elif isinstance(statement, ast.ClassDef):
+                if statement.decorator_list or statement.keywords:
+                    return None
+                members[member_name(statement.name)] = False
+            elif isinstance(statement, ast.Pass) or (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)):
+                continue
+            else:
+                return None
+        return {name: any(value.values()) if isinstance(value, dict) else value for name, value in members.items()}
+
+    def abc_class_proof(self, owner, active=()):
+        """Prove native ABC allocation, preserving Python's C3 member precedence."""
+        node = self.classes.get(owner)
+        if node is None or owner in active or len(active) > 24:
+            return None
+        cache = getattr(self, "_abc_proofs", None)
+        if cache is None:
+            self._abc_proofs = cache = {}
+        key = (owner, id(node))
+        if key in cache:
+            return cache[key]
+        cache[key] = None
+        if (node.decorator_list or owner in self.abc_mutable_classes()
+                or any(keyword.arg != "metaclass" for keyword in node.keywords)):
+            return None
+        own = self.abc_own_members(node, owner)
+        if own is None or any(name in own for name in ("__new__", "__init_subclass__", "__class_getitem__")):
+            return None
+        object_key = ("builtins", "object")
+        parents = []
+        for base in node.bases:
+            target = base.value if isinstance(base, ast.Subscript) else base
+            if not isinstance(target, (ast.Name, ast.Attribute)):
+                return None
+            if isinstance(target, ast.Name) and target.id in self.alias_nodes and not isinstance(self.alias_nodes[target.id], (ast.Name, ast.Attribute)):
+                return None
+            trusted = self.trusted_abc_reference(target, owner[:-1])
+            if trusted in (("abc", "ABC"), ("typing", "Protocol"), ("typing_extensions", "Protocol"),
+                           ("typing", "Generic"), ("typing_extensions", "Generic")):
+                parent_key = trusted
+                parents.append({"mro": [parent_key, object_key], "own": {parent_key: {}, object_key: {}},
+                                "abc": trusted[1] != "Generic"})
+                continue
+            ref = self.reference(target, owner[:-1])
+            if ref.get("type-module") == "builtins" and ref.get("type-path") == ["object"]:
+                parents.append({"mro": [object_key], "own": {object_key: {}}, "abc": False})
+                continue
+            path = tuple(ref.get("type-path", ()))
+            if ref.get("type-module") != self.name or isinstance(base, ast.Subscript):
+                return None
+            parent = self.abc_class_proof(path, active + (owner,))
+            if parent is None:
+                return None
+            parents.append(parent)
+        if not parents:
+            parents = [{"mro": [object_key], "own": {object_key: {}}, "abc": False}]
+        sequences = [list(parent["mro"]) for parent in parents] + [[parent["mro"][0] for parent in parents]]
+        inherited = []
+        while any(sequences):
+            sequences = [sequence for sequence in sequences if sequence]
+            head = next((sequence[0] for sequence in sequences
+                         if not any(sequence[0] in other[1:] for other in sequences)), None)
+            if head is None:
+                return None
+            inherited.append(head)
+            for sequence in sequences:
+                if sequence[0] == head:
+                    sequence.pop(0)
+        abc = any(parent["abc"] for parent in parents)
+        for keyword in node.keywords:
+            if not self.abc_metaclass(keyword.value, owner[:-1]):
+                return None
+            abc = True
+        identity = (self.name, *owner, id(node))
+        all_own = {key: value for parent in parents for key, value in parent["own"].items()}
+        all_own[identity] = own
+        result = {"mro": [identity, *inherited], "own": all_own, "abc": abc}
+        cache[key] = result
+        return result
+
+    def abstract_allocation_members(self, owner):
+        if not any(module == "abc" or module in ("typing", "typing_extensions")
+                   and (not path or path == ["Protocol"]) for module, path in self.aliases.values()):
+            return []
+        proof = self.abc_class_proof(owner)
+        if not proof or not proof["abc"]:
+            return []
+        members = {}
+        for identity in reversed(proof["mro"]):
+            members.update(proof["own"][identity])
+        return sorted(name for name, abstract in members.items() if abstract)
+
     def class_info(self, owner):
         if owner in self.class_results:
             return self.class_results[owner]
@@ -2592,6 +3021,9 @@ class StaticModule:
                     "type-module": self.name, "type-path": list(owner),
                     "members": children, "members-complete?": False, "bases": bases,
                     "unresolved-bases": unresolved_bases}
+            abstract_members = self.abstract_allocation_members(owner)
+            if abstract_members:
+                info["abstract-allocation-members"] = abstract_members
             info.update(self.transforms.get(node.name, {}))
             deprecated = self.deprecated(node)
             if deprecated is not None:
@@ -2610,6 +3042,9 @@ class StaticModule:
                     if name not in variable_names:
                         variable_names.append(name)
             info["type-parameters"] = [self.typevars.get(name, {"typevar": name}) for name in variable_names]
+            info["type-parameters"] = [{**parameter, "type-default": self.complete_default_type(parameter["type-default"])}
+                                       if "type-default" in parameter else parameter
+                                       for parameter in info["type-parameters"]]
             if variable_names:
                 info["type-arguments"] = [{**param, **({"unpack?": True} if param.get("variadic?") else {})}
                                           for param in info["type-parameters"]]
@@ -3205,6 +3640,746 @@ class StaticModule:
                   if include_disabled or parameter.get("dataclass-init?", True)]
         return sorted(values, key=lambda item: item["kind"] == "keyword-only")
 
+    def complete_default_type(self, reference, seen=()):
+        """Expand declared nested class defaults without evaluating expressions."""
+        if not isinstance(reference, dict) or len(seen) >= 16:
+            return reference
+        result = dict(reference)
+        for key in ("type-arguments", "type-union"):
+            if key in reference:
+                result[key] = [self.complete_default_type(item, seen) for item in reference[key]]
+        identity = (reference.get("type-module"), tuple(reference.get("type-path", [])))
+        if not all(identity) or identity in seen or reference.get("typevar"):
+            return result
+        declared = self.resolve(identity[0], list(identity[1])) or {}
+        parameters = declared.get("type-parameters", [])
+        if declared.get("kind") != "class" or not any("type-default" in parameter for parameter in parameters):
+            return result
+        if any(parameter.get("variadic?") or parameter.get("parameter-spec?") for parameter in parameters):
+            return result
+        arguments = result.get("type-arguments", [])
+        if len(arguments) >= len(parameters):
+            return result
+        bindings = bind_type_parameters(parameters, arguments, missing_unknown=True)
+        result["type-arguments"] = [self.complete_default_type(bindings[parameter["typevar"]], seen + (identity,))
+                                    for parameter in parameters]
+        return result
+
+    def function_signature_unchanged(self, argument, function, capture, allow_members=False, allow_accessors=False,
+                                     constructor=None, constructor_parameter=None):
+        """Prove a local function has no visible signature writes or escapes."""
+        if not isinstance(argument, ast.Name) or function.get("filename") != str(self.path):
+            return False
+        declarations = [node for node in ast.walk(self.tree)
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.lineno == function.get("row")]
+        if len(declarations) != 1:
+            return False
+        declaration = declarations[0]
+        declared_owner = next((owner for owner, node in self.classes.items() if declaration in node.body), ())
+        body = self.classes[declared_owner].body if declared_owner else self.tree.body
+        if (not isinstance(declaration, ast.FunctionDef) or declaration.decorator_list
+                or declared_owner and not allow_members
+                or sum(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and node.name == declaration.name for node in body) != 1):
+            # Local overload metadata is only combined after members() finishes.
+            return False
+        position = lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+        if position(declaration) >= position(argument):
+            return False
+        signature_fields = {"__defaults__", "__kwdefaults__", "__code__", "__annotations__", "__signature__"}
+        aliases = {declaration.name, ".".join((*declared_owner, declaration.name))}
+        mutators = {"setattr", "delattr"}
+        argument_proven = None
+        capturing_stores = set()
+        transparent_returns = set()
+        nested_calls = {id(child) for node in ast.walk(self.tree)
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                        for child in ast.walk(node) if isinstance(child, ast.Call)}
+
+        def referenced(value):
+            return any((isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load)
+                        and expr_text(node) in aliases)
+                       or (isinstance(node, ast.Call)
+                           and (expr_text(node.func) or "").split(".")[-1] in {"globals", "locals", "vars"})
+                       for node in ast.walk(value))
+
+        def signature_target(value):
+            return any(isinstance(node, ast.Attribute) and node.attr in signature_fields
+                       and referenced(node.value) for node in ast.walk(value))
+
+        def target_names(target):
+            return {node.id for node in ast.walk(target)
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+
+        def inert_body(body):
+            return all(isinstance(statement, ast.Pass)
+                       or isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                       or isinstance(statement, ast.Return) and (statement.value is None or isinstance(statement.value, ast.Constant))
+                       for statement in body)
+
+        def stable_callee(name):
+            names = {name}
+            def contains(value):
+                if isinstance(value, ast.Call):
+                    return ((expr_text(value.func) or "").split(".")[-1] in {"globals", "locals", "vars"}
+                            or any(contains(item) for item in [*value.args, *(keyword.value for keyword in value.keywords)]))
+                return (isinstance(value, (ast.Name, ast.Attribute)) and expr_text(value) in names
+                        or any(contains(item) for item in ast.iter_child_nodes(value)))
+            for statement in sorted(ast.walk(self.tree), key=position):
+                if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign, ast.Delete)):
+                    targets = statement.targets if isinstance(statement, (ast.Assign, ast.Delete)) else [statement.target]
+                    if any(isinstance(item, (ast.Attribute, ast.Subscript)) and contains(item.value)
+                           for target in targets for item in ast.walk(target)):
+                        return False
+                    value = getattr(statement, "value", None)
+                    if value is not None and contains(value):
+                        names.update(set().union(*(target_names(target) for target in targets)))
+                if isinstance(statement, ast.Call):
+                    if (any(contains(item) for item in [*statement.args, *(keyword.value for keyword in statement.keywords)])
+                            or isinstance(statement.func, ast.Attribute) and contains(statement.func.value)):
+                        return False
+                if isinstance(statement, (ast.Return, ast.Yield, ast.YieldFrom)) and statement.value is not None and contains(statement.value):
+                    return False
+            return True
+
+        def inert_function(node):
+            declarations = self.function_declarations.get(node.func.id, []) if isinstance(node.func, ast.Name) else []
+            if (len(declarations) != 1 or declarations[0].decorator_list or not isinstance(declarations[0], ast.FunctionDef)
+                    or node.func.id in self.alias_nodes or node.func.id in self.aliases
+                    or (node.func.id,) in self.classes or position(declarations[0]) >= position(node)
+                    or not stable_callee(node.func.id)):
+                return False
+            return inert_body(declarations[0].body)
+
+        def inert_class(node):
+            if not isinstance(node.func, ast.Name):
+                return False
+            name = node.func.id
+            declaration = self.classes.get((name,))
+            if (declaration is None or declaration.decorator_list or declaration.keywords
+                    or name in self.alias_nodes or name in self.aliases or name in self.function_declarations
+                    or position(declaration) >= position(node) or not stable_callee(name)):
+                return False
+            for item in declaration.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if item.decorator_list:
+                        return False
+                    try:
+                        for default in [*item.args.defaults, *(value for value in item.args.kw_defaults if value is not None)]:
+                            ast.literal_eval(default)
+                    except (ValueError, TypeError):
+                        return False
+                    annotations = [arg.annotation for arg in [*item.args.posonlyargs, *item.args.args, *item.args.kwonlyargs]]
+                    annotations.append(item.returns)
+                    if any(isinstance(part, ast.Call) for hint in annotations if hint is not None for part in ast.walk(hint)):
+                        return False
+                elif not (isinstance(item, ast.Pass) or isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant)):
+                    return False
+            for base in declaration.bases:
+                value = base.value if isinstance(base, ast.Subscript) else base
+                parts = (expr_text(value) or "").split(".")
+                module, path = self.aliases.get(parts[0], (None, []))
+                if (module not in ("typing", "typing_extensions") or path + parts[1:] != ["Generic"]
+                        or parts[0] in self.alias_nodes or parts[0] in self.function_declarations
+                        or (parts[0],) in self.classes or local_file(module, self.inspector.roots)
+                        or not self.factory_import_unchanged(value, parts[0], module, "Generic")):
+                    return False
+            if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in {"__new__", "__del__"}
+                   or isinstance(item, (ast.Assign, ast.AnnAssign))
+                   and any(name.id in {"__init__", "__new__", "__del__"} for name in ast.walk(item)
+                           if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store))
+                   for item in declaration.body):
+                return False
+            initializers = [item for item in declaration.body if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and item.name == "__init__"]
+            return (len(initializers) == 1 and isinstance(initializers[0], ast.FunctionDef)
+                    and not initializers[0].decorator_list and inert_body(initializers[0].body))
+
+        def unshadowed_class_name(node, name):
+            for class_node in self.classes.values():
+                if node not in ast.walk(class_node):
+                    continue
+                for statement in self.active_statements(class_node.body):
+                    if position(statement) >= position(node):
+                        continue
+                    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and statement.name == name:
+                        return False
+                    if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                        if any(name in target_names(target) for target in targets):
+                            return False
+            return True
+
+        def safe_capture(node):
+            if node is capture:
+                return True
+            # The repeated construction sites must still resolve at module/class
+            # scope; a same-named function parameter is not the factory.
+            if id(node) in nested_calls:
+                return False
+            parts = (expr_text(node.func) or "").split(".")
+            module, path = self.aliases.get(parts[0], (None, []))
+            if (module == "functools" and path + parts[1:] == ["partial"]
+                    and parts[0] not in self.alias_nodes and parts[0] not in self.function_declarations
+                    and (parts[0],) not in self.classes and not local_file(module, self.inspector.roots)
+                    and self.factory_import_unchanged(node, parts[0], module, "partial")):
+                return unshadowed_class_name(node, parts[0])
+            class_node = self.classes.get((parts[0],)) if len(parts) == 1 else None
+            if (constructor is not None and expr_text(node.func) == expr_text(capture.func)
+                    and class_node is not None and constructor.get("filename") == str(self.path)
+                    and class_node.lineno == constructor.get("row")
+                    and parts[0] not in self.alias_nodes and parts[0] not in self.aliases
+                    and parts[0] not in self.function_declarations and unshadowed_class_name(node, parts[0])
+                    and stable_callee(parts[0])):
+                return True
+            if inert_function(node) or inert_class(node):
+                return True
+            target = path + parts[1:]
+            directive = (module in ("typing", "typing_extensions") and target in (["reveal_type"], ["assert_type"]))
+            return bool(parts[0] not in self.alias_nodes and parts[0] not in self.function_declarations
+                        and (parts[0],) not in self.classes and unshadowed_class_name(node, parts[0])
+                        and ((directive and not local_file(module, self.inspector.roots)
+                              and self.factory_import_unchanged(node, parts[0], module, target[0]))
+                             or len(parts) == 1 and module is None and parts[0] in {"reveal_type", "assert_type"}))
+
+        # A visible write in the capturing constructor is not licensed by its
+        # annotation. Only direct parameter stores may retain capture certainty.
+        initializer = (constructor or {}).get("members", {}).get("__init__", {})
+        if initializer.get("filename") == str(self.path) and constructor_parameter:
+            initializers = [node for node in ast.walk(self.tree) if isinstance(node, ast.FunctionDef)
+                            and node.lineno == initializer.get("row")]
+            for initializer_node in initializers:
+                original_aliases = set(aliases)
+                aliases.add(constructor_parameter)
+                for node in sorted(ast.walk(initializer_node), key=position):
+                    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
+                        targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+                        if any(signature_target(target) for target in targets):
+                            return False
+                        value = getattr(node, "value", None)
+                        if value is not None and referenced(value):
+                            aliases.update(set().union(*(target_names(target) for target in targets)))
+                            capturing_stores.add(id(node))
+                    if isinstance(node, ast.Call) and any(referenced(value) for value in [*node.args, *(item.value for item in node.keywords)]):
+                        return False
+                aliases.clear()
+                aliases.update(original_aliases)
+
+        nodes = sorted(ast.walk(self.tree), key=position)
+        # Close aliases before checking mutations: earlier function bodies may
+        # reference a wrapper or accessor defined later in the module.
+        for _ in range(16):
+            previous = (len(aliases), len(transparent_returns))
+            for node in nodes:
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)):
+                    if node.value is not None and referenced(node.value) and position(node) > position(declaration):
+                        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                        aliases.update(set().union(*(target_names(target) for target in targets)))
+                if (allow_accessors and isinstance(node, ast.FunctionDef) and node in self.tree.body
+                        and not node.decorator_list and not node.name.startswith("__")
+                        and len(self.function_declarations.get(node.name, [])) == 1
+                        and not any((node.args.posonlyargs, node.args.args, node.args.kwonlyargs,
+                                     node.args.vararg, node.args.kwarg))):
+                    body = node.body[1:] if (node.body and isinstance(node.body[0], ast.Expr)
+                                            and isinstance(node.body[0].value, ast.Constant)
+                                            and isinstance(node.body[0].value.value, str)) else node.body
+                    if (len(body) == 1 and isinstance(body[0], ast.Return)
+                            and isinstance(body[0].value, ast.Name) and body[0].value.id in aliases
+                            and (node.returns is None or not referenced(node.returns)
+                                 and not any(isinstance(part, ast.Call) for part in ast.walk(node.returns)))):
+                        # Partial accessors expose the same captured function.
+                        # Generic constructor wrappers can carry additional state,
+                        # so their return escapes retain the conservative rule.
+                        aliases.add(node.name)
+                        transparent_returns.add(id(body[0]))
+            if previous == (len(aliases), len(transparent_returns)):
+                break
+        else:
+            return False
+
+        for node in nodes:
+            if transparent_returns:
+                # Accessors may expose the captured object through Python's
+                # implicit dispatch or introduce aliases outside simple stores.
+                # Decline those contexts instead of assuming their effects.
+                if isinstance(node, (ast.Subscript, ast.BinOp, ast.UnaryOp, ast.BoolOp,
+                                     ast.Compare, ast.AugAssign, ast.ClassDef, ast.Lambda)) and referenced(node):
+                    return False
+                if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and referenced(node.iter):
+                    return False
+                if isinstance(node, ast.Match) and referenced(node.subject):
+                    return False
+                if isinstance(node, (ast.With, ast.AsyncWith)) and any(referenced(item.context_expr) for item in node.items):
+                    return False
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                        referenced(value) for value in [*node.args.defaults, *node.args.kw_defaults] if value is not None):
+                    return False
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                value = node.value
+                if (isinstance(value, ast.Name) and value.id in mutators
+                        or isinstance(value, ast.Attribute) and value.attr in {"setattr", "delattr"}):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    mutators.update(set().union(*(target_names(target) for target in targets)))
+            elif isinstance(node, ast.ImportFrom) and node.module == "builtins":
+                mutators.update(alias.asname or alias.name for alias in node.names
+                                if alias.name in {"setattr", "delattr"})
+            if argument_proven is None and position(node) >= position(argument):
+                argument_proven = argument.id in aliases
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign, ast.Delete)):
+                targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+                if any(signature_target(target) for target in targets):
+                    return False
+                value = getattr(node, "value", None)
+                if value is not None:
+                    names = set().union(*(target_names(target) for target in targets))
+                    if referenced(value):
+                        if (id(node) not in capturing_stores
+                                and any(isinstance(part, (ast.Attribute, ast.Subscript))
+                                        for target in targets for part in ast.walk(target))):
+                            return False
+                        # Retain possible aliases even after rebinding: an earlier
+                        # container or closure can still hold the function object.
+                        if position(node) > position(declaration):
+                            aliases.update(names)
+            elif isinstance(node, ast.Call):
+                setter = (isinstance(node.func, ast.Name) and node.func.id in mutators
+                          or isinstance(node.func, ast.Attribute) and node.func.attr in {"setattr", "delattr"})
+                if setter and len(node.args) >= 2 and referenced(node.args[0]):
+                    field = node.args[1]
+                    if not isinstance(field, ast.Constant) or field.value in signature_fields:
+                        return False
+                if isinstance(node.func, ast.Attribute) and signature_target(node.func.value):
+                    return False
+                if any(referenced(value) for value in [*node.args, *(item.value for item in node.keywords)]) and not safe_capture(node):
+                    return False
+            elif (isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None
+                    and referenced(node.value) and id(node) not in transparent_returns):
+                return False
+        # Later writes affect the same function stored by an exported wrapper,
+        # so they invalidate capture too, even though its construction came first.
+        return bool(argument_proven)
+
+    def constructor_callback_function(self, argument, members):
+        """Follow only direct local aliases whose declaration is still known."""
+        if not isinstance(argument, ast.Name):
+            return {}
+        name = argument.id
+        seen = set()
+        for _ in range(16):
+            if name in seen:
+                break
+            seen.add(name)
+            value = members.get(name, {})
+            if value.get("kind") == "function":
+                return value
+            if (value.get("kind") != "variable" or type_fields(value)
+                    or value.get("filename") != str(self.path)):
+                break
+            binding = next((node for node in self.active_statements(self.tree.body)
+                            if isinstance(node, ast.Assign) and node.lineno == value.get("row")
+                            and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+                            and (node.lineno, node.col_offset) < (argument.lineno, argument.col_offset)), None)
+            if binding is None or not isinstance(binding.value, ast.Name):
+                break
+            name = binding.value.id
+        return {}
+
+    def constructor_callback_bindings(self, parameter, argument, members, capture, constructor):
+        """Capture a direct Callable[P, R] from an unambiguous function value."""
+        arguments = parameter.get("type-arguments", [])
+        if (parameter.get("type-module") != "collections.abc" or parameter.get("type-path") != ["Callable"]
+                or len(arguments) != 2 or not arguments[0].get("parameter-spec?")
+                or not arguments[0].get("typevar") or not arguments[1].get("typevar")):
+            return {}
+        inputs, result = arguments
+        names = [inputs["typevar"], result["typevar"]]
+        unknown = {name: {"type-any?": True} for name in names}
+        function = self.constructor_callback_function(argument, members)
+        if (function.get("kind") != "function" or "parameters" not in function
+                or any(function.get(key) for key in ("signature-unknown?", "overloads", "async?", "generator?", "instance-method?"))
+                or find_typevars(function)
+                or not self.function_signature_unchanged(argument, function, capture, constructor=constructor,
+                                                         constructor_parameter=parameter.get("name"))):
+            return unknown
+        parameters = function["parameters"]
+        output = type_fields(function) or {"type-any?": True}
+        if result.get("type-bound") or result.get("type-constraints"):
+            output = {"type-any?": True}
+        return {inputs["typevar"]: {"parameter-list?": True, "parameters": parameters,
+                                   "type-arguments": [type_fields(item) for item in parameters]},
+                result["typevar"]: output}
+
+    def constructor_mutable_classes(self):
+        """Track class identity exposed by aliases and constructed instances."""
+        environment = tuple((path, id(node)) for path, node in self.classes.items())
+        cached = getattr(self, "_constructor_mutable_classes", None)
+        if cached is not None and getattr(self, "_constructor_mutable_environment", None) == environment:
+            return cached
+        self._constructor_mutable_environment = environment
+        reflected = {"globals", "locals", "vars", "eval", "exec", "_getframe", "currentframe"}
+        if any((isinstance(node, ast.Name) and node.id in reflected)
+               or (isinstance(node, ast.Attribute) and node.attr in reflected)
+               or (isinstance(node, ast.Constant) and type(node.value) is str and node.value in reflected)
+               for node in ast.walk(self.tree)):
+            self._constructor_mutable_classes = set(self.classes)
+            return self._constructor_mutable_classes
+        names = {".".join(owner): {owner} for owner in self.classes}
+        for owner, declaration in self.classes.items():
+            for base in declaration.bases:
+                target = base.value if isinstance(base, ast.Subscript) else base
+                parts = (expr_text(target) or "").split(".")
+                module, path = self.aliases.get(parts[0], (None, []))
+                if module in {"typing", "typing_extensions"} and path + parts[1:] in (["Generic"], ["NamedTuple"]):
+                    names.setdefault(expr_text(target), set()).add(owner)
+                    if not path:
+                        names.setdefault(parts[0], set()).add(owner)
+        assignments = [(target.id, node.value) for node in ast.walk(self.tree)
+                       if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and node.value is not None
+                       for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                       if isinstance(target, ast.Name)]
+        def class_alias(value):
+            return names.get(expr_text(value.value if isinstance(value, ast.Subscript) else value), set())
+        for _ in assignments:
+            changed = False
+            for name, value in assignments:
+                owners = class_alias(value)
+                previous = names.setdefault(name, set())
+                if not owners <= previous:
+                    previous.update(owners); changed = True
+            if not changed:
+                break
+        instances = {}
+        def construction(value):
+            return class_alias(value.func) if isinstance(value, ast.Call) else set()
+        for _ in assignments:
+            changed = False
+            for name, value in assignments:
+                owners = construction(value) or instances.get(expr_text(value), set())
+                previous = instances.setdefault(name, set())
+                if not owners <= previous:
+                    previous.update(owners); changed = True
+            if not changed:
+                break
+        def inert_instance_call(node):
+            if not isinstance(node, ast.Call):
+                return False
+            owner = node.func.value if isinstance(node.func, ast.Attribute) else node.func
+            method = node.func.attr if isinstance(node.func, ast.Attribute) else "__call__"
+            owners = instances.get(expr_text(owner), set())
+            if not owners:
+                return False
+            for path in owners:
+                methods = [item for item in self.classes[path].body if isinstance(item, ast.FunctionDef) and item.name == method]
+                if len(methods) != 1 or methods[0].decorator_list or not all(
+                        isinstance(item, ast.Pass) or isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant)
+                        or isinstance(item, ast.Return) and (item.value is None or isinstance(item.value, ast.Constant))
+                        for item in methods[0].body):
+                    return False
+            return True
+        def directive(node):
+            parts = (expr_text(node.func) or "").split(".")
+            module, prefix = self.aliases.get(parts[0], (None, []))
+            if parts[0] in self.alias_nodes or parts[0] in self.function_declarations or (parts[0],) in self.classes:
+                return False
+            if module is None:
+                return (len(parts) == 1 and parts[0] in {"reveal_type", "assert_type"}
+                        and not any(isinstance(item, ast.ImportFrom) and any(alias.name == "*" for alias in item.names)
+                                    for item in ast.walk(self.tree)))
+            target = prefix + parts[1:]
+            return (module in {"typing", "typing_extensions"} and target in (["reveal_type"], ["assert_type"])
+                    and not local_file(module, self.inspector.roots)
+                    and self.factory_import_unchanged(node, parts[0], module, target[0]))
+        def references(node):
+            if isinstance(node, (ast.Name, ast.Attribute)):
+                owners = names.get(expr_text(node), set()) | instances.get(expr_text(node), set())
+                if owners:
+                    return owners
+            if construction(node):
+                return construction(node)
+            children = ([*node.args, *(keyword.value for keyword in node.keywords)]
+                        if inert_instance_call(node) else ast.iter_child_nodes(node))
+            return set().union(*(references(child) for child in children))
+        # A class namespace exposes stored values under qualified attributes;
+        # do not attempt to follow arbitrary class-held aliases or descriptors.
+        class_storage = {id(item) for declaration in ast.walk(self.tree) if isinstance(declaration, ast.ClassDef)
+                         for item in ast.walk(declaration)
+                         if isinstance(item, (ast.Assign, ast.AnnAssign, ast.NamedExpr))}
+        invalid = set()
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                invalid.update(references(node.value))
+                if isinstance(node, ast.Subscript):
+                    invalid.update(references(node.slice))
+            elif isinstance(node, ast.Subscript):
+                # A subscription can pass its argument to arbitrary __getitem__
+                # or __class_getitem__ code. A target class is checked separately
+                # by constructor proof, including its metaclass and bases.
+                invalid.update(references(node.slice))
+                invalid.update(references(node.value) - class_alias(node.value))
+            elif isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare,
+                                   ast.AugAssign, ast.FormattedValue, ast.Starred, ast.Set, ast.Dict)):
+                # These operations may invoke hooks with the referenced value.
+                invalid.update(references(node))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+                arguments += [item for item in (node.args.vararg, node.args.kwarg) if item is not None]
+                exposed = [*node.args.defaults, *(item for item in node.args.kw_defaults if item is not None)]
+                exposed += [item.annotation for item in arguments if item.annotation is not None]
+                if getattr(node, "returns", None) is not None:
+                    exposed.append(node.returns)
+                for value in exposed:
+                    invalid.update(references(value))
+            elif isinstance(node, ast.Call) and not directive(node):
+                for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                    invalid.update(references(argument))
+                if isinstance(node.func, ast.Attribute) and not inert_instance_call(node):
+                    invalid.update(references(node.func.value))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                if (node.value is not None and (id(node) in class_storage
+                        or not class_alias(node.value) and not construction(node.value))):
+                    invalid.update(references(node.value))
+                if isinstance(node, ast.AnnAssign):
+                    invalid.update(references(node.annotation))
+            elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
+                invalid.update(references(node.value))
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                invalid.update(references(node.iter))
+            elif isinstance(node, ast.Match):
+                invalid.update(references(node.subject))
+        pending = list(invalid)
+        while pending:
+            for base in self.classes[pending.pop()].bases:
+                target = base.value if isinstance(base, ast.Subscript) else base
+                parts = (expr_text(target) or "").split(".")
+                module, path = self.aliases.get(parts[0], (None, []))
+                if module in {"typing", "typing_extensions"} and path + parts[1:] in (["Generic"], ["NamedTuple"]):
+                    # These marker aliases point at all dependent local classes
+                    # to detect marker mutation, not at an actual local parent.
+                    continue
+                for parent in class_alias(base) - invalid:
+                    invalid.add(parent); pending.append(parent)
+        self._constructor_mutable_classes = invalid
+        return invalid
+
+    def constructor_inference_unchanged(self, declaration, seen=()):
+        owner = tuple(declaration.get("type-path", []))
+        if owner in seen or len(seen) >= 16:
+            return False
+        cache = getattr(self, "_constructor_inference_proofs", None)
+        if cache is None:
+            self._constructor_inference_proofs = cache = {}
+        # members() can replace a same-named class while walking declarations.
+        # Never reuse proof across a changed local base-class environment.
+        key = (owner, declaration.get("filename"), declaration.get("row"),
+               tuple((path, id(node)) for path, node in self.classes.items()))
+        if key not in cache:
+            cache[key] = self.prove_constructor_inference(declaration, seen)
+        return cache[key]
+
+    def passive_constructor_annotation(self, hint, owner, seen=(), operand=False):
+        """Only allow annotation operations with a proven inert implementation."""
+        if hint is None or isinstance(hint, ast.Constant):
+            return True
+        if isinstance(hint, (ast.List, ast.Tuple)):
+            return all(self.passive_constructor_annotation(item, owner, seen, operand)
+                       for item in hint.elts)
+        if isinstance(hint, ast.Name):
+            if not operand:
+                return True  # Looking up a name does not invoke its value.
+            if hint.id in self.typevars:
+                return True
+            if (hint.id not in self.alias_nodes and hint.id not in self.aliases
+                    and (hint.id,) not in self.classes and hint.id not in self.function_declarations
+                    and type(vars(sys.modules["builtins"]).get(hint.id)) is type):
+                return True
+            reference = self.reference(hint, owner)
+            if reference.get("type-module") == self.name:
+                declaration = self.resolve(self.name, reference.get("type-path", [])) or {}
+                return self.constructor_inference_unchanged(declaration, seen)
+        if isinstance(hint, (ast.Name, ast.Attribute)):
+            parts = (expr_text(hint) or "").split(".")
+            if (len(parts) == 2 and parts[0] in self.typevars
+                    and self.typevars[parts[0]].get("parameter-spec?") and parts[1] in {"args", "kwargs"}):
+                return True
+            module, prefix = self.aliases.get(parts[0], (None, []))
+            target = prefix + parts[1:]
+            return (module in {"typing", "typing_extensions"} and len(target) == 1
+                    and not local_file(module, self.inspector.roots)
+                    and self.factory_import_unchanged(hint, parts[0], module, target[0]))
+        if isinstance(hint, ast.Subscript):
+            if not self.passive_constructor_annotation(hint.slice, owner, seen, True):
+                return False
+            target = hint.value
+            if (isinstance(target, ast.Name) and target.id in {"list", "tuple", "dict", "set", "frozenset", "type"}
+                    and target.id not in self.alias_nodes and target.id not in self.aliases
+                    and (target.id,) not in self.classes and target.id not in self.function_declarations):
+                return True
+            parts = (expr_text(target) or "").split(".")
+            module, prefix = self.aliases.get(parts[0], (None, []))
+            path = prefix + parts[1:]
+            forms = {"Callable", "Concatenate", "Union", "Optional", "Tuple", "List", "Dict", "Set",
+                     "FrozenSet", "Type", "ClassVar", "Final", "Literal", "Annotated", "Unpack"}
+            if module in {"typing", "typing_extensions"} and len(path) == 1 and path[0] in forms:
+                return (not local_file(module, self.inspector.roots)
+                        and self.factory_import_unchanged(target, parts[0], module, path[0]))
+            reference = self.reference(target, owner)
+            if reference.get("type-module") == self.name:
+                declaration = self.resolve(self.name, reference.get("type-path", [])) or {}
+                return self.constructor_inference_unchanged(declaration, seen)
+        return False
+
+    def passive_constructor_body(self, method, declaration):
+        """A storage-only initializer cannot replace class slots or expose self."""
+        positional = [*method.args.posonlyargs, *method.args.args]
+        if not positional:
+            return False
+        receiver = positional[0].arg
+        parameters = {argument.arg for argument in [*positional[1:], *method.args.kwonlyargs]}
+        members = declaration.get("members", {})
+        for statement in method.body:
+            if (isinstance(statement, ast.Pass)
+                    or isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                    or isinstance(statement, ast.Return) and (statement.value is None
+                        or isinstance(statement.value, ast.Constant) and statement.value.value is None)):
+                continue
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is None:
+                return False
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            for target in targets:
+                if (not isinstance(target, ast.Attribute) or not isinstance(target.value, ast.Name)
+                        or target.value.id != receiver or target.attr.startswith("__")
+                        or members.get(target.attr, {}).get("kind") in {"function", "property"}):
+                    return False
+            if not (isinstance(statement.value, ast.Name) and statement.value.id in parameters):
+                try:
+                    ast.literal_eval(statement.value)
+                except (ValueError, TypeError):
+                    return False
+        return True
+
+    def prove_constructor_inference(self, declaration, seen=()):
+        """Borrow argument types only from an unchanged local constructor."""
+        owner = tuple(declaration.get("type-path", []))
+        node = self.classes.get(owner)
+        if (declaration.get("type-module") != self.name or declaration.get("filename") != str(self.path)
+                or node is None or node.lineno != declaration.get("row") or owner in seen or len(seen) >= 16
+                or owner in self.constructor_mutable_classes() or not self.module_import_identity_unchanged()
+                or node.decorator_list or node.keywords or declaration.get("metaclass")):
+            return False
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if statement.name in {"__new__", "__class_getitem__", "__init_subclass__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__del__"} or statement.decorator_list:
+                    return False
+                arguments = [*statement.args.posonlyargs, *statement.args.args, *statement.args.kwonlyargs]
+                arguments += [argument for argument in (statement.args.vararg, statement.args.kwarg) if argument is not None]
+                hints = [argument.annotation for argument in arguments]
+                hints += [statement.returns]
+                if not all(self.passive_constructor_annotation(hint, owner, (*seen, owner)) for hint in hints):
+                    return False
+                if statement.name == "__init__" and not self.passive_constructor_body(statement, declaration):
+                    return False
+                try:
+                    for value in [*statement.args.defaults, *(value for value in statement.args.kw_defaults if value is not None)]:
+                        ast.literal_eval(value)
+                except (ValueError, TypeError):
+                    return False
+            elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                if isinstance(statement, ast.AnnAssign) and not self.passive_constructor_annotation(statement.annotation, owner, (*seen, owner)):
+                    return False
+                if statement.value is not None:
+                    try:
+                        ast.literal_eval(statement.value)
+                    except (ValueError, TypeError):
+                        return False
+            elif not (isinstance(statement, ast.Pass)
+                      or isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)):
+                return False
+        for base in node.bases:
+            target = base.value if isinstance(base, ast.Subscript) else base
+            reference = self.reference(target, owner[:-1])
+            module, path = reference.get("type-module"), reference.get("type-path", [])
+            if module == self.name:
+                parent = self.resolve(module, path) or {}
+                if not self.constructor_inference_unchanged(parent, (*seen, owner)):
+                    return False
+            elif module == "builtins" and path == ["object"]:
+                continue
+            elif module in {"typing", "typing_extensions", "_typing"} and path in (["Generic"], ["NamedTuple"]):
+                parts = (expr_text(target) or "").split(".")
+                imported, exported = self.aliases.get(parts[0], (None, []))
+                if (imported not in {"typing", "typing_extensions"} or exported + parts[1:] != path
+                        or local_file(imported, self.inspector.roots)
+                        or not self.factory_import_unchanged(target, parts[0], imported, path[0])):
+                    return False
+            else:
+                return False
+        return True
+
+    def constructor_argument_bindings(self, call, declaration, members):
+        """Infer direct TypeVars from a known constructor's literal/value arguments."""
+        parameters = declaration.get("parameters")
+        if not declaration.get("type-parameters") or not call.args and not call.keywords:
+            return {}
+        if not self.constructor_inference_unchanged(declaration):
+            # Decline the new argument inference without replacing the existing
+            # unspecialized class reference with manufactured Any arguments.
+            # An omitted declared default would be reapplied on member access,
+            # however, so explicitly erase parameters when defaults exist.
+            if any("type-default" in parameter for parameter in declaration.get("type-parameters", [])):
+                return {parameter["typevar"]: {"type-any?": True}
+                        for parameter in declaration.get("type-parameters", [])}
+            return {}
+        if (parameters is None or declaration.get("overloads") or declaration.get("signature-unknown?")
+                or any(parameter["kind"] in ("var-positional", "var-keyword") for parameter in parameters)
+                or any(isinstance(argument, ast.Starred) for argument in call.args)
+                or any(keyword.arg is None for keyword in call.keywords)):
+            return {}
+        init = declaration.get("members", {}).get("__init__", {})
+        if init.get("parameters") and type_fields(init["parameters"][0]):
+            # An explicit receiver annotation can change specialization rules.
+            return {}
+        positional = [parameter for parameter in parameters if parameter["kind"] != "keyword-only"]
+        if len(call.args) > len(positional):
+            return {}
+        supplied = {parameter["name"]: value for parameter, value in zip(positional, call.args)}
+        by_name = {parameter["name"]: parameter for parameter in parameters}
+        for keyword in call.keywords:
+            if (keyword.arg in supplied or keyword.arg not in by_name
+                    or by_name[keyword.arg]["kind"] == "positional-only"):
+                return {}
+            supplied[keyword.arg] = keyword.value
+        if any(parameter.get("required?") and parameter["name"] not in supplied for parameter in parameters):
+            return {}
+        bindings = {}
+        conflicts = set()
+        for name, value in supplied.items():
+            parameter = by_name[name]
+            variable = parameter.get("typevar")
+            if not variable:
+                for name, actual in self.constructor_callback_bindings(parameter, value, members, call, declaration).items():
+                    if name in bindings and bindings[name] != actual:
+                        conflicts.add(name)
+                    bindings[name] = actual
+                continue
+            if parameter.get("parameter-spec?") or parameter.get("variadic?"):
+                continue
+            actual = {}
+            if isinstance(value, ast.Constant) and value.value is not Ellipsis:
+                actual = runtime_type(type(value.value))
+            elif isinstance(value, ast.Name) and members.get(value.id, {}).get("kind") == "variable":
+                actual = type_fields(members.get(value.id, {}))
+            if (not actual or actual.get("type-any?") or find_typevars(actual)
+                    or parameter.get("type-bound") or parameter.get("type-constraints")):
+                # A supplied uncertain argument is not an omitted argument:
+                # retain Any rather than selecting a possibly unrelated default.
+                actual = {"type-any?": True}
+            if variable in bindings and bindings[variable] != actual:
+                conflicts.add(variable)
+            bindings[variable] = actual
+        return {name: {"type-any?": True} if name in conflicts else reference
+                for name, reference in bindings.items()}
+
     def promote_constrained_arguments(self, reference, declaration):
         """Widen a proven local subclass to its one matching TypeVar constraint."""
         parameters = declaration.get("type-parameters", [])
@@ -3462,9 +4637,19 @@ class StaticModule:
                                 else:
                                     ref = self.promote_constrained_arguments(candidate, constructor)
                                     parameters = constructor.get("type-parameters", [])
-                                    if parameters and ("type-arguments" in candidate or not node.value.args and not node.value.keywords):
-                                        bindings = bind_type_parameters(parameters, ref.get("type-arguments", []),
-                                                                        missing_unknown=True)
+                                    inferred = (self.constructor_argument_bindings(node.value, constructor, members)
+                                                if "type-arguments" not in candidate else {})
+                                    if parameters and ("type-arguments" in candidate or inferred
+                                                       or not node.value.args and not node.value.keywords):
+                                        if inferred:
+                                            bindings = dict(inferred)
+                                            for parameter in parameters:
+                                                variable = parameter["typevar"]
+                                                if variable not in bindings:
+                                                    bindings[variable] = substitute_types(parameter.get("type-default", {"type-any?": True}), bindings)
+                                        else:
+                                            bindings = bind_type_parameters(parameters, ref.get("type-arguments", []),
+                                                                            missing_unknown=True)
                                         template = {"type-module": ref.get("type-module"), "type-path": ref.get("type-path"),
                                                     "type-arguments": [{"typevar": parameter["typevar"],
                                                         **({"unpack?": True} if parameter.get("variadic?") else {})}

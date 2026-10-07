@@ -266,7 +266,7 @@
         (return-type (dissoc metadata :typevar))
         (cond-> (select-keys metadata [:module :path :arguments :union :nullable?
                                        :typevar :bound :constraints :default :variance :literal-values
-                                       :any? :never? :ellipsis? :parameter-spec? :variadic? :unpack? :typing-form?
+                                       :any? :never? :ellipsis? :parameter-spec? :variadic? :unpack? :typing-form? :non-class-value?
                                        :parameter-part :parameter-list? :type-pack? :callable-overloads])
           (and (:parameter-list? metadata) (contains? metadata :parameters)) (assoc :parameters (:parameters metadata))
           (contains? metadata :type-arguments) (assoc :arguments (mapv return-type (:type-arguments metadata)))
@@ -281,6 +281,7 @@
                      (:nullable? metadata) (assoc :nullable? true)
                      (contains? metadata :literal-values) (assoc :literal-values (:literal-values metadata))
                      (:typing-form? metadata) (assoc :typing-form? true)
+                     (:non-class-value? metadata) (assoc :non-class-value? true)
                      (:type-any? metadata) (assoc :any? true)
                      (:type-never? metadata) (assoc :never? true)
                      (:type-ellipsis? metadata) (assoc :ellipsis? true)
@@ -305,6 +306,7 @@
     (:nullable? type) (assoc :nullable? true)
     (contains? type :literal-values) (assoc :literal-values (:literal-values type))
     (:typing-form? type) (assoc :typing-form? true)
+    (:non-class-value? type) (assoc :non-class-value? true)
     (:any? type) (assoc :type-any? true)
     (:never? type) (assoc :type-never? true)
     (:ellipsis? type) (assoc :type-ellipsis? true)
@@ -320,7 +322,7 @@
 (def ^:private type-keys
   [:type-module :type-path :type-arguments :type-union :typevar :type-bound
    :type-constraints :type-default :type-variance :nullable? :literal-values :type-any? :type-never?
-   :type-ellipsis? :parameter-spec? :variadic? :unpack? :parameter-part :parameter-list? :type-pack? :typing-form?])
+   :type-ellipsis? :parameter-spec? :variadic? :unpack? :parameter-part :parameter-list? :type-pack? :typing-form? :non-class-value?])
 
 (def ^:private none-type {:module "builtins" :path ["NoneType"]})
 (def ^:private object-type {:module "builtins" :path ["object"]})
@@ -423,7 +425,8 @@
                                                     (let [result (type-compatible? source target)]
                                                       (if (nil? result) (invariant-compatible? source target) result))) targets))) sources)))]
       (every-compatible [(covered? actuals expecteds) (covered? expecteds actuals)]))
-    (not= (dissoc actual :arguments :literal-values) (dissoc expected :arguments :literal-values)) false
+    (not= (dissoc actual :arguments :literal-values :non-class-value?)
+          (dissoc expected :arguments :literal-values :non-class-value?)) false
     (= none-type (dissoc actual :literal-values)) true
     (or (:literal-values actual) (:literal-values expected))
     (and (= (count (:literal-values actual)) (count (:literal-values expected)))
@@ -466,7 +469,8 @@
     (= actual expected) true
     (:never? actual) true
     (:never? expected) false
-    (and (:typing-form? actual) (= "builtins" (:module expected)) (= ["type"] (:path expected))) false
+    (and (or (:typing-form? actual) (:non-class-value? actual))
+         (= "builtins" (:module expected)) (= ["type"] (:path expected))) false
     (or (:union actual) (:nullable? actual))
     (every-compatible (map #(compare % expected) (variants actual)))
     (or (:union expected) (:nullable? expected))
@@ -676,6 +680,7 @@
     (cond-> {:module "collections.abc" :path ["Callable"]
              :arguments [(when (contains? metadata :parameters) (parameter-list (:parameters metadata)))
                          (call-return-type metadata)]}
+      (:new-type-constructor? metadata) (assoc :non-class-value? true)
       (seq (:overloads metadata))
       (assoc :callable-overloads (mapv #(callable-type (assoc % :kind :function)) (:overloads metadata))))
     :else (when (callable-ref? (return-type metadata)) (return-type metadata))))
@@ -1359,6 +1364,24 @@
       (cond-> (assoc-in (meta bindings) [::constraint-compatibility name] checks)
         lower? (update ::constraint-lower-inputs (fnil conj #{}) name)))))
 
+(defn- disjoint-parameter-domains? [left right]
+  ;; Search the finite binding shapes, without guessing intersections of value
+  ;; types. Extra variadic positions cannot rescue an otherwise invalid shape.
+  (let [positional? #(contains? #{:positional-only :positional-or-keyword} (:kind %))
+        limit (max (count (filter positional? left)) (count (filter positional? right)))
+        required-keywords (fn [parameters count]
+                            (map :name (filter #(and (:required? %)
+                                                     (contains? #{:positional-or-keyword :keyword-only} (:kind %)))
+                                               (concat (drop count (filter positional? parameters))
+                                                       (filter #(= :keyword-only (:kind %)) parameters)))))]
+    (and (<= limit 32)
+         (not-any? (fn [count]
+                     (let [keywords (set (concat (required-keywords left count)
+                                                 (required-keywords right count)))]
+                       (and (empty? (check-single-call {:parameters left} count keywords))
+                            (empty? (check-single-call {:parameters right} count keywords)))))
+                   (range (inc limit))))))
+
 (defn- infer-bindings
   ([bindings expected actual] (infer-bindings bindings expected actual false {}))
   ([bindings expected actual upper?] (infer-bindings bindings expected actual upper? {}))
@@ -1424,6 +1447,15 @@
                    :else inferred)
            bindings (if (seq upper-bounds)
                       (with-meta bindings (assoc-in (meta bindings) [::upper-bounds name] upper-bounds))
+                      bindings)
+           captured (get-in (meta bindings) [::parameter-domains name])
+           parameters (when (and (:parameter-spec? expected) (:parameter-list? actual))
+                        (:parameters actual))
+           bindings (if (some? parameters)
+                      (with-meta bindings
+                        (cond-> (update-in (meta bindings) [::parameter-domains name] (fnil conj []) parameters)
+                          (some #(disjoint-parameter-domains? % parameters) captured)
+                          (assoc ::disjoint-parameters? true)))
                       bindings)]
        (assoc bindings name value))
      (:union expected)
@@ -1451,6 +1483,14 @@
                      upper? (assoc opts ::contained-type? true))
      (and (:parameter-list? expected) (:parameter-list? actual) (:parameters actual))
      (infer-arguments bindings (:arguments expected) (positional-pattern (:parameters actual)) upper? opts)
+     (and (seq (:arguments expected)) (contains? actual :arguments) (:module expected)
+          (not= [(:module expected) (:path expected)] [(:module actual) (:path actual)])
+          (not (contains? #{"builtins" "collections.abc" "typing"} (:module expected)))
+          (:protocol? (inspect-path (:module expected) (:path expected) opts)))
+     ;; Structural protocols relate member contracts, not the positions of an
+     ;; unrelated class's generic parameters. infer-call-argument collects the
+     ;; member constraints; guessing positional correspondence pollutes them.
+     bindings
      (and (seq (:arguments expected)) (contains? actual :arguments)
           (= (boolean (callable-ref? expected)) (boolean (callable-ref? actual))))
      (let [parameters (when (and (:module expected)
@@ -1652,6 +1692,24 @@
                     (if (empty? candidates) false
                         (any-compatible (map :type-match? candidates))))) targets)))))))
 
+(defn- self-reference [value]
+  (cond
+    (:type-self? value) value
+    (map? value) (some self-reference (vals (select-keys value (conj type-keys :parameters))))
+    (vector? value) (some self-reference value)))
+
+(defn- unbound-self-receiver [signature positional keyword opts]
+  ;; Calling C.method(instance) leaves the receiver in the signature. Other
+  ;; Self inputs need joint inference; the receiver alone cannot determine them.
+  (when (and (:instance-method? signature) (not (:bound? signature))
+             (not-any? self-reference (rest (:parameters signature))))
+    (let [parameter (first (:parameters signature))
+          receiver (or (first positional) (get keyword (:name parameter)))
+          owner (when receiver (some-> (self-reference signature) return-type (dissoc :nullable?)))]
+      (when (and (contains? #{:positional-only :positional-or-keyword} (:kind parameter))
+                 owner (true? (type-compatible? receiver owner opts)))
+        receiver))))
+
 (defn- select-call-signatures
   [metadata positional-types keyword-types opts]
   (let [branches (when-not (::collective-callbacks? opts)
@@ -1682,8 +1740,10 @@
                                    (not (seq (check-single-call signature (count positional-types) (keys keyword-types))))))]
                  (when valid?
                    (let [pairs (vec (argument-pairs signature positional-types keyword-types opts))
+                         receiver (unbound-self-receiver signature positional-types keyword-types opts)
+                         initial (cond-> (:bindings prepared) receiver (assoc "__Self__" receiver))
                          bindings (reduce (fn [result [expected actual]]
-                                            (infer-call-argument result expected actual opts)) (:bindings prepared) pairs)
+                                            (infer-call-argument result expected actual opts)) initial pairs)
                          bindings (if (= :class (:kind signature))
                                     (complete-class-bindings bindings (:type-parameters signature) false) bindings)
                          specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
@@ -1704,6 +1764,7 @@
                                         (some (fn [[expected actual fresh?]]
                                                 (and (not (:parameter-part expected))
                                                      (false? (argument-compatible? actual expected fresh? opts)))) pairs))
+                                   (::disjoint-parameters? (meta bindings))
                                    (false? forwarded)
                                    (some false? comparisons)
                                    (and (not (identical? original specialized))
