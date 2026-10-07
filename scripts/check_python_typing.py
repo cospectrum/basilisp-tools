@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import io
 import json
+import keyword as pykeyword
 from pathlib import Path
 import re
 import sys
@@ -28,10 +29,34 @@ DECLARATIONS = {"TypeVar", "TypeVarTuple", "ParamSpec", "NewType", "TypedDict", 
 ASSERTIONS = {"assert_type", "reveal_type"}
 CALL_ERRORS = {"invalid-arity", "type-mismatch", "unresolved-python-member"}
 PYRIGHT_CALL_ERRORS = {"reportCallIssue", "reportArgumentType", "reportAttributeAccessIssue", "reportIndexIssue", "reportOperatorIssue"}
+SNAPSHOT_CALL_ERRORS = {
+    "invalid-argument-type", "missing-argument", "too-many-positional-arguments",
+    "unknown-argument", "parameter-already-assigned", "no-matching-overload",
+    "call-non-callable", "unresolved-attribute", "invalid-attribute-access",
+    "possibly-missing-attribute", "not-subscriptable", "index-out-of-bounds",
+    "unsupported-operator", "deprecated",
+}
+SUPPRESSION_CODES = {
+    "arg-type": {"type-mismatch"}, "call-arg": {"invalid-arity"},
+    "call-overload": {"type-mismatch", "invalid-arity"},
+    "attr-defined": {"unresolved-python-member"}, "union-attr": {"unresolved-python-member"},
+    "index": {"type-mismatch", "invalid-arity"}, "operator": {"type-mismatch"},
+    "invalid-argument-type": {"type-mismatch"}, "bad-argument-type": {"type-mismatch"},
+    "missing-argument": {"invalid-arity"}, "too-many-positional-arguments": {"invalid-arity"},
+    "unexpected-keyword": {"invalid-arity"}, "unknown-argument": {"invalid-arity"},
+    "reportArgumentType": {"type-mismatch"}, "reportCallIssue": {"invalid-arity"},
+    "reportAttributeAccessIssue": {"unresolved-python-member"},
+    "reportIndexIssue": {"type-mismatch", "invalid-arity"}, "reportOperatorIssue": {"type-mismatch"},
+    "deprecated": {"deprecated-var"}, "reportDeprecated": {"deprecated-var"},
+}
 
 
 class Unsupported(ValueError):
     pass
+
+
+class LocalName(ast.Name):
+    """A translated lexical binding, distinct from a Python module export."""
 
 
 def name_of(node):
@@ -60,11 +85,152 @@ def markers(source):
             result[number].extend(pending)
             pending = []
         column, text = comments.get(number, (0, ""))
-        comment = re.match(r"#\s*(E(?:\?|\[[^]]+\])?(?::|\s|$).*|error:.*|revealed:.*|N:.*)", text)
-        if comment:
+        pattern = r"#\s*(E(?:\?|\[[^]]+\])?(?::|\s|$)|error:|revealed:|N:|snapshot:)"
+        starts = list(re.finditer(pattern, text))
+        for index, comment in enumerate(starts):
+            end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
             target = pending if not line[:column].strip() else result[number]
-            target.append(comment.group(1))
+            target.append(text[comment.start(1):end].strip())
     return dict(result)
+
+
+def expects_diagnostic(notes):
+    return any((re.match(r"E(?:\s|:|$)|error:", note) and "revealed type:" not in note.lower())
+               or (note.startswith("snapshot:") and note.split(":", 1)[1].strip() in SNAPSHOT_CALL_ERRORS)
+               for note in notes)
+
+
+def suppressions(source, provider):
+    """Retain explicit upstream ignores as scoped Basilisp linter configuration."""
+    result = {}
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        for token in tokens:
+            if token.type != tokenize.COMMENT:
+                continue
+            match = re.search(r"#\s*(type|pyright|pyrefly|ty):\s*ignore(?:\[([^]]*)\])?", token.string)
+            if not match or match[1] not in {"type", provider}:
+                continue
+            codes = [code.strip() for code in match[2].split(",")] if match[2] is not None else []
+            all_codes = CALL_ERRORS | {"deprecated-var"}
+            if not codes:
+                ignored = all_codes
+            elif provider == "pyrefly" and match[1] == "type":
+                own_codes = [code.removeprefix("pyrefly:") for code in codes if code.startswith("pyrefly:")]
+                ignored = (set().union(*(SUPPRESSION_CODES.get(code, set()) for code in own_codes))
+                           if own_codes else all_codes)
+            else:
+                ignored = set().union(*(SUPPRESSION_CODES.get(code, set()) for code in codes))
+            conditional = provider == "mypy" and "misc" in codes
+            if ignored or conditional:
+                result[token.start[0]] = {"comment": match[0], "diagnostics": sorted(ignored)}
+                if conditional:
+                    result[token.start[0]]["conditional"] = "mypy-too-many-positional"
+    except (tokenize.TokenError, IndentationError):
+        pass
+    return result
+
+
+def immutable_literal_expression(node, bindings):
+    """Copy a provable immutable value without evaluating upstream fixture code."""
+    if isinstance(node, ast.Constant) and (node.value is None or type(node.value) in (bool, int, float, str, bytes)):
+        return copy.deepcopy(node)
+    if isinstance(node, ast.Name) and node.id in bindings:
+        return copy.deepcopy(bindings[node.id])
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        operand = immutable_literal_expression(node.operand, bindings)
+        if isinstance(operand, ast.Constant) and type(operand.value) in (int, float):
+            return ast.copy_location(ast.Constant(-operand.value if isinstance(node.op, ast.USub) else operand.value), node)
+    if isinstance(node, ast.Tuple):
+        values = [immutable_literal_expression(value, bindings) for value in node.elts]
+        if all(value is not None for value in values):
+            return ast.copy_location(ast.Tuple(elts=values, ctx=ast.Load()), node)
+    return None
+
+
+def literal_bindings_before(tree, line):
+    """Replay immutable module assignments up to the consumer's source position."""
+    bindings = {}
+    for statement in tree.body:
+        if statement.lineno >= line:
+            break
+        value = None
+        targets = []
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            value = immutable_literal_expression(statement.value, bindings) if statement.value is not None else None
+            # Preserve explicit abstract annotations used by upstream nonliteral tests.
+            # Literal and Final annotations alone promise the retained constant fact.
+            if isinstance(statement, ast.AnnAssign):
+                annotation = statement.annotation
+                origin = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+                if name_of(origin) not in {"Final", "Literal"}:
+                    value = None
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            writes = {statement.name}
+        else:
+            writes = {node.id for node in ast.walk(statement)
+                      if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))}
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            writes.update(alias.asname or alias.name.split('.')[0] for alias in statement.names)
+        for name in writes:
+            bindings.pop(name, None)
+        if value is not None:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = copy.deepcopy(value)
+    return bindings
+
+
+def comprehension_bindings(node, parents, source):
+    """Retain only generators whose bindings are in scope at this assertion."""
+    groups = []
+    ancestor = parents.get(node)
+    while ancestor and not isinstance(ancestor, ast.Module):
+        if isinstance(ancestor, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            generators = []
+            for generator in ancestor.generators:
+                if node in ast.walk(generator.iter):
+                    break
+                generators.append({"target": ast.get_source_segment(source, generator.target),
+                                   "iterable": ast.get_source_segment(source, generator.iter),
+                                   "filters": [ast.get_source_segment(source, value) for value in generator.ifs],
+                                   "async": bool(generator.is_async)})
+                if any(node in ast.walk(value) for value in generator.ifs):
+                    raise Unsupported("Assertion inside a comprehension filter requires preserving filter order")
+            groups.append(generators)
+        ancestor = parents.get(ancestor)
+    return [generator for group in reversed(groups) for generator in group]
+
+
+def lexical_comprehension(row, module, bindings):
+    """Build equivalent for bindings without evaluating fixture iterables."""
+    bindings = dict(bindings)
+    clauses = []
+    locals_ = {}
+    local_count = 0
+
+    def target(node):
+        nonlocal local_count
+        if isinstance(node, ast.Name):
+            local = LocalName(id=f"blt-comprehension-{local_count}", ctx=ast.Load())
+            local_count += 1
+            locals_[node.id] = local
+            bindings[node.id] = local
+            return local.id
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return "[" + " ".join(target(item) for item in node.elts) + "]"
+        raise Unsupported("Comprehension target requires unsupported destructuring: " + type(node).__name__)
+
+    for generator in row.get("comprehension_bindings", []):
+        if generator["async"]:
+            raise Unsupported("Async comprehension requires its async iterator contract")
+        iterable = translate(ast.parse(generator["iterable"], mode="eval").body, module, bindings)
+        pattern = target(ast.parse(generator["target"], mode="eval").body)
+        clauses.extend([pattern, iterable])
+        for value in generator["filters"]:
+            clauses.extend([":when", translate(ast.parse(value, mode="eval").body, module, bindings)])
+    return bindings, ("(for [" + " ".join(clauses) + "] " if clauses else ""), locals_
 
 
 def discover(item):
@@ -74,6 +240,7 @@ def discover(item):
         if not filename.endswith((".py", ".pyi")):
             continue
         comments = markers(source)
+        ignored = suppressions(source, item["provider"])
         for line in item["metadata"].get("expected_output", "").splitlines():
             diagnostic = re.match(r"([^:]+):(\d+): (error|note): (.*)", line)
             if diagnostic and diagnostic.group(1) in {filename, "main" if filename == "main.py" else filename}:
@@ -138,9 +305,31 @@ def discover(item):
                    "kind": "return" if assertion else "call", "expression": ast.get_source_segment(source, expression),
                    "expected_annotation": expectation, "expected_display": expected_text,
                    "markers": notes, "context": context,
-                   "expected_error": any(re.match(r"E(?:\s|:|$)|error:", note) and "revealed type:" not in note.lower() for note in notes)}
+                   "expected_error": expects_diagnostic(notes)}
+            if isinstance(parent, ast.Assign) and len(parent.targets) == 1 and isinstance(parent.targets[0], ast.Attribute):
+                row["assignment_target"] = ast.get_source_segment(source, parent.targets[0])
+                row["assignment_statement"] = ast.get_source_segment(source, parent)
+                row["oracle_start"] = [parent.lineno - 1, utf16_column(source, parent.lineno, parent.col_offset)]
+                row["oracle_end"] = [parent.end_lineno - 1, utf16_column(source, parent.end_lineno, parent.end_col_offset)]
+            if row["expected_error"]:
+                row["expected_diagnostic_types"] = (["deprecated-var"] if any("deprecated" in note.lower() for note in notes)
+                                                     else sorted(CALL_ERRORS))
+            row_suppressions = [value for line, value in ignored.items() if node.lineno <= line <= node.end_lineno]
+            if row_suppressions:
+                row["suppression_directives"] = row_suppressions
             row["assertion_source"] = "type-directive" if assertion else "expected-diagnostic" if notes else "consumer-call"
+            try:
+                generators = comprehension_bindings(node, parents, source)
+                if generators:
+                    row["comprehension_bindings"] = generators
+            except Unsupported as error:
+                row["excluded"] = str(error)
+            local_names = {part.id for generator in row.get("comprehension_bindings", [])
+                           for part in ast.walk(ast.parse(generator["target"], mode="eval")) if isinstance(part, ast.Name)}
+            literal_bindings = literal_bindings_before(tree, node.lineno)
             rebound = sorted({part.id for part in ast.walk(expression) if isinstance(part, ast.Name)
+                              and part.id not in local_names
+                              and part.id not in literal_bindings
                               and any(line >= node.lineno for line in writes.get(part.id, []))})
             if context:
                 row["excluded"] = "Lexical/control-flow context requires adaptation: " + ",".join(context)
@@ -193,12 +382,15 @@ def apply_pyright_oracle(item, rows, diagnostics):
                       and [diagnostic["range"].get("end", diagnostic["range"]["start"])["line"],
                            diagnostic["range"].get("end", diagnostic["range"]["start"]).get("character", 0)] >= start]
         row["oracle_diagnostics"] = errors
-        if errors and not all(error.get("rule") in PYRIGHT_CALL_ERRORS for error in errors):
+        allowed = PYRIGHT_CALL_ERRORS | ({"reportAssignmentType"} if row.get("assignment_target") else set())
+        if errors and not all(error.get("rule") in allowed for error in errors):
             row["excluded"] = "Native oracle rejects a non-call aspect of this Python statement"
         elif row["kind"] == "return" and errors:
             row["excluded"] = "Upstream reveal expression is rejected by the independent oracle"
         else:
             row["expected_error"] = bool(errors)
+            if errors:
+                row["expected_diagnostic_types"] = sorted(CALL_ERRORS)
 
 
 def translate(node, module, bindings=None):
@@ -206,7 +398,9 @@ def translate(node, module, bindings=None):
         class Substitute(ast.NodeTransformer):
             def visit_Name(self, name):
                 if name.id in bindings:
-                    return ast.copy_location(ast.Name(id=bindings[name.id], ctx=ast.Load()), name)
+                    value = bindings[name.id]
+                    return ast.copy_location(copy.deepcopy(value) if isinstance(value, ast.AST)
+                                             else ast.Name(id=value, ctx=ast.Load()), name)
                 return name
         # Symbol replacements contain their complete Basilisp qualification.
         node = Substitute().visit(copy.deepcopy(node))
@@ -219,9 +413,11 @@ def translate(node, module, bindings=None):
             return "false"
         if isinstance(node.value, (str, int, float)):
             return json.dumps(node.value, ensure_ascii=False, allow_nan=False)
+        if isinstance(node.value, bytes):
+            return '#b"' + ''.join(f'\\x{value:02x}' for value in node.value) + '"'
         raise Unsupported("Unsupported Python literal: " + type(node.value).__name__)
     if isinstance(node, ast.Name):
-        return node.id if "/" in node.id else module + "/" + node.id
+        return node.id if isinstance(node, LocalName) or "/" in node.id else module + "/" + node.id
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         opening, closing = ("#py [", "]") if isinstance(node, ast.List) else ("#py (", ")") if isinstance(node, ast.Tuple) else ("#py #{", "}")
         return opening + " ".join(translate(value, module) for value in node.elts) + closing
@@ -257,6 +453,11 @@ def translate(node, module, bindings=None):
                 keywords.append((arg.arg, arg.value))
         if len({key for key, _ in keywords}) != len(keywords):
             raise Unsupported("Repeated keyword arguments require preserving Python compilation or unpacking errors before Basilisp call generation")
+        if any(not key.isidentifier() or pykeyword.iskeyword(key) for key, _ in keywords):
+            mapping = "{" + " ".join(part for key, value in keywords
+                                      for part in (json.dumps(key, ensure_ascii=False), translate(value, module))) + "}"
+            target = translate(node.func, module)
+            return "(" + " ".join(["apply-kw", target, *values, mapping]) + ")"
         if keywords:
             values += ["**"] + [part for key, value in keywords for part in (":" + key, translate(value, module))]
         if isinstance(node.func, ast.Attribute):
@@ -346,13 +547,16 @@ def consumer_metadata(node, module, row, result, bridge, options, to_lisp, bindi
     if not isinstance(node, ast.Call):
         return None
     if isinstance(node.func, ast.Name):
-        owner, name = bindings.get(node.func.id, module + "/" + node.func.id).split("/", 1)
+        target = bindings.get(node.func.id, module + "/" + node.func.id)
+        if not isinstance(target, str):
+            return None
+        owner, name = target.split("/", 1)
         return plain(bridge.inspect_path(owner, to_lisp([name]), options))
     if isinstance(node.func, ast.Attribute):
         receiver = node.func.value
-        if isinstance(receiver, ast.Name):
+        if isinstance(receiver, ast.Name) and not isinstance(bindings.get(receiver.id), ast.AST):
             return plain(bridge.inspect_path(module, to_lisp([receiver.id, node.func.attr]), options))
-        translated = translate(receiver, module)
+        translated = translate(receiver, module, bindings)
         offset = row["basilisp"].find(translated)
         column = row["basilisp_column"] + offset
         types = [value.get("python-type") for value in result.get("python-expressions", [])
@@ -362,11 +566,64 @@ def consumer_metadata(node, module, row, result, bridge, options, to_lisp, bindi
     return None
 
 
+def conditionally_suppressed_findings(node, metadata, row, findings):
+    """Mypy's misc alias covers keyword-only positional misuse, not all arity errors."""
+    if not any(directive.get("conditional") == "mypy-too-many-positional"
+               for directive in row.get("suppression_directives", [])):
+        return []
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        return []
+    if not signature_known(metadata) or metadata.get("overloads"):
+        return []
+    kinds = [parameter.get("kind", "").removeprefix(":") for parameter in metadata["parameters"]]
+    if "var-positional" in kinds:
+        return []
+    positional = sum(kind in {"positional-only", "positional-or-keyword"} for kind in kinds)
+    keyword_only = kinds.count("keyword-only")
+    supplied = 0
+    for argument in node.args:
+        if isinstance(argument, ast.Starred):
+            if not isinstance(argument.value, (ast.List, ast.Tuple)):
+                return []
+            supplied += len(argument.value.elts)
+        else:
+            supplied += 1
+    if not positional < supplied <= positional + keyword_only:
+        return []
+    message = f"Expected at most {positional} positional arguments, received {supplied}"
+    return [finding for finding in findings
+            if finding.get("type", "").removeprefix(":") == "invalid-arity"
+            and finding.get("message") == message
+            and finding.get("col") == row["basilisp_column"]]
+
+
 def internal_analysis_findings(findings):
     """Internal failures cannot satisfy an expected argument diagnostic."""
     return [finding for finding in findings
             if finding.get("type", "").removeprefix(":") in {"file", "syntax", "python-inspection"}
             or finding.get("message", "").startswith("Analysis failed:")]
+
+
+def finding_type(finding):
+    """Distinguish the analyzer's Python-member diagnostic from lexical errors."""
+    kind = finding.get("type", "").removeprefix(":")
+    if kind == "unresolved-symbol" and finding.get("message", "").startswith("Unresolved Python member: "):
+        return "unresolved-python-member"
+    return kind
+
+
+def diagnostic_status(row):
+    """A concrete diagnostic overrides incomplete return/signature metadata."""
+    findings = row.get("findings", [])
+    if any(finding_type(finding) == "unresolved-symbol" for finding in findings):
+        return "error"
+    if row.get("expected_error"):
+        expected = row.get("expected_diagnostic_types", CALL_ERRORS)
+        if any(finding_type(finding) in expected for finding in findings):
+            return "passed"
+    elif any(finding_type(finding) in CALL_ERRORS for finding in findings):
+        return "failed"
+    return None
 
 
 def replay(item, rows, working, engine):
@@ -402,7 +659,19 @@ def replay(item, rows, working, engine):
             row["excluded"] = "Auxiliary-file assertion requires its own lexical replay"
             continue
         try:
-            expression = translate(ast.parse(row["expression"], mode="eval").body, module, bindings)
+            node = ast.parse(row["expression"], mode="eval").body
+            literals = literal_bindings_before(tree, row["line"])
+            used = {part.id for part in ast.walk(node) if isinstance(part, ast.Name)}
+            row["literal_bindings"] = {name: ast.unparse(value) for name, value in literals.items() if name in used}
+            scope, context, locals_ = lexical_comprehension(row, module, {**bindings, **literals})
+            expression = translate(node, module, scope)
+            if context:
+                row["lexical_names"] = {name: local.id for name, local in locals_.items()}
+                row["basilisp_context"] = context + expression + ")"
+                row["basilisp_context_offset"] = len(context)
+            if row.get("assignment_target"):
+                target = ast.parse(row["assignment_target"], mode="eval").body
+                expression = "(set! " + translate(target, module, {**bindings, **literals}) + " " + expression + ")"
             expected = expected_annotation(row)
             if expected:
                 ast.parse(expected, mode="eval")
@@ -423,11 +692,18 @@ def replay(item, rows, working, engine):
         body = f"(ns blt-typing-audit (:import {module} builtins))\n"
         for index, row in enumerate(translated):
             prefix = f"(def blt-case-{index} "
-            row["basilisp_start"] = len(body) + len(prefix)
-            body += prefix + row["basilisp"] + ")\n"
-            row["basilisp_end"] = len(body) - 2
+            if row.get("suppression_directives"):
+                ignored = sorted({kind for directive in row["suppression_directives"]
+                                  for kind in directive["diagnostics"]
+                                  if kind != "unresolved-python-member"})
+                if ignored:
+                    prefix = "#_{:clj-kondo/ignore [" + " ".join(":" + kind for kind in ignored) + "]} " + prefix
+            offset = row.get("basilisp_context_offset", 0)
+            row["basilisp_start"] = len(body) + len(prefix) + offset
+            body += prefix + row.get("basilisp_context", row["basilisp"]) + ")\n"
+            row["basilisp_end"] = row["basilisp_start"] + len(row["basilisp"])
             row["basilisp_row"] = index + 2
-            row["basilisp_column"] = len(prefix) + 1
+            row["basilisp_column"] = len(prefix) + offset + 1
         result = plain(analyzer.analyze(body, to_lisp({"filename": str(folder / "audit.lpy"), "python-options": options})))
         document_findings = result["findings"]
         internal = internal_analysis_findings(document_findings)
@@ -444,19 +720,32 @@ def replay(item, rows, working, engine):
             if row.get("expected_helper"):
                 metadata = bridge.inspect_path(module, to_lisp([row["expected_helper"]]), options)
                 expected = plain(bridge.return_type(metadata))
-            errors = [finding for finding in findings if finding.get("type", "").removeprefix(":") in CALL_ERRORS]
             node = ast.parse(row["expression"], mode="eval").body
-            metadata = consumer_metadata(node, module, row, result, bridge, options, to_lisp, bindings)
+            literal_bindings = {name: ast.parse(value, mode="eval").body for name, value in row.get("literal_bindings", {}).items()}
+            lexical_names = {name: LocalName(id=local, ctx=ast.Load()) for name, local in row.get("lexical_names", {}).items()}
+            metadata = consumer_metadata(node, module, row, result, bridge, options, to_lisp,
+                                         {**bindings, **literal_bindings, **lexical_names})
+            suppressed = conditionally_suppressed_findings(node, metadata, row, findings)
+            if any("unresolved-python-member" in directive["diagnostics"]
+                   for directive in row.get("suppression_directives", [])):
+                suppressed.extend(finding for finding in findings
+                                  if finding_type(finding) == "unresolved-python-member")
+            if suppressed:
+                row["suppressed_findings"] = suppressed
+                findings = [finding for finding in findings if finding not in suppressed]
             contract_known = not isinstance(node, ast.Call) or signature_known(metadata)
             return_known = type_resolved(canonical(actual))
             explicit_any = (row["kind"] == "return" and explicit_any_expectation(row)
                             and expected is not None and canonical(expected).get("any?"))
             row.update(actual=canonical(actual, expected), expected=canonical(expected), findings=findings,
                        coverage={"return_resolved": return_known, "signature_resolved": contract_known})
-            if row["expected_error"]:
-                row["status"] = "passed" if errors else "unknown" if actual is None or not contract_known else "failed"
-            elif errors:
-                row["status"] = "failed"
+            diagnosed = diagnostic_status(row)
+            if diagnosed:
+                row["status"] = diagnosed
+                if diagnosed == "error":
+                    row["error"] = "Unresolved lexical symbol in the adapted expression"
+            elif row["expected_error"]:
+                row["status"] = "unknown" if actual is None or not contract_known else "failed"
             elif not contract_known:
                 row["status"] = "unknown"
             elif not return_known and not explicit_any:
@@ -471,11 +760,71 @@ def replay(item, rows, working, engine):
         bridge.stop_cache__BANG__(cache)
 
 
+def load_selection(path):
+    """Require exact pinned fixtures and reviewed result counts for strict CI."""
+    if path is None:
+        return None
+    result = {}
+    for item in json.loads(path.read_text()):
+        if set(item) != {"provider", "path", "name", "source_sha256", "expected"}:
+            raise ValueError("Selection entries need provider/path/name/source_sha256/expected")
+        key = tuple(item[name] for name in ("provider", "path", "name"))
+        if not all(isinstance(value, str) and value for value in key) or key in result:
+            raise ValueError("Selection fixtures must have unique nonempty identities")
+        if not re.fullmatch(r"[0-9a-f]{64}", item["source_sha256"]):
+            raise ValueError("Selection fixtures need an exact SHA256")
+        expected = item["expected"]
+        keys = {"passed", "excluded", "positive_calls", "negative_calls", "return_assertions"}
+        if set(expected) != keys or any(type(value) is not int or value < 0 for value in expected.values()):
+            raise ValueError("Selection entries need nonnegative exact result and coverage counts")
+        if expected["passed"] == 0:
+            raise ValueError("A strict selected fixture must exercise a resolved assertion")
+        result[key] = item
+    if not result:
+        raise ValueError("Selection must contain at least one fixture")
+    return result
+
+
+def selection_result(fixture):
+    rows = fixture["cases"]
+    statuses = collections.Counter(row["status"] for row in rows)
+    return {**{status: statuses[status] for status in ("passed", "excluded")},
+            **{status: count for status, count in statuses.items() if status not in {"passed", "excluded"}},
+            "positive_calls": sum(row["status"] == "passed" and row["kind"] == "call"
+                                  and not row.get("expected_error") for row in rows),
+            "negative_calls": sum(row["status"] == "passed" and row.get("expected_error", False)
+                                  for row in rows),
+            "return_assertions": sum(row["status"] == "passed" and row["kind"] == "return"
+                                     and not row.get("expected_error") for row in rows)}
+
+
+def validate_selection(report, selection):
+    if selection is None:
+        return []
+    seen = set()
+    failures = []
+    for fixture in report["fixtures"]:
+        key = tuple(fixture[name] for name in ("provider", "path", "name"))
+        if key in seen or key not in selection:
+            failures.append({"fixture": key, "reason": "Unexpected or duplicate selected fixture"})
+            continue
+        seen.add(key)
+        expected = selection[key]
+        actual = selection_result(fixture)
+        if fixture["source_sha256"] != expected["source_sha256"] or actual != expected["expected"]:
+            failures.append({"fixture": key, "expected": expected,
+                             "actual": {"source_sha256": fixture["source_sha256"], "counts": actual}})
+    failures.extend({"fixture": key, "reason": "Selected fixture was not discovered"}
+                    for key in selection.keys() - seen)
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corpus", required=True, type=Path)
     parser.add_argument("--manifest", type=Path, default=Path(__file__).with_name("python_typing_sources.json"))
     parser.add_argument("--provider", action="append")
+    parser.add_argument("--selection", type=Path, help="Exact pinned fixture/result manifest for strict CI")
     parser.add_argument("--fixture", help="Substring filter, always recorded in report scope")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inventory-only", action="store_true")
@@ -483,6 +832,9 @@ def main():
     parser.add_argument("--fetch", action="store_true", help="Download pinned archives and extract only fixture/license paths")
     parser.add_argument("--pyright-oracle", type=Path, help="Pyright --outputjson report over the original Pyright sample corpus")
     args = parser.parse_args()
+    if args.selection and (args.provider or args.fixture or args.inventory_only):
+        parser.error("--selection cannot be combined with provider/fixture filters or inventory-only")
+    selection = load_selection(args.selection)
     entries = json.loads(args.manifest.read_text())
     unknown = set(args.provider or []) - {entry["provider"] for entry in entries}
     if unknown:
@@ -504,21 +856,30 @@ def main():
                          "boundary": "Translated Python interop calls; not whole-Python language conformance"},
               "sources": entries, "fixtures": [], "started": time.time(),
               "source_hashes_start": source_hashes(engine)}
+    if selection is not None:
+        report["scope"]["selection"] = {"sha256": hashlib.sha256(args.selection.read_bytes()).hexdigest(),
+                                        "fixtures": list(selection.values())}
     if engine:
         report["engine"] = {"analyzer": engine[0].__file__, "python_bridge": engine[1].__file__}
     if args.pyright_oracle:
         report["oracle"] = {"version": payload["version"], "summary": payload["summary"],
                             "sha256": hashlib.sha256(args.pyright_oracle.read_bytes()).hexdigest(),
                             "profile": "Pyright CLI defaults plus fixture directives; original TypeScript test-runner settings are not reproduced"}
+        if "blt_invocation" in payload:
+            report["oracle"]["invocation"] = payload["blt_invocation"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="blt-typing-fixtures-") as directory:
         for entry in report["sources"]:
             if args.provider and entry["provider"] not in args.provider:
                 continue
+            if selection is not None and entry["provider"] not in {key[0] for key in selection}:
+                continue
             if args.fetch:
                 fetch_source(entry, args.corpus)
             for item in fixtures(entry["provider"], args.corpus / entry["directory"]):
                 if args.fixture and args.fixture not in item["path"] + "::" + item["name"]:
+                    continue
+                if selection is not None and tuple(item[name] for name in ("provider", "path", "name")) not in selection:
                     continue
                 rows = discover(item)
                 if item["provider"] == "pyright" and engine:
@@ -558,9 +919,10 @@ def main():
     report["seconds"] = time.time() - report["started"]
     report["source_hashes_end"] = source_hashes(engine)
     report["source_changed_during_run"] = report["source_hashes_start"] != report["source_hashes_end"]
+    report["selection_failures"] = validate_selection(report, selection)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     failures = ["failed", "error"] + (["unknown"] if args.require_resolved else [])
-    return int(any(report["counts"].get(status, 0) for status in failures))
+    return int(bool(report["selection_failures"]) or any(report["counts"].get(status, 0) for status in failures))
 
 
 if __name__ == "__main__":

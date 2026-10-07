@@ -8,6 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from check_python_typing import CALL_ERRORS, finding_type
+
 
 def index(report):
     result = {}
@@ -27,8 +29,7 @@ def coverage(cases):
         "matched_return_assertions": sum(case["status"] == "passed" and case["kind"] == "return"
                                          and not case.get("expected_error") for case in cases),
         "expected_valid_diagnostic_cases": sum(not case.get("expected_error", False) and case["status"] == "failed"
-                                               and any(finding.get("type", "").removeprefix(":") in {
-                                                   "invalid-arity", "type-mismatch", "unresolved-python-member"}
+                                               and any(finding_type(finding) in CALL_ERRORS
                                                        for finding in case.get("findings", [])) for case in cases),
     }
 

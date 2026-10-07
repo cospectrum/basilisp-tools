@@ -2089,7 +2089,7 @@
                                              (if (keyword? (:tag value))
                                                (str/capitalize (basilisp.core/name (:tag value))) label)) arity))))))
 
-(declare python-index-value!)
+(declare python-index-value! python-apply-keywords!)
 
 (defn- lint-types! [ctx node info args values]
   (lint-extra-types! ctx node info args values)
@@ -2127,6 +2127,8 @@
         (finding! ctx node :not-empty? "Use (seq x) instead of (not (empty? x)) when x is a seq")))
     (cond
       (:python-operator spec) operator-value
+      (and (op/eq "basilisp.core" (:ns info)) (op/eq "apply-kw" (:name info)))
+      (python-apply-keywords! ctx node args values)
       (and (op/eq "basilisp.test" (:ns info)) (op/eq "compose-fixtures" (:name info))) (tagged :fn)
       (:macro info) nil
       (and (op/eq "basilisp.set" (:ns info)) (= 1 (count values))
@@ -2202,7 +2204,7 @@
         keyword-tail (vec (rest (drop-while #(not= "**" (token %)) args)))
         keys (vec (take-nth 2 keyword-tail))
         invalid (first (remove #(#{:keyword :string} (:kind %)) keys))
-        names (when-not invalid (mapv python-keyword-name keys))
+        names (when-not invalid (or (:python-raw-keyword-names ctx) (mapv python-keyword-name keys)))
         duplicate (first (for [i (range (count names)) :when (some #{(nth names i)} (take i names))]
                            (nth keys i)))
         problem (cond
@@ -2222,9 +2224,11 @@
 
 (defn- python-literal-value [node value]
   ;; References to earlier literals are existing mutable values at this call.
-  (if (fresh-python-container? node)
-    (or (:python-literal-value value) {:type (:python-type value)})
-    {:type (:python-type value)}))
+  (cond-> (if (fresh-python-container? node)
+            (or (:python-literal-value value) {:type (:python-type value)})
+            {:type (:python-type value)})
+    (and (= :class (get-in value [:python-member :kind]))
+         (get-in value [:python-member :nominal?])) (assoc :class-object? true)))
 
 (defn- python-deprecated! [ctx node member]
   (when-let [message (:deprecated member)]
@@ -2282,6 +2286,65 @@
     (when-let [type (when (seq candidates) (py/call-result member positional-types keyword-types options candidates))]
       (python-value type))))
 
+(defn- python-apply-keywords! [ctx node args values]
+  (let [function (first values)
+        mapping (last values)
+        options (get-in @(:state ctx) [:opts :python-options] {})
+        member (or (:python-member function)
+                   (when (:python-type function) (py/inspect-member (:python-type function) "__call__" options)))
+        known? (or (= :nil (:tag mapping)) (:map-closed? mapping))
+        entries (when (:map-closed? mapping) (vec (:map-values mapping)))
+        names (mapv (fn [[key _]]
+                      (cond (string? key) key
+                            (keyword? key) (util/munge (name key) ** :allow_builtins true))) entries)]
+    (cond
+      (< (count values) 2)
+      (finding! ctx node :invalid-arity "apply-kw requires a function and a final keyword argument map")
+      (and member known? (every? some? names) (= (count names) (count (set names))))
+      (let [positional-nodes (vec (butlast (rest args)))
+            positional-values (vec (butlast (rest values)))
+            inline? (= :map (:kind (unwrap (last args))))
+            keyword-nodes (mapcat (fn [[name [_ value]]]
+                                    [(assoc (last args) :kind :string :text (pr-str name) :children [])
+                                     (if inline? (:node value) (assoc (last args) :kind :analyzed-value))])
+                                  (map vector names entries))
+            keyword-values (mapcat (fn [[_ value]] [nil value]) entries)
+            marker (assoc (last args) :kind :symbol :text "**" :children [])]
+        ;; Raw string keys survive apply-kw unchanged; keyword keys are munged.
+        ;; Ambiguous converted-key collisions remain unknown because map iteration
+        ;; order determines which value wins in the runtime dictionary.
+        (python-call-value (assoc ctx :python-raw-keyword-names names) node member
+                           (into (conj positional-nodes marker) keyword-nodes)
+                           (into (conj positional-values nil) keyword-values) nil)))))
+
+(defn- python-typing-subscript-value [type value]
+  (let [key-type (:python-type value)
+        items (if (and (= "builtins" (:module key-type)) (= ["tuple"] (:path key-type)))
+                (get-in value [:python-literal-value :items])
+                [{:type key-type :class-object? (and (= :class (get-in value [:python-member :kind]))
+                                                     (get-in value [:python-member :nominal?]))}])
+        none? #(and (= "builtins" (:module %)) (= ["NoneType"] (:path %)))
+        references (mapv (fn [{argument :type}]
+                           (cond
+                             (and (= "builtins" (:module argument)) (= ["type"] (:path argument)))
+                             (first (:arguments argument))
+                             (none? argument) argument)) items)
+        exact? (and (some? items) (every? #(or (:class-object? %) (none? (:type %))) items))
+        name (first (:path type))
+        collapsed (when (and (seq references) (every? some? references))
+                    (case name
+                      "Union" (when (or (= 1 (count references)) (and exact? (apply = references)))
+                                (first references))
+                      "Optional" (when (and (= 1 (count references)) (none? (first references)))
+                                   (first references))
+                      nil))]
+    (cond
+      collapsed (python-value {:module "builtins" :path ["type"] :arguments [collapsed]})
+      ;; Union/Optional can collapse to a class at runtime. Unknown class values
+      ;; cannot establish that their result is a non-class typing form.
+      (and (#{"Union" "Optional"} name) (not exact?)) nil
+      :else (python-value type))))
+
 (defn- python-index-value! [ctx node receiver argument value]
   (let [options (get-in @(:state ctx) [:opts :python-options] {})
         type (:python-type receiver)
@@ -2289,7 +2352,8 @@
         builtin-sequence? (and (not class?) (= "builtins" (:module type))
                                (contains? #{"list" "tuple" "str" "bytes" "bytearray" "range"} (first (:path type))))
         class-type (when class? (first (:arguments type)))
-        owner (when class? (or (:python-member receiver) (py/inspect-type class-type options)))
+        owner (when class? (or (when (= :class (get-in receiver [:python-member :kind])) (:python-member receiver))
+                               (py/inspect-type class-type options)))
         metaclass (when (:metaclass owner) (py/inspect-type (:metaclass owner) options))
         meta-getitem (get (:members metaclass) "__getitem__")
         getitem (cond
@@ -2307,9 +2371,10 @@
         generic? (and class? (not meta-getitem) (or builtin-generic? (seq (:type-parameters owner)))
                       (seq arguments) (every? some? arguments))]
     (cond
+      (:typing-form? type) (python-typing-subscript-value type value)
       generic?
       (let [specialized (assoc class-type :arguments arguments)
-            member (cond-> (py/specialize owner specialized)
+            member (cond-> (py/specialize owner specialized options)
                      builtin-generic? (assoc :type-arguments arguments))]
         (assoc (python-member-value (:python-module receiver) (:python-path receiver) member)
                :python-specialized? true))
@@ -2485,16 +2550,22 @@
         extra-positional (if (and injected (not receiver-injected?)) 1 0)
         env (dissoc env :thread-target)
         direct? (and (:python-module target) (#{:function :class} (get-in target [:python-member :kind])))
-        instance? (and (not direct?) (boolean (:python-type target)))
-        object (if instance? (:python-type target)
-                   (when (:python-module target) {:module (:python-module target) :path (:python-path target)}))
+        class-receiver (when (and (not direct?) (= "builtins" (get-in target [:python-type :module]))
+                                  (= ["type"] (get-in target [:python-type :path])))
+                         (first (get-in target [:python-type :arguments])))
+        instance? (and (not direct?) (not class-receiver) (boolean (:python-type target)))
+        object (or class-receiver (if instance? (:python-type target)
+                                      (when (:python-module target) {:module (:python-module target) :path (:python-path target)})))
         raw (token head) field? (.startswith raw ".-")
         member-name (subs raw (if field? 2 1))
         member (when object
                  (if (and field? (op/eq "arities" member-name) (:arglists target))
                    {:kind :variable :type {:module "basilisp.lang.set" :path ["PersistentSet"]}}
-                   (if (:python-specialized? target)
-                     (py/resolve-member (:python-member target) (util/munge member-name ** :allow_builtins true))
+                   (if (or class-receiver (:python-specialized? target))
+                     (py/resolve-member (if class-receiver
+                                          (py/inspect-type class-receiver (get-in @(:state ctx) [:opts :python-options] {}))
+                                          (:python-member target))
+                                        (util/munge member-name ** :allow_builtins true))
                      (if instance?
                        (py/inspect-member object (util/munge member-name ** :allow_builtins true)
                                           (get-in @(:state ctx) [:opts :python-options] {}))

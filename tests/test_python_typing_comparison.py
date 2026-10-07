@@ -30,6 +30,13 @@ def test_new_false_positive_is_retained_for_review(comparison):
     assert result["remaining_differences"] == ["case"]
 
 
+def test_coverage_counts_python_member_errors_without_lexical_errors(comparison):
+    rows = [{'status': 'failed', 'kind': 'call', 'expected_error': False,
+             'findings': [{'type': ':unresolved-symbol', 'message': message}]}
+            for message in ('Unresolved Python member: absent', 'Unresolved symbol: local-name')]
+    assert comparison.coverage(rows)['expected_valid_diagnostic_cases'] == 1
+
+
 def test_negative_reveal_is_not_counted_as_a_matched_return(comparison):
     cases = [
         {"status": "passed", "kind": "call", "expected_error": False},

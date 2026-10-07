@@ -28,6 +28,17 @@ CALLABLE_TYPES = (types.FunctionType, types.BuiltinFunctionType,
                   types.MethodDescriptorType, types.WrapperDescriptorType,
                   types.ClassMethodDescriptorType)
 UNKNOWN_VALUE = object()
+TYPING_FORMS = frozenset({"Annotated", "Any", "Callable", "ClassVar", "Concatenate", "Final", "Generic",
+                          "Literal", "LiteralString", "Never", "NoReturn", "NotRequired", "Optional",
+                          "Protocol", "ReadOnly", "Required", "Self", "TypeAlias", "TypeGuard", "TypeIs",
+                          "Union", "Unpack"})
+
+
+def typing_form(module, path):
+    if module in ("typing", "typing_extensions") and len(path) == 1 and path[0] in TYPING_FORMS:
+        return {"status": "known", "kind": "variable", "name": path[0], "typing-form?": True,
+                "type-module": module, "type-path": path}
+    return None
 
 TYPEVAR_TYPE = type(typing.TypeVar("_BltT"))
 PARAMSPEC_TYPE = type(typing.ParamSpec("_BltP"))
@@ -135,7 +146,7 @@ def union_type(values):
                 nullable = True
             elif item not in unique and not item.get("type-never?"):
                 unique.append(item)
-    result = (dict(unique[0]) if len(unique) == 1 else {"type-union": unique}
+    result = (dict(unique[0]) if len(unique) == 1 and not unique[0].get("unpack?") else {"type-union": unique}
               if unique else ({"type-module": "builtins", "type-path": ["NoneType"]}
                                if nullable else {"type-never?": True}))
     if len(unique) > 1:
@@ -156,12 +167,17 @@ def bind_type_parameters(parameters, arguments):
     packs = [index for index, param in enumerate(parameters) if param.get("variadic?")]
     if not packs:
         return {param["typevar"]: arg for param, arg in zip(parameters, arguments)}
-    if (len(packs) != 1 or len(arguments) < len(parameters) - 1
-            or any(arg.get("unpack?") or arg.get("type-ellipsis?") for arg in arguments)):
+    if len(packs) != 1 or len(arguments) < len(parameters) - 1:
         return {}
     index = packs[0]
     suffix = len(parameters) - index - 1
     end = len(arguments) - suffix
+    # One symbolic pack can remain inside the captured variadic segment.
+    # It cannot safely bind a fixed prefix or suffix parameter.
+    if (any(arg.get("unpack?") for arg in arguments[:index] + arguments[end:])
+            or sum(bool(arg.get("unpack?")) for arg in arguments[index:end]) > 1
+            or any(arg.get("type-ellipsis?") for arg in arguments)):
+        return {}
     result = {param["typevar"]: arg for param, arg in zip(parameters[:index], arguments[:index])}
     result[parameters[index]["typevar"]] = {"type-pack?": True, "type-arguments": arguments[index:end]}
     result.update({param["typevar"]: arg for param, arg in zip(parameters[index + 1:], arguments[end:])})
@@ -203,6 +219,17 @@ def substitute_types(value, bindings, variables=None):
                 arguments.append(replaced)
         if any(a is not b for a, b in zip(arguments, result["type-arguments"])) or len(arguments) != len(result["type-arguments"]):
             result["type-arguments"] = arguments
+    if "type-union" in value:
+        alternatives = []
+        for original, replaced in zip(value["type-union"], result["type-union"]):
+            if original.get("unpack?") and replaced.get("type-pack?"):
+                alternatives.extend(replaced.get("type-arguments", []))
+            else:
+                alternatives.append(replaced)
+        if alternatives != value["type-union"]:
+            result = {key: item for key, item in result.items()
+                      if key not in {"type-union", "type-module", "type-path", "nullable?"}}
+            result.update(union_type(alternatives))
     if variable in bindings:
         result = {key: item for key, item in result.items() if key not in TYPE_KEYS}
         result.update(bindings[variable])
@@ -574,6 +601,14 @@ def unannotated_signature(info):
     return result
 
 
+def typed_dict_parameters(fields, extra=None):
+    parameters = [{"name": "mapping", "kind": "positional-only", "required?": False}]
+    parameters.extend({"kind": "keyword-only", **field} for field in fields.values())
+    if extra is not None and not extra.get("type-never?"):
+        parameters.append({"name": "kwargs", "kind": "var-keyword", "required?": False, **extra})
+    return parameters
+
+
 def expand_typed_keywords(info, resolve):
     """PEP 692 kwargs are separate keyword-only parameters, not scalar TypedDict values."""
     if "parameters" not in info or not any(
@@ -597,6 +632,9 @@ def expand_typed_keywords(info, resolve):
                     parameters.append({**type_fields(field), "name": name,
                                        "kind": "keyword-only", "required?": bool(field.get("required?")),
                                        **({"annotation": field["annotation"]} if field.get("annotation") else {})})
+            if "typed-dict-extra-items" in schema and not schema["typed-dict-extra-items"].get("type-never?"):
+                parameters.append({"name": parameter["name"], "kind": "var-keyword", "required?": False,
+                                   **substitute_types(schema["typed-dict-extra-items"], bindings)})
         else:
             # An unresolved Unpack isn't the scalar type of every keyword value.
             parameters.append({key: value for key, value in parameter.items() if key not in TYPE_KEYS})
@@ -809,8 +847,28 @@ def runtime_signature(value, drop_first=False, owner=None, ignore_annotations=Fa
         runtime_keyword_schema)
 
 
+def runtime_typing_form(value):
+    if type(value) is types.UnionType:
+        return {"status": "known", "kind": "variable", "typing-form?": True,
+                "type-module": "types", "type-path": ["UnionType"]}
+    if exact_type(value, (str, int, float, bool, bytes, type(None))):
+        return None
+    origin = typing.get_origin(value) if exact_type(value, TYPING_TYPES) else None
+    for module_name in ("typing", "typing_extensions"):
+        module = sys.modules.get(module_name)
+        if type(module) is types.ModuleType:
+            for name in TYPING_FORMS:
+                declared = vars(module).get(name, UNKNOWN_VALUE)
+                if value is declared or origin is declared:
+                    return typing_form(module_name, [name])
+    return None
+
+
 def safe_member(name, value, depth=1, owner=None):
     try:
+        form = runtime_typing_form(value)
+        if form:
+            return {**form, "name": name}
         result = runtime_member(name, value, depth, owner)
         declared = value
         if exact_type(declared, (staticmethod, classmethod)):
@@ -1074,7 +1132,20 @@ def runtime_member(name, value, depth=1, owner=None):
                         fields[key] = {"name": key, "required?": key in required_keys,
                                        **type_fields(members.get(key, {}))}
                 result["typed-dict-fields"] = fields
-                params = [{"kind": "keyword-only", **field} for field in fields.values()]
+                extra = class_dict.get("__extra_items__", UNKNOWN_VALUE)
+                markers = [UNKNOWN_VALUE]
+                for module_name in ("typing", "typing_extensions"):
+                    module = sys.modules.get(module_name)
+                    if type(module) is types.ModuleType:
+                        markers.append(vars(module).get("NoExtraItems", UNKNOWN_VALUE))
+                if not any(extra is marker for marker in markers):
+                    result["typed-dict-extra-items"] = runtime_type(extra, class_attribute(value, "__module__"), value)
+                if type(class_dict.get("__closed__")) is bool:
+                    result["typed-dict-closed?"] = class_dict["__closed__"]
+                params = typed_dict_parameters(fields, result.get("typed-dict-extra-items"))
+                result["mapping-constructor?"] = True
+                if static_class_member(type(value), "__call__") is dict:
+                    result.pop("constructor-return", None)
                 result.update(parameters=params, signature=signature_text(params, result["return-type"]))
             named_fields = class_dict.get("_fields")
             if type(named_fields) is tuple and all(type(field) is str for field in named_fields):
@@ -1157,12 +1228,22 @@ def expr_text(node):
     return ast.unparse(node)
 
 
-def static_signature(node, drop_first=False):
+def static_signature(node, drop_first=False, class_scope=False):
     args = node.args
     positional = list(args.posonlyargs) + list(args.args)
     required = len(positional) - len(args.defaults)
+    legacy = set()
+    if not (args.posonlyargs or args.kwonlyargs):
+        for index, item in enumerate(positional):
+            if item.arg.startswith("__") and not item.arg.endswith("__"):
+                legacy.add(index)
+            elif not class_scope:
+                # Historical free-function spelling applies to a leading
+                # parameter group, never a keyword following an ordinary one.
+                break
     params = [{"name": item.arg,
-               "kind": "positional-only" if index < len(args.posonlyargs) else "positional-or-keyword",
+               "kind": "positional-only" if (index < len(args.posonlyargs)
+                         or index in legacy) else "positional-or-keyword",
                "required?": index < required, "annotation": expr_text(item.annotation)}
               for index, item in enumerate(positional)]
     if drop_first and params:
@@ -1419,7 +1500,11 @@ class StaticModule:
     def factory_class(self, name, value, source):
         if not isinstance(value, ast.Call) or len(value.args) < 2:
             return None
-        factory = self.annotation_name(value.func)
+        parts = (expr_text(value.func) or "").split(".")
+        module, path = self.aliases.get(parts[0], (None, []))
+        if module not in ("typing", "typing_extensions") or parts[0] in self.alias_nodes:
+            return None
+        factory = (path + parts[1:])[-1] if path or len(parts) > 1 else ""
         fields = value.args[1]
         pairs = []
         if factory == "TypedDict" and isinstance(fields, ast.Dict):
@@ -1436,7 +1521,7 @@ class StaticModule:
         body = [ast.copy_location(ast.AnnAssign(target=ast.Name(id=key, ctx=ast.Store()),
                                                annotation=hint, value=None, simple=1), source)
                 for key, hint in pairs]
-        result = ast.ClassDef(name=name, bases=[ast.Name(id=factory, ctx=ast.Load())],
+        result = ast.ClassDef(name=name, bases=[value.func],
                               keywords=value.keywords, body=body, decorator_list=[])
         return ast.fix_missing_locations(ast.copy_location(result, source))
 
@@ -1677,6 +1762,8 @@ class StaticModule:
                     return {"type-never?": True}
             if full and (module, tuple(full)) not in seen:
                 value = self.resolve(module, full)
+                if value and "alias-type" in value:
+                    return value["alias-type"]
                 if value and type_fields(value):
                     return type_fields(value)
                 alias = self.inspector.source_alias(module, full) if self.is_stub or self.aliases_only else None
@@ -1705,6 +1792,9 @@ class StaticModule:
     def resolve(self, module, path):
         if not module or self.aliases_only:
             return None
+        form = typing_form(module, path)
+        if form and not local_file(module, self.inspector.roots):
+            return form
         if module == self.name and tuple(path) in self.classes:
             return self.class_info(tuple(path))
         child = ".".join([module, *path])
@@ -1718,6 +1808,99 @@ class StaticModule:
         if not info and self.inspector.path(child):
             return {"status": "known", "kind": "module", "name": path[-1], "target": child}
         return info or None
+
+    def typing_form_value(self, node, members=None):
+        base = node.value if isinstance(node, ast.Subscript) else node
+        parts = (expr_text(base) or "").split(".")
+        module, path = self.aliases.get(parts[0], (None, []))
+        if (module is None or parts[0] in self.alias_nodes or (parts[0],) in self.classes
+                or parts[0] in self.function_declarations or local_file(module, self.inspector.roots)):
+            return None
+        if (isinstance(node, ast.Subscript) and path + parts[1:] in (["Union"], ["Optional"])
+                and module in ("typing", "typing_extensions")):
+            arguments = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+            references = [self.class_value_reference(arg, members or {}) for arg in arguments]
+            if not all(references):
+                if len(arguments) == 1 and path + parts[1:] == ["Union"] and isinstance(arguments[0], ast.Name):
+                    value = (members or {}).get(arguments[0].id, {})
+                    if value.get("type-module") == "builtins" and value.get("type-path") == ["type"]:
+                        return {"status": "known", "kind": "variable", **type_fields(value)}
+                if not any(self.nonclass_union_operand(arg, members or {}) for arg in arguments):
+                    # An unknown type-valued operand can equal another arm, or
+                    # NoneType for Optional; the runtime union may be a class.
+                    return {"status": "unknown", "kind": "variable", "type-any?": True}
+                return typing_form(module, path + parts[1:])
+            collapsed = union_type(references + ([runtime_type(None)] if path + parts[1:] == ["Optional"] else []))
+            if (collapsed.get("type-module") and collapsed.get("type-path")
+                    and not any(collapsed.get(key) for key in
+                                ("type-union", "type-arguments", "nullable?", "typevar", "type-any?"))):
+                declared = self.resolve(collapsed["type-module"], collapsed["type-path"])
+                if declared and declared.get("kind") == "class":
+                    return dict(declared)
+                if collapsed["type-module"] == "builtins" and len(collapsed["type-path"]) == 1:
+                    name = collapsed["type-path"][0]
+                    if name == "NoneType" or type(vars(sys.modules["builtins"]).get(name)) is type:
+                        # Union removes identical alternatives, and Optional[None]
+                        # collapses to NoneType. These values are actual classes.
+                        return {"status": "known", "kind": "class", "name": name,
+                                "members-complete?": False, "nominal?": True, **collapsed}
+        return typing_form(module, path + parts[1:])
+
+    def nonclass_union_operand(self, node, members, seen=()):
+        """Only prove nonclass operands whose runtime wrapper is unambiguous."""
+        if len(seen) > 16:
+            return False
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)  # Union retains a ForwardRef.
+        if isinstance(node, ast.Name) and node.id in members:
+            value = members[node.id]
+            return bool(value.get("typing-form?") or value.get("type-module") == "builtins"
+                        and value.get("type-path") == ["str"] and value.get("kind") != "class")
+        if isinstance(node, ast.Name) and node.id in self.alias_nodes and node.id not in seen:
+            return self.nonclass_union_operand(self.alias_nodes[node.id], members, seen + (node.id,))
+        if self.reference(node).get("typevar"):
+            return True
+        if isinstance(node, ast.Subscript):
+            parts = expr_text(node.value).split(".")
+            if parts[0] in self.alias_nodes or (parts[0],) in self.classes or parts[0] in self.function_declarations:
+                return False
+            module, path = self.aliases.get(parts[0], (None, []))
+            if module in ("typing", "typing_extensions") and not local_file(module, self.inspector.roots):
+                full = path + parts[1:]
+                return bool(typing_form(module, full)) and full not in (["Union"], ["Optional"])
+            return (isinstance(node.value, ast.Name) and node.value.id not in self.alias_nodes
+                    and node.value.id not in self.aliases and (node.value.id,) not in self.classes
+                    and node.value.id not in self.function_declarations
+                    and node.value.id in {"list", "dict", "set", "frozenset", "tuple", "type"})
+        return False
+
+    def class_value_reference(self, node, members):
+        """Use the current value table, not a later rebinding of an annotation alias."""
+        if isinstance(node, ast.Constant) and node.value is None:
+            return runtime_type(None)
+        if isinstance(node, ast.Name):
+            if node.id in members:
+                value = members[node.id]
+                if value.get("kind") == "class" and value.get("nominal?"):
+                    return {key: value[key] for key in ("type-module", "type-path") if key in value}
+                return {}
+            if (node.id not in self.alias_nodes and node.id not in self.aliases
+                    and (node.id,) not in self.classes and node.id not in self.function_declarations
+                    and type(vars(sys.modules["builtins"]).get(node.id)) is type):
+                return runtime_type(vars(sys.modules["builtins"])[node.id])
+        if isinstance(node, ast.Attribute):
+            parts = expr_text(node).split(".")
+            module, path = self.aliases.get(parts[0], (None, []))
+            current = members.get(parts[0], {})
+            if module and current.get("kind") == "module" and current.get("target") == module:
+                value = self.resolve(module, path + parts[1:])
+                if value and value.get("kind") == "class" and value.get("nominal?"):
+                    return {key: value[key] for key in ("type-module", "type-path") if key in value}
+        if isinstance(node, ast.Subscript):
+            value = self.typing_form_value(node, members)
+            if value and value.get("kind") == "class":
+                return type_fields(value)
+        return {}
 
     def decorators(self, node):
         return {expr_text(d.func if isinstance(d, ast.Call) else d).split(".")[-1]
@@ -1750,7 +1933,7 @@ class StaticModule:
         deprecated = self.deprecated(node)
         if deprecated is not None:
             info["deprecated"] = deprecated
-        info.update(static_signature(node, drop_first=cls_method))
+        info.update(static_signature(node, drop_first=cls_method, class_scope=bool(owner)))
         if getattr(node, "type_comment", None):
             try:
                 comment = ast.parse(node.type_comment, mode="func_type")
@@ -1761,7 +1944,7 @@ class StaticModule:
                             param.annotation = hint
                 if node.returns is None:
                     node.returns = comment.returns
-                info.update(static_signature(node, drop_first=cls_method))
+                info.update(static_signature(node, drop_first=cls_method, class_scope=bool(owner)))
             except (SyntaxError, ValueError):
                 pass
         previous_bounds = self.bounds
@@ -1947,8 +2130,10 @@ class StaticModule:
             variable_names = []
             for parameter in getattr(node, "type_params", []):
                 variable_names.append(parameter.name)
-            for base in node.bases:
-                for name in find_typevars(self.reference(base, owner[:-1])):
+            explicit_generics = [ref for ref in bases if ref.get("type-module") in ("typing", "typing_extensions", "_typing")
+                                 and ref.get("type-path") in (["Generic"], ["Protocol"])]
+            for base in explicit_generics or bases:
+                for name in find_typevars(base):
                     if name not in variable_names:
                         variable_names.append(name)
             info["type-parameters"] = [self.typevars.get(name, {"typevar": name}) for name in variable_names]
@@ -1956,8 +2141,20 @@ class StaticModule:
                 info["type-arguments"] = [{**param, **({"unpack?": True} if param.get("variadic?") else {})}
                                           for param in info["type-parameters"]]
             base_names = {expr_text(base).split("[")[0].split(".")[-1] for base in node.bases}
-            enum = any(ref.get("type-module") == "enum"
-                       and ref.get("type-path", [""])[0] in ("Enum", "IntEnum", "StrEnum", "Flag", "IntFlag") for ref in bases)
+            base_infos = [self.resolve(ref.get("type-module"), ref.get("type-path", [])) or {} for ref in bases]
+            standard_enum = not local_file("enum", self.inspector.roots)
+            enum_meta = (standard_enum and any(ref.get("type-module") == "enum"
+                            and ref.get("type-path") in (["EnumMeta"], ["EnumType"]) for ref in bases)
+                         or any(base.get("enum-metaclass?") for base in base_infos))
+            if enum_meta:
+                info["enum-metaclass?"] = True
+            meta_info = self.resolve(metaclass.get("type-module"), metaclass.get("type-path", [])) if metaclass else None
+            enum = (standard_enum and any(ref.get("type-module") == "enum"
+                        and ref.get("type-path", [""])[0] in ("Enum", "IntEnum", "StrEnum", "Flag", "IntFlag") for ref in bases)
+                    or any(base.get("enum?") for base in base_infos)
+                    or bool((meta_info or {}).get("enum-metaclass?"))
+                    or bool(standard_enum and metaclass and metaclass.get("type-module") == "enum"
+                            and metaclass.get("type-path") in (["EnumMeta"], ["EnumType"])))
             if enum:
                 info["enum?"] = True
                 for name, member in children.items():
@@ -1976,7 +2173,6 @@ class StaticModule:
             constructor = own.get("__init__") or own.get("__new__")
             constructor_return = None
             result_from_constructor = False
-            meta_info = self.resolve(metaclass.get("type-module"), metaclass.get("type-path", [])) if metaclass else None
             meta_call = (meta_info or {}).get("members", {}).get("__call__", {})
             new_method = children.get("__new__", {})
             meta_return = self.constructor_override(meta_call, owner)
@@ -2003,6 +2199,55 @@ class StaticModule:
                     constructor_return = declared_new
                     if self.constructor_init_overridden(declared_new, owner):
                         constructor = {"signature-unknown?": True}
+            if enum and not meta_call and (not metaclass or (meta_info or {}).get("enum-metaclass?")
+                    or metaclass.get("type-module") == "enum" and metaclass.get("type-path") in (["EnumMeta"], ["EnumType"])):
+                # EnumMeta.__call__ looks up members or builds a new enum class;
+                # an enum member's __init__/__new__ is not this call contract.
+                constructor = {"parameters": [
+                    {"name": "cls", "kind": "positional-only", "required?": True},
+                    {"name": "value", "kind": "positional-or-keyword", "required?": True},
+                    {"name": "names", "kind": "positional-or-keyword", "required?": False},
+                    *({"name": name, "kind": "keyword-only", "required?": False}
+                      for name in ("module", "qualname", "type", "start", "boundary"))]}
+                # The interpreter's EnumMeta signature gained variadic lookup
+                # values in newer Python releases. Read only its raw function.
+                enum_module = sys.modules.get("enum")
+                enum_meta = vars(enum_module).get("EnumMeta") if type(enum_module) is types.ModuleType else None
+                enum_call = static_class_member(enum_meta, "__call__") if is_class(enum_meta) else None
+                if type(enum_call) is types.FunctionType:
+                    signature = runtime_signature(enum_call)
+                    if signature.get("parameters"):
+                        constructor["parameters"] = signature["parameters"]
+                # A literal member proves this is value lookup, not the empty
+                # enum functional API. Dynamic or ignored members stay unknown.
+                assignments = [field for field in node.body if isinstance(field, (ast.Assign, ast.AnnAssign))]
+                ignored = any(isinstance(target, ast.Name) and target.id == "_ignore_"
+                              for field in assignments for target in
+                              (field.targets if isinstance(field, ast.Assign) else [field.target]))
+                populated = False
+                if not ignored:
+                    for field in assignments:
+                        targets = field.targets if isinstance(field, ast.Assign) else [field.target]
+                        if any(isinstance(target, ast.Name) and not target.id.startswith("_") for target in targets):
+                            try:
+                                ast.literal_eval(field.value)
+                                populated = True
+                            except (ValueError, TypeError):
+                                pass
+                lookup = [dict(parameter) for parameter in constructor["parameters"]]
+                if not populated:
+                    lookup[2].update(runtime_type(None))
+                functional = [dict(parameter) for parameter in constructor["parameters"]]
+                functional[2]["required?"] = True
+                constructor["overloads"] = [
+                    {"parameters": lookup},
+                    {"parameters": functional, "constructor-return": {
+                        "type-module": "builtins", "type-path": ["type"], "type-arguments": [{"type-any?": True}]}
+                            if not assignments else {"type-any?": True}}]
+                if populated:
+                    constructor["overloads"] = [{"parameters": lookup}]
+                constructor_return = None
+                result_from_constructor = False
             dataclass = "dataclass" in self.decorators(node) or bool(transform)
             if dataclass:
                 inherited_fields = {}
@@ -2055,10 +2300,12 @@ class StaticModule:
                     - self.no_type_check_decorators(node)) and not transform:
                 for key in ("parameters", "signature", "overloads", "constructor-return"):
                     info.pop(key, None)
-            if "TypedDict" in base_names or any(child.get("typed-dict?") for child in
+            if any(ref.get("type-module") in ("typing", "typing_extensions") and ref.get("type-path") == ["TypedDict"]
+                   for ref in bases) or any(child.get("typed-dict?") for child in
                     [self.resolve(b.get("type-module"), b.get("type-path", [])) or {} for b in bases]):
                 self.typed_dict_info(info, node, bases)
-            elif "NamedTuple" in base_names:
+            elif any(ref.get("type-module") in ("typing", "typing_extensions") and ref.get("type-path") == ["NamedTuple"]
+                     for ref in bases):
                 params = [{"name": field.target.id, "kind": "positional-or-keyword",
                            "required?": field.value is None, "annotation": expr_text(field.annotation),
                            **self.reference(field.annotation, owner)}
@@ -2125,6 +2372,14 @@ class StaticModule:
         for ref in bases:
             base = self.resolve(ref.get("type-module"), ref.get("type-path", [])) or {}
             fields.update(base.get("typed-dict-fields", {}))
+            for key in ("typed-dict-extra-items", "typed-dict-closed?"):
+                if key in base:
+                    info[key] = base[key]
+        for keyword in node.keywords:
+            if keyword.arg == "extra_items":
+                info["typed-dict-extra-items"] = self.reference(keyword.value, (node.name,))
+            elif keyword.arg == "closed" and isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is bool:
+                info["typed-dict-closed?"] = keyword.value.value
         total = not any(kw.arg == "total" and isinstance(kw.value, ast.Constant) and kw.value.value is False
                         for kw in node.keywords)
         for field in self.active_statements(node.body):
@@ -2135,9 +2390,10 @@ class StaticModule:
             required = True if wrapper == "Required" else False if wrapper == "NotRequired" else total
             fields[field.target.id] = {"name": field.target.id, "required?": required,
                                       "annotation": expr_text(hint), **self.reference(hint, (node.name,))}
-        params = [{"kind": "keyword-only", **field} for field in fields.values()]
+        params = typed_dict_parameters(fields, info.get("typed-dict-extra-items"))
         info.update(parameters=params, signature=signature_text(params, info["return-type"]))
         info["typed-dict?"] = True
+        info["mapping-constructor?"] = True
         info["typed-dict-fields"] = fields
 
     def field_defaults(self, call):
@@ -2342,6 +2598,22 @@ class StaticModule:
                   if include_disabled or parameter.get("dataclass-init?", True)]
         return sorted(values, key=lambda item: item["kind"] == "keyword-only")
 
+    def promote_constrained_arguments(self, reference, declaration):
+        """Widen a proven local subclass to its one matching TypeVar constraint."""
+        parameters = declaration.get("type-parameters", [])
+        arguments = reference.get("type-arguments", [])
+        if len(parameters) != len(arguments) or any(parameter.get("variadic?") for parameter in parameters):
+            return reference
+        promoted = []
+        for parameter, argument in zip(parameters, arguments):
+            actual = self.resolve(argument.get("type-module"), argument.get("type-path", [])) or {}
+            matches = [constraint for constraint in parameter.get("type-constraints", [])
+                       if actual.get("nominal?") and constraint.get("type-module") == self.name
+                       and not constraint.get("type-arguments")
+                       and self.constructor_instance(argument, tuple(constraint.get("type-path", [])))]
+            promoted.append(matches[0] if len(matches) == 1 else argument)
+        return {**reference, "type-arguments": promoted} if promoted != arguments else reference
+
     def members(self, body, owner=()):
         members = {}
         overloads = {}
@@ -2420,7 +2692,7 @@ class StaticModule:
                                     if not constructor.get("overloads") and not find_typevars(constructor):
                                         ref = constructor["constructor-return"]
                                 else:
-                                    ref = candidate
+                                    ref = self.promote_constrained_arguments(candidate, constructor)
                                     returns = expr_text(node.value.func)
                     if isinstance(node.value, ast.Subscript) and not ref:
                         ref = self.reference(node.value, owner)
@@ -2430,9 +2702,16 @@ class StaticModule:
                         value = self.resolve(alias_ref.get("type-module"), alias_ref.get("type-path", [])) if alias_ref else None
                         if value:
                             members[target.id] = {**value, "name": target.id}
+                            if value.get("typing-form?"):
+                                members[target.id].update({"type-alias?": True, "alias-type": alias_ref})
                             continue
+                    form = self.typing_form_value(node.value, members) if node.value is not None else None
+                    if form and form.get("type-any?"):
+                        ref = {}
                     members[target.id] = {**self.location(node, target.id), "kind": "variable",
-                                          "return-type": returns, **ref}
+                                          "return-type": returns, **ref, **(form or {}), "name": target.id}
+                    if form:
+                        members[target.id].update({"type-alias?": True, "alias-type": self.reference(node.value, owner)})
                     if alias or (isinstance(node.value, ast.Subscript) and find_typevars(ref)):
                         members[target.id]["type-alias?"] = True
                         members[target.id]["alias-parameters"] = find_typevars(ref)
@@ -2495,7 +2774,8 @@ class StaticModule:
                     break
         return {"status": "known", "name": self.name, "kind": "module",
                 "filename": str(self.path), "doc": (ast.get_docstring(self.tree) or "")[:2000],
-                "members": members, "members-complete?": complete and not partial, "partial-stub?": partial,
+                "members": members, "members-complete?": complete and not partial and "__getattr__" not in members,
+                "partial-stub?": partial,
                 "exports": sorted(self.exports) if self.exports is not None else None,
                 "package-paths": [str(self.path.parent)] if self.path.name.startswith("__init__.") else [],
                 "inspection": "static"}
@@ -2682,6 +2962,11 @@ def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
                 result = {**result, "members": {**runtime.get("members", {}), **result.get("members", {})}}
         return result
     if not enabled:
+        if name in ("typing", "typing_extensions"):
+            members = {key: typing_form(name, [key]) for key in TYPING_FORMS
+                       if name == "typing_extensions" or key in vars(typing)}
+            return {"status": "known", "name": name, "kind": "module", "members": members,
+                    "members-complete?": False, "inspection": "static"}
         return {"status": "unknown", "name": name, "reason": "inspection-disabled"}
     try:
         # PathFinder bypasses editable-install meta finders that could import the
@@ -2815,7 +3100,7 @@ def metadata_decoder(keyword, persistent_map, vector):
                     value = [persistent_map(item) if type(item) is dict and not item else item
                              for item in value]
                 value = vector(value)
-            elif key in ("type-bound", "type-default") and type(value) is dict and not value:
+            elif key in ("type-bound", "type-default", "typed-dict-extra-items", "alias-type") and type(value) is dict and not value:
                 value = persistent_map(value)
             elif key in enum_keys and value is not None:
                 value = intern(value)

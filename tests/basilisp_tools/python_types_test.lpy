@@ -254,7 +254,7 @@
                 "class Record(typing.TypedDict):\n"
                 "    name: str\n"
                 "info = worker.runtime_member('Record', Record)\n"
-                "assert info['typed-dict?'] and info['parameters'][0]['required?'], info\n"
+                "assert info['typed-dict?'] and any(p['name']=='name' and p['required?'] for p in info['parameters']), info\n"
                 "print('safe')\n")
         worker (.with_name (pathlib/Path (.-__file__ (get sys/modules "basilisp_tools.python"))) "_inspect.py")
         result (subprocess/run (lisp->py [sys/executable "-I" "-c" script (str worker)])

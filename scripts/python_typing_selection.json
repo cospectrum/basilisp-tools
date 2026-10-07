@@ -1,0 +1,132 @@
+[
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-classes.test",
+    "name": "testMethodCallWithSubtype",
+    "source_sha256": "a6f3733cacfe4a88d85bd95f292588ad3a60e80f657ed8494d4f740ad3a1ae1e",
+    "expected": {
+      "passed": 4,
+      "excluded": 0,
+      "positive_calls": 3,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-kwargs.test",
+    "name": "testTwoKeywordArgumentsNotInOrder",
+    "source_sha256": "1dbb1352e70b979c43718b54f154045547bf98937ecfe5da409f1b77825de14f",
+    "expected": {
+      "passed": 4,
+      "excluded": 0,
+      "positive_calls": 2,
+      "negative_calls": 2,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/calls.rs",
+    "name": "test_deprecated_method_call",
+    "source_sha256": "7e6761d4918c357bebe0824f5f064553ae7df879f1ef2ea332ec061c1496ccc1",
+    "expected": {
+      "passed": 2,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/type_var_tuple.rs",
+    "name": "test_type_var_tuple_callable_optional_parameter",
+    "source_sha256": "7a8acf9abf39e7500a97e3323a175fd28564725fcec2a81806d3f0b1a0550775",
+    "expected": {
+      "passed": 4,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 2,
+      "return_assertions": 2
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/generics/legacy/functions.md",
+    "name": "Generic functions: Legacy syntax / Invalid bounds in generic union members",
+    "source_sha256": "a47d46167ba247bd9b64f48a714b7c967e4a94836300c7a8025ca062ede4ed78",
+    "expected": {
+      "passed": 5,
+      "excluded": 1,
+      "positive_calls": 3,
+      "negative_calls": 2,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/named_tuple.md",
+    "name": "`NamedTuple` / `typing.NamedTuple` / Functional syntax with Final variable field names",
+    "source_sha256": "8d3b9c8010544ca6f5d7fa8e0c7d157a9a02f042d9471599ad74f06ba0edd3ea",
+    "expected": {
+      "passed": 3,
+      "excluded": 1,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 2
+    }
+  },
+  {
+    "provider": "pyright",
+    "path": "packages/pyright-internal/src/tests/samples/constrainedTypeVar8.py",
+    "name": "constrainedTypeVar8.py",
+    "source_sha256": "cc2b234c2570b728dbc011eeaccffafc0caedaef1dc80e1789e58437284e63e7",
+    "expected": {
+      "passed": 7,
+      "excluded": 1,
+      "positive_calls": 3,
+      "negative_calls": 1,
+      "return_assertions": 3
+    }
+  },
+  {
+    "provider": "pyright",
+    "path": "packages/pyright-internal/src/tests/samples/typedDict26.py",
+    "name": "typedDict26.py",
+    "source_sha256": "5938fb3f1f46e400c6e92bbad227ff7a8462e0aa22480ad357dfb7869b427037",
+    "expected": {
+      "passed": 2,
+      "excluded": 0,
+      "positive_calls": 1,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "pyright",
+    "path": "packages/pyright-internal/src/tests/samples/typeVarTuple25.py",
+    "name": "typeVarTuple25.py",
+    "source_sha256": "16f9530db13c8f75ebd2cc796b9ecddee6b0f5ffd0680b77703d19672e4939e7",
+    "expected": {
+      "passed": 1,
+      "excluded": 1,
+      "positive_calls": 0,
+      "negative_calls": 0,
+      "return_assertions": 1
+    }
+  },
+  {
+    "provider": "pyright",
+    "path": "packages/pyright-internal/src/tests/samples/typeVarTuple29.py",
+    "name": "typeVarTuple29.py",
+    "source_sha256": "41850cc4e3de9b5a29c63250b2143154b7174d9c81c50ea90df3dd36e3aea309",
+    "expected": {
+      "passed": 2,
+      "excluded": 5,
+      "positive_calls": 2,
+      "negative_calls": 0,
+      "return_assertions": 0
+    }
+  }
+]

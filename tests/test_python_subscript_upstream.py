@@ -32,6 +32,9 @@ class ViaMeta(metaclass=Meta):
 def pair() -> tuple[int, str]: return (1, "a")
 def named() -> Pair: return Pair(1, "a")
 def box() -> Box[int]: return Box(1)
+def box_class() -> type[Box[int]]: return Box
+def meta_class() -> type[ViaMeta]: return ViaMeta
+meta_value: type[ViaMeta] = ViaMeta
 ''')
     analyzer = importlib.import_module("basilisp_tools.analyzer")
     bridge = importlib.import_module("basilisp_tools.python")
@@ -66,6 +69,9 @@ def analyze(environment, expression):
     ('(aget (s/box) "key")', {"module": "builtins", "path": ["int"]}),
     ('(aget #py [#py [1]] 0 0)', {"module": "builtins", "path": ["int"]}),
     ('(.-value (aget s/Box python/int))', {"module": "builtins", "path": ["int"]}),
+    ('(.-value (s/box-class))', {"module": "builtins", "path": ["int"]}),
+    ('(aget (s/meta-class) "key")', {"module": "builtins", "path": ["int"]}),
+    ('(aget s/meta-value "key")', {"module": "builtins", "path": ["int"]}),
     ('(let [klass (aget s/Box python/int)] (.-value klass))', {"module": "builtins", "path": ["int"]}),
     ('(do (def klass (aget s/Box python/int)) (.-value klass))', {"module": "builtins", "path": ["int"]}),
     ('(do (def data #b "abc") (aget data 0))', {"module": "builtins", "path": ["int"], "literal-values": [97]}),
@@ -83,6 +89,7 @@ def test_subscription_result(environment, expression, expected):
 @pytest.mark.parametrize("expression", [
     '(aget "abc" 1.5)', '(aget #py [1] "key")', '(aget (s/box) 1)',
     '(aget s/Custom "bad")', '(aget s/ViaMeta 1)',
+    '(aget (s/meta-class) 1)', '(aget s/meta-value 1)',
     '(aget "abc" 3)', '(aget "abc" -4)', '(aget (s/pair) 2)', '(aget #py () 0)', '(aget #b "abc" 3)',
 ])
 def test_subscription_argument_errors(environment, expression):

@@ -176,7 +176,11 @@
         (is (= (:arguments mixed) (:arguments (shape {:module "callbacks" :path ["MixedConcrete"]}))))
         (is (= [int-type str-type] (:arguments (py/call-result (py/inspect-path "callbacks" ["alias"] opts) [] {} opts))))
         (is (= "Ts" (:typevar (first (:arguments (shape (assoc array :arguments [{:typevar "Unknown" :variadic? true :unpack? true}])))))))
-        (is (= "Ts" (:typevar (first (:arguments (shape (dissoc array :arguments)))))))))))
+        ;; An unspecialized instance has an unknown pack, not a new generic
+        ;; variable that each method call can independently bind.
+        (is (= {:module "builtins" :path ["tuple"] :unpack? true
+                :arguments [{:any? true} {:ellipsis? true}]}
+               (first (:arguments (shape (dissoc array :arguments))))))))))
 
 (deftest unpacked-positional-parameters-capture-heterogeneous-arguments
   (with-source

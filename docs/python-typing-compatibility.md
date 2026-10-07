@@ -182,12 +182,52 @@ assertion rows come from two fixtures raising `TypeError` on unhashable metadata
 one fixture failure can affect several assertions. Neither engine's counts omit
 namespace-row inspection failures.
 
-CI checks four typing fixtures with 36 resolved assertions: 26 valid calls and
-10 rejected calls. It requires the exact fixture counts 17, 8, 5, and 6 for
+## Follow-up interop improvements
+
+[The follow-up evidence](data/python-typing-followup.json) records a separate,
+same-adapter comparison against `6c96acf`, covering 21,802 fixtures and 91,002
+discovered units. Its frozen candidate has 4,851 matches versus 4,410 before,
+1,053 differences versus 1,159, 7,518 unknowns, and 77,580 explicit exclusions.
+These counts precede the final narrow safety repairs and diagnostic-classifier
+correction; their separate source hashes and bounded replays are retained in the
+artifact. They must not be compared numerically with the earlier adapter's table.
+
+The changes cover callback protocols, class-valued results, generic defaults and
+constraints, TypedDict mapping constructors, and Basilisp `apply-kw`. The adapter
+also retains literal and comprehension contexts and translates attribute
+writes. Newly introduced diagnostic differences were reviewed individually;
+confirmed invalid assumptions were repaired, while native/oracle disagreements
+remain visible. For example, Python collapses `Optional[None]` to the `NoneType`
+class, and double-underscore class parameters have mangled runtime keyword names.
+Unknown or dynamic values do not establish that a union is a non-class value.
+
+The classifier now recognizes the analyzer's exact missing-Python-member message.
+It keeps unrelated unresolved lexical names as replay errors. Explicit upstream
+attribute-error suppressions affect only member findings. The artifact includes
+the twelve affected historical rows as a labeled derived classification, without
+rewriting the original full reports or counting adapter errors as matches.
+
+CI checks 70 resolved assertions. Four typing fixtures contribute 36 assertions:
+26 valid calls and 10 rejected calls. It requires the exact fixture counts
+17, 8, 5, and 6 for
 `dataclasses_kwonly.py`, `dataclasses_transform_class.py`,
 `dataclasses_transform_field.py`, and `generics_basic.py`, respectively, with
-zero unknowns, differences, or replay errors. The full audit remains failing
-and supplies a work inventory beyond that regression gate.
+zero unknowns, differences, or replay errors.
+
+Ten additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 34 resolved
+assertions, including 11 rejected calls. Their identities, source digests,
+positive/negative counts, return assertions, and nine explicit exclusions are
+pinned in [`python_typing_selection.json`](../scripts/python_typing_selection.json).
+CI generates independent expectations for the four selected Pyright files using
+the pinned Pyright release. Missing, duplicate, or changed fixtures and newly
+unknown assertions fail the gate; exclusions never count as matches. Repeat it
+with `--selection scripts/python_typing_selection.json --require-resolved`,
+supplying the corpus and Pyright oracle as above.
+
+The full audit remains failing and supplies a work inventory beyond these
+regression gates. The historical full-corpus counts above precede the current
+adapter's additional assignment, comprehension, and literal-binding coverage;
+comparisons across different adapter versions are not valid improvement counts.
 
 To repeat the comparison, prepare the pinned corpus and Pyright oracle as above,
 then run the current adapter on both source trees:

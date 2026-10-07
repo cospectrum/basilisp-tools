@@ -1,0 +1,1282 @@
+{
+  "schema": 1,
+  "scope": "Second incremental milestone: exact same-adapter full comparison, followed by explicitly separate final-source bounded repairs and classifier review. This is not a claim that all upstream mismatches are fixed.",
+  "historical_full_comparison": {
+    "sources": [
+      {
+        "provider": "typing",
+        "repo": "python/typing",
+        "revision": "dc0a8a924c99c6d6ab70f5dc4708e8e4017386ae",
+        "directory": "python-typing",
+        "paths": [
+          "conformance/",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "pyright",
+        "repo": "microsoft/pyright",
+        "revision": "eb175addd4ebf25a6c0c5301b3f2cfae7d0c6618",
+        "directory": "microsoft-pyright",
+        "oracle_version": "1.1.414",
+        "paths": [
+          "packages/pyright-internal/src/tests/",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "mypy",
+        "repo": "python/mypy",
+        "revision": "e576c204a29a5a5567d5374aae93f61762c691b2",
+        "directory": "python-mypy",
+        "oracle_version": "2.4.0",
+        "paths": [
+          "test-data/unit/",
+          "mypy/test/data.py",
+          "mypy/test/config.py",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "pyrefly",
+        "repo": "facebook/pyrefly",
+        "revision": "2f1c6328b3949f76162f76b92d81dafa9097eec4",
+        "directory": "facebook-pyrefly",
+        "oracle_version": "1.3.2",
+        "paths": [
+          "pyrefly/lib/test/",
+          "test/",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "ty",
+        "repo": "astral-sh/ruff",
+        "revision": "0692804812c61094835ee52a3e933fc119d3e3fa",
+        "directory": "astral-sh-ruff",
+        "oracle_version": "0.0.84",
+        "paths": [
+          "crates/ty_python_semantic/resources/",
+          "crates/ty_python_semantic/tests/",
+          "crates/ty_test/",
+          "LICENSE"
+        ]
+      }
+    ],
+    "oracle": {
+      "version": "1.1.414",
+      "summary": {
+        "filesAnalyzed": 1381,
+        "errorCount": 3598,
+        "warningCount": 52,
+        "informationCount": 3558,
+        "timeInSec": 7.852
+      },
+      "sha256": "2f5ed5c5cadfd84add7794c3b1e5d2f03a77d81f3e78370382d7b9156b44fc53",
+      "profile": "Pyright CLI defaults plus fixture directives; original TypeScript test-runner settings are not reproduced"
+    },
+    "before": {
+      "excluded": 77580,
+      "unknown": 7853,
+      "passed": 4410,
+      "failed": 1159
+    },
+    "after": {
+      "excluded": 77580,
+      "passed": 4851,
+      "unknown": 7518,
+      "failed": 1053
+    },
+    "transitions": {
+      "unknown -> passed": 323,
+      "failed -> passed": 128,
+      "passed -> unknown": 5,
+      "failed -> unknown": 5,
+      "unknown -> failed": 22,
+      "passed -> failed": 5
+    },
+    "source_hashes_before": {
+      "scripts/check_python_typing.py": "a31e754451e52eac1823e6acfadb9d100a8d48615e4d2293a30b3f2606981029",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "ffe6f974206eafe701c2d5fdaff1ecb8b5318abd70cdb1ebc6afcac040e8fc8e",
+      "src/basilisp_tools/analyzer.lpy": "adc03a2faea162b372504ad58236af6f1cff1b9703acdecee0ff19ceea7064b9",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "1a5a77922af25988c27b4065b186959b53235ec65e067120987dedf895edaac2",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "source_hashes_after": {
+      "scripts/check_python_typing.py": "a31e754451e52eac1823e6acfadb9d100a8d48615e4d2293a30b3f2606981029",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "f23dd9e227b99de7e276fd97b73cb3af1c17ce7593ccb305eca530ac58f9e4ed",
+      "src/basilisp_tools/analyzer.lpy": "9f0646236013dbad564045f94b610bf4d24be38dc53a182bc9edf59586c1ff24",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "raw_reports": {
+      "baseline": {
+        "name": "baseline-second.json",
+        "sha256": "83a21a2a4a917ebada92f636d8e61f4d839fbb989dbfdac2b62756bfd5105a69"
+      },
+      "candidate": {
+        "name": "candidate-second-repaired.json",
+        "sha256": "7d8bc322c3f24e83fc049b7688414ffbe3c7da786144dfdc9f7da6b7d112d6ee"
+      }
+    }
+  },
+  "provider_totals": {
+    "mypy": {
+      "fixtures": 8327,
+      "empty_fixtures": 843,
+      "units": 27162,
+      "before": {
+        "excluded": 25596,
+        "passed": 723,
+        "failed": 212,
+        "unknown": 631
+      },
+      "after": {
+        "excluded": 25596,
+        "passed": 762,
+        "failed": 194,
+        "unknown": 610
+      },
+      "coverage_before": {
+        "matched_positive_calls": 337,
+        "matched_negative_calls": 167,
+        "matched_return_assertions": 219,
+        "expected_valid_diagnostic_cases": 5
+      },
+      "coverage_after": {
+        "matched_positive_calls": 349,
+        "matched_negative_calls": 169,
+        "matched_return_assertions": 244,
+        "expected_valid_diagnostic_cases": 5
+      }
+    },
+    "pyrefly": {
+      "fixtures": 5136,
+      "empty_fixtures": 601,
+      "units": 13775,
+      "before": {
+        "unknown": 1516,
+        "failed": 162,
+        "passed": 982,
+        "excluded": 11115
+      },
+      "after": {
+        "unknown": 1475,
+        "failed": 161,
+        "passed": 1024,
+        "excluded": 11115
+      },
+      "coverage_before": {
+        "matched_positive_calls": 503,
+        "matched_negative_calls": 168,
+        "matched_return_assertions": 311,
+        "expected_valid_diagnostic_cases": 15
+      },
+      "coverage_after": {
+        "matched_positive_calls": 537,
+        "matched_negative_calls": 174,
+        "matched_return_assertions": 313,
+        "expected_valid_diagnostic_cases": 9
+      }
+    },
+    "pyright": {
+      "fixtures": 1375,
+      "empty_fixtures": 247,
+      "units": 9651,
+      "before": {
+        "unknown": 1905,
+        "excluded": 6504,
+        "passed": 985,
+        "failed": 257
+      },
+      "after": {
+        "unknown": 1750,
+        "excluded": 6504,
+        "passed": 1226,
+        "failed": 171
+      },
+      "coverage_before": {
+        "matched_positive_calls": 666,
+        "matched_negative_calls": 156,
+        "matched_return_assertions": 163,
+        "expected_valid_diagnostic_cases": 14
+      },
+      "coverage_after": {
+        "matched_positive_calls": 827,
+        "matched_negative_calls": 225,
+        "matched_return_assertions": 174,
+        "expected_valid_diagnostic_cases": 3
+      }
+    },
+    "ty": {
+      "fixtures": 6812,
+      "empty_fixtures": 225,
+      "units": 37712,
+      "before": {
+        "unknown": 3438,
+        "passed": 1329,
+        "failed": 490,
+        "excluded": 32455
+      },
+      "after": {
+        "unknown": 3340,
+        "passed": 1420,
+        "failed": 497,
+        "excluded": 32455
+      },
+      "coverage_before": {
+        "matched_positive_calls": 444,
+        "matched_negative_calls": 216,
+        "matched_return_assertions": 669,
+        "expected_valid_diagnostic_cases": 25
+      },
+      "coverage_after": {
+        "matched_positive_calls": 515,
+        "matched_negative_calls": 222,
+        "matched_return_assertions": 683,
+        "expected_valid_diagnostic_cases": 17
+      }
+    },
+    "typing": {
+      "fixtures": 152,
+      "empty_fixtures": 9,
+      "units": 2702,
+      "before": {
+        "excluded": 1910,
+        "unknown": 363,
+        "passed": 391,
+        "failed": 38
+      },
+      "after": {
+        "excluded": 1910,
+        "passed": 419,
+        "unknown": 343,
+        "failed": 30
+      },
+      "coverage_before": {
+        "matched_positive_calls": 217,
+        "matched_negative_calls": 75,
+        "matched_return_assertions": 99,
+        "expected_valid_diagnostic_cases": 2
+      },
+      "coverage_after": {
+        "matched_positive_calls": 239,
+        "matched_negative_calls": 81,
+        "matched_return_assertions": 99,
+        "expected_valid_diagnostic_cases": 0
+      }
+    }
+  },
+  "historical_remaining_failures": {
+    "count": 1053,
+    "by_provider_and_family": [
+      {
+        "provider": "mypy",
+        "family": "expected-valid diagnostics",
+        "count": 5
+      },
+      {
+        "provider": "mypy",
+        "family": "missed expected diagnostic",
+        "count": 139
+      },
+      {
+        "provider": "mypy",
+        "family": "return precision or representation mismatch",
+        "count": 50
+      },
+      {
+        "provider": "pyrefly",
+        "family": "expected-valid diagnostics",
+        "count": 9
+      },
+      {
+        "provider": "pyrefly",
+        "family": "missed expected diagnostic",
+        "count": 58
+      },
+      {
+        "provider": "pyrefly",
+        "family": "return precision or representation mismatch",
+        "count": 94
+      },
+      {
+        "provider": "pyright",
+        "family": "expected-valid diagnostics",
+        "count": 3
+      },
+      {
+        "provider": "pyright",
+        "family": "missed expected diagnostic",
+        "count": 36
+      },
+      {
+        "provider": "pyright",
+        "family": "return precision or representation mismatch",
+        "count": 132
+      },
+      {
+        "provider": "ty",
+        "family": "expected-valid diagnostics",
+        "count": 17
+      },
+      {
+        "provider": "ty",
+        "family": "missed expected diagnostic",
+        "count": 130
+      },
+      {
+        "provider": "ty",
+        "family": "return precision or representation mismatch",
+        "count": 350
+      },
+      {
+        "provider": "typing",
+        "family": "missed expected diagnostic",
+        "count": 16
+      },
+      {
+        "provider": "typing",
+        "family": "return precision or representation mismatch",
+        "count": 14
+      }
+    ],
+    "id_list_sha256": "fdd56ed5b9bc80eea6c86924f6f0e8f533ad504be5cc284046288467f5c21bdd",
+    "status": "Unresolved differences remain open unless an exact review below provides evidence; no bulk waiver or subtraction has been applied."
+  },
+  "final_source_targeted_replay": {
+    "source_hashes": {
+      "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "088a49cf83359cead60f85b95f5d977d27b84333565d7e20c2df018072e2401d",
+      "src/basilisp_tools/analyzer.lpy": "e587bd3eccd42682c4f86e29731885061c553cfe029d094da619e6ef9100dcb8",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "source_changed_during_run": false,
+    "containing_fixtures": 13,
+    "containing_fixture_counts": {
+      "passed": 34,
+      "excluded": 27,
+      "unknown": 14,
+      "failed": 5
+    },
+    "reviewed_rows": 16,
+    "introduced_case_reviews": [
+      {
+        "id": "typing:conformance/tests/historical_positional.py::historical_positional.py::historical_positional.py:69:0:call:6",
+        "source_sha256": "53ee3d7de709953ca5bd46d936f26409eeae8e585a34f4dca5bf95443a4451ac",
+        "expression": "f4(3, __y=4)",
+        "baseline_status": "passed",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "passed",
+        "latest_targeted_status": "passed",
+        "latest_actual": {
+          "module": "builtins",
+          "path": [
+            "NoneType"
+          ]
+        },
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired applicable regression",
+        "reason": "The exact original assertion now passes on the final source; containing fixtures retain their negative controls."
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/call14.py::call14.py::call14.py:30:0:call:3",
+        "source_sha256": "5812e9189232b0751a5eba4dfb29e1d004a4256f17cc7dec6def186dabe6239d",
+        "expression": "func4(1, __b=2)",
+        "baseline_status": "passed",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "passed",
+        "latest_targeted_status": "passed",
+        "latest_actual": {
+          "module": "builtins",
+          "path": [
+            "NoneType"
+          ]
+        },
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired applicable regression",
+        "reason": "The exact original assertion now passes on the final source; containing fixtures retain their negative controls."
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/enum7.py::enum7.py::enum7.py:16:0:call:1",
+        "source_sha256": "3d760f52589fdc641051df5f1776c528eb10d96212ca1a7cec8188e49120b692",
+        "expression": "Foo(1, 2, 3, 4)",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "passed",
+        "latest_targeted_status": "passed",
+        "latest_actual": {
+          "module": "blt_fixture_e5556bc28e83a38a",
+          "path": [
+            "Foo"
+          ]
+        },
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired applicable regression",
+        "reason": "The exact original assertion now passes on the final source; containing fixtures retain their negative controls."
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/paramSpec18.py::paramSpec18.py::paramSpec18.py:29:5:call:4",
+        "source_sha256": "309fab43cf8bac1ac95d2b82a4b75370ed20c1ed43b8eddade2055560faefa07",
+        "expression": "func_with_protocol(callback)",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "passed",
+        "latest_targeted_status": "passed",
+        "latest_actual": {
+          "module": "collections.abc",
+          "path": [
+            "Callable"
+          ],
+          "arguments": [
+            {
+              "parameter-list?": true,
+              "arguments": [
+                {
+                  "module": "builtins",
+                  "path": [
+                    "str"
+                  ]
+                },
+                {
+                  "module": "builtins",
+                  "path": [
+                    "str"
+                  ]
+                }
+              ]
+            },
+            {
+              "module": "builtins",
+              "path": [
+                "bool"
+              ]
+            }
+          ]
+        },
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired applicable regression",
+        "reason": "The exact original assertion now passes on the final source; containing fixtures retain their negative controls."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/callable.rs::test_historical_positional_only_params::main.py:7:0:call:3",
+        "source_sha256": "678948ba89e722498bf74d26c56ecff5a16a34fd57d41a35f456258780e1950f",
+        "expression": "f2(\"hello\", __y=\"my\", __z__=\"world\")",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "unknown",
+        "latest_targeted_status": "unknown",
+        "latest_actual": null,
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired diagnostic with unresolved unannotated return",
+        "reason": "The invalid-arity false positive is removed. The unannotated result remains unknown and is not counted as a pass."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/callable.rs::test_historical_positional_only_params::main.py:10:0:call:4",
+        "source_sha256": "678948ba89e722498bf74d26c56ecff5a16a34fd57d41a35f456258780e1950f",
+        "expression": "f3(__x=\"hello\", __y__=\"my\", __z=\"world\")",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "failed",
+        "latest_targeted_status": "unknown",
+        "latest_actual": null,
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired diagnostic with unresolved unannotated return",
+        "reason": "The invalid-arity false positive is removed. The unannotated result remains unknown and is not counted as a pass."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/simple.rs::test_literal_union::main.py:3:0:return:0",
+        "source_sha256": "700ddd0e6ad98a201188d83752f51e51131793b972a8e0d090113771161fba40",
+        "expression": "Literal[True, False]",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "failed",
+        "latest_targeted_status": "failed",
+        "latest_actual": {
+          "module": "typing",
+          "path": [
+            "Literal"
+          ]
+        },
+        "latest_expected": {
+          "module": "builtins",
+          "path": [
+            "type"
+          ],
+          "arguments": [
+            {
+              "module": "builtins",
+              "path": [
+                "bool"
+              ]
+            }
+          ]
+        },
+        "latest_findings": [],
+        "classification": "reviewed oracle/runtime convention disagreement",
+        "reason": "The object is typing._LiteralGenericAlias, not the bool class. All four pinned checkers reject the equivalent assert_type(value, type[bool]) control; the Pyrefly display convention is not a runtime class proof.",
+        "evidence": "literal-form-oracle.json"
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/call/function.md::Call expression / PEP-484 convention for positional-only parameters::mdtest_snippet.py:51:0:call:5",
+        "source_sha256": "a15f99fbfaf95df6bb2b3dea91fafdf6b8b3f32705b3d33507535bb8c478f547",
+        "expression": "i(\"foo\", __y=42)",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "unknown",
+        "latest_targeted_status": "unknown",
+        "latest_actual": null,
+        "latest_expected": null,
+        "latest_findings": [],
+        "classification": "repaired diagnostic with unresolved unannotated return",
+        "reason": "The invalid-arity false positive is removed. The unannotated result remains unknown and is not counted as a pass."
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/call/function.md::Call expression / PEP-484 convention for positional-only parameters::mdtest_snippet.py:71:0:call:8",
+        "source_sha256": "a15f99fbfaf95df6bb2b3dea91fafdf6b8b3f32705b3d33507535bb8c478f547",
+        "expression": "C.static_method(\"x\", __x=42)",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "failed",
+        "latest_targeted_status": "failed",
+        "latest_actual": null,
+        "latest_expected": null,
+        "latest_findings": [
+          {
+            "type": ":invalid-arity",
+            "message": "Unexpected Python keyword argument '__x'"
+          }
+        ],
+        "classification": "reviewed native-invalid upstream positive",
+        "reason": "Python class scope mangles __x to _C__x. The original keyword raises TypeError on both supported test interpreters; the mangled spelling succeeds. Acceptance of the mangled spelling is separate applicable work.",
+        "evidence": "second-native-conventions-310.json and second-native-conventions-313.json"
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/enums.md::Enums / Constructor calls::mdtest_snippet.py:41:0:return:6",
+        "source_sha256": "86cbb4cbfb2b48a27004ed0b2aff800a9128048aee0b0c2c444ac03e295bc724",
+        "expression": "Planet(1, 3.303e23, 2.4397e6)",
+        "baseline_status": "passed",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "passed",
+        "latest_targeted_status": "passed",
+        "latest_actual": {
+          "module": "blt_fixture_6e2de594e6fcdf80",
+          "path": [
+            "Planet"
+          ]
+        },
+        "latest_expected": {
+          "module": "blt_fixture_6e2de594e6fcdf80",
+          "path": [
+            "Planet"
+          ]
+        },
+        "latest_findings": [],
+        "classification": "repaired applicable regression",
+        "reason": "The exact original assertion now passes on the final source; containing fixtures retain their negative controls."
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/enums.md::Enums / Constructor calls::mdtest_snippet.py:46:0:return:7",
+        "source_sha256": "86cbb4cbfb2b48a27004ed0b2aff800a9128048aee0b0c2c444ac03e295bc724",
+        "expression": "EmptyEnum(foo=1)",
+        "baseline_status": "unknown",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "failed",
+        "latest_targeted_status": "failed",
+        "latest_actual": {
+          "module": "blt_fixture_6e2de594e6fcdf80",
+          "path": [
+            "EmptyEnum"
+          ]
+        },
+        "latest_expected": {
+          "module": "blt_fixture_6e2de594e6fcdf80",
+          "path": [
+            "EmptyEnum"
+          ]
+        },
+        "latest_findings": [
+          {
+            "type": ":invalid-arity",
+            "message": "Unexpected Python keyword argument 'foo'"
+          }
+        ],
+        "classification": "reviewed upstream known missing diagnostic",
+        "reason": "The pinned upstream source explicitly TODOs the missing TypeError diagnostic. Native 3.10 and 3.13 reject foo; retaining the invalid-arity finding is correct.",
+        "evidence": "second-native-conventions-310.json and second-native-conventions-313.json"
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/implicit_type_aliases.md::Implicit type aliases / `Optional`::mdtest_snippet.py:12:0:return:3",
+        "source_sha256": "d2f2e22ad63f3255174f6a01cd2cc16bc6624450195532515520e8788ea70356",
+        "expression": "JustNone",
+        "baseline_status": "passed",
+        "initial_candidate_status": "failed",
+        "repaired_full_status": "failed",
+        "latest_targeted_status": "failed",
+        "latest_actual": {
+          "module": "builtins",
+          "path": [
+            "type"
+          ],
+          "arguments": [
+            {
+              "module": "builtins",
+              "path": [
+                "NoneType"
+              ]
+            }
+          ]
+        },
+        "latest_expected": {
+          "module": "builtins",
+          "path": [
+            "NoneType"
+          ]
+        },
+        "latest_findings": [],
+        "classification": "reviewed oracle/runtime value convention disagreement",
+        "reason": "Optional[None] evaluates to the NoneType class, not the None singleton. Latest metadata now records type[NoneType]; upstream reveal expects the instance type.",
+        "evidence": "second-native-conventions-310.json and second-native-conventions-313.json"
+      }
+    ]
+  },
+  "classifier_review": {
+    "bounded_rule": "Only unresolved-symbol findings whose message begins Unresolved Python member: are classified as Python member diagnostics. Other unresolved-symbol findings are replay errors. Explicit attr-defined ignores suppress only the normalized member finding, never lexical symbols.",
+    "raw_reports_preserved": true,
+    "raw_statuses_were_all_unknown": true,
+    "same_12_rows_both_reports": true,
+    "derived_counts_not_a_rerun": {
+      "baseline": {
+        "excluded": 77580,
+        "unknown": 7841,
+        "passed": 4411,
+        "failed": 1162,
+        "error": 8
+      },
+      "repaired_candidate": {
+        "excluded": 77580,
+        "passed": 4852,
+        "unknown": 7506,
+        "failed": 1056,
+        "error": 8
+      }
+    },
+    "cases": [
+      {
+        "id": "mypy:test-data/unit/check-errorcodes.test::testErrorCodeIgnoreMultiple1::main.py:1:4:call:0",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "'x'.foobar(b)",
+        "findings": [
+          {
+            "type": ":redundant-ignore",
+            "message": "Redundant ignore"
+          },
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_0144e9018c74e169/b"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "mypy:test-data/unit/check-errorcodes.test::testErrorCodeIgnoreMultiple2::main.py:1:4:call:0",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "'x'.foobar(c)",
+        "findings": [
+          {
+            "type": ":redundant-ignore",
+            "message": "Redundant ignore"
+          },
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_3acbcd38ea4f7c27/c"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "mypy:test-data/unit/check-incomplete-fixture.test::testVariableUndefinedUsingDefaultFixture::main.py:4:0:call:0",
+        "raw_status": "unknown",
+        "derived_status": "passed",
+        "expected_error": true,
+        "expression": "m.x",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved Python member: x"
+          }
+        ],
+        "latest_targeted_status": "passed",
+        "latest_findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved Python member: x"
+          }
+        ],
+        "review": "Real undefined module member negative now passes."
+      },
+      {
+        "id": "mypy:test-data/unit/check-modules.test::testModuleLevelGetattrAssignedGood::main.py:2:0:return:0",
+        "raw_status": "unknown",
+        "derived_status": "failed",
+        "expected_error": false,
+        "expression": "non_stub.name",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved Python member: name"
+          }
+        ],
+        "latest_targeted_status": "unknown",
+        "latest_findings": [],
+        "review": "Dynamic module hooks make absence unprovable; latest worker removes the unsupported absence finding and result remains unknown. AssignedBad additionally has a native-invalid zero-argument hook, not proof of member absence."
+      },
+      {
+        "id": "mypy:test-data/unit/check-modules.test::testModuleLevelGetattrAssignedBad::main.py:2:0:return:0",
+        "raw_status": "unknown",
+        "derived_status": "failed",
+        "expected_error": false,
+        "expression": "non_stub.name",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved Python member: name"
+          }
+        ],
+        "latest_targeted_status": "unknown",
+        "latest_findings": [],
+        "review": "Dynamic module hooks make absence unprovable; latest worker removes the unsupported absence finding and result remains unknown. AssignedBad additionally has a native-invalid zero-argument hook, not proof of member absence."
+      },
+      {
+        "id": "mypy:test-data/unit/check-modules.test::testModuleLevelGetattrImportedGood::main.py:2:0:return:0",
+        "raw_status": "unknown",
+        "derived_status": "failed",
+        "expected_error": false,
+        "expression": "non_stub.name",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved Python member: name"
+          }
+        ],
+        "latest_targeted_status": "unknown",
+        "latest_findings": [],
+        "review": "Dynamic module hooks make absence unprovable; latest worker removes the unsupported absence finding and result remains unknown. AssignedBad additionally has a native-invalid zero-argument hook, not proof of member absence."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:9:4:return:0",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "e1",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e1"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:11:4:return:1",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "e2",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e2"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:18:4:return:2",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "e3",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e3"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:23:4:return:3",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "e4",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e4"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:28:4:return:4",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": false,
+        "expression": "e5",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e5"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/generic_legacy.rs::test_error_on_bad_legacy_tparam::main.py:12:4:call:1",
+        "raw_status": "unknown",
+        "derived_status": "error",
+        "expected_error": true,
+        "expression": "oops()",
+        "findings": [
+          {
+            "type": ":unresolved-symbol",
+            "message": "Unresolved symbol: blt_fixture_26036cbf08289111/oops"
+          }
+        ],
+        "review": "Adapter lexical context is unresolved; never accepted as a matching Python type error. Five exception-group names need TryStar context adaptation; other unresolved names retain explicit errors."
+      }
+    ]
+  },
+  "native_evidence": {
+    "python_3_10": {
+      "python": "3.10.16 (main, Dec  6 2024, 20:50:22) [Clang 18.1.8 ]",
+      "staticmethod_parameter_names": [
+        "self",
+        "_C__x"
+      ],
+      "cases": [
+        {
+          "expression": "EmptyEnum(foo=1)",
+          "outcome": "raised",
+          "exception": "TypeError",
+          "message": "EnumMeta.__call__() got an unexpected keyword argument 'foo'"
+        },
+        {
+          "expression": "C.static_method(\"x\",__x=42)",
+          "outcome": "raised",
+          "exception": "TypeError",
+          "message": "C.static_method() got an unexpected keyword argument '__x'"
+        },
+        {
+          "expression": "C.static_method(\"x\",_C__x=42)",
+          "outcome": "returned",
+          "value": "None"
+        },
+        {
+          "expression": "Optional[None]",
+          "outcome": "returned",
+          "value": "<class 'NoneType'>",
+          "is_None": false,
+          "is_NoneType": true,
+          "runtime_type": "type"
+        }
+      ]
+    },
+    "python_3_13": {
+      "python": "3.13.2 (main, Feb 12 2025, 14:59:08) [Clang 19.1.6 ]",
+      "staticmethod_parameter_names": [
+        "self",
+        "_C__x"
+      ],
+      "cases": [
+        {
+          "expression": "EmptyEnum(foo=1)",
+          "outcome": "raised",
+          "exception": "TypeError",
+          "message": "EnumType.__call__() got an unexpected keyword argument 'foo'"
+        },
+        {
+          "expression": "C.static_method(\"x\",__x=42)",
+          "outcome": "raised",
+          "exception": "TypeError",
+          "message": "C.static_method() got an unexpected keyword argument '__x'"
+        },
+        {
+          "expression": "C.static_method(\"x\",_C__x=42)",
+          "outcome": "returned",
+          "value": "None"
+        },
+        {
+          "expression": "Optional[None]",
+          "outcome": "returned",
+          "value": "<class 'NoneType'>",
+          "is_None": false,
+          "is_NoneType": true,
+          "runtime_type": "type"
+        }
+      ]
+    },
+    "literal_special_form": {
+      "source": "from typing import Literal, assert_type\nvalue = Literal[True, False]\nassert_type(value, type[bool])\ndef accepts_class(value: type[bool]) -> None: pass\naccepts_class(value)\n",
+      "source_sha256": "9059d4c32305e4c3ea15e2c5f66221c437f3935d73c96072be5e4196d75a75e3",
+      "cwd": "/tmp/blt-python-mismatches-20261007/literal-form-oracle",
+      "native": {
+        "repr": "typing.Literal[True, False]",
+        "is_class": false,
+        "exact_type": "<class 'typing._LiteralGenericAlias'>"
+      },
+      "oracles": {
+        "pyright": {
+          "command": [
+            "/tmp/blt-python-types-20261006/oracles/bin/pyright",
+            "--pythonversion",
+            "3.13",
+            "--outputjson",
+            "/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py"
+          ],
+          "returncode": 1,
+          "stdout": "{\n    \"version\": \"1.1.414\",\n    \"time\": \"1791329459406\",\n    \"generalDiagnostics\": [\n        {\n            \"file\": \"/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py\",\n            \"severity\": \"error\",\n            \"message\": \"\\\"assert_type\\\" mismatch: expected \\\"type[bool]\\\" but received \\\"UnionType\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 2,\n                    \"character\": 12\n                },\n                \"end\": {\n                    \"line\": 2,\n                    \"character\": 17\n                }\n            },\n            \"rule\": \"reportAssertTypeFailure\"\n        },\n        {\n            \"file\": \"/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py\",\n            \"severity\": \"error\",\n            \"message\": \"Argument of type \\\"value\\\" cannot be assigned to parameter \\\"value\\\" of type \\\"type[bool]\\\" in function \\\"accepts_class\\\"\\n\u00a0\u00a0Type \\\"UnionType\\\" is not assignable to type \\\"type[bool]\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 4,\n                    \"character\": 14\n                },\n                \"end\": {\n                    \"line\": 4,\n                    \"character\": 19\n                }\n            },\n            \"rule\": \"reportArgumentType\"\n        }\n    ],\n    \"summary\": {\n        \"filesAnalyzed\": 1,\n        \"errorCount\": 2,\n        \"warningCount\": 0,\n        \"informationCount\": 0,\n        \"timeInSec\": 0.23\n    }\n}\n\n",
+          "stderr": ""
+        },
+        "mypy": {
+          "command": [
+            "/tmp/blt-python-types-20261006/oracles/bin/mypy",
+            "--python-version",
+            "3.13",
+            "--no-incremental",
+            "--cache-dir",
+            "/tmp/blt-python-mismatches-20261007/literal-form-oracle/mypy-cache",
+            "/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py"
+          ],
+          "returncode": 1,
+          "stdout": "/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py:3: error: Expression is of type \"<typing special form>\", not \"type[bool]\"  [assert-type]\n/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py:5: error: Argument 1 to \"accepts_class\" has incompatible type \"<typing special form>\"; expected \"type[bool]\"  [arg-type]\nFound 2 errors in 1 file (checked 1 source file)\n",
+          "stderr": ""
+        },
+        "pyrefly": {
+          "command": [
+            "/tmp/blt-python-types-20261006/oracles/bin/pyrefly",
+            "check",
+            "--preset",
+            "default",
+            "--python-version",
+            "3.13",
+            "/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py"
+          ],
+          "returncode": 1,
+          "stdout": "ERROR assert_type(type[bool], type[bool]) failed [assert-type]\n --> /tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py:3:12\n  |\n3 | assert_type(value, type[bool])\n  |            ^^^^^^^^^^^^^^^^^^^\n",
+          "stderr": " INFO 1 error\n"
+        },
+        "ty": {
+          "command": [
+            "/tmp/blt-python-types-20261006/oracles/bin/ty",
+            "check",
+            "--python-version",
+            "3.13",
+            "/tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py"
+          ],
+          "returncode": 1,
+          "stdout": "error[type-assertion-failure]: Argument does not have asserted type `<class 'bool'>`\n --> /tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py:3:1\n  |\n3 | assert_type(value, type[bool])\n  | ^^^^^^^^^^^^-----^^^^^^^^^^^^^\n  |             |\n  |             Inferred type is `<special-form 'bool'>`\ninfo: `<class 'bool'>` and `<special-form 'bool'>` are not equivalent types\n\nerror[invalid-argument-type]: Argument to function `accepts_class` is incorrect\n --> /tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py:5:15\n  |\n5 | accepts_class(value)\n  |               ^^^^^ Expected `<class 'bool'>`, found `<special-form 'bool'>`\ninfo: Function defined here\n --> /tmp/blt-python-mismatches-20261007/literal-form-oracle/control.py:4:5\n  |\n4 | def accepts_class(value: type[bool]) -> None: pass\n  |     ^^^^^^^^^^^^^ ----------------- Parameter declared here\n\nFound 2 diagnostics\n",
+          "stderr": ""
+        }
+      }
+    }
+  },
+  "validation": {
+    "classifier_unit_tests": {
+      "python3.13": {
+        "passed": 69,
+        "exitcode": 0
+      },
+      "python3.10": {
+        "passed": 69,
+        "exitcode": 0
+      }
+    },
+    "strict_selected_providers": {
+      "counts": {
+        "excluded": 9,
+        "passed": 34
+      },
+      "selection_failures": [],
+      "source_hashes": {
+        "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+        "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+        "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+        "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+        "src/basilisp_tools/_inspect.py": "088a49cf83359cead60f85b95f5d977d27b84333565d7e20c2df018072e2401d",
+        "src/basilisp_tools/analyzer.lpy": "e587bd3eccd42682c4f86e29731885061c553cfe029d094da619e6ef9100dcb8",
+        "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+        "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+        "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+        "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+        "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+        "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+        "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+        "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+        "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+      }
+    },
+    "strict_typing": [
+      {
+        "name": "dataclasses_kwonly",
+        "returncode": 0,
+        "counts": {
+          "passed": 17,
+          "excluded": 2
+        },
+        "source_changed_during_run": false,
+        "source_hashes": {
+          "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+          "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+          "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+          "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+          "src/basilisp_tools/_inspect.py": "088a49cf83359cead60f85b95f5d977d27b84333565d7e20c2df018072e2401d",
+          "src/basilisp_tools/analyzer.lpy": "e587bd3eccd42682c4f86e29731885061c553cfe029d094da619e6ef9100dcb8",
+          "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+          "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+          "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+          "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+          "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+          "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+          "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+          "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+          "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+        }
+      },
+      {
+        "name": "dataclasses_transform_class",
+        "returncode": 0,
+        "counts": {
+          "excluded": 11,
+          "passed": 8
+        },
+        "source_changed_during_run": false,
+        "source_hashes": {
+          "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+          "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+          "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+          "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+          "src/basilisp_tools/_inspect.py": "088a49cf83359cead60f85b95f5d977d27b84333565d7e20c2df018072e2401d",
+          "src/basilisp_tools/analyzer.lpy": "e587bd3eccd42682c4f86e29731885061c553cfe029d094da619e6ef9100dcb8",
+          "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+          "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+          "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+          "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+          "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+          "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+          "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+          "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+          "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+        }
+      },
+      {
+        "name": "dataclasses_transform_field",
+        "returncode": 0,
+        "counts": {
+          "excluded": 5,
+          "passed": 5
+        },
+        "source_changed_during_run": false,
+        "source_hashes": {
+          "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+          "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+          "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+          "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+          "src/basilisp_tools/_inspect.py": "088a49cf83359cead60f85b95f5d977d27b84333565d7e20c2df018072e2401d",
+          "src/basilisp_tools/analyzer.lpy": "e587bd3eccd42682c4f86e29731885061c553cfe029d094da619e6ef9100dcb8",
+          "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+          "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+          "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+          "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+          "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+          "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+          "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+          "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+          "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+        }
+      },
+      {
+        "name": "generics_basic",
+        "returncode": 0,
+        "counts": {
+          "excluded": 45,
+          "passed": 6
+        },
+        "source_changed_during_run": false,
+        "source_hashes": {
+          "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+          "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+          "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+          "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+          "src/basilisp_tools/_inspect.py": "088a49cf83359cead60f85b95f5d977d27b84333565d7e20c2df018072e2401d",
+          "src/basilisp_tools/analyzer.lpy": "e587bd3eccd42682c4f86e29731885061c553cfe029d094da619e6ef9100dcb8",
+          "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+          "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+          "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+          "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+          "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+          "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+          "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+          "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+          "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+        }
+      }
+    ],
+    "total_strict_assertions": 70
+  },
+  "artifacts": {
+    "baseline-second.json": {
+      "sha256": "83a21a2a4a917ebada92f636d8e61f4d839fbb989dbfdac2b62756bfd5105a69"
+    },
+    "candidate-second.json": {
+      "sha256": "87185b3e3cb90616cc95f90d988012286dce010e9eced64603ed0303e88cf77b"
+    },
+    "candidate-second-repaired.json": {
+      "sha256": "7d8bc322c3f24e83fc049b7688414ffbe3c7da786144dfdc9f7da6b7d112d6ee"
+    },
+    "comparison-second-repaired.json": {
+      "sha256": "d0e742a9d7c8b5dd955f5050cfe6f73b7cc49b4bd8eb9eaaaf480fe01aa9ac69"
+    },
+    "second-final-reviewed-replay.json": {
+      "sha256": "dea9afe08aad562dc11b9b62993d4ab108410d706ef73db8ad99b21a7143163d"
+    },
+    "literal-form-oracle.json": {
+      "sha256": "ea1bb9bd5f411b7963fe5b20aff674cdbb2707d56be97c5923955b6a78319984"
+    },
+    "second-native-conventions-310.json": {
+      "sha256": "da6c4d7bf7760006455a879097d27cbb869d346611dcafdccca2d43351414a39"
+    },
+    "second-native-conventions-313.json": {
+      "sha256": "e6de0547bcfb0935192d2318834f983288e1431cef3ed686b0920939e31d6a09"
+    },
+    "selection-second-final-classifier.json": {
+      "sha256": "818da420577908facbc3312c406c9a93d280d1997abf7e3dff1546744128cd26"
+    },
+    "strict-typing-second-final-summary.json": {
+      "sha256": "d93f1d014d843a92096ae908bb6f2060894f9493d832bc6ab3652ef9c9def806"
+    }
+  },
+  "final_identity_safety_gate": {
+    "reason": "Final narrow repair requires proven runtime class identity before collapsing Union or Optional operands, preserving uncertainty for decorator-replaced or custom-equality classes. Earlier bounded overlays and full reports retain their original hashes.",
+    "source_hashes": {
+      "scripts/check_python_typing.py": "a90a3b5f5d915bd92c6317b802a835759744db7db1a3b38797a2cff0361518d1",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "fb7a321c79cbf3618d52f09f179ce04aeb612f34afed7ab72e18ce6690036c58",
+      "src/basilisp_tools/analyzer.lpy": "276d14f245ff9f5e2599272f54deb56fc0a0291121da41648ed6e7fa2f8060fa",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "source_changed_during_run": false,
+    "strict_selected_provider_assertions": 34,
+    "strict_typing_assertions": 36,
+    "total_strict_assertions": 70,
+    "selected_counts": {
+      "excluded": 9,
+      "passed": 34
+    },
+    "typing_counts": [
+      {
+        "name": "dataclasses_kwonly",
+        "counts": {
+          "passed": 17,
+          "excluded": 2
+        },
+        "returncode": 0
+      },
+      {
+        "name": "dataclasses_transform_class",
+        "counts": {
+          "excluded": 11,
+          "passed": 8
+        },
+        "returncode": 0
+      },
+      {
+        "name": "dataclasses_transform_field",
+        "counts": {
+          "excluded": 5,
+          "passed": 5
+        },
+        "returncode": 0
+      },
+      {
+        "name": "generics_basic",
+        "counts": {
+          "excluded": 45,
+          "passed": 6
+        },
+        "returncode": 0
+      }
+    ],
+    "focused_worker_validation": {
+      "python3.13": {
+        "passed": 55
+      },
+      "python3.10": {
+        "passed": 54,
+        "skipped": 1
+      },
+      "source": "Worker-owner native metadata controls"
+    },
+    "artifacts": {
+      "selection-second-identity-final.json": {
+        "sha256": "2f33b873eb708f975aef3cf498caeb1553f5540e4bf5aae7dd53263abf2180f2"
+      },
+      "strict-typing-second-identity-summary.json": {
+        "sha256": "614fa19ff495b9391825750fffae41b5b09ba3a1fbe67d8593dde8de630ac3d5"
+      }
+    }
+  }
+}

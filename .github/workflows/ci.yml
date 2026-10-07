@@ -123,7 +123,40 @@ jobs:
           nix develop --no-update-lock-file --command uv run --locked python scripts/generate_ml_projects.py --output "$RUNNER_TEMP/blt-ml-generated" --size 16
           nix develop --no-update-lock-file --command uv run --locked python scripts/check_ml_packages.py --python "$RUNNER_TEMP/blt-ml/bin/python" --manifest "$RUNNER_TEMP/blt-ml-generated/cases.json" --case-timeout 600 --output "$RUNNER_TEMP/blt-python-reports/generated.json"
       - name: Fetch and inventory pinned Python typing fixtures
-        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_python_typing.py --corpus "$RUNNER_TEMP/blt-typing" --provider typing --fetch --inventory-only --output "$RUNNER_TEMP/blt-python-reports/typing-inventory.json"
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_python_typing.py --corpus "$RUNNER_TEMP/blt-typing" --fetch --inventory-only --output "$RUNNER_TEMP/blt-python-reports/typing-inventory.json"
+      - name: Install pinned Pyright oracle
+        run: |
+          nix develop --no-update-lock-file --command uv venv "$RUNNER_TEMP/blt-oracles"
+          nix develop --no-update-lock-file --command uv pip install --python "$RUNNER_TEMP/blt-oracles/bin/python" pyright==1.1.414
+      - name: Generate independent Pyright expectations
+        run: |
+          nix develop --no-update-lock-file --command uv run --locked python - "$RUNNER_TEMP/blt-typing" "$RUNNER_TEMP/blt-oracles/bin/pyright" "$RUNNER_TEMP/blt-python-reports/pyright-native.json" <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
+          corpus, executable, output = map(Path, sys.argv[1:])
+          manifest = Path("scripts/python_typing_selection.json")
+          selection = json.loads(manifest.read_text())
+          source = next(item for item in json.loads(Path("scripts/python_typing_sources.json").read_text())
+                        if item["provider"] == "pyright")
+          paths = sorted({str(corpus / source["directory"] / item["path"])
+                          for item in selection if item["provider"] == "pyright"})
+          assert paths and all(Path(path).is_file() for path in paths)
+          command = [str(executable), "--outputjson", *paths]
+          process = subprocess.run(command, capture_output=True, text=True, timeout=120)
+          if process.returncode not in (0, 1):
+              raise RuntimeError(process.stdout + process.stderr)
+          report = json.loads(process.stdout)
+          assert report["version"] == source["oracle_version"], report["version"]
+          assert isinstance(report["generalDiagnostics"], list)
+          report["blt_invocation"] = {"command": command,
+                                      "selection_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
+          output.write_text(json.dumps(report, indent=2) + "\n")
+          PY
+      - name: Compare strict contracts from all four Python checkers
+        run: nix develop --no-update-lock-file --command uv run --locked python scripts/check_python_typing.py --corpus "$RUNNER_TEMP/blt-typing" --selection scripts/python_typing_selection.json --pyright-oracle "$RUNNER_TEMP/blt-python-reports/pyright-native.json" --require-resolved --output "$RUNNER_TEMP/blt-python-reports/typing-selection.json"
       - name: Compare upstream constructor and generic contracts
         run: |
           for fixture in dataclasses_kwonly dataclasses_transform_class dataclasses_transform_field generics_basic; do
