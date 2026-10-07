@@ -1,0 +1,5429 @@
+{
+  "schema": 1,
+  "scope": "Third same-adapter full replay of translated Python interop assertions, followed by separately identified targeted repairs. Whole-Python declaration/control-flow conformance is outside this adapter. Unknowns, exclusions, and replay errors never count as passes.",
+  "inputs": {
+    "baseline_revision": "5ad875adeb466dcbf4d9c0e7e36cf5ff26a0fd15",
+    "sources": [
+      {
+        "provider": "typing",
+        "repo": "python/typing",
+        "revision": "dc0a8a924c99c6d6ab70f5dc4708e8e4017386ae",
+        "directory": "python-typing",
+        "paths": [
+          "conformance/",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "pyright",
+        "repo": "microsoft/pyright",
+        "revision": "eb175addd4ebf25a6c0c5301b3f2cfae7d0c6618",
+        "directory": "microsoft-pyright",
+        "oracle_version": "1.1.414",
+        "paths": [
+          "packages/pyright-internal/src/tests/",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "mypy",
+        "repo": "python/mypy",
+        "revision": "e576c204a29a5a5567d5374aae93f61762c691b2",
+        "directory": "python-mypy",
+        "oracle_version": "2.4.0",
+        "paths": [
+          "test-data/unit/",
+          "mypy/test/data.py",
+          "mypy/test/config.py",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "pyrefly",
+        "repo": "facebook/pyrefly",
+        "revision": "2f1c6328b3949f76162f76b92d81dafa9097eec4",
+        "directory": "facebook-pyrefly",
+        "oracle_version": "1.3.2",
+        "paths": [
+          "pyrefly/lib/test/",
+          "test/",
+          "LICENSE"
+        ]
+      },
+      {
+        "provider": "ty",
+        "repo": "astral-sh/ruff",
+        "revision": "0692804812c61094835ee52a3e933fc119d3e3fa",
+        "directory": "astral-sh-ruff",
+        "oracle_version": "0.0.84",
+        "paths": [
+          "crates/ty_python_semantic/resources/",
+          "crates/ty_python_semantic/tests/",
+          "crates/ty_test/",
+          "LICENSE"
+        ]
+      }
+    ],
+    "oracle": {
+      "version": "1.1.414",
+      "summary": {
+        "filesAnalyzed": 1381,
+        "errorCount": 3598,
+        "warningCount": 52,
+        "informationCount": 3558,
+        "timeInSec": 7.852
+      },
+      "sha256": "2f5ed5c5cadfd84add7794c3b1e5d2f03a77d81f3e78370382d7b9156b44fc53",
+      "profile": "Pyright CLI defaults plus fixture directives; original TypeScript test-runner settings are not reproduced"
+    },
+    "raw_reports": {
+      "baseline": {
+        "name": "baseline-third.json",
+        "sha256": "1af97933e73a929ea9819ae815c7945db7197e8991bacc56b8c832e5e0d26d62"
+      },
+      "candidate": {
+        "name": "candidate-third.json",
+        "sha256": "5aeb7204cf219626c7fc9547f9b45e610968570f4ba7e7791ddfdf29cd7ac694"
+      }
+    },
+    "adapter_hashes": {
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2"
+    }
+  },
+  "full_comparison": {
+    "fixtures": 21802,
+    "discovered_assertions": 91002,
+    "baseline_counts": {
+      "excluded": 77577,
+      "passed": 4832,
+      "unknown": 7516,
+      "failed": 1069,
+      "error": 8
+    },
+    "candidate_counts": {
+      "excluded": 77577,
+      "passed": 4911,
+      "unknown": 7547,
+      "failed": 959,
+      "error": 8
+    },
+    "transitions": {
+      "failed -> unknown": 34,
+      "passed -> unknown": 31,
+      "unknown -> passed": 32,
+      "passed -> failed": 5,
+      "unknown -> failed": 2,
+      "failed -> passed": 83
+    },
+    "source_hashes_before": {
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "fb7a321c79cbf3618d52f09f179ce04aeb612f34afed7ab72e18ce6690036c58",
+      "src/basilisp_tools/analyzer.lpy": "276d14f245ff9f5e2599272f54deb56fc0a0291121da41648ed6e7fa2f8060fa",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "source_hashes_after": {
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "1322c40c7bd4e9a300a3aab4caa24231a04aabcc37f1d55d14990eb9684d2d8a",
+      "src/basilisp_tools/analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "de1cd84ffdf77cd2947c2b8bc60ed8b8cb7a738f4997e789ba0d33cae3487d34",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "unchanged_sources": true,
+    "provider_totals": {
+      "mypy": {
+        "fixtures": 8327,
+        "units": 27162,
+        "before": {
+          "excluded": 25596,
+          "passed": 767,
+          "failed": 202,
+          "unknown": 595,
+          "error": 2
+        },
+        "after": {
+          "excluded": 25596,
+          "passed": 779,
+          "failed": 183,
+          "unknown": 602,
+          "error": 2
+        },
+        "coverage_before": {
+          "matched_positive_calls": 353,
+          "matched_negative_calls": 170,
+          "matched_return_assertions": 244,
+          "expected_valid_diagnostic_cases": 4
+        },
+        "coverage_after": {
+          "matched_positive_calls": 353,
+          "matched_negative_calls": 177,
+          "matched_return_assertions": 249,
+          "expected_valid_diagnostic_cases": 4
+        }
+      },
+      "pyrefly": {
+        "fixtures": 5136,
+        "units": 13775,
+        "before": {
+          "unknown": 1477,
+          "failed": 160,
+          "passed": 1017,
+          "excluded": 11115,
+          "error": 6
+        },
+        "after": {
+          "unknown": 1492,
+          "failed": 149,
+          "passed": 1013,
+          "excluded": 11115,
+          "error": 6
+        },
+        "coverage_before": {
+          "matched_positive_calls": 530,
+          "matched_negative_calls": 174,
+          "matched_return_assertions": 313,
+          "expected_valid_diagnostic_cases": 8
+        },
+        "coverage_after": {
+          "matched_positive_calls": 527,
+          "matched_negative_calls": 174,
+          "matched_return_assertions": 312,
+          "expected_valid_diagnostic_cases": 7
+        }
+      },
+      "pyright": {
+        "fixtures": 1375,
+        "units": 9651,
+        "before": {
+          "unknown": 1765,
+          "excluded": 6501,
+          "passed": 1203,
+          "failed": 182
+        },
+        "after": {
+          "unknown": 1768,
+          "excluded": 6501,
+          "passed": 1252,
+          "failed": 130
+        },
+        "coverage_before": {
+          "matched_positive_calls": 805,
+          "matched_negative_calls": 222,
+          "matched_return_assertions": 176,
+          "expected_valid_diagnostic_cases": 3
+        },
+        "coverage_after": {
+          "matched_positive_calls": 810,
+          "matched_negative_calls": 225,
+          "matched_return_assertions": 217,
+          "expected_valid_diagnostic_cases": 3
+        }
+      },
+      "ty": {
+        "fixtures": 6812,
+        "units": 37712,
+        "before": {
+          "unknown": 3334,
+          "passed": 1428,
+          "failed": 495,
+          "excluded": 32455
+        },
+        "after": {
+          "unknown": 3339,
+          "passed": 1448,
+          "failed": 470,
+          "excluded": 32455
+        },
+        "coverage_before": {
+          "matched_positive_calls": 523,
+          "matched_negative_calls": 222,
+          "matched_return_assertions": 683,
+          "expected_valid_diagnostic_cases": 17
+        },
+        "coverage_after": {
+          "matched_positive_calls": 522,
+          "matched_negative_calls": 225,
+          "matched_return_assertions": 701,
+          "expected_valid_diagnostic_cases": 13
+        }
+      },
+      "typing": {
+        "fixtures": 152,
+        "units": 2702,
+        "before": {
+          "excluded": 1910,
+          "passed": 417,
+          "unknown": 345,
+          "failed": 30
+        },
+        "after": {
+          "excluded": 1910,
+          "passed": 419,
+          "unknown": 346,
+          "failed": 27
+        },
+        "coverage_before": {
+          "matched_positive_calls": 237,
+          "matched_negative_calls": 81,
+          "matched_return_assertions": 99,
+          "expected_valid_diagnostic_cases": 0
+        },
+        "coverage_after": {
+          "matched_positive_calls": 237,
+          "matched_negative_calls": 82,
+          "matched_return_assertions": 100,
+          "expected_valid_diagnostic_cases": 0
+        }
+      }
+    },
+    "remaining_failures": 959,
+    "remaining_failure_ids_sha256": "3ce26d5477c6590690a0798dbc077350445e921bd95d879fce53f2907368411d",
+    "remaining_status": "All 959 initial candidate failures remain visible in the historical report. No aggregate subtraction for native/oracle reviews or unknowns is applied."
+  },
+  "introduced_case_reviews": [
+    {
+      "id": "typing:conformance/tests/dataclasses_descriptors.py::dataclasses_descriptors.py::dataclasses_descriptors.py:38:0:return:3",
+      "fixture_source_sha256": "67a098856dbb5a2083fcdebf6f5e3d43e2056946d1cd67e87e46c5e51961d9c1",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "DC1.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Desc1"
+          ],
+          "module": "blt_fixture_80ba145e1f821273"
+        },
+        "expected": {
+          "path": [
+            "Desc1"
+          ],
+          "module": "blt_fixture_80ba145e1f821273"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "DC1.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "module": "blt_fixture_80ba145e1f821273",
+          "path": [
+            "Desc1"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "DC1.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Desc1"
+          ],
+          "module": "blt_fixture_80ba145e1f821273"
+        },
+        "expected": {
+          "path": [
+            "Desc1"
+          ],
+          "module": "blt_fixture_80ba145e1f821273"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/constrainedTypeVar14.py::constrainedTypeVar14.py::constrainedTypeVar14.py:28:0:return:3",
+      "fixture_source_sha256": "1d3468208b0cd4f0189255c416e2e8ae77d634192128961a5c83b25c5d5bf3a1",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "f2",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "F"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "A"
+              ],
+              "module": "blt_fixture_568944e651e5d3a2"
+            }
+          ],
+          "module": "blt_fixture_568944e651e5d3a2"
+        },
+        "expected": {
+          "path": [
+            "F"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "A"
+              ],
+              "module": "blt_fixture_568944e651e5d3a2"
+            }
+          ],
+          "module": "blt_fixture_568944e651e5d3a2"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "f2",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "module": "blt_fixture_568944e651e5d3a2",
+              "path": [
+                "A2"
+              ]
+            }
+          ],
+          "module": "blt_fixture_568944e651e5d3a2",
+          "path": [
+            "F"
+          ]
+        },
+        "expected": {
+          "arguments": [
+            {
+              "module": "blt_fixture_568944e651e5d3a2",
+              "path": [
+                "A"
+              ]
+            }
+          ],
+          "module": "blt_fixture_568944e651e5d3a2",
+          "path": [
+            "F"
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "f2",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "path": [
+                "A"
+              ],
+              "module": "blt_fixture_568944e651e5d3a2"
+            }
+          ],
+          "path": [
+            "F"
+          ],
+          "module": "blt_fixture_568944e651e5d3a2"
+        },
+        "expected": {
+          "arguments": [
+            {
+              "path": [
+                "A"
+              ],
+              "module": "blt_fixture_568944e651e5d3a2"
+            }
+          ],
+          "path": [
+            "F"
+          ],
+          "module": "blt_fixture_568944e651e5d3a2"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/constructor20.py::constructor20.py::constructor20.py:42:0:call:10",
+      "fixture_source_sha256": "8d469199bfd4dcca0f46d9ffef7721ae4de12804874c8f32dcda7103e7deef15",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "unknown",
+        "expression": "generic_adder.add(1, \"b\")",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "generic_adder.add(1, \"b\")",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": [
+          {
+            "type": ":type-mismatch",
+            "message": "No Python signature accepts argument types (Literal[1], Literal['b'])"
+          }
+        ]
+      },
+      "review_status": "intentional-gradual-contract",
+      "repair_overlay": {
+        "status": "unknown",
+        "expression": "generic_adder.add(1, \"b\")",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "reason": "The unspecialized Adder has an Unknown generic argument, as its upstream source explicitly states. Mixed arguments must not be rejected. Removing that false diagnostic preserves an Any result, which remains unknown coverage.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "third-worker-repaired-replay.json",
+        "microsoft-pyright/packages/pyright-internal/src/tests/samples/constructor20.py:36-42"
+      ]
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/dataclassDescriptors1.py::dataclassDescriptors1.py::dataclassDescriptors1.py:33:0:return:2",
+      "fixture_source_sha256": "b2954c89c49fdac15092c2b02dfc89d4ab894ea6dd4c57d6fe11ab9d458b4a5b",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "Foo.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "MyDescriptor"
+          ],
+          "module": "blt_fixture_96a5fc0ec74a0da8"
+        },
+        "expected": {
+          "path": [
+            "MyDescriptor"
+          ],
+          "module": "blt_fixture_96a5fc0ec74a0da8"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "Foo.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "module": "blt_fixture_96a5fc0ec74a0da8",
+          "path": [
+            "MyDescriptor"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "Foo.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "MyDescriptor"
+          ],
+          "module": "blt_fixture_96a5fc0ec74a0da8"
+        },
+        "expected": {
+          "path": [
+            "MyDescriptor"
+          ],
+          "module": "blt_fixture_96a5fc0ec74a0da8"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/descriptor6.py::descriptor6.py::descriptor6.py:220:0:return:23",
+      "fixture_source_sha256": "b850039282fb3d969efa2d90af55f82ae9e990c9a6de971012ad7fbcdd2954fd",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "OverloadedContainer.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "OverloadedDescriptor"
+          ],
+          "module": "blt_fixture_7e91759dde9a5b1c"
+        },
+        "expected": {
+          "path": [
+            "OverloadedDescriptor"
+          ],
+          "module": "blt_fixture_7e91759dde9a5b1c"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "OverloadedContainer.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "module": "blt_fixture_7e91759dde9a5b1c",
+          "path": [
+            "OverloadedDescriptor"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "OverloadedContainer.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "OverloadedDescriptor"
+          ],
+          "module": "blt_fixture_7e91759dde9a5b1c"
+        },
+        "expected": {
+          "path": [
+            "OverloadedDescriptor"
+          ],
+          "module": "blt_fixture_7e91759dde9a5b1c"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:157:9:call:75",
+      "fixture_source_sha256": "dc6668864d028b12e3f8ec9c1c68096f2f1cc8f2e971757d919d8dbb3fdbd1d4",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "TestEnum10.A",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "TestEnum10"
+          ],
+          "module": "blt_fixture_4fadde12e7fa6491"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "TestEnum10.A",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "TestEnum10.A",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "TestEnum10"
+          ],
+          "module": "blt_fixture_4fadde12e7fa6491"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:278:0:return:104",
+      "fixture_source_sha256": "dc6668864d028b12e3f8ec9c1c68096f2f1cc8f2e971757d919d8dbb3fdbd1d4",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "TestEnum21.A.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "TestEnum21.A.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "TestEnum21.A.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/genericType40.py::genericType40.py::genericType40.py:14:5:call:1",
+      "fixture_source_sha256": "d331855db488e8edfce0f9f082f55a90df3cb522da47f4707d71b2207584af36",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "func1(None)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Callable"
+          ],
+          "arguments": [
+            {
+              "parameter-list?": true,
+              "arguments": [
+                {
+                  "path": [
+                    "NoneType"
+                  ],
+                  "module": "builtins"
+                }
+              ]
+            },
+            {
+              "path": [
+                "NoneType"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "collections.abc"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "func1(None)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "arguments": [
+                {
+                  "typevar": "_T1"
+                }
+              ],
+              "parameter-list?": true
+            },
+            {
+              "typevar": "_T1"
+            }
+          ],
+          "module": "collections.abc",
+          "path": [
+            "Callable"
+          ]
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Optional TypeVar inference now correctly avoids treating the None branch as evidence for T, but unsolved function variables survive in return metadata or expanded union branches. Requires scoped completion and return normalization; original concrete output must not be restored blindly. No blanket unknown-as-pass or expectation waiver."
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:40:0:return:3",
+      "fixture_source_sha256": "f5943c3554aec8da7d93271cfa5d75ff17199c0211e3b8ad0d8fb71fb8bef11d",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ClassA.bar",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "DescriptorA"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff"
+        },
+        "expected": {
+          "path": [
+            "DescriptorA"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ClassA.bar",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "arguments": [
+            {
+              "module": "builtins",
+              "path": [
+                "str"
+              ]
+            }
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff",
+          "path": [
+            "DescriptorA"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "ClassA.bar",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "path": [
+            "DescriptorA"
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff"
+        },
+        "expected": {
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "path": [
+            "DescriptorA"
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:100:0:call:8",
+      "fixture_source_sha256": "f5943c3554aec8da7d93271cfa5d75ff17199c0211e3b8ad0d8fb71fb8bef11d",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ClassE.x",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "DescriptorE"
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ClassE.x",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "safe-unknown-unannotated-getter",
+      "repair_overlay": {
+        "status": "unknown",
+        "expression": "ClassE.x",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "reason": "DescriptorE.__get__ has no return annotation and returns None in the source. Both class and instance native reads produce None, not the previously reported DescriptorE storage type. Inferring unannotated getter bodies remains a separate precision improvement.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "ty-dispatch-native-310.json",
+        "ty-dispatch-native-313.json"
+      ]
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:101:0:call:9",
+      "fixture_source_sha256": "f5943c3554aec8da7d93271cfa5d75ff17199c0211e3b8ad0d8fb71fb8bef11d",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ClassE().x",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "DescriptorE"
+          ],
+          "module": "blt_fixture_39cf57c4e9b426ff"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ClassE().x",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "safe-unknown-unannotated-getter",
+      "repair_overlay": {
+        "status": "unknown",
+        "expression": "ClassE().x",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "reason": "DescriptorE.__get__ has no return annotation and returns None in the source. Both class and instance native reads produce None, not the previously reported DescriptorE storage type. Inferring unannotated getter bodies remains a separate precision improvement.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "ty-dispatch-native-310.json",
+        "ty-dispatch-native-313.json"
+      ]
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess23.py::memberAccess23.py::memberAccess23.py:49:0:return:4",
+      "fixture_source_sha256": "11f1c4b6a7ad47150d8e3cfb0d52be62afc24aa4b9691c393cb4db4ad6aeb639",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "A.attr3",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "A.attr3",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "module": "builtins",
+          "path": [
+            "property"
+          ]
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "int"
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "A.attr3",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:35:0:call:1",
+      "fixture_source_sha256": "b26d8656feac6cb60c0e8b5c7e3551dbf721541ffc5c79c74b3874aee18ed4fc",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ChildA.attr1",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Column"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "blt_fixture_f94aa54b399f3e45"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ChildA.attr1",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "ChildA.attr1",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "path": [
+            "Column"
+          ],
+          "module": "blt_fixture_f94aa54b399f3e45"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:36:0:call:2",
+      "fixture_source_sha256": "b26d8656feac6cb60c0e8b5c7e3551dbf721541ffc5c79c74b3874aee18ed4fc",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ChildA().attr1",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Column"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "blt_fixture_f94aa54b399f3e45"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ChildA().attr1",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "ChildA().attr1",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:37:0:call:3",
+      "fixture_source_sha256": "b26d8656feac6cb60c0e8b5c7e3551dbf721541ffc5c79c74b3874aee18ed4fc",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ChildA.attr2",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Column"
+          ],
+          "module": "blt_fixture_f94aa54b399f3e45"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ChildA.attr2",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable-open-constructor-inference",
+      "repair_overlay": {
+        "status": "unknown",
+        "expression": "ChildA.attr2",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "typevar": "_T"
+            }
+          ],
+          "path": [
+            "Column"
+          ],
+          "module": "blt_fixture_f94aa54b399f3e45"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "reason": "The unannotated export Column(str) needs constructor-argument generic inference to establish Column[str]. The new descriptor path exposes an unresolved T instead of treating bare Column as a resolved value. This is an applicable precision gap reserved for fourth worker work.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "microsoft-pyright/packages/pyright-internal/src/tests/samples/memberAccess6.py:16-38"
+      ]
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:38:0:call:4",
+      "fixture_source_sha256": "b26d8656feac6cb60c0e8b5c7e3551dbf721541ffc5c79c74b3874aee18ed4fc",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "ChildA().attr2",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Column"
+          ],
+          "module": "blt_fixture_f94aa54b399f3e45"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "ChildA().attr2",
+        "kind": "call",
+        "expected_error": false,
+        "actual": null,
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable-open-constructor-inference",
+      "repair_overlay": {
+        "status": "unknown",
+        "expression": "ChildA().attr2",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "typevar": "_T"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "reason": "The unannotated export Column(str) needs constructor-argument generic inference to establish Column[str]. The new descriptor path exposes an unresolved T instead of treating bare Column as a resolved value. This is an applicable precision gap reserved for fourth worker work.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "microsoft-pyright/packages/pyright-internal/src/tests/samples/memberAccess6.py:16-38"
+      ]
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/solver18.py::solver18.py::solver18.py:15:0:return:2",
+      "fixture_source_sha256": "a706837e0752102a6e218252b9dd5129fc30fdd765f0e6f544b97fe61a82b9a7",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "func1(None)",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "nullable?": true,
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "nullable?": true,
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "func1(None)",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "union": [
+            {
+              "module": "builtins",
+              "path": [
+                "str"
+              ]
+            },
+            {
+              "typevar": "_T"
+            }
+          ],
+          "nullable?": true
+        },
+        "expected": {
+          "nullable?": true,
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Optional TypeVar inference now correctly avoids treating the None branch as evidence for T, but unsolved function variables survive in return metadata or expanded union branches. Requires scoped completion and return normalization; original concrete output must not be restored blindly. No blanket unknown-as-pass or expectation waiver."
+    },
+    {
+      "id": "pyright:packages/pyright-internal/src/tests/samples/solver8.py::solver8.py::solver8.py:23:9:call:1",
+      "fixture_source_sha256": "cd099798267374c35884d692820e3e52181348a202b71dd222340038b8ded5ed",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "func1(f)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "int"
+          ],
+          "nullable?": true,
+          "module": "builtins"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "func1(f)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "union": [
+            {
+              "module": "builtins",
+              "path": [
+                "int"
+              ]
+            },
+            {
+              "typevar": "_T"
+            }
+          ]
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Optional TypeVar inference now correctly avoids treating the None branch as evidence for T, but unsolved function variables survive in return metadata or expanded union branches. Requires scoped completion and return normalization; original concrete output must not be restored blindly. No blanket unknown-as-pass or expectation waiver."
+    },
+    {
+      "id": "mypy:test-data/unit/check-python313.test::testNonRecursiveSimpleTypeVarDefaultNewStyle::main.py:5:0:return:0",
+      "fixture_source_sha256": "70da94387ecd19f46e424b2d2b094c53199c7814494e48f72a5591a1e40003fd",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "unknown",
+        "expression": "Child()",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Child"
+          ],
+          "arguments": [
+            {
+              "typevar": "S"
+            }
+          ],
+          "module": "blt_fixture_3454c39af255eba9"
+        },
+        "expected": {
+          "path": [
+            "Child"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "Parent"
+              ],
+              "arguments": [
+                {
+                  "path": [
+                    "int"
+                  ],
+                  "module": "builtins"
+                }
+              ],
+              "module": "blt_fixture_3454c39af255eba9"
+            }
+          ],
+          "module": "blt_fixture_3454c39af255eba9"
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "Child()",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "module": "blt_fixture_3454c39af255eba9",
+              "path": [
+                "Parent"
+              ]
+            }
+          ],
+          "module": "blt_fixture_3454c39af255eba9",
+          "path": [
+            "Child"
+          ]
+        },
+        "expected": {
+          "arguments": [
+            {
+              "arguments": [
+                {
+                  "module": "builtins",
+                  "path": [
+                    "int"
+                  ]
+                }
+              ],
+              "module": "blt_fixture_3454c39af255eba9",
+              "path": [
+                "Parent"
+              ]
+            }
+          ],
+          "module": "blt_fixture_3454c39af255eba9",
+          "path": [
+            "Child"
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable recursive-default normalization remains open",
+      "reason": "Child[S=Parent] precedes Parent[T=int]. Child() produces Child[Parent] because the bare forward default has not undergone bounded recursive class-default normalization. Applicable precision gap; no waiver."
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/attributes.rs::test_metaclass_property_precedence::main.py:14:0:return:0",
+      "fixture_source_sha256": "84577749bd4e5429c094a79627fd938b8b30c8c9d94f962ccae50c28e59a6fb1",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "C.f",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "C.f",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "module": "builtins",
+          "path": [
+            "property"
+          ]
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "C.f",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_non_data_descriptor_returns_own_class::main.py:24:0:return:0",
+      "fixture_source_sha256": "a45e57887935a1e968b91c8ffbc1a62c339e21487f50f9ab93808d8c55922f0f",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "Base().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "expected": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "Base().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "module": "blt_fixture_6ef9bc7497e0ca30",
+          "path": [
+            "Dev"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "Base().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "expected": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_non_data_descriptor_returns_own_class::main.py:25:0:return:1",
+      "fixture_source_sha256": "a45e57887935a1e968b91c8ffbc1a62c339e21487f50f9ab93808d8c55922f0f",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "Sub().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "expected": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "Sub().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "module": "blt_fixture_6ef9bc7497e0ca30",
+          "path": [
+            "Dev"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "Sub().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "expected": {
+          "path": [
+            "Dev"
+          ],
+          "module": "blt_fixture_6ef9bc7497e0ca30"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:63:0:return:2",
+      "fixture_source_sha256": "14a65eca8dc1bdd692c912b46c604e7c189c7cd57d8bfb576972cad4f2f6e559",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "c.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "NonData"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "expected": {
+          "path": [
+            "NonData"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "c.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "module": "blt_fixture_8798eac8c3fec71f",
+          "path": [
+            "NonData"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "native-storage-disagreement",
+      "repair_overlay": {
+        "status": "unknown",
+        "expression": "c.y",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "path": [
+            "NonData"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "reason": "C() stores the non-data descriptor class getter default, declared as list[NonData], in the instance y slot. It does not invoke the instance getter after storage. A native implementation returning a hashable list subclass stores that list on3.13;3.10 rejects even a hashable list-valued dataclass default. Returning NonData would overstate the proven storage type.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "nondata-default-native-310.json",
+        "nondata-default-native-313.json"
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:65:0:return:4",
+      "fixture_source_sha256": "14a65eca8dc1bdd692c912b46c604e7c189c7cd57d8bfb576972cad4f2f6e559",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "C.x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Data"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "expected": {
+          "path": [
+            "Data"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "C.x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "module": "blt_fixture_8798eac8c3fec71f",
+          "path": [
+            "Data"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "C.x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Data"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "expected": {
+          "path": [
+            "Data"
+          ],
+          "module": "blt_fixture_8798eac8c3fec71f"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/delayed_inference.rs::test_partial_quantified_in_function::main.py:5:4:call:0",
+      "fixture_source_sha256": "fa75ff067fee04a4c676cbd08de6b14c2b8842cf8a111abd498ef890213a37d9",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "f(None)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "list"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "NoneType"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "builtins"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "f(None)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "typevar": "T"
+            }
+          ],
+          "module": "builtins",
+          "path": [
+            "list"
+          ]
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Optional TypeVar inference now correctly avoids treating the None branch as evidence for T, but unsolved function variables survive in return metadata or expanded union branches. Requires scoped completion and return normalization; original concrete output must not be restored blindly. No blanket unknown-as-pass or expectation waiver."
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/delayed_inference.rs::test_partial_quantified_in_class_constructor::main.py:7:4:call:0",
+      "fixture_source_sha256": "cb163fb71de3917f10da4fc0fec0e40c127ed62db3807d237e2da191cf946388",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "A(None)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "A"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "NoneType"
+              ],
+              "module": "builtins"
+            }
+          ],
+          "module": "blt_fixture_f4e3daad12d4db93"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "A(None)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "typevar": "T2"
+            }
+          ],
+          "module": "blt_fixture_f4e3daad12d4db93",
+          "path": [
+            "A"
+          ]
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Optional TypeVar inference now correctly avoids treating the None branch as evidence for T, but unsolved function variables survive in return metadata or expanded union branches. Requires scoped completion and return normalization; original concrete output must not be restored blindly. No blanket unknown-as-pass or expectation waiver."
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:23:0:return:1",
+      "fixture_source_sha256": "d9bccc4860976fc5658987f931c686178e9ce1c74865f60328b400e47baa43d2",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "settings.with_default",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "settings.with_default",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "typevar": "T"
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "settings.with_default",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:24:0:return:2",
+      "fixture_source_sha256": "d9bccc4860976fc5658987f931c686178e9ce1c74865f60328b400e47baa43d2",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "settings.optional",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "nullable?": true,
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "nullable?": true,
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "settings.optional",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "expected": {
+          "nullable?": true,
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "settings.optional",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "nullable?": true,
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "nullable?": true,
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:25:0:return:3",
+      "fixture_source_sha256": "d9bccc4860976fc5658987f931c686178e9ce1c74865f60328b400e47baa43d2",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "settings.distinct",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "union": [
+            {
+              "path": [
+                "int"
+              ],
+              "module": "builtins"
+            },
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ]
+        },
+        "expected": {
+          "union": [
+            {
+              "path": [
+                "int"
+              ],
+              "module": "builtins"
+            },
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "settings.distinct",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "typevar": "T"
+        },
+        "expected": {
+          "union": [
+            {
+              "module": "builtins",
+              "path": [
+                "int"
+              ]
+            },
+            {
+              "module": "builtins",
+              "path": [
+                "str"
+              ]
+            }
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "settings.distinct",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "union": [
+            {
+              "path": [
+                "int"
+              ],
+              "module": "builtins"
+            },
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ]
+        },
+        "expected": {
+          "union": [
+            {
+              "path": [
+                "int"
+              ],
+              "module": "builtins"
+            },
+            {
+              "path": [
+                "str"
+              ],
+              "module": "builtins"
+            }
+          ]
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:26:0:return:4",
+      "fixture_source_sha256": "d9bccc4860976fc5658987f931c686178e9ce1c74865f60328b400e47baa43d2",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "settings.aliased",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "settings.aliased",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "typevar": "T"
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "settings.aliased",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:27:0:return:5",
+      "fixture_source_sha256": "d9bccc4860976fc5658987f931c686178e9ce1c74865f60328b400e47baa43d2",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "Settings.with_default",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "Settings.with_default",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "typevar": "T"
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "repaired; original assertion now passes",
+      "repair_overlay": {
+        "status": "passed",
+        "expression": "Settings.with_default",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/generic_restrictions.rs::test_circular_bound::main.py:12:0:return:2",
+      "fixture_source_sha256": "034bd1c26a556e6cf6ccc0bf5e0ad825e126029b7d4f37bcca1792a591a55771",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "a1.f()",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "any?": true
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "failed",
+        "expression": "a1.f()",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "typevar": "P",
+          "bound": {
+            "module": "blt_fixture_2a8a30b356de758c",
+            "path": [
+              "A"
+            ]
+          }
+        },
+        "expected": {
+          "any?": true
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Bare generic construction and recursive bounds need review after the private constructor20 worker/receiver-Any repair. Likely shared missing class-argument completion, but no exact frozen overlay has yet verified these rows."
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/generic_restrictions.rs::test_circular_bound::main.py:14:5:call:3",
+      "fixture_source_sha256": "034bd1c26a556e6cf6ccc0bf5e0ad825e126029b7d4f37bcca1792a591a55771",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "A(a1)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "A"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "A"
+              ],
+              "module": "blt_fixture_2a8a30b356de758c"
+            }
+          ],
+          "module": "blt_fixture_2a8a30b356de758c"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "A(a1)",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "typevar": "P",
+              "bound": {
+                "module": "blt_fixture_2a8a30b356de758c",
+                "path": [
+                  "A"
+                ]
+              }
+            }
+          ],
+          "module": "blt_fixture_2a8a30b356de758c",
+          "path": [
+            "A"
+          ]
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Bare generic construction and recursive bounds need review after the private constructor20 worker/receiver-Any repair. Likely shared missing class-argument completion, but no exact frozen overlay has yet verified these rows."
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/recursive_alias.rs::test_user_defined_container_not_cyclic::main.py:9:7:call:0",
+      "fixture_source_sha256": "3f63a10aa0cf04e1a743a6231acc79697c45d2f963bbfcc23074105c11c81700",
+      "family": "generic inference and defaults",
+      "owner": "Python type bridge",
+      "baseline": {
+        "status": "passed",
+        "expression": "C(x=C(x=None))",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "C"
+          ],
+          "arguments": [
+            {
+              "path": [
+                "C"
+              ],
+              "arguments": [
+                {
+                  "path": [
+                    "NoneType"
+                  ],
+                  "module": "builtins"
+                }
+              ],
+              "module": "blt_fixture_f0d68532494bdbc0"
+            }
+          ],
+          "module": "blt_fixture_f0d68532494bdbc0"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "C(x=C(x=None))",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "arguments": [
+            {
+              "typevar": "T"
+            }
+          ],
+          "module": "blt_fixture_f0d68532494bdbc0",
+          "path": [
+            "C"
+          ]
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "applicable inference gap remains open",
+      "reason": "Optional TypeVar inference now correctly avoids treating the None branch as evidence for T, but unsolved function variables survive in return metadata or expanded union branches. Requires scoped completion and return normalization; original concrete output must not be restored blindly. No blanket unknown-as-pass or expectation waiver."
+    },
+    {
+      "id": "ty:crates/ty_python_semantic/resources/mdtest/attributes.md::Attributes / Classes with custom `__getattribute__` methods / Basic::mdtest_snippet.py:8:0:return:0",
+      "fixture_source_sha256": "a92a7176261617a5649fd5e3a7a39fb113167b747fcd8d88595d1d9d74be0b55",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "Foo().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "Foo().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "native-runtime-disagreement",
+      "reason": "Native Foo().x is integer42, because __getattribute__ intercepts declared x:str. The upstream prose explicitly says its str convention differs from runtime. Keeping unknown prevents enforcing the incorrect stored-field type.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "ty-dispatch-native-310.json",
+        "ty-dispatch-native-313.json"
+      ]
+    },
+    {
+      "id": "ty:crates/ty_python_semantic/resources/mdtest/attributes.md::Attributes / Metaclasses with custom `__getattribute__` methods / Class attributes take precedence::mdtest_snippet.py:8:0:return:0",
+      "fixture_source_sha256": "da3f4ecbf34901c63048e0483c6389dd3d6a9cc87e6d69bbb064ec5262ddfc87",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "Foo.x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "Foo.x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "str"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "native-runtime-disagreement",
+      "reason": "Native Foo.x is integer1, because the metaclass __getattribute__ intercepts the stored x:str value. Unknown preserves safety; the upstream str preference does not model runtime dispatch.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "ty-dispatch-native-310.json",
+        "ty-dispatch-native-313.json"
+      ]
+    },
+    {
+      "id": "ty:crates/ty_python_semantic/resources/mdtest/descriptor_protocol.md::Descriptor protocol / Error handling and edge cases / An instance `__getattribute__` may delegate to descriptor lookup::mdtest_snippet.py:11:0:call:0",
+      "fixture_source_sha256": "e9a4ab12ca358ff28a70fed7378f743ef4fc7bb2232e8a37e389880b52edaa79",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "C().value",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "Descriptor"
+          ],
+          "module": "blt_fixture_3f4fe7d199f0b574"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "C().value",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "safe-unknown-dynamic-dispatch",
+      "reason": "The custom getter actually delegates to a malformed descriptor __get__(self), so native access raises TypeError for three supplied arguments. The previous inferred Descriptor value was not the accessed value. The hook declaration alone does not prove delegation or an accessed value type.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "ty-dispatch-native-310.json",
+        "ty-dispatch-native-313.json"
+      ]
+    },
+    {
+      "id": "ty:crates/ty_python_semantic/resources/mdtest/enums.md::Enums / Enum members / Custom enum metaclass member transformation::mdtest_snippet.py:27:0:return:3",
+      "fixture_source_sha256": "436567b64be386179e8623be0f8ab302050c7698c4e916fda8c8158c2de8c079",
+      "family": "attribute, descriptor, or Enum metadata",
+      "owner": "Python metadata and analyzer member resolution",
+      "baseline": {
+        "status": "passed",
+        "expression": "AnnotatedChoices.GOOD._value_",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "initial_candidate": {
+        "status": "unknown",
+        "expression": "AnnotatedChoices.GOOD._value_",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "module": "builtins",
+          "path": [
+            "int"
+          ]
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      "review_status": "safe-unknown-custom-metaclass",
+      "reason": "The explicit custom EnumMeta.__new__ can replace the class. This fixture returns None from its placeholder body, so AnnotatedChoices cannot be defined natively (TypeError). A declared _value_:int cannot prove the identity/value of a replacement object. Precise inference requires a separately proven metaclass constructor contract.",
+      "waives_diagnostic_failure": false,
+      "evidence": [
+        "ty-dispatch-native-310.json",
+        "ty-dispatch-native-313.json"
+      ]
+    }
+  ],
+  "adapter_lexical_boundaries": [
+    {
+      "id": "mypy:test-data/unit/check-errorcodes.test::testErrorCodeIgnoreMultiple1::main.py:1:4:call:0",
+      "fixture_source_sha256": "533cffdd02397fbf620702579b32f0711f5338b9425385b8c2c272b2d7e6cba6",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "'x'.foobar(b)",
+      "expected_error": false,
+      "boundary": "The upstream name-defined suppression is not modeled; generic lexical errors remain distinct from attribute/call diagnostics.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_0144e9018c74e169/b"
+        }
+      ]
+    },
+    {
+      "id": "mypy:test-data/unit/check-errorcodes.test::testErrorCodeIgnoreMultiple2::main.py:1:4:call:0",
+      "fixture_source_sha256": "f248c7f302104a28bb947ed2be0133e59022c96fc5c0c1fe06c26c1508e28b74",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "'x'.foobar(c)",
+      "expected_error": false,
+      "boundary": "The upstream name-defined suppression is not modeled; generic lexical errors remain distinct from attribute/call diagnostics.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_3acbcd38ea4f7c27/c"
+        }
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:9:4:return:0",
+      "fixture_source_sha256": "3c4dbd01eefccd898c914619f6dc714dc6e7e798f98340b20e7f02b8077e685c",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "e1",
+      "expected_error": false,
+      "boundary": "Exception-group handler binding scope (TryStar) is not adapted; no matching negative is credited.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e1"
+        }
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:11:4:return:1",
+      "fixture_source_sha256": "3c4dbd01eefccd898c914619f6dc714dc6e7e798f98340b20e7f02b8077e685c",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "e2",
+      "expected_error": false,
+      "boundary": "Exception-group handler binding scope (TryStar) is not adapted; no matching negative is credited.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e2"
+        }
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:18:4:return:2",
+      "fixture_source_sha256": "3c4dbd01eefccd898c914619f6dc714dc6e7e798f98340b20e7f02b8077e685c",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "e3",
+      "expected_error": false,
+      "boundary": "Exception-group handler binding scope (TryStar) is not adapted; no matching negative is credited.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e3"
+        }
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:23:4:return:3",
+      "fixture_source_sha256": "3c4dbd01eefccd898c914619f6dc714dc6e7e798f98340b20e7f02b8077e685c",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "e4",
+      "expected_error": false,
+      "boundary": "Exception-group handler binding scope (TryStar) is not adapted; no matching negative is credited.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e4"
+        }
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/flow_branching.rs::test_exception_group_handler::main.py:28:4:return:4",
+      "fixture_source_sha256": "3c4dbd01eefccd898c914619f6dc714dc6e7e798f98340b20e7f02b8077e685c",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "e5",
+      "expected_error": false,
+      "boundary": "Exception-group handler binding scope (TryStar) is not adapted; no matching negative is credited.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_c5f772432f762a29/e5"
+        }
+      ]
+    },
+    {
+      "id": "pyrefly:pyrefly/lib/test/generic_legacy.rs::test_error_on_bad_legacy_tparam::main.py:12:4:call:1",
+      "fixture_source_sha256": "a26244c3fd6bef5b6582fb3563c730d0e37431cf4c3ee78201d43cbfa8b9affc",
+      "baseline_status": "error",
+      "candidate_status": "error",
+      "expression": "oops()",
+      "expected_error": true,
+      "boundary": "The Python name oops is genuinely undefined. A separate name-resolution oracle is needed; this is not accepted as a generic call/type error.",
+      "findings": [
+        {
+          "type": ":unresolved-symbol",
+          "message": "Unresolved symbol: blt_fixture_26036cbf08289111/oops"
+        }
+      ]
+    }
+  ],
+  "targeted_worker_repair_overlay": {
+    "scope": "Targeted third worker/descriptor introduced regressions; whole containing fixtures retained. This is not a whole-corpus rerun.",
+    "source_hashes": {
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "8a8cdded05e835f1ca67eafb2d90af1d22c0d8382c91109f27928e621c516031",
+      "src/basilisp_tools/analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "4400c6556bbdad931c07a7e7d183e14d6536995cfdda5546fc5515f348ed30ad",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "unchanged_sources": true,
+    "raw_report_sha256": "742f75af56f951e2595e3873e102330ea3080e9665626e51cc90f3eb4e749353",
+    "fixture_count": 13,
+    "case_count": 250,
+    "whole_fixture_counts": {
+      "excluded": 60,
+      "passed": 63,
+      "failed": 9,
+      "unknown": 118
+    },
+    "targeted_counts": {
+      "passed": 19,
+      "unknown": 6
+    },
+    "target_case_ids": [
+      "pyrefly:pyrefly/lib/test/attributes.rs::test_metaclass_property_precedence::main.py:14:0:return:0",
+      "pyrefly:pyrefly/lib/test/dataclasses.rs::test_non_data_descriptor_returns_own_class::main.py:24:0:return:0",
+      "pyrefly:pyrefly/lib/test/dataclasses.rs::test_non_data_descriptor_returns_own_class::main.py:25:0:return:1",
+      "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:63:0:return:2",
+      "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:65:0:return:4",
+      "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:23:0:return:1",
+      "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:24:0:return:2",
+      "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:25:0:return:3",
+      "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:26:0:return:4",
+      "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:27:0:return:5",
+      "pyright:packages/pyright-internal/src/tests/samples/constrainedTypeVar14.py::constrainedTypeVar14.py::constrainedTypeVar14.py:28:0:return:3",
+      "pyright:packages/pyright-internal/src/tests/samples/constructor20.py::constructor20.py::constructor20.py:42:0:call:10",
+      "pyright:packages/pyright-internal/src/tests/samples/dataclassDescriptors1.py::dataclassDescriptors1.py::dataclassDescriptors1.py:33:0:return:2",
+      "pyright:packages/pyright-internal/src/tests/samples/descriptor6.py::descriptor6.py::descriptor6.py:220:0:return:23",
+      "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:157:9:call:75",
+      "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:278:0:return:104",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:100:0:call:8",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:101:0:call:9",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:40:0:return:3",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess23.py::memberAccess23.py::memberAccess23.py:49:0:return:4",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:35:0:call:1",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:36:0:call:2",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:37:0:call:3",
+      "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:38:0:call:4",
+      "typing:conformance/tests/dataclasses_descriptors.py::dataclasses_descriptors.py::dataclasses_descriptors.py:38:0:return:3"
+    ],
+    "all_status_changes": [
+      {
+        "id": "typing:conformance/tests/dataclasses_descriptors.py::dataclasses_descriptors.py::dataclasses_descriptors.py:37:0:return:2",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "typing:conformance/tests/dataclasses_descriptors.py::dataclasses_descriptors.py::dataclasses_descriptors.py:38:0:return:3",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "typing:conformance/tests/dataclasses_descriptors.py::dataclasses_descriptors.py::dataclasses_descriptors.py:63:0:return:6",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/constrainedTypeVar14.py::constrainedTypeVar14.py::constrainedTypeVar14.py:28:0:return:3",
+        "before": "failed",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/constructor20.py::constructor20.py::constructor20.py:37:0:call:8",
+        "before": "passed",
+        "after": "unknown"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/constructor20.py::constructor20.py::constructor20.py:38:0:call:9",
+        "before": "passed",
+        "after": "unknown"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/constructor20.py::constructor20.py::constructor20.py:42:0:call:10",
+        "before": "failed",
+        "after": "unknown"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/dataclassDescriptors1.py::dataclassDescriptors1.py::dataclassDescriptors1.py:32:0:return:1",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/dataclassDescriptors1.py::dataclassDescriptors1.py::dataclassDescriptors1.py:33:0:return:2",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/dataclassDescriptors1.py::dataclassDescriptors1.py::dataclassDescriptors1.py:41:0:return:5",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/descriptor6.py::descriptor6.py::descriptor6.py:220:0:return:23",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:157:9:call:75",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:278:0:return:104",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess1.py::memberAccess1.py::memberAccess1.py:40:0:return:3",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess23.py::memberAccess23.py::memberAccess23.py:45:0:return:0",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess23.py::memberAccess23.py::memberAccess23.py:49:0:return:4",
+        "before": "failed",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess23.py::memberAccess23.py::memberAccess23.py:51:0:return:6",
+        "before": "failed",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:35:0:call:1",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/memberAccess6.py::memberAccess6.py::memberAccess6.py:36:0:call:2",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/attributes.rs::test_metaclass_property_precedence::main.py:14:0:return:0",
+        "before": "failed",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_non_data_descriptor_returns_own_class::main.py:24:0:return:0",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_non_data_descriptor_returns_own_class::main.py:25:0:return:1",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:62:0:return:1",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:64:0:return:3",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/dataclasses.rs::test_overloaded_descriptor_in_dataclass::main.py:65:0:return:4",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:23:0:return:1",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:24:0:return:2",
+        "before": "failed",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:25:0:return:3",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:26:0:return:4",
+        "before": "unknown",
+        "after": "passed"
+      },
+      {
+        "id": "pyrefly:pyrefly/lib/test/descriptors.rs::test_descriptor_get_distributes_over_union::main.py:27:0:return:5",
+        "before": "unknown",
+        "after": "passed"
+      }
+    ],
+    "precision_loss_review": "Two additional constructor20 homogeneous calls changed passed to unknown alongside removal of the mixed-call error. The sample explicitly declares the unspecialized receiver type argument Unknown; a concrete return type is not proved. No new failure/error/diagnostic was introduced by this overlay.",
+    "not_a_full_rerun": true
+  },
+  "strict_regression_gate": {
+    "selection_manifest_sha256": "ec86b01bb73a0e5fe02de129f1fc2c9a12fbe7568934791e6d4cff35b3059b1c",
+    "selection_manifest": [
+      {
+        "provider": "mypy",
+        "path": "test-data/unit/check-classes.test",
+        "name": "testMethodCallWithSubtype",
+        "source_sha256": "a6f3733cacfe4a88d85bd95f292588ad3a60e80f657ed8494d4f740ad3a1ae1e",
+        "expected": {
+          "passed": 4,
+          "excluded": 0,
+          "positive_calls": 3,
+          "negative_calls": 1,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "mypy",
+        "path": "test-data/unit/check-kwargs.test",
+        "name": "testTwoKeywordArgumentsNotInOrder",
+        "source_sha256": "1dbb1352e70b979c43718b54f154045547bf98937ecfe5da409f1b77825de14f",
+        "expected": {
+          "passed": 4,
+          "excluded": 0,
+          "positive_calls": 2,
+          "negative_calls": 2,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "pyrefly",
+        "path": "pyrefly/lib/test/calls.rs",
+        "name": "test_deprecated_method_call",
+        "source_sha256": "7e6761d4918c357bebe0824f5f064553ae7df879f1ef2ea332ec061c1496ccc1",
+        "expected": {
+          "passed": 2,
+          "excluded": 0,
+          "positive_calls": 1,
+          "negative_calls": 1,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "pyrefly",
+        "path": "pyrefly/lib/test/type_var_tuple.rs",
+        "name": "test_type_var_tuple_callable_optional_parameter",
+        "source_sha256": "7a8acf9abf39e7500a97e3323a175fd28564725fcec2a81806d3f0b1a0550775",
+        "expected": {
+          "passed": 4,
+          "excluded": 0,
+          "positive_calls": 0,
+          "negative_calls": 2,
+          "return_assertions": 2
+        }
+      },
+      {
+        "provider": "ty",
+        "path": "crates/ty_python_semantic/resources/mdtest/generics/legacy/functions.md",
+        "name": "Generic functions: Legacy syntax / Invalid bounds in generic union members",
+        "source_sha256": "a47d46167ba247bd9b64f48a714b7c967e4a94836300c7a8025ca062ede4ed78",
+        "expected": {
+          "passed": 5,
+          "excluded": 1,
+          "positive_calls": 3,
+          "negative_calls": 2,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "ty",
+        "path": "crates/ty_python_semantic/resources/mdtest/named_tuple.md",
+        "name": "`NamedTuple` / `typing.NamedTuple` / Functional syntax with Final variable field names",
+        "source_sha256": "8d3b9c8010544ca6f5d7fa8e0c7d157a9a02f042d9471599ad74f06ba0edd3ea",
+        "expected": {
+          "passed": 3,
+          "excluded": 1,
+          "positive_calls": 0,
+          "negative_calls": 1,
+          "return_assertions": 2
+        }
+      },
+      {
+        "provider": "pyright",
+        "path": "packages/pyright-internal/src/tests/samples/constrainedTypeVar8.py",
+        "name": "constrainedTypeVar8.py",
+        "source_sha256": "cc2b234c2570b728dbc011eeaccffafc0caedaef1dc80e1789e58437284e63e7",
+        "expected": {
+          "passed": 7,
+          "excluded": 1,
+          "positive_calls": 3,
+          "negative_calls": 1,
+          "return_assertions": 3
+        }
+      },
+      {
+        "provider": "pyright",
+        "path": "packages/pyright-internal/src/tests/samples/typedDict26.py",
+        "name": "typedDict26.py",
+        "source_sha256": "5938fb3f1f46e400c6e92bbad227ff7a8462e0aa22480ad357dfb7869b427037",
+        "expected": {
+          "passed": 2,
+          "excluded": 0,
+          "positive_calls": 1,
+          "negative_calls": 1,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "pyright",
+        "path": "packages/pyright-internal/src/tests/samples/typeVarTuple25.py",
+        "name": "typeVarTuple25.py",
+        "source_sha256": "16f9530db13c8f75ebd2cc796b9ecddee6b0f5ffd0680b77703d19672e4939e7",
+        "expected": {
+          "passed": 1,
+          "excluded": 1,
+          "positive_calls": 0,
+          "negative_calls": 0,
+          "return_assertions": 1
+        }
+      },
+      {
+        "provider": "pyright",
+        "path": "packages/pyright-internal/src/tests/samples/typeVarTuple29.py",
+        "name": "typeVarTuple29.py",
+        "source_sha256": "41850cc4e3de9b5a29c63250b2143154b7174d9c81c50ea90df3dd36e3aea309",
+        "expected": {
+          "passed": 2,
+          "excluded": 5,
+          "positive_calls": 2,
+          "negative_calls": 0,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "pyright",
+        "path": "packages/pyright-internal/src/tests/samples/paramSpec20.py",
+        "name": "paramSpec20.py",
+        "source_sha256": "28308725aec97c2ec0b45ba381a690426a1bbf780a250367eea200b06630669e",
+        "expected": {
+          "passed": 2,
+          "excluded": 5,
+          "positive_calls": 2,
+          "negative_calls": 0,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "mypy",
+        "path": "test-data/unit/check-classvar.test",
+        "name": "testTypeCheckOnAssignment",
+        "source_sha256": "bdeda098ee5ea20693671b02e68adafdd2a9c836d8ac9be091604dbf81260b9c",
+        "expected": {
+          "passed": 1,
+          "excluded": 0,
+          "positive_calls": 0,
+          "negative_calls": 1,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "mypy",
+        "path": "test-data/unit/check-classvar.test",
+        "name": "testClassVarWithUnion",
+        "source_sha256": "218ad8466f4f83f43b99ed4fd4c9207f335c39080c9492d5b6648620a9aee5ce",
+        "expected": {
+          "passed": 2,
+          "excluded": 0,
+          "positive_calls": 0,
+          "negative_calls": 1,
+          "return_assertions": 1
+        }
+      },
+      {
+        "provider": "mypy",
+        "path": "test-data/unit/check-newsemanal.test",
+        "name": "testNewAnalyzerFinalReassignModuleVar",
+        "source_sha256": "3e72bc449ce97cc51175c78885693959a626bd3d6a623eda05c15db5e27be894",
+        "expected": {
+          "passed": 3,
+          "excluded": 3,
+          "positive_calls": 2,
+          "negative_calls": 1,
+          "return_assertions": 0
+        }
+      },
+      {
+        "provider": "mypy",
+        "path": "test-data/unit/check-unions.test",
+        "name": "testGenericUnionMemberWithTypeVarConstraints",
+        "source_sha256": "3f2d20c559d19eba618b5947612f0fe51e69bf991519f550052722efb796a7d3",
+        "expected": {
+          "passed": 4,
+          "excluded": 1,
+          "positive_calls": 0,
+          "negative_calls": 0,
+          "return_assertions": 4
+        }
+      },
+      {
+        "provider": "pyrefly",
+        "path": "pyrefly/lib/test/descriptors.rs",
+        "name": "test_simple_user_defined_get_descriptor",
+        "source_sha256": "3d855fd22d256ae23c9cc451b6b65fedb1bddcae0a375620e848bbd9e879b488",
+        "expected": {
+          "passed": 2,
+          "excluded": 3,
+          "positive_calls": 0,
+          "negative_calls": 0,
+          "return_assertions": 2
+        }
+      },
+      {
+        "provider": "pyrefly",
+        "path": "pyrefly/lib/test/generic_restrictions.rs",
+        "name": "test_type_var_tuple_default",
+        "source_sha256": "1d9d3677c7af73f4321635d055df33b72bbead57bc3b48e5dc5f91652568221a",
+        "expected": {
+          "passed": 1,
+          "excluded": 3,
+          "positive_calls": 0,
+          "negative_calls": 0,
+          "return_assertions": 1
+        }
+      },
+      {
+        "provider": "ty",
+        "path": "crates/ty_python_semantic/resources/mdtest/dataclasses/dataclasses.md",
+        "name": "Dataclasses / Descriptor-typed fields / Different types in `__get__` and `__set__`",
+        "source_sha256": "2c797efb2352d5ac2e8b1edc220c1f7dcc4666790b3cad603c3e4edbdced2322",
+        "expected": {
+          "passed": 5,
+          "excluded": 3,
+          "positive_calls": 2,
+          "negative_calls": 2,
+          "return_assertions": 1
+        }
+      }
+    ],
+    "selected_fixtures": 18,
+    "selected_passed": 54,
+    "selected_expected_diagnostics": 16,
+    "selected_excluded": 27,
+    "typing_fixture_counts": {
+      "dataclasses_kwonly": 17,
+      "dataclasses_transform_class": 8,
+      "dataclasses_transform_field": 5,
+      "generics_basic": 6
+    },
+    "total_resolved_assertions": 90,
+    "validation_source_hashes": {
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "8a8cdded05e835f1ca67eafb2d90af1d22c0d8382c91109f27928e621c516031",
+      "src/basilisp_tools/analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "4400c6556bbdad931c07a7e7d183e14d6536995cfdda5546fc5515f348ed30ad",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "selected_counts": {
+      "excluded": 27,
+      "passed": 54
+    },
+    "selection_failures": [],
+    "typing_results": [
+      {
+        "name": "dataclasses_kwonly",
+        "returncode": 0,
+        "counts": {
+          "passed": 17,
+          "excluded": 2
+        },
+        "source_changed_during_run": false
+      },
+      {
+        "name": "dataclasses_transform_class",
+        "returncode": 0,
+        "counts": {
+          "excluded": 11,
+          "passed": 8
+        },
+        "source_changed_during_run": false
+      },
+      {
+        "name": "dataclasses_transform_field",
+        "returncode": 0,
+        "counts": {
+          "excluded": 5,
+          "passed": 5
+        },
+        "source_changed_during_run": false
+      },
+      {
+        "name": "generics_basic",
+        "returncode": 0,
+        "counts": {
+          "excluded": 45,
+          "passed": 6
+        },
+        "source_changed_during_run": false
+      }
+    ],
+    "raw_report_sha256": "e46fc641a36067546229582208115cdb1995f90819e91e2884167930a157b7a2"
+  },
+  "final_validation": {
+    "status": "passed; full suites, strict 90, source and format checks, actionlint, installed-wheel smoke, public regression checks, and final ML gates completed",
+    "completed_serial_gate": {
+      "passed": true,
+      "source_hashes": {
+        "src/basilisp_tools/analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+        "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+        "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+        "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+        "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+        "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+        "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+        "src/basilisp_tools/python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+        "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+        "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2",
+        "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+        "src/basilisp_tools/_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b",
+        "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+        "scripts/compare_python_typing.py": "bdfda3d54c8845dcdab86496ecb929a5c13b31d7d5987cb484099a738ae57732",
+        "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+        "scripts/python_typing_selection.json": "ec86b01bb73a0e5fe02de129f1fc2c9a12fbe7568934791e6d4cff35b3059b1c",
+        "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+        ".github/workflows/ci.yml": "fae8ce2c81f4fd073cbb656398574d7dbaa7415711fe3272eb4343a5f45de9eb"
+      },
+      "source_changed_during_run": false,
+      "strict_assertions": 90,
+      "source_errors": 0,
+      "source_warnings": 0,
+      "checks": [
+        {
+          "name": "selection",
+          "returncode": 0,
+          "log_sha256": "ef691564eae0c728dcfc2a692e7c51f5056997b0267741a6dd3518f32f6f8dac",
+          "counts": {
+            "excluded": 27,
+            "passed": 54
+          },
+          "count_guard_passed": true
+        },
+        {
+          "name": "dataclasses_kwonly",
+          "returncode": 0,
+          "log_sha256": "cec3201f1d38d7ad6c02f4ff97b69c3f400e7d1cbab5cc68f587326f4552cbbf",
+          "counts": {
+            "passed": 17,
+            "excluded": 2
+          },
+          "count_guard_passed": true
+        },
+        {
+          "name": "dataclasses_transform_class",
+          "returncode": 0,
+          "log_sha256": "f141b00added6433a7f456c4972748434e784db0560af30e0eceb33b23eb57d2",
+          "counts": {
+            "excluded": 11,
+            "passed": 8
+          },
+          "count_guard_passed": true
+        },
+        {
+          "name": "dataclasses_transform_field",
+          "returncode": 0,
+          "log_sha256": "7791486e557845ae9a838879f68c120d73dd6179b5bb1a22c25a3cd488bed205",
+          "counts": {
+            "excluded": 5,
+            "passed": 5
+          },
+          "count_guard_passed": true
+        },
+        {
+          "name": "generics_basic",
+          "returncode": 0,
+          "log_sha256": "591be7bb01880b978d8920114de21f2cb4e5dc26af90dc491bd932ecf2f65d06",
+          "counts": {
+            "excluded": 45,
+            "passed": 6
+          },
+          "count_guard_passed": true
+        },
+        {
+          "name": "source",
+          "returncode": 0,
+          "log_sha256": "d21677b3f894ddd75d1b6a3d573555fa4994d4f1c0e567a55627ea5afe2a66dc"
+        },
+        {
+          "name": "actionlint",
+          "returncode": 0,
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "raw_record_sha256": "c2dd0bef64cfec688a5c31a7b3d8a378668ab074568715c82f04bdf076c8185c"
+    },
+    "full_test_suites": [
+      {
+        "python": "3.13.2",
+        "command": [
+          ".venv/bin/basilisp",
+          "test",
+          "-p",
+          "tests",
+          "--include-unsafe-path=false"
+        ],
+        "cwd": "repository root",
+        "environment_overrides": {},
+        "loopback_access": "enabled for LSP integration tests",
+        "exit_code": 0,
+        "passed": 1402,
+        "skipped": 0,
+        "log": "tests313-third-final.log",
+        "log_sha256": "b8a3a30fec4dbb410071b08d465e2031e6841c1b8c13d3de45938d0cfbc50d73"
+      },
+      {
+        "python": "3.10.16",
+        "command": [
+          "/tmp/blt-final-python310/bin/basilisp",
+          "test",
+          "-p",
+          "tests",
+          "--include-unsafe-path=false"
+        ],
+        "cwd": "repository root",
+        "environment_overrides": {},
+        "loopback_access": "enabled for LSP integration tests",
+        "exit_code": 0,
+        "passed": 1399,
+        "skipped": 3,
+        "log": "tests310-third-final.log",
+        "log_sha256": "6d869d15313d742b491d4bc7ab4d8d7ad56f42a126f095456cae9b12129b3646"
+      }
+    ],
+    "full_test_source_hashes": {
+      "src/basilisp_tools/analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b",
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/compare_python_typing.py": "bdfda3d54c8845dcdab86496ecb929a5c13b31d7d5987cb484099a738ae57732",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_selection.json": "ec86b01bb73a0e5fe02de129f1fc2c9a12fbe7568934791e6d4cff35b3059b1c",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      ".github/workflows/ci.yml": "fae8ce2c81f4fd073cbb656398574d7dbaa7415711fe3272eb4343a5f45de9eb"
+    },
+    "format_check": {
+      "command": [
+        ".venv/bin/blt",
+        "format",
+        "--check",
+        "src",
+        "tests"
+      ],
+      "exit_code": 0,
+      "log": "format-third-exact-final.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "source_hashes": {
+        "src/basilisp_tools/analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+        "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+        "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+        "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+        "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+        "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+        "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+        "src/basilisp_tools/python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+        "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+        "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2",
+        "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+        "src/basilisp_tools/_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b",
+        "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+        "scripts/compare_python_typing.py": "bdfda3d54c8845dcdab86496ecb929a5c13b31d7d5987cb484099a738ae57732",
+        "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+        "scripts/python_typing_selection.json": "ec86b01bb73a0e5fe02de129f1fc2c9a12fbe7568934791e6d4cff35b3059b1c",
+        "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+        ".github/workflows/ci.yml": "fae8ce2c81f4fd073cbb656398574d7dbaa7415711fe3272eb4343a5f45de9eb"
+      },
+      "final_source_confirmed": true
+    },
+    "package": {
+      "passed": true,
+      "source_hashes": {
+        "src/basilisp_tools/analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+        "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+        "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+        "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+        "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+        "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+        "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+        "src/basilisp_tools/python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+        "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+        "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2",
+        "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+        "src/basilisp_tools/_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b",
+        "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+        "scripts/compare_python_typing.py": "bdfda3d54c8845dcdab86496ecb929a5c13b31d7d5987cb484099a738ae57732",
+        "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+        "scripts/python_typing_selection.json": "ec86b01bb73a0e5fe02de129f1fc2c9a12fbe7568934791e6d4cff35b3059b1c",
+        "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+        ".github/workflows/ci.yml": "fae8ce2c81f4fd073cbb656398574d7dbaa7415711fe3272eb4343a5f45de9eb"
+      },
+      "wheel_sources_byte_verified": true,
+      "isolated_installed_location_verified": true,
+      "logs_sha256": {
+        "build.log": "89aee37e565e08470e2781544cc927022d752ac14ee5b51ab9384a5bf077bb3f",
+        "wheel-venv.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "wheel-install.log": "2f44298e252d679f6de177728cfbfad84255d500927240ee1ddc69c240174cad",
+        "wheel-location.log": "9b11a08f8d4da82c7d813a70b028e14e16a3d1131886c4ecab949a06f5bda521",
+        "wheel-version.log": "8e0aebcba5c24e89bc4e3fa1ceb988f4c9159ccadafaa430d8c785950ee52a76",
+        "wheel-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "wheel-check.log": "f7f86ea54b07cda3316c6074d6e70222e0a9b2ae32afd53d179afc3fcd1fb418",
+        "wheel-lsp.log": "f0e13ddcb26e547c9f75a01d24d07d35517c4616a9899b0e556fa0dd66e3a08c"
+      },
+      "stages": [
+        {
+          "stage": "build",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-venv",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-install",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-location",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-version",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-format",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-check",
+          "exit": 0
+        },
+        {
+          "stage": "wheel-lsp",
+          "exit": 0
+        }
+      ],
+      "runner_source": "from pathlib import Path\nimport importlib.metadata,json,os,subprocess,sys,tempfile,time,zipfile\nroot=Path('/Users/alexseverin/basilisp-tools')\nlogs=Path('/tmp/blt-python-mismatches-20261007/package-third-final');logs.mkdir(exist_ok=True)\npython=root/'.venv/bin/python'\nuv=Path('/nix/store/71zq15rr7i4avy58y89hfgf2lhp3b7la-uv-0.12.5/bin/uv')\ncache=logs/'uv-cache'\nresults=[]\ndef run(name,cmd,*,cwd=root,env=None,data=None):\n print(json.dumps({'stage':name,'status':'running'}),flush=True)\n start=time.monotonic()\n with (logs/(name+'.log')).open('w') as f:\n  p=subprocess.run(list(map(str,cmd)),cwd=cwd,env=env,input=data,text=True,stdout=f,stderr=subprocess.STDOUT)\n result={'stage':name,'exit':p.returncode,'seconds':round(time.monotonic()-start,2),'log':str(logs/(name+'.log'))};results.append(result)\n (logs/'results.json').write_text(json.dumps(results,indent=2)+'\\n');print(json.dumps(result),flush=True)\n if p.returncode:print((logs/(name+'.log')).read_text()[-5000:],flush=True);raise SystemExit(p.returncode)\nenv=dict(os.environ);env['PYTHONPATH']='/Users/alexseverin/.cache/uv/archive-v0/bCAQW7DTxk0j3R3_'\nrun('build',[uv,'build','--offline','--no-build-isolation','--cache-dir',cache,'--python',python],env=env)\nwheel=max((root/'dist').glob('*.whl'),key=lambda p:p.stat().st_mtime)\nwith zipfile.ZipFile(wheel) as z:\n for source in (root/'src/basilisp_tools').iterdir():\n  if source.suffix in ('.py','.lpy'):\n   assert z.read('basilisp_tools/'+source.name)==source.read_bytes(),source\nprint(json.dumps({'wheel':str(wheel),'sources_verified':True}),flush=True)\nwith tempfile.TemporaryDirectory(prefix='blt-final-wheel-') as folder:\n folder=Path(folder);venv=folder/'venv'\n run('wheel-venv',[python,'-m','venv','--without-pip',venv])\n site=next((venv/'lib').glob('python*/site-packages'));(site/'dependencies.pth').write_text(str(root/'.venv/lib/python3.13/site-packages')+'\\n')\n run('wheel-install',[uv,'pip','install','--offline','--no-deps','--cache-dir',cache,'--python',venv/'bin/python',wheel])\n run('wheel-location',[venv/'bin/python','-c','import basilisp_tools; print(basilisp_tools.__file__); assert \"'+str(venv)+'\" in basilisp_tools.__file__'],cwd=folder)\n blt=venv/'bin/blt'\n run('wheel-version',[blt,'--version'],cwd=folder)\n run('wheel-format',[blt,'format','--check','-'],cwd=folder,data='(let [x 1]\\n  x)\\n')\n run('wheel-check',[blt,'check','--repro','-'],cwd=folder,data='(ns wheel-smoke (:import [math])) (math/sqrt 4)\\n')\n run('wheel-lsp',[python,root/'scripts/smoke_lsp.py',blt,'lsp'],cwd=folder)\nprint('Package build and isolated installed-wheel checks passed.',flush=True)\n",
+      "runner_sha256": "19dfd83c5169f1759094cce5330347f9f82dbae2ff6a022d86896989079d4ac4",
+      "runner_log_sha256": "79a0b7f877c4449db9cbcaaf72ffb0bfd501205ae8885bcd99139bd3712c3999",
+      "artifacts": [
+        {
+          "filename": "basilisp_tools-0.1.0.tar.gz",
+          "sha256": "7592f20b2b71db473f481b0e29e3db06d6a87a736c5e3b8d2c3e7b7d5befe44a"
+        },
+        {
+          "filename": "basilisp_tools-0.0.1-py3-none-any.whl",
+          "sha256": "22e78b600e20b69134c96841f894ef914b3d0caf327f9d0d44f51d8a6acae249"
+        },
+        {
+          "filename": "basilisp_tools-0.0.1.tar.gz",
+          "sha256": "9f2b8462b353096ccd309384e9d545e7439c511303afe67322baef9114a81dc8"
+        },
+        {
+          "filename": "basilisp_tools-0.1.0-py3-none-any.whl",
+          "sha256": "1e843e33d59beacfeac8267dffb900fa5404741432c28eee4766a0d907cda4a3"
+        }
+      ]
+    },
+    "controlled_performance": {
+      "order": [
+        "before",
+        "after",
+        "after",
+        "before"
+      ],
+      "manifest_sha256": "88b666d25296eeba7e6dcd5bae326e60cb9bcff5276342e15871ba37fa6a385d",
+      "harness_sha256": "489ff7473e9acd7b5f2a1dec0f3030cb76bcb0aaac90b15309380683c6d32be0",
+      "notes": "Quiet coordinated sequential ABBA; generated size16 positive programs. Cold first analysis followed by two warm calls sharing one inspection cache. Parent CPU excludes worker CPU. Whole-source before/after comparison, not isolated optimization.",
+      "observables_equal": true,
+      "medians": {
+        "torch-large": {
+          "before": {
+            "seconds": 2.61245231248904,
+            "parent_cpu_seconds": 2.6124035
+          },
+          "after": {
+            "seconds": 2.8553844790440053,
+            "parent_cpu_seconds": 2.8553550000000003
+          },
+          "wall_change_percent": 9.299008651511386
+        },
+        "onnx-large": {
+          "before": {
+            "seconds": 6.176233166479506,
+            "parent_cpu_seconds": 6.176056999999999
+          },
+          "after": {
+            "seconds": 6.815818000002764,
+            "parent_cpu_seconds": 6.8156324999999995
+          },
+          "wall_change_percent": 10.3555810845112
+        }
+      },
+      "final_sources": {
+        "before": {
+          "python.lpy": "14602b8a45b73cd156ea3d7b47a8fbe9d9f2d7b7bbb8c26e0eef2e220f3ecfe8",
+          "analyzer.lpy": "276d14f245ff9f5e2599272f54deb56fc0a0291121da41648ed6e7fa2f8060fa",
+          "_inspect.py": "fb7a321c79cbf3618d52f09f179ce04aeb612f34afed7ab72e18ce6690036c58"
+        },
+        "after": {
+          "python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+          "analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+          "_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b"
+        }
+      },
+      "scope": "Whole-feature comparison on two generated size16 positive ML programs; no speedup claimed.",
+      "raw_report_sha256": "66092fb7ed73eddd0078e2033919ec99396f660f82cf103819ea4b3cb5dc8193",
+      "runs": [
+        {
+          "iteration": 0,
+          "source": "before",
+          "case": "torch-large",
+          "subprocess_seconds": 32.959293249994516,
+          "cold": [
+            {
+              "seconds": 26.34562608296983,
+              "parent_cpu_seconds": 5.3345910000000005,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 2.8364917499711737,
+              "parent_cpu_seconds": 2.8364510000000003,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            },
+            {
+              "seconds": 2.425579624949023,
+              "parent_cpu_seconds": 2.425547999999999,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "raw_report_sha256": "a030fa53e84c978119648148e21b3349563b81bddefdeced6837626d8d28c34b"
+        },
+        {
+          "iteration": 0,
+          "source": "before",
+          "case": "onnx-large",
+          "subprocess_seconds": 25.42106324993074,
+          "cold": [
+            {
+              "seconds": 12.064610540983267,
+              "parent_cpu_seconds": 7.519569,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 6.135435208096169,
+              "parent_cpu_seconds": 6.135316,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            },
+            {
+              "seconds": 6.150563625036739,
+              "parent_cpu_seconds": 6.150359999999999,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "raw_report_sha256": "214ff088cd08a6b688dc9adefc8b62895f93577735761f1f774489f557a905dc"
+        },
+        {
+          "iteration": 1,
+          "source": "after",
+          "case": "torch-large",
+          "subprocess_seconds": 71.33114658296108,
+          "cold": [
+            {
+              "seconds": 30.309748125029728,
+              "parent_cpu_seconds": 5.511194000000003,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 3.071572458022274,
+              "parent_cpu_seconds": 3.0715509999999995,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            },
+            {
+              "seconds": 2.6329523329623044,
+              "parent_cpu_seconds": 2.6327970000000036,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "raw_report_sha256": "bf9e96373b2e3805d355ceaeda8681f923a7012ef4e8a5b7f0f4aae92ac044a8"
+        },
+        {
+          "iteration": 1,
+          "source": "after",
+          "case": "onnx-large",
+          "subprocess_seconds": 28.282637999975123,
+          "cold": [
+            {
+              "seconds": 13.538723375066184,
+              "parent_cpu_seconds": 8.114792000000001,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 6.982729082927108,
+              "parent_cpu_seconds": 6.982325000000001,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            },
+            {
+              "seconds": 6.722319624968804,
+              "parent_cpu_seconds": 6.722011999999999,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "raw_report_sha256": "be1546a4b21e21b37ffa0e5dc63a7001a1ae8a6e1070cc8e004c03d98cf0d249"
+        },
+        {
+          "iteration": 2,
+          "source": "after",
+          "case": "torch-large",
+          "subprocess_seconds": 37.05774225003552,
+          "cold": [
+            {
+              "seconds": 30.010124415974133,
+              "parent_cpu_seconds": 5.6124469999999995,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 3.084023499977775,
+              "parent_cpu_seconds": 3.0840249999999996,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            },
+            {
+              "seconds": 2.6391965000657365,
+              "parent_cpu_seconds": 2.639159000000001,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "raw_report_sha256": "f788f5564eb478a3da1345ecad576fc60fb6132a5d7bdef71430139e3c0370b7"
+        },
+        {
+          "iteration": 2,
+          "source": "after",
+          "case": "onnx-large",
+          "subprocess_seconds": 28.152936041005887,
+          "cold": [
+            {
+              "seconds": 13.527452667010948,
+              "parent_cpu_seconds": 8.079369999999999,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 6.909316375036724,
+              "parent_cpu_seconds": 6.909253,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            },
+            {
+              "seconds": 6.697634749929421,
+              "parent_cpu_seconds": 6.697444999999998,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "raw_report_sha256": "3358a469ddb8a7ac55024d4fef885c98af1c7598b33e609ac9a3a966ba9b7e45"
+        },
+        {
+          "iteration": 3,
+          "source": "before",
+          "case": "torch-large",
+          "subprocess_seconds": 32.99161100003403,
+          "cold": [
+            {
+              "seconds": 26.497046708944254,
+              "parent_cpu_seconds": 5.396604,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 2.791183750028722,
+              "parent_cpu_seconds": 2.7911479999999997,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            },
+            {
+              "seconds": 2.4337208749493584,
+              "parent_cpu_seconds": 2.4336590000000005,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "0b7b96455d62c3bb11e02453f4e168542616ab3acf44f0ee120cbcfcfa8fb99d"
+            }
+          ],
+          "raw_report_sha256": "fa7cace34bd2dc322451204afbdfaec4245d2c94e2f8569780b9866b3268e459"
+        },
+        {
+          "iteration": 3,
+          "source": "before",
+          "case": "onnx-large",
+          "subprocess_seconds": 25.553844499983825,
+          "cold": [
+            {
+              "seconds": 12.128078292007558,
+              "parent_cpu_seconds": 7.5580110000000005,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "warm": [
+            {
+              "seconds": 6.201902707922272,
+              "parent_cpu_seconds": 6.201753999999999,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            },
+            {
+              "seconds": 6.207823292003013,
+              "parent_cpu_seconds": 6.207578000000002,
+              "findings_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+              "python_usages_sha256": "b151429a6d8e0819d6444f7d64dc8764a5bca96c57c44b6b60749092c56a1f53"
+            }
+          ],
+          "raw_report_sha256": "82e8bf543bacce22aa589a4920390ef0674cc42ccb78ce36a2173460fb6e5ead"
+        }
+      ]
+    },
+    "final_ml_and_package_regressions": {
+      "scope": "Exact final frozen third checkpoint. Sequential correctness evidence; timings are not performance claims.",
+      "source_hashes": {
+        "python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+        "analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+        "_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b"
+      },
+      "summary_sha256": "dffc21dde7673b4c5b5280d11d475dafaedbe85763317abd1620a82a2b1ef3d2",
+      "passed": true,
+      "ml35": {
+        "summary": {
+          "cases": 35,
+          "positive_cases": 22,
+          "negative_cases": 13,
+          "failed_cases": 3,
+          "unresolved_signatures": 0,
+          "unresolved_returns": 0,
+          "positive_diagnostic_cases": 0,
+          "missed_negative_cases": 2,
+          "unresolved_member_cases": 1
+        },
+        "baseline": {
+          "path": "/tmp/blt-python-mismatches-20261007/third-validation/scripts/ml_typing_baseline.json",
+          "sha256": "0e65eb2da19ea09a1ce54753204f07a1fb7dc877c05136ac321ce9e461427e8a",
+          "matched": [
+            {
+              "case": "distribution-multivariate",
+              "reason": "Result member metadata was not resolved"
+            },
+            {
+              "case": "onnx-array-bad-value",
+              "reason": "Known invalid argument was not diagnosed"
+            },
+            {
+              "case": "onnx-model-bad-graph",
+              "reason": "Known invalid argument was not diagnosed"
+            }
+          ],
+          "unexpected": [],
+          "stale": [],
+          "passed": true
+        },
+        "versions": {
+          "torch": "2.14.1",
+          "onnx": "1.23.2",
+          "numpy": "2.5.3",
+          "basilisp": "0.5.1"
+        },
+        "report_sha256": "ce10a664b0fe1479bfc8e571e4f2d0b5e3132cb4eb9a347ca9a85be49040fdd9",
+        "case_results": [
+          {
+            "name": "tensor",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "96787d0f1f0aa9d4df8ab7ba9a15c2ff98d5ebd30176d9a9152dabef14bfa409"
+          },
+          {
+            "name": "factory-device",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "7d0a75cc6cf0dd7f48fa5f39e2c2d67b89302b8bea5531927c8b46453b5dfc4a"
+          },
+          {
+            "name": "tensor-method",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "ab9b92f99e78caaf1c0f421ef0ed36ac6e1717b3b02c47899138002445c285fa"
+          },
+          {
+            "name": "tensor-to",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "e81e29a77293e972255afb0c1d39b93049af0c243439838101cc9f983090cd8c"
+          },
+          {
+            "name": "tensor-add",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "cf257d94e41043de781c078625391e8d4dc4ab6bafe61263f35f539e71df3a4c"
+          },
+          {
+            "name": "tensor-matmul",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "9a394ff936103fc51c83e5e44885d3956d1c91c448da27af9ae002f9ff19b679"
+          },
+          {
+            "name": "tensor-native-add",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "546be1d951e24995f6932a2d4c420037e824b2359fdb7b8d1b39d317945d6d3d"
+          },
+          {
+            "name": "tensor-native-sub",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "9c9ee486bc2b8579390b3c3caa70a2da65aef5ef77ced822630e6fa6e03a5e89"
+          },
+          {
+            "name": "tensor-native-mul",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "1472ca91c448dbc48c61afff4aeb01d7db28e20e165504a79c94f2fdf181b29e"
+          },
+          {
+            "name": "nn-linear",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "79e379e0651d8e82301c5e44dbc1f774713e5545a66ffa293d01af609311a0d3"
+          },
+          {
+            "name": "nn-functional",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "be0b64e83cecc6d6d4e44dbca489b251ec06a492c22275c6035311ca524ddaad"
+          },
+          {
+            "name": "optimizer",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "c888d5d6fd9e9573e5002b68694936aa7fa5a949f3721d9945847be7baf8ce31"
+          },
+          {
+            "name": "training-step",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "95693f50a2f8c84690dcaebab8e49f0bb5891dff4894bc0ef7f2e7a61cd73a91"
+          },
+          {
+            "name": "data-loader",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "abb6e6aadc4d0ba135776e52f2b45ae933aaab679c37429f69165f79dce70e76"
+          },
+          {
+            "name": "no-grad",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "04a5e29baace86235222fc6093ada3770a640061bd30efc55c1270888ce61918"
+          },
+          {
+            "name": "onnx-array",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "d238f89d638b281052e8f24872ee7ea76c9086ba6a71502388e9e671dd9b14e0"
+          },
+          {
+            "name": "onnx-node",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "c125dd8bf2da1af17ef7e47aa1ad2e3d564b91adf055cd419ab2e54eee11f337"
+          },
+          {
+            "name": "onnx-graph",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "6a87eccee93966655e870a61a9419f1ac19d95e5a3040bd19c1b0929cd242654"
+          },
+          {
+            "name": "onnx-reference",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "8775bcfba0696208517ff22668294b03b9d015076f88b87340928a8b1273cbba"
+          },
+          {
+            "name": "tensor-size",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "f83a31ac0953a24a331a94f6a6ad153ca9d3391bc7069c42d3e0d1064096f8c2"
+          },
+          {
+            "name": "distribution-normal",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "684c5de69ae92d640468ee394585dc7fca7536cb572511d2a95db24d4a1c2dc4"
+          },
+          {
+            "name": "distribution-multivariate",
+            "failures": [
+              "Result member metadata was not resolved"
+            ],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": false
+            },
+            "native_exception": null,
+            "source_sha256": "4efe8659fa3be0d34989feb94ce5d20ce8b42e91d17a87827023f28db8e89648"
+          },
+          {
+            "name": "tensor-missing-argument",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "4bc8d42e5cb29bfede81eb5f537dcf6ae394853a1c4e5b45a4426b16502ff521"
+          },
+          {
+            "name": "tensor-bad-size",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "9ab37bfa4e649c07148b25b5147bd7e82aeebbfb0fb20f984dfb201fa9c789b8"
+          },
+          {
+            "name": "tensor-bad-operand",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "b4c4a6df59f582be2536e01aeb0fddf6cd955337519914ae688f028beefdb8a1"
+          },
+          {
+            "name": "linear-bad-size",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "07508f36054b39929d98cf4e6f06b4834f0523a620b00cb0b5ee74e098da6c78"
+          },
+          {
+            "name": "functional-missing-input",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "c1b085878b70b1297b9e4656c986edb5a42405a15e724f69d408adf8b022870a"
+          },
+          {
+            "name": "onnx-node-bad-name",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "acfc189d8d482b02624c99dd772df281bfadb42dda4755e214d5b4711b6b8103"
+          },
+          {
+            "name": "onnx-model-bad-graph",
+            "failures": [
+              "Known invalid argument was not diagnosed"
+            ],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "8949b89a22ca2891e8ad38779d867f9ed23be38cfdc1d9a1a57d72a391bb7004"
+          },
+          {
+            "name": "onnx-array-bad-value",
+            "failures": [
+              "Known invalid argument was not diagnosed"
+            ],
+            "coverage": {},
+            "native_exception": "AttributeError",
+            "source_sha256": "50b62216b13de0275f9d00d8cd9170cababbd21499b2ce8a8450690b07e1e41c"
+          },
+          {
+            "name": "tensor-bad-dtype",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "f03abb20d4c23f0907e906168eaeeb08d1b7870b42a9ebaecf955476b0df77b4"
+          },
+          {
+            "name": "ones-bad-dtype",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "84e0db9fe65500d7e7d00bb55c7a3800957a13c336fb28b41375f167089539b6"
+          },
+          {
+            "name": "zeros-bad-dtype",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "32ed8b5fe3420dcbd8a96516370486b628d0bf500d43aca9d2178e95252b16c3"
+          },
+          {
+            "name": "rng-bad-state",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "7225f5dda383f27ec96bded1b162637655375a3796e05dbcad466cc635cab84a"
+          },
+          {
+            "name": "size-bad-add",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "2037a29ab9a4b88223b0e9403f44cf4474703bade6a37820bc916483430ab2a1"
+          }
+        ]
+      },
+      "generated128": {
+        "summary": {
+          "cases": 4,
+          "positive_cases": 2,
+          "negative_cases": 2,
+          "failed_cases": 0,
+          "unresolved_signatures": 0,
+          "unresolved_returns": 0,
+          "positive_diagnostic_cases": 0,
+          "missed_negative_cases": 0,
+          "unresolved_member_cases": 0
+        },
+        "report_sha256": "0cf408763bbfa2258e9f0b0ee1abd2f46ccf45889a37a8b4afcb98b25e68371b",
+        "case_results": [
+          {
+            "name": "torch-large",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d"
+          },
+          {
+            "name": "onnx-large",
+            "failures": [],
+            "coverage": {
+              "symbol_known": true,
+              "signature_resolved": true,
+              "return_resolved": true,
+              "members_resolved": true
+            },
+            "native_exception": null,
+            "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a"
+          },
+          {
+            "name": "torch-large-negative",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "7b9764fb83b66214474551f33ec1713de555173ca343bdd0a8e8a60eadb28ea5"
+          },
+          {
+            "name": "onnx-large-negative",
+            "failures": [],
+            "coverage": {},
+            "native_exception": "TypeError",
+            "source_sha256": "c725f396ed88a6ad8eaf0cef1bc80b3cbdf6835ff5acffff59f0bb039459f518"
+          }
+        ],
+        "manifest_sha256": "9a3a202c42b1fad9eb2fbe5de7ce133b3911f50a40e2acda1d1eb859486ab3ac"
+      },
+      "real_packages": {
+        "exit_code": 0,
+        "message": "Real-package interop passed (NumPy, Requests stubs, Pydantic; 10.04s).",
+        "command": [
+          "/Users/alexseverin/basilisp-tools/.venv/bin/python",
+          "/tmp/blt-python-mismatches-20261007/third-validation/scripts/check_python_packages.py",
+          "--python",
+          "/tmp/blt-python-parity-8x84llx5/bin/python",
+          "--timeout",
+          "10"
+        ],
+        "environment": {
+          "PYTHONPATH": "/tmp/blt-python-mismatches-20261007/fourth-ml-nominal/final-third-base/src"
+        },
+        "log_sha256": "e0a13ca72f34031c47a524f9b9709a57a891bf5ccb7336447ed4cefa33da6a35",
+        "earlier_launch_failure": {
+          "reason": "Dependency-only interpreter was mistakenly used as frontend; it lacks Basilisp. Corrected invocation uses project frontend and selects dependency interpreter with --python.",
+          "log_sha256": "b2b5324fa8160561428b965a6e07f5b98e0032dfcc4eef62febf68f13e09291a"
+        }
+      }
+    },
+    "scope_note": "The ML gate retains exactly three reviewed known limitations, which are not passing strict assertions. Initial compatibility and generated-nine-project checks retain their separate earlier source hashes. Controlled performance records the observed cost increase."
+  },
+  "bridge_review_provenance": {
+    "sha256": "9870296c305ca33930947862ceb7abb81b8cd4d4b0d61d67c9e17dd5847ef095",
+    "scope": "Bridge-owned third introduced precision rows reviewed so far; not an exhaustive completed ledger.",
+    "no_waivers": true
+  },
+  "enum_identity_safety_overlay": {
+    "scope": "Targeted Enum metaclass safety guard plus four newly reviewed ty dispatch boundaries; whole containing fixtures retained. This is not a whole-corpus rerun.",
+    "source_hashes": {
+      "scripts/check_python_typing.py": "18365b8049eb4fc0838eae07f4dcd508a3df1700dd3fefb266f3b86e029e24c3",
+      "scripts/python_typing_corpus.py": "fd4cd0cf8cccc3fbbf73aaf63341a006c78c65c14763a46011578e89db526f31",
+      "scripts/python_typing_sources.json": "4e126e107269d34ab45d2c4e39dd7e8b80b3c7d3e8be31687e64044b8b1271b2",
+      "src/basilisp_tools/__init__.py": "8e915e85fbbfa02b2ce8ff139c755960611d0ce733b7b2765e71ccc536b617f7",
+      "src/basilisp_tools/_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b",
+      "src/basilisp_tools/analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+      "src/basilisp_tools/cache.lpy": "dbc19b1b1ad3331622429baea85b708bcb990b49c6907ceac0ba0cc7a88e24f8",
+      "src/basilisp_tools/check.lpy": "8a0f968ab95170efb7272106e53c1d74f7b5854048e1c8881529568ebb626a37",
+      "src/basilisp_tools/cli.lpy": "aebdf1d4db140484516c843d3929cdb8c2469f6bde03dfa85254b92161d83e2a",
+      "src/basilisp_tools/format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22",
+      "src/basilisp_tools/hooks.lpy": "67daa379f734771be5a1d9465ffda6b8381c848add8fcbc5f508d4b209937d6a",
+      "src/basilisp_tools/lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "src/basilisp_tools/python.lpy": "4400c6556bbdad931c07a7e7d183e14d6536995cfdda5546fc5515f348ed30ad",
+      "src/basilisp_tools/regex.lpy": "cf82c1a895386adebcce9f583504122175487f1587eb61dbaaa9cf19c781c2c6",
+      "src/basilisp_tools/syntax.lpy": "1279437eb020db16d0c3daf0dd57999e9b6b88a199e3ef32974aecba3de682f2"
+    },
+    "source_changed_during_run": false,
+    "raw_report_sha256": "b78377a0486c7821cc09c714d40e293e706c1933b62f260a9ad47622119fd525",
+    "targeted_counts": {
+      "passed": 2,
+      "unknown": 4
+    },
+    "whole_fixture_counts": {
+      "unknown": 111,
+      "passed": 7,
+      "failed": 2,
+      "excluded": 15
+    },
+    "reviewed_rows": [
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:157:9:call:75",
+        "status": "passed",
+        "expression": "TestEnum10.A",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "TestEnum10"
+          ],
+          "module": "blt_fixture_4fadde12e7fa6491"
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      {
+        "id": "pyright:packages/pyright-internal/src/tests/samples/enum1.py::enum1.py::enum1.py:278:0:return:104",
+        "status": "passed",
+        "expression": "TestEnum21.A.value",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": true,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/attributes.md::Attributes / Classes with custom `__getattribute__` methods / Basic::mdtest_snippet.py:8:0:return:0",
+        "status": "unknown",
+        "expression": "Foo().x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/attributes.md::Attributes / Metaclasses with custom `__getattribute__` methods / Class attributes take precedence::mdtest_snippet.py:8:0:return:0",
+        "status": "unknown",
+        "expression": "Foo.x",
+        "kind": "return",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": {
+          "path": [
+            "str"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/descriptor_protocol.md::Descriptor protocol / Error handling and edge cases / An instance `__getattribute__` may delegate to descriptor lookup::mdtest_snippet.py:11:0:call:0",
+        "status": "unknown",
+        "expression": "C().value",
+        "kind": "call",
+        "expected_error": false,
+        "actual": {
+          "any?": true
+        },
+        "expected": null,
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      },
+      {
+        "id": "ty:crates/ty_python_semantic/resources/mdtest/enums.md::Enums / Enum members / Custom enum metaclass member transformation::mdtest_snippet.py:27:0:return:3",
+        "status": "unknown",
+        "expression": "AnnotatedChoices.GOOD._value_",
+        "kind": "return",
+        "expected_error": false,
+        "actual": null,
+        "expected": {
+          "path": [
+            "int"
+          ],
+          "module": "builtins"
+        },
+        "coverage": {
+          "return_resolved": false,
+          "signature_resolved": true
+        },
+        "findings": []
+      }
+    ]
+  },
+  "native_review_evidence": {
+    "ty-dispatch-native-310.json": {
+      "sha256": "20e43c88b0c4a6d3c00cccb4a257562fa8f889e73510211d98bf394f6be8d2d3",
+      "result": {
+        "python": "3.10.16 (main, Dec  6 2024, 20:50:22) [Clang 18.1.8 ]",
+        "cases": {
+          "instance_getattribute": {
+            "source": "from typing import Any\nclass Foo:\n x:str\n def __getattribute__(self,attr:str)->Any:return 42\n",
+            "expression": "Foo().x",
+            "definition_succeeded": true,
+            "value": "42",
+            "type": "builtins.int"
+          },
+          "metaclass_getattribute": {
+            "source": "class Meta(type):\n def __getattribute__(cls,name:str)->int:return 1\nclass Foo(metaclass=Meta):\n x:str='hello'\n",
+            "expression": "Foo.x",
+            "definition_succeeded": true,
+            "value": "1",
+            "type": "builtins.int"
+          },
+          "delegated_malformed_descriptor": {
+            "source": "class Descriptor:\n def __get__(self)->int:return 1\nclass C:\n value=Descriptor()\n def __getattribute__(self,name:str)->str:return super().__getattribute__(name)\n",
+            "expression": "C().value",
+            "definition_succeeded": true,
+            "error_type": "TypeError",
+            "error": "Descriptor.__get__() takes 1 positional argument but 3 were given"
+          },
+          "custom_enum_metaclass_placeholder": {
+            "source": "from enum import EnumMeta,IntEnum\nclass ChoicesType(EnumMeta):\n def __new__(metacls,classname,bases,classdict,**kwds):...\nclass IntegerChoices(IntEnum,metaclass=ChoicesType):\n _value_:int\nclass AnnotatedChoices(IntegerChoices):\n GOOD=1,'I like this'\n",
+            "expression": "AnnotatedChoices.GOOD._value_",
+            "error_type": "TypeError",
+            "error": "NoneType takes no arguments"
+          },
+          "unannotated_descriptor_returns_none": {
+            "source": "class DescriptorE:\n def __get__(self,instance:'ClassE | None',owner:'type[ClassE]'):return None\nclass ClassE:\n x=DescriptorE()\n",
+            "expression": "(ClassE.x, ClassE().x)",
+            "definition_succeeded": true,
+            "value": "(None, None)",
+            "type": "builtins.tuple"
+          }
+        }
+      }
+    },
+    "ty-dispatch-native-313.json": {
+      "sha256": "59e7528e610623ff246ba096f60d96126e0b389e4d3a5ed4634d872368f6754b",
+      "result": {
+        "python": "3.13.2 (main, Feb 12 2025, 14:59:08) [Clang 19.1.6 ]",
+        "cases": {
+          "instance_getattribute": {
+            "source": "from typing import Any\nclass Foo:\n x:str\n def __getattribute__(self,attr:str)->Any:return 42\n",
+            "expression": "Foo().x",
+            "definition_succeeded": true,
+            "value": "42",
+            "type": "builtins.int"
+          },
+          "metaclass_getattribute": {
+            "source": "class Meta(type):\n def __getattribute__(cls,name:str)->int:return 1\nclass Foo(metaclass=Meta):\n x:str='hello'\n",
+            "expression": "Foo.x",
+            "definition_succeeded": true,
+            "value": "1",
+            "type": "builtins.int"
+          },
+          "delegated_malformed_descriptor": {
+            "source": "class Descriptor:\n def __get__(self)->int:return 1\nclass C:\n value=Descriptor()\n def __getattribute__(self,name:str)->str:return super().__getattribute__(name)\n",
+            "expression": "C().value",
+            "definition_succeeded": true,
+            "error_type": "TypeError",
+            "error": "Descriptor.__get__() takes 1 positional argument but 3 were given"
+          },
+          "custom_enum_metaclass_placeholder": {
+            "source": "from enum import EnumMeta,IntEnum\nclass ChoicesType(EnumMeta):\n def __new__(metacls,classname,bases,classdict,**kwds):...\nclass IntegerChoices(IntEnum,metaclass=ChoicesType):\n _value_:int\nclass AnnotatedChoices(IntegerChoices):\n GOOD=1,'I like this'\n",
+            "expression": "AnnotatedChoices.GOOD._value_",
+            "error_type": "TypeError",
+            "error": "NoneType takes no arguments"
+          },
+          "unannotated_descriptor_returns_none": {
+            "source": "class DescriptorE:\n def __get__(self,instance:'ClassE | None',owner:'type[ClassE]'):return None\nclass ClassE:\n x=DescriptorE()\n",
+            "expression": "(ClassE.x, ClassE().x)",
+            "definition_succeeded": true,
+            "value": "(None, None)",
+            "type": "builtins.tuple"
+          }
+        }
+      }
+    },
+    "nondata-default-native-310.json": {
+      "sha256": "e7b1b30584e48031ee9dd1fb1d45ef089e278f7481adf79549b506fb4573a42d",
+      "result": {
+        "python": "3.10.16 (main, Dec  6 2024, 20:50:22) [Clang 18.1.8 ]",
+        "source": "from dataclasses import dataclass\nfrom typing import Any,overload\nclass HashableList(list):\n __hash__=object.__hash__\nclass NonData:\n @overload\n def __get__(self,obj:None,owner:Any)->list['NonData']:...\n @overload\n def __get__(self,obj:object,owner:Any)->'NonData':...\n def __get__(self,obj,owner):return HashableList([self]) if obj is None else self\n@dataclass\nclass C:\n y:NonData=NonData()\n",
+        "preserved_contract": "Non-data descriptor class getter returns list[NonData]; dataclass has y:NonData=NonData(); no-argument construction stores the class getter default.",
+        "error_type": "ValueError",
+        "error": "mutable default <class 'HashableList'> for field y is not allowed: use default_factory"
+      }
+    },
+    "nondata-default-native-313.json": {
+      "sha256": "431c706dd400185da935c68957b94093a85877cd84937bc557dd1d540bef2633",
+      "result": {
+        "python": "3.13.2 (main, Feb 12 2025, 14:59:08) [Clang 19.1.6 ]",
+        "source": "from dataclasses import dataclass\nfrom typing import Any,overload\nclass HashableList(list):\n __hash__=object.__hash__\nclass NonData:\n @overload\n def __get__(self,obj:None,owner:Any)->list['NonData']:...\n @overload\n def __get__(self,obj:object,owner:Any)->'NonData':...\n def __get__(self,obj,owner):return HashableList([self]) if obj is None else self\n@dataclass\nclass C:\n y:NonData=NonData()\n",
+        "preserved_contract": "Non-data descriptor class getter returns list[NonData]; dataclass has y:NonData=NonData(); no-argument construction stores the class getter default.",
+        "definition_succeeded": true,
+        "stored_type": "HashableList",
+        "stored_is_list": true,
+        "stored_is_descriptor": false
+      }
+    }
+  },
+  "worker_review_sha256": "aa760424db19eb8085d3b56afe9a2d9a142ee001da6ab0bb7d7807b69686bde2",
+  "public_regression_gate": {
+    "source_hashes": {
+      "_inspect.py": "64004d642d1fd07767ad145a031c2332a993a0254952d78b04a962751cbfb48b",
+      "analyzer.lpy": "4b4bee2460a8a8ba90b16486a9ea93e96904c4c0f86582ff01094110b7092308",
+      "python.lpy": "678b124bcd3860201b0f605547dadc5411d6f3155e4d39af98951ddacf9552f6",
+      "lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+      "format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22"
+    },
+    "unchanged_sources": true,
+    "commands": [
+      {
+        "name": "public_check",
+        "code": 0,
+        "seconds": 54.719
+      },
+      {
+        "name": "public_lsp",
+        "code": 0,
+        "seconds": 100.284
+      }
+    ],
+    "checker_projects": [
+      {
+        "repo": "ikappaki/basilisp-nrepl-async",
+        "sha": "ed3b930a70814743335d6ffda78a3b9c34a6e894",
+        "files": 4,
+        "bytes": 78358,
+        "findings_stable": true,
+        "exit": 3,
+        "summary": {
+          "info": 13,
+          "duration": 23017,
+          "warning": 29,
+          "error": 1,
+          "type": "summary",
+          "files": 4
+        }
+      },
+      {
+        "repo": "vefjun/basilisp-flask",
+        "sha": "ccdb8e90477d166ba7247b1385d2bd3b9905465d",
+        "files": 1,
+        "bytes": 558,
+        "findings_stable": true,
+        "exit": 0,
+        "summary": {
+          "warning": 0,
+          "duration": 1106,
+          "files": 1,
+          "error": 0,
+          "info": 0,
+          "type": "summary"
+        }
+      }
+    ],
+    "checker_note": "Expected public-project lint findings remain visible; the audit verifies valid output and unchanged findings, not zero existing lint findings.",
+    "lsp_projects": [
+      {
+        "repo": "ikappaki/basilisp-nrepl-async",
+        "revision": "ed3b930a70814743335d6ffda78a3b9c34a6e894",
+        "file": "utils.lpy",
+        "assertions": [
+          {
+            "name": "incremental sync advertised",
+            "passed": true
+          },
+          {
+            "name": "no server/configuration failure",
+            "passed": true
+          },
+          {
+            "name": "document symbols found",
+            "passed": true
+          },
+          {
+            "name": "editable declaration found",
+            "passed": true
+          },
+          {
+            "name": "declared symbol hover",
+            "passed": true
+          },
+          {
+            "name": "references include declaration",
+            "passed": true
+          },
+          {
+            "name": "definition points to same document",
+            "passed": true
+          },
+          {
+            "name": "rename contains declaration edit",
+            "passed": true
+          },
+          {
+            "name": "edit introduces unresolved symbol",
+            "passed": true
+          },
+          {
+            "name": "edit removes unresolved symbol",
+            "passed": true
+          },
+          {
+            "name": "edit introduces syntax error",
+            "passed": true
+          },
+          {
+            "name": "syntax diagnostic range uses UTF-16",
+            "passed": true
+          },
+          {
+            "name": "edit repairs introduced syntax error",
+            "passed": true
+          },
+          {
+            "name": "Python instance completion",
+            "passed": true
+          },
+          {
+            "name": "Python method hover",
+            "passed": true
+          },
+          {
+            "name": "clean shutdown",
+            "passed": true
+          },
+          {
+            "name": "no background server/configuration failures",
+            "passed": true
+          }
+        ],
+        "passed": true
+      },
+      {
+        "repo": "vefjun/basilisp-flask",
+        "revision": "ccdb8e90477d166ba7247b1385d2bd3b9905465d",
+        "file": "demo.lpy",
+        "assertions": [
+          {
+            "name": "incremental sync advertised",
+            "passed": true
+          },
+          {
+            "name": "no server/configuration failure",
+            "passed": true
+          },
+          {
+            "name": "document symbols found",
+            "passed": true
+          },
+          {
+            "name": "editable declaration found",
+            "passed": true
+          },
+          {
+            "name": "declared symbol hover",
+            "passed": true
+          },
+          {
+            "name": "references include declaration",
+            "passed": true
+          },
+          {
+            "name": "definition points to same document",
+            "passed": true
+          },
+          {
+            "name": "rename contains declaration edit",
+            "passed": true
+          },
+          {
+            "name": "edit introduces unresolved symbol",
+            "passed": true
+          },
+          {
+            "name": "edit removes unresolved symbol",
+            "passed": true
+          },
+          {
+            "name": "edit introduces syntax error",
+            "passed": true
+          },
+          {
+            "name": "syntax diagnostic range uses UTF-16",
+            "passed": true
+          },
+          {
+            "name": "edit repairs introduced syntax error",
+            "passed": true
+          },
+          {
+            "name": "Python instance completion",
+            "passed": true
+          },
+          {
+            "name": "Python method hover",
+            "passed": true
+          },
+          {
+            "name": "clean shutdown",
+            "passed": true
+          },
+          {
+            "name": "no background server/configuration failures",
+            "passed": true
+          }
+        ],
+        "passed": true
+      }
+    ],
+    "lsp_passed_assertions": 34
+  },
+  "initial_checkpoint_regression_gates": {
+    "scope": "Initial frozen third checkpoint, before separately reviewed production repairs. These results are not claimed as reruns of the final worker/analyzer/bridge. Concurrent timings are not performance claims.",
+    "source_hashes": {
+      "python.lpy": "de1cd84ffdf77cd2947c2b8bc60ed8b8cb7a738f4997e789ba0d33cae3487d34",
+      "analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+      "_inspect.py": "1322c40c7bd4e9a300a3aab4caa24231a04aabcc37f1d55d14990eb9684d2d8a"
+    },
+    "compatibility": {
+      "source_before": {
+        "_inspect.py": "1322c40c7bd4e9a300a3aab4caa24231a04aabcc37f1d55d14990eb9684d2d8a",
+        "analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+        "python.lpy": "de1cd84ffdf77cd2947c2b8bc60ed8b8cb7a738f4997e789ba0d33cae3487d34",
+        "lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+        "format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22"
+      },
+      "source_after": {
+        "_inspect.py": "1322c40c7bd4e9a300a3aab4caa24231a04aabcc37f1d55d14990eb9684d2d8a",
+        "analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+        "python.lpy": "de1cd84ffdf77cd2947c2b8bc60ed8b8cb7a738f4997e789ba0d33cae3487d34",
+        "lsp.lpy": "4a29f7596e0d976d3f78190c0c16de55cbc2e1ff1172e1fda7489061db6d1262",
+        "format.lpy": "d6f791d9cec7ed31720a71f2da96c9f01e573552d7f3787bd760080779505d22"
+      },
+      "unchanged_sources": true,
+      "checks": [
+        {
+          "name": "public_check",
+          "code": 0,
+          "seconds": 95.03
+        },
+        {
+          "name": "public_lsp",
+          "code": 0,
+          "seconds": 153.69
+        },
+        {
+          "name": "cljfmt",
+          "code": 0,
+          "seconds": 312.849
+        },
+        {
+          "name": "config",
+          "code": 0,
+          "seconds": 15.647
+        },
+        {
+          "name": "lein_profiles",
+          "code": 0,
+          "seconds": 4.906
+        },
+        {
+          "name": "regex",
+          "code": 0,
+          "seconds": 3.563
+        },
+        {
+          "name": "kondo",
+          "code": 0,
+          "seconds": 32.907
+        },
+        {
+          "name": "kondo_config",
+          "code": 0,
+          "seconds": 12.148
+        },
+        {
+          "name": "kondo_output",
+          "code": 0,
+          "seconds": 19.586
+        },
+        {
+          "name": "hooks",
+          "code": 0,
+          "seconds": 278.125
+        },
+        {
+          "name": "lsp_refactors",
+          "code": 0,
+          "seconds": 11.397
+        },
+        {
+          "name": "lsp_config",
+          "code": 0,
+          "seconds": 5.036
+        },
+        {
+          "name": "lsp_upstream",
+          "code": 0,
+          "seconds": 13.965
+        },
+        {
+          "name": "kondo_upstream",
+          "code": 0,
+          "seconds": 356.539
+        }
+      ],
+      "result_sha256": "72e501beb0a1bdbd167a1b0e07b7bf84ffef121c1381c19369d00a88275f8c59"
+    },
+    "generated_projects": {
+      "source_provenance": "Ran against the initial third checkpoint in the same validation period; this harness does not independently fingerprint the engine.",
+      "projects": [
+        {
+          "project": "namespaces-0",
+          "source_files": 3,
+          "source_bytes": 188,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "python-0",
+          "source_files": 2,
+          "source_bytes": 176,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "reader-conditional-0",
+          "source_files": 3,
+          "source_bytes": 248,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "unicode-0",
+          "source_files": 2,
+          "source_bytes": 192,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "macro-0",
+          "source_files": 3,
+          "source_bytes": 258,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "stubs-0",
+          "source_files": 2,
+          "source_bytes": 177,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "context-manager-0",
+          "source_files": 2,
+          "source_bytes": 178,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "lint-as-0",
+          "source_files": 3,
+          "source_bytes": 245,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        },
+        {
+          "project": "workspace-0",
+          "source_files": 14,
+          "source_bytes": 910,
+          "dependencies": [],
+          "failures": [],
+          "passed": true
+        }
+      ],
+      "count": 9,
+      "passed": true,
+      "report_sha256": "f73dd47d8153c9d13f4d7dae942363bf4f69223a9badfc419659916cf71d9ba7"
+    },
+    "ml35": {
+      "summary": {
+        "cases": 35,
+        "positive_cases": 22,
+        "negative_cases": 13,
+        "failed_cases": 3,
+        "unresolved_signatures": 0,
+        "unresolved_returns": 0,
+        "positive_diagnostic_cases": 0,
+        "missed_negative_cases": 2,
+        "unresolved_member_cases": 1
+      },
+      "baseline": {
+        "path": "/tmp/blt-python-mismatches-20261007/third-validation/scripts/ml_typing_baseline.json",
+        "sha256": "0e65eb2da19ea09a1ce54753204f07a1fb7dc877c05136ac321ce9e461427e8a",
+        "matched": [
+          {
+            "case": "distribution-multivariate",
+            "reason": "Result member metadata was not resolved"
+          },
+          {
+            "case": "onnx-array-bad-value",
+            "reason": "Known invalid argument was not diagnosed"
+          },
+          {
+            "case": "onnx-model-bad-graph",
+            "reason": "Known invalid argument was not diagnosed"
+          }
+        ],
+        "unexpected": [],
+        "stale": [],
+        "passed": true
+      },
+      "versions": {
+        "torch": "2.14.1",
+        "onnx": "1.23.2",
+        "numpy": "2.5.3",
+        "basilisp": "0.5.1"
+      },
+      "report_sha256": "60178b84e303b63e708f3526b7986f171aa848295826de6f7126a115ae30b2b7"
+    },
+    "generated_ml128": {
+      "source_hashes": {
+        "python.lpy": "de1cd84ffdf77cd2947c2b8bc60ed8b8cb7a738f4997e789ba0d33cae3487d34",
+        "analyzer.lpy": "4eb635f51ef0098217b13737fcd8e18c46c3777bb5e5a3fd39eb1d155bdc2b54",
+        "_inspect.py": "1322c40c7bd4e9a300a3aab4caa24231a04aabcc37f1d55d14990eb9684d2d8a"
+      },
+      "summary": {
+        "cases": 4,
+        "positive_cases": 2,
+        "negative_cases": 2,
+        "failed_cases": 0,
+        "unresolved_signatures": 0,
+        "unresolved_returns": 0,
+        "positive_diagnostic_cases": 0,
+        "missed_negative_cases": 0,
+        "unresolved_member_cases": 0
+      },
+      "manifest_sha256": "9a3a202c42b1fad9eb2fbe5de7ce133b3911f50a40e2acda1d1eb859486ab3ac",
+      "cases": [
+        {
+          "name": "torch-large",
+          "source_sha256": "c8adccdee0ad9fecb72920ae816fa29b8adbeb086a715026e029f4fe51bcbf5d",
+          "source_bytes": 42531,
+          "native_exception": null,
+          "failures": []
+        },
+        {
+          "name": "onnx-large",
+          "source_sha256": "8c9c5055c7316c1a9e5980ee300f9781f26ec250e9744ead2b3413193834278a",
+          "source_bytes": 84840,
+          "native_exception": null,
+          "failures": []
+        },
+        {
+          "name": "torch-large-negative",
+          "source_sha256": "7b9764fb83b66214474551f33ec1713de555173ca343bdd0a8e8a60eadb28ea5",
+          "source_bytes": 41125,
+          "native_exception": "TypeError",
+          "failures": []
+        },
+        {
+          "name": "onnx-large-negative",
+          "source_sha256": "c725f396ed88a6ad8eaf0cef1bc80b3cbdf6835ff5acffff59f0bb039459f518",
+          "source_bytes": 83199,
+          "native_exception": "TypeError",
+          "failures": []
+        }
+      ],
+      "report_sha256": "81c591d6ae707d10fc230330565be2826d3afd281231f1bd2436b8bf793fb294"
+    },
+    "real_packages": {
+      "log": "/tmp/blt-python-mismatches-20261007/third-validation/real-packages.log",
+      "exit_code": 0,
+      "message": "Real-package interop passed (NumPy, Requests stubs, Pydantic; 25.90s)."
+    }
+  }
+}

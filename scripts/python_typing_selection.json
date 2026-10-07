@@ -128,5 +128,109 @@
       "negative_calls": 0,
       "return_assertions": 0
     }
+  },
+  {
+    "provider": "pyright",
+    "path": "packages/pyright-internal/src/tests/samples/paramSpec20.py",
+    "name": "paramSpec20.py",
+    "source_sha256": "28308725aec97c2ec0b45ba381a690426a1bbf780a250367eea200b06630669e",
+    "expected": {
+      "passed": 2,
+      "excluded": 5,
+      "positive_calls": 2,
+      "negative_calls": 0,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-classvar.test",
+    "name": "testTypeCheckOnAssignment",
+    "source_sha256": "bdeda098ee5ea20693671b02e68adafdd2a9c836d8ac9be091604dbf81260b9c",
+    "expected": {
+      "passed": 1,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-classvar.test",
+    "name": "testClassVarWithUnion",
+    "source_sha256": "218ad8466f4f83f43b99ed4fd4c9207f335c39080c9492d5b6648620a9aee5ce",
+    "expected": {
+      "passed": 2,
+      "excluded": 0,
+      "positive_calls": 0,
+      "negative_calls": 1,
+      "return_assertions": 1
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-newsemanal.test",
+    "name": "testNewAnalyzerFinalReassignModuleVar",
+    "source_sha256": "3e72bc449ce97cc51175c78885693959a626bd3d6a623eda05c15db5e27be894",
+    "expected": {
+      "passed": 3,
+      "excluded": 3,
+      "positive_calls": 2,
+      "negative_calls": 1,
+      "return_assertions": 0
+    }
+  },
+  {
+    "provider": "mypy",
+    "path": "test-data/unit/check-unions.test",
+    "name": "testGenericUnionMemberWithTypeVarConstraints",
+    "source_sha256": "3f2d20c559d19eba618b5947612f0fe51e69bf991519f550052722efb796a7d3",
+    "expected": {
+      "passed": 4,
+      "excluded": 1,
+      "positive_calls": 0,
+      "negative_calls": 0,
+      "return_assertions": 4
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/descriptors.rs",
+    "name": "test_simple_user_defined_get_descriptor",
+    "source_sha256": "3d855fd22d256ae23c9cc451b6b65fedb1bddcae0a375620e848bbd9e879b488",
+    "expected": {
+      "passed": 2,
+      "excluded": 3,
+      "positive_calls": 0,
+      "negative_calls": 0,
+      "return_assertions": 2
+    }
+  },
+  {
+    "provider": "pyrefly",
+    "path": "pyrefly/lib/test/generic_restrictions.rs",
+    "name": "test_type_var_tuple_default",
+    "source_sha256": "1d9d3677c7af73f4321635d055df33b72bbead57bc3b48e5dc5f91652568221a",
+    "expected": {
+      "passed": 1,
+      "excluded": 3,
+      "positive_calls": 0,
+      "negative_calls": 0,
+      "return_assertions": 1
+    }
+  },
+  {
+    "provider": "ty",
+    "path": "crates/ty_python_semantic/resources/mdtest/dataclasses/dataclasses.md",
+    "name": "Dataclasses / Descriptor-typed fields / Different types in `__get__` and `__set__`",
+    "source_sha256": "2c797efb2352d5ac2e8b1edc220c1f7dcc4666790b3cad603c3e4edbdced2322",
+    "expected": {
+      "passed": 5,
+      "excluded": 3,
+      "positive_calls": 2,
+      "negative_calls": 2,
+      "return_assertions": 1
+    }
   }
 ]

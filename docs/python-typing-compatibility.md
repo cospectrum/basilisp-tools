@@ -2,9 +2,9 @@
 
 `scripts/check_python_typing.py` translates Python consumer expressions from pinned
 typing, Pyright, mypy, Pyrefly, and ty fixtures into Basilisp interop expressions.
-It checks call diagnostics and structured return types. This is an interop audit;
-it does not claim that Basilisp implements Python's declaration, assignment, or
-control-flow type system.
+It checks call and attribute-assignment diagnostics and structured expression
+types. This interop audit covers operations expressible in Basilisp; Python
+declaration and control-flow rules require separate adaptation.
 
 The source pins and released oracle versions are in
 [`python_typing_sources.json`](../scripts/python_typing_sources.json). The ty
@@ -88,7 +88,9 @@ gate cannot silently lose previously available contracts.
 - `unknown`: metadata needed for the assertion was unavailable. Absence of a
   diagnostic with an unresolved contract does not count as a pass.
 - `excluded`: a concrete adapter or language boundary is recorded for that unit.
-- `error`: the replay itself raised an exception.
+- `error`: the replay raised an exception, the analyzer reported a document or
+  inspection failure, or an adapted expression contained an unresolved lexical
+  symbol outside the supported diagnostic mapping.
 
 Exclusions currently include lexical/control-flow environments, temporal global
 rebinding, optional/grouped or ambiguous same-line error oracles, custom mypy
@@ -207,27 +209,50 @@ attribute-error suppressions affect only member findings. The artifact includes
 the twelve affected historical rows as a labeled derived classification, without
 rewriting the original full reports or counting adapter errors as matches.
 
-CI checks 70 resolved assertions. Four typing fixtures contribute 36 assertions:
+The [third comparison](data/python-typing-third.json) replays all 21,802 fixtures
+with one frozen adapter against the second milestone and the initial third
+candidate. Matched assertions rise from 4,832 to 4,911, while differences fall
+from 1,069 to 959. Unknown results rise from 7,516 to 7,547; 77,577 exclusions
+and eight lexical adapter errors remain explicit. The artifact records all 38
+introduced diagnostic or precision regressions, separate targeted repairs, and
+the complete strict selection manifest. These full-corpus counts describe the
+initial candidate; later repair overlays retain their own source hashes.
+
+This checkpoint checks native `set!` writes to Python attributes and module
+objects, including declared field types, read-only properties, and mutable
+protocol fields. Descriptor reads distinguish class access from instance access
+and check calls through a returned `Callable`. Generic inference preserves
+explicit `Any` receiver arguments and resolves dependent defaults in parameter
+order. Custom attribute hooks, unknown decorators, and metaclasses that can
+replace a class keep uncertain contracts unknown.
+
+A controlled ABBA comparison of generated size-16 Torch and ONNX programs
+preserved identical findings and member metadata. Median warm analysis time
+increased from 2.61 to 2.86 seconds for Torch and from 6.18 to 6.82 seconds for
+ONNX. The artifact retains cold and warm samples separately; this checkpoint
+adds checking coverage with a measured runtime cost.
+
+CI checks 90 resolved assertions. Four typing fixtures contribute 36 assertions:
 26 valid calls and 10 rejected calls. It requires the exact fixture counts
 17, 8, 5, and 6 for
 `dataclasses_kwonly.py`, `dataclasses_transform_class.py`,
 `dataclasses_transform_field.py`, and `generics_basic.py`, respectively, with
 zero unknowns, differences, or replay errors.
 
-Ten additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 34 resolved
-assertions, including 11 rejected calls. Their identities, source digests,
-positive/negative counts, return assertions, and nine explicit exclusions are
+Eighteen additional fixtures from ty, Pyright, mypy, and Pyrefly contribute 54
+resolved assertions, including 16 expected diagnostics for calls and assignments.
+Their identities, source digests, positive/negative counts, return assertions,
+and 27 explicit exclusions are
 pinned in [`python_typing_selection.json`](../scripts/python_typing_selection.json).
-CI generates independent expectations for the four selected Pyright files using
+CI generates independent expectations for the five selected Pyright files using
 the pinned Pyright release. Missing, duplicate, or changed fixtures and newly
 unknown assertions fail the gate; exclusions never count as matches. Repeat it
 with `--selection scripts/python_typing_selection.json --require-resolved`,
 supplying the corpus and Pyright oracle as above.
 
 The full audit remains failing and supplies a work inventory beyond these
-regression gates. The historical full-corpus counts above precede the current
-adapter's additional assignment, comprehension, and literal-binding coverage;
-comparisons across different adapter versions are not valid improvement counts.
+regression gates. Each comparison records its adapter hashes; comparisons across
+different adapter versions are not valid improvement counts.
 
 To repeat the comparison, prepare the pinned corpus and Pyright oracle as above,
 then run the current adapter on both source trees:

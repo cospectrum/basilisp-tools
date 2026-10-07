@@ -233,6 +233,65 @@ def lexical_comprehension(row, module, bindings):
     return bindings, ("(for [" + " ".join(clauses) + "] " if clauses else ""), locals_
 
 
+def display_parameter_slots(tree, line=None):
+    """Identify local ParamSpec positions independently of inferred result types."""
+    imports, parameters, classes = {}, set(), {}
+
+    def origin(node):
+        if isinstance(node, ast.Name):
+            return imports.get(node.id)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if imports.get(node.value.id) in ("typing", "typing_extensions"):
+                return node.attr
+        return None
+
+    for statement in tree.body:
+        if line is not None and statement.lineno >= line:
+            break
+        if isinstance(statement, ast.ImportFrom) and statement.module in ("typing", "typing_extensions"):
+            imports.update({alias.asname or alias.name: alias.name for alias in statement.names})
+        elif isinstance(statement, ast.Import):
+            imports.update({alias.asname or alias.name: alias.name for alias in statement.names
+                            if alias.name in ("typing", "typing_extensions")})
+        elif isinstance(statement, ast.Assign):
+            declared = isinstance(statement.value, ast.Call) and origin(statement.value.func) == "ParamSpec"
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    imports.pop(target.id, None)
+                    parameters.discard(target.id)
+                    classes.pop(target.id, None)
+                    if declared:
+                        parameters.add(target.id)
+        elif isinstance(statement, ast.ClassDef):
+            classes.pop(statement.name, None)
+            for base in statement.bases:
+                if isinstance(base, ast.Subscript) and origin(base.value) in ("Generic", "Protocol"):
+                    arguments = base.slice.elts if isinstance(base.slice, ast.Tuple) else [base.slice]
+                    slots = [isinstance(argument, ast.Name) and argument.id in parameters for argument in arguments]
+                    if any(slots):
+                        classes[statement.name] = slots
+            if getattr(statement, "type_params", []):
+                slots = [type(parameter).__name__ == "ParamSpec" for parameter in statement.type_params]
+                if any(slots):
+                    classes[statement.name] = slots
+            imports.pop(statement.name, None)
+            parameters.discard(statement.name)
+        elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            imports.pop(statement.name, None)
+            parameters.discard(statement.name)
+            classes.pop(statement.name, None)
+        else:
+            writes = {node.id for node in ast.walk(statement)
+                      if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))}
+            writes.update(node.name for node in ast.walk(statement)
+                          if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)))
+            for name in writes:
+                imports.pop(name, None)
+                parameters.discard(name)
+                classes.pop(name, None)
+    return classes
+
+
 def discover(item):
     """Inventory assertions and direct consumer calls, with their lexical context."""
     rows = []
@@ -306,14 +365,24 @@ def discover(item):
                    "expected_annotation": expectation, "expected_display": expected_text,
                    "markers": notes, "context": context,
                    "expected_error": expects_diagnostic(notes)}
-            if isinstance(parent, ast.Assign) and len(parent.targets) == 1 and isinstance(parent.targets[0], ast.Attribute):
+            target = parent.targets[0] if isinstance(parent, ast.Assign) and len(parent.targets) == 1 else None
+            annotated_module_target = isinstance(target, ast.Name) and any(
+                isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+                and statement.target.id == target.id and statement.lineno < node.lineno for statement in tree.body)
+            if isinstance(target, ast.Attribute) or annotated_module_target:
                 row["assignment_target"] = ast.get_source_segment(source, parent.targets[0])
+                if annotated_module_target:
+                    row["assignment_module_target"] = target.id
                 row["assignment_statement"] = ast.get_source_segment(source, parent)
                 row["oracle_start"] = [parent.lineno - 1, utf16_column(source, parent.lineno, parent.col_offset)]
                 row["oracle_end"] = [parent.end_lineno - 1, utf16_column(source, parent.end_lineno, parent.end_col_offset)]
             if row["expected_error"]:
                 row["expected_diagnostic_types"] = (["deprecated-var"] if any("deprecated" in note.lower() for note in notes)
                                                      else sorted(CALL_ERRORS))
+            if expected_text and item["provider"] == "pyright":
+                display_slots = display_parameter_slots(tree, node.lineno)
+                if display_slots:
+                    row["display_parameter_slots"] = display_slots
             row_suppressions = [value for line, value in ignored.items() if node.lineno <= line <= node.end_lineno]
             if row_suppressions:
                 row["suppression_directives"] = row_suppressions
@@ -523,6 +592,24 @@ def expected_annotation(row):
                     elif node.value.id == "__main__":
                         return ast.copy_location(ast.Name(id=node.attr, ctx=ast.Load()), node)
                 return node
+
+            def visit_Subscript(self, node):
+                node = self.generic_visit(node)
+                slots = row.get("display_parameter_slots", {}).get(node.value.id) if isinstance(node.value, ast.Name) else None
+                if not slots:
+                    return node
+                arguments = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+                if len(slots) == 1 and slots[0] and len(arguments) > 1:
+                    arguments = [ast.List(elts=arguments, ctx=ast.Load())]
+                elif len(arguments) == len(slots):
+                    arguments = [ast.List(elts=list(argument.elts) if isinstance(argument, ast.Tuple) else [argument], ctx=ast.Load())
+                                 if parameter and not isinstance(argument, ast.List)
+                                 and not (isinstance(argument, ast.Constant) and argument.value is Ellipsis) else argument
+                                 for parameter, argument in zip(slots, arguments)]
+                else:
+                    return node
+                node.slice = arguments[0] if len(arguments) == 1 else ast.Tuple(elts=arguments, ctx=ast.Load())
+                return node
         tree = DisplayNames().visit(tree)
     return ast.unparse(tree)
 
@@ -604,6 +691,72 @@ def internal_analysis_findings(findings):
             or finding.get("message", "").startswith("Analysis failed:")]
 
 
+def configured_source(source, provider):
+    """Express mypy's explicit implicit-optional policy in ordinary annotations."""
+    if provider != "mypy":
+        return source, []
+    enabled = False
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            directive = re.fullmatch(r"#\s*mypy:\s*(.*)", token.string)
+            if directive:
+                for option in directive[1].split(","):
+                    match = re.fullmatch(r"\s*(no[-_])?implicit[-_]optional(?:\s*=\s*(true|false))?\s*", option, re.I)
+                    if match:
+                        enabled = not bool(match[1]) and (match[2] or "true").lower() == "true"
+    except (tokenize.TokenError, IndentationError):
+        return source, []
+    if not enabled:
+        return source, []
+    tree = ast.parse(source)
+    alias = "__blt_config_typing"
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    names.update(node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    names.update(alias.asname or alias.name.split('.')[0] for node in ast.walk(tree)
+                 if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names)
+    while alias in names:
+        alias += "_"
+    encoded = source.encode("utf-8")
+    lines = encoded.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    edits, annotations = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        positional = [*node.args.posonlyargs, *node.args.args]
+        defaults = [None] * (len(positional) - len(node.args.defaults)) + node.args.defaults
+        for argument, default in [*zip(positional, defaults), *zip(node.args.kwonlyargs, node.args.kw_defaults)]:
+            if argument.annotation is None or not isinstance(default, ast.Constant) or default.value is not None:
+                continue
+            hint = argument.annotation
+            text = ast.get_source_segment(source, hint)
+            replacement = f"{alias}.Optional[{text}]"
+            edits.append((offsets[hint.lineno - 1] + hint.col_offset,
+                          offsets[hint.end_lineno - 1] + hint.end_col_offset, replacement.encode("utf-8")))
+            annotations.append({"line": hint.lineno, "column": hint.col_offset,
+                                "before": text, "after": replacement})
+    if not edits:
+        return source, []
+    import_line = 0
+    for index, node in enumerate(tree.body):
+        if (index == 0 and isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)) or isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            import_line = node.end_lineno
+        else:
+            break
+    edits.append((offsets[import_line], offsets[import_line], f"import typing as {alias}\n".encode()))
+    for start, end, replacement in sorted(edits, reverse=True):
+        encoded = encoded[:start] + replacement + encoded[end:]
+    adapted = encoded.decode("utf-8")
+    return adapted, [{"provider": "mypy", "option": "implicit-optional", "annotations": annotations,
+                      "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                      "adapted_sha256": hashlib.sha256(encoded).hexdigest()}]
+
+
 def finding_type(finding):
     """Distinguish the analyzer's Python-member diagnostic from lexical errors."""
     kind = finding.get("type", "").removeprefix(":")
@@ -650,6 +803,13 @@ def replay(item, rows, working, engine):
                 row.setdefault("excluded", "Fixture requires an external/absolute Python module layout")
             return
         target.parent.mkdir(parents=True, exist_ok=True)
+        if path.endswith((".py", ".pyi")):
+            content, adaptations = configured_source(content, item["provider"])
+            if adaptations:
+                item["metadata"].setdefault("configuration_adaptations", []).extend(
+                    {"file": path, **adaptation} for adaptation in adaptations)
+            if path == filename:
+                source = content
         target.write_text(content, encoding="utf-8")
     translated = []
     for index, row in enumerate(rows):
@@ -665,15 +825,23 @@ def replay(item, rows, working, engine):
             row["literal_bindings"] = {name: ast.unparse(value) for name, value in literals.items() if name in used}
             scope, context, locals_ = lexical_comprehension(row, module, {**bindings, **literals})
             expression = translate(node, module, scope)
+            closing = ")" if context else ""
             if context:
                 row["lexical_names"] = {name: local.id for name, local in locals_.items()}
-                row["basilisp_context"] = context + expression + ")"
-                row["basilisp_context_offset"] = len(context)
             if row.get("assignment_target"):
                 target = ast.parse(row["assignment_target"], mode="eval").body
-                expression = "(set! " + translate(target, module, {**bindings, **literals}) + " " + expression + ")"
+                if row.get("assignment_module_target"):
+                    rendered_target = f'(.-{target.id} (python/__import__ {json.dumps(module)} nil nil #py ["*"]))'
+                else:
+                    rendered_target = translate(target, module, {**bindings, **literals})
+                context += "(set! " + rendered_target + " "
+                closing += ")"
+            if context:
+                row["basilisp_context"] = context + expression + closing
+                row["basilisp_context_offset"] = len(context)
             expected = expected_annotation(row)
             if expected:
+                row["expected_rendered_annotation"] = expected
                 ast.parse(expected, mode="eval")
                 helper = f"__blt_expected_{index}"
                 generated.append(f"def {helper}() -> {expected}: ...\n")

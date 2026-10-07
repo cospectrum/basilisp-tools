@@ -967,6 +967,14 @@
         (finding! ctx (:node entry) :python-inspection
                   (str "Unable to inspect Python module " (:name entry) " (" (:reason module) ")"))))))
 
+(defn- python-descriptor-value [ctx member owner instance?]
+  (when-let [getter (:descriptor-get member)]
+    (let [options (get-in @(:state ctx) [:opts :python-options] {})
+          receiver (if instance? owner {:module "builtins" :path ["NoneType"]})
+          owner-type {:module "builtins" :path ["type"] :arguments [owner]}]
+      (when-let [type (py/call-result (py/bind-member getter) [receiver owner-type] {} options)]
+        (python-value type)))))
+
 (defn- python-member-value [module path member]
   (merge {:python-member member :python-module module :python-path path}
          (when-let [type (py/callable-type member)]
@@ -995,11 +1003,16 @@
       (and (op/eq :missing (:status module))
            (not (contains? (:reported-python-modules @(:state ctx)) module-name)))
       (finding! ctx node :unresolved-namespace (str "Unresolved namespace " module-name ". Are you missing an import?"))
-      (and member-name (op/eq :known (:status module)) (nil? member))
+      (and member-name (not (:python-assignment-target? ctx)) (op/eq :known (:status module)) (nil? member))
       (finding! ctx node :unresolved-symbol (str "Unresolved symbol: " module-name "/" member-name)))
     (when member
-      (python-deprecated! ctx node member)
-      (python-member-value module-name (or path []) member))))
+      (when-not (:python-assignment-target? ctx) (python-deprecated! ctx node member))
+      (cond
+        (and (:class-read-type member) (> (count path) 1))
+        (python-value (py/return-type (:class-read-type member)))
+        (and (:descriptor-get member) (> (count path) 1))
+        (python-descriptor-value ctx member {:module module-name :path (vec (butlast path))} false)
+        :else (python-member-value module-name (or path []) member)))))
 
 (defn- lint-reference! [ctx env node info]
   (when (and info (:ns info) (:name info))
@@ -2271,11 +2284,12 @@
     (when (and (:type-guard member) (not (:async? member)))
       (swap! (:state ctx) assoc-in [:guard-calls (:start node)]
              {:guard (py/return-type (:type-guard member)) :type-is? (:type-is? member)}))
-    (let [calls (:calls @(:state ctx))]
-      (when (pos? (python/len calls))
-        (let [index (op/sub (python/len calls) 1)]
-          (op/setitem calls index (assoc (op/getitem calls index)
-                                         :positional-types positional-types :keyword-types keyword-types :signatures candidates)))))
+    (when-not (:python-check-only? ctx)
+      (let [calls (:calls @(:state ctx))]
+        (when (pos? (python/len calls))
+          (let [index (op/sub (python/len calls) 1)]
+            (op/setitem calls index (assoc (op/getitem calls index)
+                                           :positional-types positional-types :keyword-types keyword-types :signatures candidates))))))
     (doseq [problem problems] (finding! ctx node (:type problem) (:message problem)))
     (when (and valid? (empty? problems) (empty? candidates)
                (or (seq (:parameters member)) (seq (:overloads member))))
@@ -2358,7 +2372,8 @@
         meta-getitem (get (:members metaclass) "__getitem__")
         getitem (cond
                   meta-getitem (py/bind-member meta-getitem)
-                  class? (get (:members owner) "__class_getitem__")
+                  class? (or (get (:members owner) "__class_getitem__")
+                             (get (:members metaclass) "__class_getitem__"))
                   (not builtin-sequence?) (py/inspect-member type "__getitem__" options))
         key-type (:python-type value)
         literal (when (= 1 (count (:literal-values key-type))) (first (:literal-values key-type)))
@@ -2379,7 +2394,10 @@
         (assoc (python-member-value (:python-module receiver) (:python-path receiver) member)
                :python-specialized? true))
       class?
-      (when getitem (python-call-value ctx node getitem [argument] [value] nil))
+      (if getitem
+        (python-call-value ctx node getitem [argument] [value] nil)
+        (when (and (= :class (get-in receiver [:python-member :kind])) (:class-members-complete? owner))
+          (finding! ctx node :type-mismatch (str "Python class is not subscriptable: " (py/type-label class-type)))))
       :else
       (let [invalid-key? (and builtin-sequence? (= "builtins" (:module key-type))
                               (contains? #{"str" "float" "complex" "NoneType" "list" "dict" "tuple" "set" "frozenset"}
@@ -2544,7 +2562,8 @@
 (defn- walk-python-method! [ctx env node head args]
   (let [injected (:thread-target env)
         receiver-injected? (and injected (or (not (:last? injected)) (empty? args)))
-        target (if receiver-injected? (:value injected) (walk! ctx (dissoc env :thread-target) (first args)))
+        target (if receiver-injected? (:value injected)
+                   (walk! (dissoc ctx :python-assignment-target?) (dissoc env :thread-target) (first args)))
         receiver (if receiver-injected? (:node injected) (first args))
         arguments (if receiver-injected? args (rest args))
         extra-positional (if (and injected (not receiver-injected?)) 1 0)
@@ -2571,6 +2590,16 @@
                                           (get-in @(:state ctx) [:opts :python-options] {}))
                        (py/inspect-path (:module object) (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))
                                         (get-in @(:state ctx) [:opts :python-options] {}))))))
+        class-target? (or class-receiver (= :class (get-in target [:python-member :kind])))
+        read-override (if instance? (:instance-read-type member) (when class-target? (:class-read-type member)))
+        property? (and instance? (= :property (:kind member)))
+        descriptor? (and (not read-override) (:descriptor-get member)
+                         (or (not instance?) (:descriptor-instance? member)))
+        read-value (when-not (:python-assignment-target? ctx)
+                     (cond
+                       read-override (python-value (py/return-type read-override))
+                       descriptor? (python-descriptor-value ctx member object instance?)
+                       property? (python-return (:module object) member)))
         values (mapv #(if (op/eq "**" (token %)) nil (walk! ctx (assoc env :tail? false) %)) arguments)]
     (when object
       (record-call! ctx env node head arguments member
@@ -2580,18 +2609,72 @@
                                                        :python true :definition member
                                                        :python-module (:module object)
                                                        :python-path (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true))}))
-      (if (nil? member)
+      (if (and (nil? member) (not (:python-assignment-target? ctx)))
         (finding! ctx head :unresolved-symbol (str "Unresolved Python member: " member-name))
         nil))
     (when member
-      (when field? (python-deprecated! ctx node member))
-      (if field?
+      (when (and field? (not (:python-assignment-target? ctx))) (python-deprecated! ctx node member))
+      (cond
+        (and field? (:python-assignment-target? ctx))
+        {:python-assignment-member member :python-assignment-instance? instance?
+         :python-assignment-class? class-target?}
+        (or read-override descriptor? property?)
+        (if field? read-value
+            (when-let [callable (:python-member read-value)]
+              (python-call-value ctx node callable arguments values (when (pos? extra-positional) injected))))
+        field?
         (if (#{:function :class :module} (:kind member))
           (python-member-value (:module object)
                                (conj (vec (:path object)) (util/munge member-name ** :allow_builtins true)) member)
           (python-return (:module object) member))
-        (python-call-value ctx node member arguments values
-                           (when (pos? extra-positional) injected))))))
+        :else (python-call-value ctx node member arguments values
+                                 (when (pos? extra-positional) injected))))))
+
+(defn- walk-python-assignment! [ctx env node args]
+  (if-not (= 2 (count args))
+    (walk-body! ctx env args)
+    (let [[target expression] args
+          target-value (walk! (assoc ctx :python-assignment-target? true) (assoc env :tail? false) target)
+          value (walk! ctx (assoc env :tail? false) expression)
+          member (:python-assignment-member target-value)
+          instance? (:python-assignment-instance? target-value)
+          expected (or (when instance? (:instance-assignment-type member))
+                       (when (:python-assignment-class? target-value) (:class-assignment-type member))
+                       (:assignment-type member))]
+      (cond
+        (or (:read-only? member) (and instance? (:instance-read-only? member))
+            (and (:python-assignment-class? target-value) (:class-read-only? member)))
+        (finding! ctx target :type-mismatch (str "Cannot assign to read-only Python member: " (:name member)))
+        expected
+        ;; Reuse argument checking so a fresh collection can adopt the declared
+        ;; field type while an existing mutable collection remains invariant.
+        (python-call-value (assoc ctx :python-check-only? true) node
+                           {:kind :function :name (:name member)
+                            :parameters [(merge expected {:name (:name member) :kind :positional-only :required? true})]}
+                           [(assoc expression :kind :analyzed-value :text ""
+                                   :fresh-python-container? (fresh-python-container? expression))]
+                           [value] nil))
+      value)))
+
+(defn- python-import-value [ctx info args values]
+  ;; __import__ returns the top-level package unless an explicit fromlist is
+  ;; supplied. Resolve only literal absolute imports with known default options.
+  (when (and (= "builtins" (:python-module info)) (= ["__import__"] (:python-path info)))
+    (let [name-type (:python-type (first values))
+          name (when (= 1 (count (:literal-values name-type))) (first (:literal-values name-type)))
+          argc (count args)
+          from-items (get-in (nth values 3 nil) [:python-literal-value :items])
+          from-known? (and (fresh-python-container? (nth args 3 nil)) (some? from-items)
+                           (every? #(and (= "builtins" (get-in % [:type :module]))
+                                         (= ["str"] (get-in % [:type :path]))) from-items))
+          defaults? (and (every? #(= ["NoneType"] (get-in % [:python-type :path])) (take 2 (rest values)))
+                         (or (= 4 argc) (and (= 5 argc) (= [0] (get-in (nth values 4 nil) [:python-type :literal-values])))))
+          supported? (or (= 1 argc) (and defaults? from-known?))]
+      (when (and supported? (string? name) (re/fullmatch "[A-Za-z_][A-Za-z0-9_]*(?:[.][A-Za-z_][A-Za-z0-9_]*)*" name))
+        (let [module-name (if (and from-known? (seq from-items)) name (first (str/split name #"[.]")))
+              metadata (python-module ctx module-name)]
+          (when (= :known (:status metadata))
+            (python-member-value module-name [] metadata)))))))
 
 (defn- walk-call! [ctx env node injected]
   (let [[head & args] (forms node)
@@ -2657,9 +2740,10 @@
                       (merge {:implicit-arguments injected :arity (+ injected (count args))}
                              (when (:python-member info) {:python true :ns (:python-module info)})))
         (if-let [member (:python-member info)]
-          (or (python-call-value ctx node member args values thread)
-              (when (op/eq :class (:kind member))
-                {:python-type {:module (:python-module info) :path (:python-path info)}}))
+          (let [result (python-call-value ctx node member args values thread)]
+            (or (when-not thread (python-import-value ctx info args values)) result
+                (when (op/eq :class (:kind member))
+                  {:python-type {:module (:python-module info) :path (:python-path info)}})))
           (do (if (and (#{:set :vector} (:tag info)) (op/ne 1 (+ injected (count args))))
                 (finding! ctx node :invalid-arity
                           (str (str/capitalize (name (:tag info))) " can only be called with 1 arg but was called with: " (+ injected (count args))))
@@ -3460,6 +3544,7 @@
     (let [dispatch-value name]
       (lint-special-arity! ctx node name args)
       (cond
+        (op/eq dispatch-value "set!") (walk-python-assignment! ctx env node args)
         (and (empty? args) (#{"let" "let*" "loop" "loop*" "deftype" "defrecord" "defn" "defn-" "defmacro" "defmacro-" "defasync"} name)) nil
         (op/eq dispatch-value "ns")
         (analyze-ns! (assoc ctx :nested-ns? (not= :root (:kind (:scope env)))) node)

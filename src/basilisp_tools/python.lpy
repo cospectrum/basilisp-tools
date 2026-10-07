@@ -445,7 +445,7 @@
            (contains? #{"Iterable" "Sequence" "Collection" "Container"} target))
       [(if (:ellipsis? (last (:arguments actual))) (first (:arguments actual))
            (union-type (:arguments actual)))]
-      (and (= "builtins" (:module actual)) (contains? #{"str" "bytes" "range"} kind))
+      (and (= "builtins" (:module actual)) (contains? #{"str" "bytes" "bytearray" "range"} kind))
       [{:module "builtins" :path [(if (= "str" kind) "str" "int")]}]
       (contains? #{"Iterable" "Collection" "Container" "Set" "Sequence" "MutableSequence" "MutableSet"} target)
       (when (seq (:arguments actual)) [(first (:arguments actual))])
@@ -464,15 +464,15 @@
     (:never? actual) true
     (:never? expected) false
     (and (:typing-form? actual) (= "builtins" (:module expected)) (= ["type"] (:path expected))) false
+    (or (:union actual) (:nullable? actual))
+    (every-compatible (map #(compare % expected) (variants actual)))
+    (or (:union expected) (:nullable? expected))
+    (any-compatible (map #(compare actual %) (variants expected)))
     (:typevar expected) (cond
                           (:constraints expected) (any-compatible (map #(compare actual %) (:constraints expected)))
                           (:bound expected) (compare actual (:bound expected))
                           :else nil)
     (:typevar actual) (when (:bound actual) (compare (:bound actual) expected))
-    (or (:union actual) (:nullable? actual))
-    (every-compatible (map #(compare % expected) (variants actual)))
-    (or (:union expected) (:nullable? expected))
-    (any-compatible (map #(compare actual %) (variants expected)))
     (:literal-values expected)
     (when-let [values (if (contains? actual :literal-values) (:literal-values actual)
                           (when (= none-type actual) [nil]))]
@@ -521,13 +521,13 @@
         :else nil))
     (and (= "builtins" (:module actual)) (= "collections.abc" (:module expected)))
     (let [a (first (:path actual)) e (first (:path expected))
-          known {"Iterable" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "range"}
-                 "Sequence" #{"list" "tuple" "str" "bytes" "range"}
-                 "Collection" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "range"}
+          known {"Iterable" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "bytearray" "range"}
+                 "Sequence" #{"list" "tuple" "str" "bytes" "bytearray" "range"}
+                 "Collection" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "bytearray" "range"}
                  "Mapping" #{"dict"} "MutableMapping" #{"dict"}
-                 "MutableSequence" #{"list"} "Set" #{"set" "frozenset"} "MutableSet" #{"set"}
-                 "Container" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "range"}
-                 "Sized" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "range"}}]
+                 "MutableSequence" #{"list" "bytearray"} "Set" #{"set" "frozenset"} "MutableSet" #{"set"}
+                 "Container" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "bytearray" "range"}
+                 "Sized" #{"list" "tuple" "set" "frozenset" "dict" "str" "bytes" "bytearray" "range"}}]
       (when-let [accepted (get known e)]
         (if (contains? accepted a)
           (generic-compatible? (collection-arguments actual expected) (:arguments expected)
@@ -570,7 +570,8 @@
 
 (defn- substitute-type [type bindings]
   (cond
-    (:typevar type) (or (get bindings (:typevar type)) (:default type) (:bound type) type)
+    (:typevar type) (cond-> (or (get bindings (:typevar type)) (:default type) (:bound type) type)
+                      (:nullable? type) (assoc :nullable? true))
     :else (cond-> type
             (:arguments type) (assoc :arguments (substitute-arguments (:arguments type) bindings))
             (:parameters type) (assoc :parameters (substitute-metadata (:parameters type) bindings))
@@ -617,7 +618,8 @@
                       (let [result (into {} (map (fn [[key item]] [key (substitute-metadata item bindings memo)]) value))
                             replacement (get bindings (if (:type-self? value) "__Self__" (:typevar value)))
                             result (if replacement
-                                     (merge (apply dissoc result (conj type-keys :type-self?)) (type-metadata replacement))
+                                     (cond-> (merge (apply dissoc result (conj type-keys :type-self?)) (type-metadata replacement))
+                                       (:nullable? value) (assoc :nullable? true))
                                      result)
                             result (cond-> result
                                      (:type-arguments value)
@@ -742,25 +744,49 @@
 
 (declare infer-arguments)
 
+(defn- default-type-binding [type]
+  (if (and (:unpack? type) (= "builtins" (:module type)) (= ["tuple"] (:path type)))
+    {:type-pack? true :arguments (if (some :ellipsis? (:arguments type)) [type] (:arguments type))}
+    type))
+
+(defn- complete-class-bindings [bindings parameters unknown?]
+  (reduce (fn [bindings parameter]
+            (let [parameter (return-type parameter) name (:typevar parameter)]
+              (if (or (nil? name) (contains? bindings name))
+                bindings
+                (if-let [default (:default parameter)]
+                  (assoc bindings name (default-type-binding (substitute-type default bindings)))
+                  (if unknown?
+                    (assoc bindings name (cond
+                                           (:variadic? parameter)
+                                           {:type-pack? true :arguments
+                                            [{:module "builtins" :path ["tuple"] :unpack? true
+                                              :arguments [{:any? true} {:ellipsis? true}]}]}
+                                           (:parameter-spec? parameter) {:ellipsis? true}
+                                           :else {:any? true}))
+                    bindings))))) bindings parameters))
+
 (defn specialize
   "Substitute a receiver's generic arguments throughout its class/member metadata."
   ([metadata receiver] (specialize metadata receiver {}))
   ([metadata receiver opts]
    (let [parameters (:type-parameters metadata)
          expected (mapv #(cond-> (return-type %) (:variadic? %) (assoc :unpack? true)) parameters)
+         supplied (:arguments receiver)
          bindings (if (contains? receiver :arguments)
-                    (infer-arguments {} expected (:arguments receiver) false opts)
-                   ;; An unspecialized instance has unknown class arguments;
-                   ;; those variables are not rebound independently by each method.
-                    (into {} (keep (fn [parameter]
-                                     (when-let [name (:typevar parameter)]
-                                       [name (or (:default parameter)
-                                                 (if (:variadic? parameter)
-                                                   {:type-pack? true :arguments
-                                                    [{:module "builtins" :path ["tuple"] :unpack? true
-                                                      :arguments [{:any? true} {:ellipsis? true}]}]}
-                                                   {:any? true}))])) expected)))]
-     (if (seq bindings) (substitute-metadata metadata (assoc bindings "__Self__" receiver)) metadata))))
+                    (infer-arguments {} expected supplied false (assoc opts ::receiver-specialization? true)) {})
+         ;; Omitted packs may use defaults, but an explicit empty Unpack is an
+         ;; intentional specialization and must remain empty.
+         bindings (reduce (fn [bindings [index parameter]]
+                            (if (and (:variadic? parameter) (:default parameter)
+                                     (= index (count supplied))
+                                     (empty? (:arguments (get bindings (:typevar parameter)))))
+                              (dissoc bindings (:typevar parameter)) bindings))
+                          bindings (map-indexed vector expected))
+         bindings (complete-class-bindings bindings parameters (not (contains? receiver :arguments)))
+         self (cond-> receiver
+                (seq bindings) (assoc :arguments (substitute-arguments expected bindings)))]
+     (if (seq bindings) (substitute-metadata metadata (assoc bindings "__Self__" self)) metadata))))
 
 (declare inspect-path inspect-member inherited-metadata)
 
@@ -1069,13 +1095,26 @@
            (map (fn [[name member]]
                   (let [provided (if (and (= "__call__" name) (callable-ref? actual))
                                    (callable-metadata actual)
-                                   (inspect-member actual name opts))]
+                                   (inspect-member actual name opts))
+                        read-type (or (some-> (:instance-read-type provided) return-type)
+                                      (return-type provided))]
                     (cond
                       (nil? provided) false
                       (= :unknown (:status provided)) nil
-                      (= :function (:kind member)) (callable-compatible? (callable-type (bind-member provided))
-                                                                         (callable-type (bind-member member)) opts)
-                      :else (type-compatible? (return-type provided) (return-type member) opts))))
+                      (= :function (:kind member))
+                      (if (:instance-read-type provided)
+                        (type-compatible? read-type (callable-type (bind-member member)) opts)
+                        (callable-compatible? (callable-type (bind-member provided))
+                                              (callable-type (bind-member member)) opts))
+                      (and (= :variable (:kind member)) (not (:read-only? member)))
+                      (if (or (:read-only? provided) (:instance-read-only? provided))
+                        false
+                        (let [write-type (or (some-> (:instance-assignment-type provided) return-type)
+                                             (some-> (:assignment-type provided) return-type)
+                                             (when (= :variable (:kind provided)) (return-type provided)))]
+                          (every-compatible [(type-compatible? read-type (return-type member) opts)
+                                             (type-compatible? (return-type member) write-type opts)])))
+                      :else (type-compatible? read-type (return-type member) opts))))
                 (remove (fn [[name _]] (contains? #{"__init__" "__new__" "__class_getitem__"} name)) (:members (inspect-type expected opts)))))
           :else
           (let [object-type {:module "builtins" :path ["object"]}
@@ -1226,6 +1265,10 @@
   ([bindings expected actual upper?] (infer-bindings bindings expected actual upper? {}))
   ([bindings expected actual upper? opts]
    (cond
+     ;; Explicit Adder[Any] is a specialization, not an unknown call argument.
+     ;; Preserve it without changing ordinary function-call constraint inference.
+     (and (::receiver-specialization? opts) (:typevar expected) (:any? actual))
+     (assoc bindings (:typevar expected) actual)
      (or (nil? expected) (nil? actual) (:any? actual) (:parameter-part expected)
          (and (:unpack? expected) (:variadic? expected))) bindings
      ;; A polymorphic callback's variables belong to its own invocation. They
@@ -1250,12 +1293,16 @@
           (infer-arguments bindings prefix (mapv return-type fixed) upper? opts)
           (last (:arguments expected))
           (parameter-list (drop (count prefix) parameters)) upper? opts)))
+     (and (:nullable? expected) (not (:nullable? actual)) (= none-type (dissoc actual :literal-values))) bindings
+     (and (:nullable? expected) (:nullable? actual))
+     (infer-bindings bindings (dissoc expected :nullable?) (dissoc actual :nullable?) upper? opts)
      (:typevar expected)
      (let [name (:typevar expected)
            constraint (first (filter #(true? (type-compatible? actual % opts)) (:constraints expected)))
            upper? (and upper? (not (:parameter-spec? expected)) (not (:variadic? expected))
                        (empty? (:constraints expected)))
-           inferred (if upper? actual (or constraint (dissoc actual :literal-values)))
+           inferred (or constraint (if (or upper? (::contained-type? opts)) actual
+                                       (dissoc actual :literal-values)))
            previous (get bindings name)
            upper-bounds (get-in (meta bindings) [::upper-bounds name])
            upper-bounds (if upper?
@@ -1272,13 +1319,29 @@
                       bindings)]
        (assoc bindings name value))
      (:union expected)
-     (let [candidate (first (filter #(not (false? (type-compatible? actual % opts))) (:union expected)))]
+     (let [members (:union expected)
+           concrete (first (filter #(and (not (unresolved-type-variable? %))
+                                         (true? (type-compatible? actual % opts))) members))
+           shaped (first (filter #(and (:module %) (= [(:module %) (:path %)] [(:module actual) (:path actual)])
+                                       (not (false? (type-compatible? actual % opts)))) members))
+           candidate (or concrete shaped
+                         (first (filter #(not (false? (type-compatible? actual % opts))) members)))]
        (if candidate (infer-bindings bindings candidate actual upper? opts) bindings))
+     (and (= "collections.abc" (:module expected))
+          (contains? #{["Iterable"] ["Sequence"] ["Collection"]}
+                     (:path expected))
+          (= 1 (count (:arguments expected)))
+          (= "builtins" (:module actual))
+          (contains? #{["str"] ["bytes"] ["bytearray"] ["range"] ["tuple"] ["list"] ["set"] ["frozenset"] ["dict"]}
+                     (:path actual)))
+     (infer-bindings bindings (first (:arguments expected)) (first (collection-arguments actual expected))
+                     upper? (assoc opts ::contained-type? true))
      (and (:parameter-list? expected) (:parameter-list? actual) (:parameters actual))
      (infer-arguments bindings (:arguments expected) (positional-pattern (:parameters actual)) upper? opts)
      (and (seq (:arguments expected)) (contains? actual :arguments)
           (= (boolean (callable-ref? expected)) (boolean (callable-ref? actual))))
-     (infer-arguments bindings (:arguments expected) (:arguments actual) upper? opts)
+     (infer-arguments bindings (:arguments expected) (:arguments actual) upper?
+                      (assoc opts ::contained-type? true))
      :else bindings)))
 
 (defn- unpacked-call-signature
@@ -1394,10 +1457,53 @@
       (if (= :function (:kind member)) [expected (callable-type member)] [expected actual]))
     :else [expected actual]))
 
+(declare call-signatures)
+
+(defn- forwarded-call-compatible? [signature pairs positional keyword opts]
+  ;; A captured ParamSpec constrains the arguments forwarded to that callback,
+  ;; even when the callback itself is generic and needs another instantiation.
+  (let [parameters (:parameters signature)
+        varargs (first (filter #(= :var-positional (:kind %)) parameters))
+        varkw (first (filter #(= :var-keyword (:kind %)) parameters))
+        pack (return-type varargs)
+        keyword-pack (return-type varkw)
+        name (:typevar pack)
+        targets (when (and (:parameter-spec? pack) (= "args" (:parameter-part pack))
+                           (= name (:typevar keyword-pack)) (= "kwargs" (:parameter-part keyword-pack)))
+                  (keep (fn [[expected actual]]
+                          (when (and (callable-ref? expected) (unresolved-type-variable? actual)
+                                     (= name (:typevar (first (:arguments expected)))))
+                            (callable-metadata actual))) pairs))]
+    (if-not (seq targets)
+      true
+      (when (< (get opts ::forwarded-depth 0) 12)
+        (let [fixed (count (filter #(contains? #{:positional-only :positional-or-keyword} (:kind %)) parameters))
+              owned-keywords (set (map :name (filter #(contains? #{:positional-or-keyword :keyword-only} (:kind %)) parameters)))
+              forwarded-positional (vec (drop fixed positional))
+              forwarded-keyword (apply dissoc keyword owned-keywords)
+              opts (-> opts
+                       (update ::forwarded-depth (fnil inc 0))
+                       (update-in [:python-fresh-values :positional]
+                                  #(into {} (keep (fn [[index value]]
+                                                    (when (>= index fixed) [(- index fixed) value])) %)))
+                       (update-in [:python-fresh-arguments :positional]
+                                  #(set (map (fn [index] (- index fixed)) (filter (fn [index] (>= index fixed)) %)))))]
+          (every-compatible
+           (map (fn [target]
+                  (let [candidates (call-signatures target forwarded-positional forwarded-keyword opts)]
+                    (if (empty? candidates) false
+                        (any-compatible (map :type-match? candidates))))) targets)))))))
+
 (defn- select-call-signatures
   [metadata positional-types keyword-types opts]
   (let [branches (callable-argument-branches metadata positional-types keyword-types opts)
-        signatures (or (seq (:overloads metadata)) [metadata])]
+        signatures (or (seq (:overloads metadata)) [metadata])
+        ;; An explicit Any shared by every overload cannot select a branch.
+        ;; Other unknown arguments retain their ordinary uncertainty.
+        shared-any (when (:overloads metadata)
+                     (let [pairs (mapv #(vec (argument-pairs % positional-types keyword-types opts)) signatures)]
+                       (mapv (fn [index] (every? #(get-in % [index 0 :any?]) pairs))
+                             (range (+ (count positional-types) (count keyword-types))))))]
     (if (and branches (> (count branches) 1))
       (vec (mapcat (fn [[positional keyword]]
                      (map #(assoc % :callable-branch? true)
@@ -1415,23 +1521,29 @@
                          bindings (reduce (fn [result [expected actual]]
                                             (let [[expected actual] (callable-inference-pair expected actual opts)]
                                               (infer-bindings result expected actual false opts))) (:bindings prepared) pairs)
+                         bindings (if (= :class (:kind signature))
+                                    (complete-class-bindings bindings (:type-parameters signature) false) bindings)
                          specialized (if (seq bindings) (substitute-metadata signature bindings) signature)
                          unchanged? (identical? specialized signature)
                          specialized-pairs (if unchanged? pairs (argument-pairs specialized positional-types keyword-types opts))
-                         comparisons (map (fn [[expected actual fresh?]]
-                                            (let [result (argument-compatible? actual expected fresh? opts)
-                                                  substituted (substitute-type expected bindings)]
-                                              (if (or (false? result) (= expected substituted))
-                                                result
-                                                (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
+                         forwarded (forwarded-call-compatible? signature pairs positional-types keyword-types opts)
+                         comparisons (map-indexed (fn [index [expected actual fresh?]]
+                                                    (let [result (if (and (:any? expected) (get shared-any index))
+                                                                   true
+                                                                   (argument-compatible? actual expected fresh? opts))
+                                                          substituted (substitute-type expected bindings)]
+                                                      (if (or (false? result) (= expected substituted))
+                                                        result
+                                                        (argument-compatible? actual substituted fresh? opts)))) specialized-pairs)]
                      (when-not (or (and (not unchanged?)
                                         (some (fn [[expected actual fresh?]]
                                                 (and (not (:parameter-part expected))
                                                      (false? (argument-compatible? actual expected fresh? opts)))) pairs))
+                                   (false? forwarded)
                                    (some false? comparisons)
                                    (and (not (identical? original specialized))
                                         (seq (check-call specialized (count positional-types) (keys keyword-types)))))
-                       (assoc specialized :type-match? (every-compatible comparisons)))))))
+                       (assoc specialized :type-match? (every-compatible (cons forwarded comparisons))))))))
              signatures)))))
 
 (defn- expand-arguments [positional-types keyword-types]

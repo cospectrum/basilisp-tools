@@ -128,6 +128,61 @@ TYPE_KEYS = ("type-module", "type-path", "type-arguments", "type-union",
              "parameter-list?", "type-pack?")
 
 
+def uncertain_attribute_dispatch(value, name, default):
+    raw = static_class_member(value, name)
+    if raw is default:
+        return False
+    if (type(raw) in (types.WrapperDescriptorType, types.MethodDescriptorType)
+            and class_attribute(raw.__objclass__, "__module__") == "builtins"):
+        return False
+    return True
+
+
+def dynamic_member_contexts(members, instance_read=False, instance_write=False,
+                            class_read=False, class_write=False):
+    """Keep declared class contracts separate from intercepted instance access."""
+    if not any((instance_read, instance_write, class_read, class_write)):
+        return members
+    result = {}
+    for name, member in members.items():
+        member = dict(member)
+        for context, read, write in (("instance", instance_read, instance_write),
+                                     ("class", class_read, class_write)):
+            if read:
+                member[context + "-read-type"] = {"type-any?": True}
+            if write:
+                member[context + "-assignment-type"] = {"type-any?": True}
+                member.pop(context + "-read-only?", None)
+        result[name] = member
+    return result
+
+
+
+def metaclass_property_contexts(members, meta_members):
+    """Data properties on a metaclass precede fields stored on its classes."""
+    result = dict(members)
+    for name, descriptor in meta_members.items():
+        if (descriptor.get("kind") != "property"
+                or descriptor.get("class-read-type") != {"type-module": "builtins", "type-path": ["property"]}):
+            continue
+        member = dict(result.get(name, {"status": "known", "name": name,
+                                        "kind": "variable", "type-any?": True}))
+        read_type = descriptor.get("instance-read-type", type_fields(descriptor))
+        # Receiver-dependent contracts need specialization against this class.
+        member["class-read-type"] = (read_type if read_type and not find_typevars(read_type)
+                                      and not read_type.get("type-self?") else {"type-any?": True})
+        write_type = descriptor.get("instance-assignment-type", {"type-any?": True})
+        member["class-assignment-type"] = (write_type if not find_typevars(write_type)
+                                            and not write_type.get("type-self?") else {"type-any?": True})
+        if member.pop("read-only?", False):
+            member["instance-read-only?"] = True
+        member.pop("class-read-only?", None)
+        if descriptor.get("instance-read-only?"):
+            member["class-read-only?"] = True
+        result[name] = member
+    return result
+
+
 def type_fields(info):
     return {key: info[key] for key in TYPE_KEYS if key in info and key not in ("parameters", "callable-overloads")}
 
@@ -162,26 +217,53 @@ def union_type(values):
     return result
 
 
-def bind_type_parameters(parameters, arguments):
-    """Capture one variadic pack without truncating following generic arguments."""
+def bind_type_parameters(parameters, arguments, missing_unknown=False):
+    """Capture one variadic pack and resolve declared defaults in order."""
+    def fill_defaults(result, params):
+        for parameter in params:
+            name = parameter["typevar"]
+            if name not in result:
+                if "type-default" in parameter:
+                    result[name] = substitute_types(parameter["type-default"], result)
+                elif missing_unknown:
+                    result[name] = {"type-any?": True}
+        return result
+
+    def pack_arguments(values):
+        result = []
+        for value in values:
+            args = value.get("type-arguments", [])
+            if (value.get("unpack?") and value.get("type-module") == "builtins"
+                    and value.get("type-path") == ["tuple"]
+                    and not any(arg.get("type-ellipsis?") for arg in args)):
+                result.extend(args)
+            else:
+                result.append(value)
+        return result
+
     packs = [index for index, param in enumerate(parameters) if param.get("variadic?")]
     if not packs:
-        return {param["typevar"]: arg for param, arg in zip(parameters, arguments)}
-    if len(packs) != 1 or len(arguments) < len(parameters) - 1:
+        return fill_defaults({param["typevar"]: arg for param, arg in zip(parameters, arguments)}, parameters)
+    if len(packs) != 1:
         return {}
     index = packs[0]
     suffix = len(parameters) - index - 1
-    end = len(arguments) - suffix
-    # One symbolic pack can remain inside the captured variadic segment.
-    # It cannot safely bind a fixed prefix or suffix parameter.
+    if suffix and len(arguments) < index + suffix:
+        return {}
+    end = max(index, len(arguments) - suffix)
     if (any(arg.get("unpack?") for arg in arguments[:index] + arguments[end:])
             or sum(bool(arg.get("unpack?")) for arg in arguments[index:end]) > 1
             or any(arg.get("type-ellipsis?") for arg in arguments)):
         return {}
-    result = {param["typevar"]: arg for param, arg in zip(parameters[:index], arguments[:index])}
-    result[parameters[index]["typevar"]] = {"type-pack?": True, "type-arguments": arguments[index:end]}
+    result = fill_defaults({param["typevar"]: arg for param, arg in zip(parameters[:index], arguments[:index])},
+                           parameters[:index])
+    captured = arguments[index:end]
+    parameter = parameters[index]
+    if not captured and "type-default" in parameter:
+        captured = [substitute_types(parameter["type-default"], result)]
+    result[parameter["typevar"]] = {"type-pack?": True, "type-arguments": pack_arguments(captured)}
     result.update({param["typevar"]: arg for param, arg in zip(parameters[index + 1:], arguments[end:])})
-    return result
+    return fill_defaults(result, parameters[index + 1:])
 
 
 def type_parameter_infos(value, names):
@@ -1042,13 +1124,20 @@ def runtime_member(name, value, depth=1, owner=None):
     if static or type(value) is classmethod:
         value = value.__func__
     if type(value) is property:
-        result.update(kind="property")
+        result.update(kind="property", **{"class-read-type": runtime_type(property)})
         if type(value.fget) is types.FunctionType:
             info = runtime_signature(value.fget, owner=owner)
             result.update({key: item for key, item in info.items()
                            if key == "return-type" or key in TYPE_KEYS})
             result.update(filename=value.fget.__code__.co_filename, row=value.fget.__code__.co_firstlineno)
             result["doc"] = (value.fget.__doc__ or "")[:2000]
+        if value.fset is None:
+            result["instance-read-only?"] = True
+        elif type(value.fset) is types.FunctionType:
+            setter = runtime_signature(value.fset, owner=owner)
+            parameters = setter.get("parameters", [])
+            result["instance-assignment-type"] = (type_fields(parameters[1]) or {"type-any?": True}
+                                                   if len(parameters) > 1 else {"type-any?": True})
         return result
     if type(value) is types.ModuleType:
         result.update(kind="module", target=vars(value).get("__name__", name))
@@ -1106,10 +1195,22 @@ def runtime_member(name, value, depth=1, owner=None):
                     if not key.startswith("_") or key in ("__getitem__", "__iter__", "__next__", "__call__",
                                                           "__enter__", "__exit__", "__aenter__", "__anext__",
                                                           "__truediv__", "__rtruediv__", "__add__", "__radd__",
-                                                          "__sub__", "__rsub__", "__mul__", "__rmul__"):
+                                                          "__sub__", "__rsub__", "__mul__", "__rmul__",
+                                                          "__class_getitem__", "__get__", "__set__", "__delete__", "__setattr__", "__index__"):
                         member = safe_member(key, child, depth=0, owner=value)
                         if native_member(child):
                             member = supplement_stub(member, declared.get(key))
+                        if not is_class(child) and type(child) is not property:
+                            getter = static_class_member(type(child), "__get__")
+                            if type(getter) is types.FunctionType:
+                                setter = static_class_member(type(child), "__set__")
+                                deleter = static_class_member(type(child), "__delete__")
+                                shadowed = (static_class_member(value, "__init__") is not object.__dict__["__init__"]
+                                            or static_class_member(value, "__new__") is not object.__dict__["__new__"])
+                                member["descriptor-get"] = safe_member("__get__", getter, depth=0, owner=type(child))
+                                member["descriptor-instance?"] = bool(setter is not None or deleter is not None or not shadowed)
+                                if type(setter) is types.FunctionType:
+                                    member["descriptor-set"] = safe_member("__set__", setter, depth=0, owner=type(child))
                         members[key] = substitute_types(member, generic_bindings)
                 annotations = runtime_class_annotations(base)
                 if type(annotations) is dict:
@@ -1117,11 +1218,38 @@ def runtime_member(name, value, depth=1, owner=None):
                         if type(key) is str and not key.startswith("_") and (
                                 key not in members or members[key].get("kind") == "variable"
                                 or type(class_attribute(base, "__dict__").get(key)) is types.MemberDescriptorType):
-                            members[key] = {"status": "known", "name": key, "kind": "variable",
+                            accessors = {key: value for key, value in members.get(key, {}).items()
+                                         if key.startswith("descriptor-")}
+                            members[key] = {"status": "known", "name": key, "kind": "variable", **accessors,
                                             "return-type": annotation(hint),
                                             **substitute_types(runtime_type(hint, class_attribute(base, "__module__"), base),
                                                                generic_bindings)}
-            result["members"] = members
+                            members[key]["assignment-type"] = type_fields(members[key]) or {"type-any?": True}
+                            if exact_type(hint, TYPING_TYPES) and typing.get_origin(hint) is typing.Final:
+                                members[key]["read-only?"] = True
+            for key, member in list(members.items()):
+                if member.get("descriptor-instance?") is False:
+                    members[key] = {field: item for field, item in member.items() if field not in TYPE_KEYS}
+                    members[key]["type-any?"] = True
+            meta_members = {}
+            for base in reversed(class_attribute(type(value), "__mro__")):
+                for key, child in tuple(class_attribute(base, "__dict__").items()):
+                    if type(child) is property:
+                        meta_members[key] = safe_member(key, child, depth=0, owner=type(value))
+                    else:
+                        meta_members.pop(key, None)
+            members = metaclass_property_contexts(members, meta_members)
+            result["members"] = dynamic_member_contexts(members,
+                instance_read=uncertain_attribute_dispatch(value, "__getattribute__", object.__dict__["__getattribute__"]),
+                instance_write=uncertain_attribute_dispatch(value, "__setattr__", object.__dict__["__setattr__"]),
+                class_read=uncertain_attribute_dispatch(type(value), "__getattribute__", type.__dict__["__getattribute__"]),
+                class_write=uncertain_attribute_dispatch(type(value), "__setattr__", type.__dict__["__setattr__"]))
+            result["class-members-complete?"] = type(value) is type
+            result["instance-members-complete?"] = bool(type(value) is type
+                and static_class_member(value, "__init__") is object.__dict__["__init__"]
+                and static_class_member(value, "__new__") is object.__dict__["__new__"]
+                and static_class_member(value, "__getattribute__") is object.__dict__["__getattribute__"]
+                and static_class_member(value, "__getattr__") is None)
             required_keys = class_dict.get("__required_keys__")
             optional_keys = class_dict.get("__optional_keys__")
             if type(required_keys) is frozenset and type(optional_keys) is frozenset:
@@ -1778,8 +1906,9 @@ class StaticModule:
                 return {"type-module": self.name, "type-path": list(candidate)}
         if name in self.alias_nodes and name not in seen:
             previous = self.typevars
-            self.typevars = {**previous, **{p.name: self.typevar_info(p.name, p)
-                                          for p in self.alias_parameter_infos.get(name, [])}}
+            self.typevars = dict(previous)
+            for parameter in self.alias_parameter_infos.get(name, []):
+                self.typevars[parameter.name] = self.typevar_info(parameter.name, parameter)
             try:
                 return self.reference(self.alias_nodes[name], owner, seen + (name,))
             finally:
@@ -1951,8 +2080,9 @@ class StaticModule:
         self.bounds = {**self.bounds, **{p.name: p.bound for p in getattr(node, "type_params", [])
                                       if hasattr(p, "bound") and p.bound is not None}}
         previous_vars = self.typevars
-        self.typevars = {**self.typevars, **{p.name: self.typevar_info(p.name, p)
-                                           for p in getattr(node, "type_params", [])}}
+        self.typevars = dict(self.typevars)
+        for parameter in getattr(node, "type_params", []):
+            self.typevars[parameter.name] = self.typevar_info(parameter.name, parameter)
         parameters = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
         parameters += [p for p in (node.args.vararg, node.args.kwarg) if p is not None]
         by_name = {p.arg: p for p in parameters}
@@ -2055,6 +2185,88 @@ class StaticModule:
         return any(self.constructor_init_overridden(self.reference(base, path[:-1]), owner, seen + (path,))
                    for base in declaration.bases)
 
+    def externally_mutable_classes(self):
+        """Index visible class writes and escapes once, without evaluating code."""
+        cached = getattr(self, "_externally_mutable_classes", None)
+        if cached is not None:
+            return cached
+        names = {".".join(owner): owner for owner in self.classes}
+        for _ in range(len(self.alias_nodes)):
+            previous = len(names)
+            for name, value in self.alias_nodes.items():
+                target = expr_text(value)
+                if target in names:
+                    names[name] = names[target]
+            if len(names) == previous:
+                break
+        ignored = set()
+        for node in ast.walk(self.tree):
+            annotations = []
+            if isinstance(node, ast.AnnAssign):
+                annotations.append(node.annotation)
+            elif isinstance(node, ast.arg):
+                annotations.append(node.annotation)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                annotations.append(node.returns)
+            elif isinstance(node, ast.ClassDef):
+                annotations.extend(node.bases)
+            for annotation in annotations:
+                if annotation is not None:
+                    ignored.update(id(child) for child in ast.walk(annotation))
+        invalid = {owner for owner, declaration in self.classes.items() if declaration.decorator_list}
+        factories = {}
+        for name, declarations in self.function_declarations.items():
+            for declaration in declarations:
+                annotation = declaration.returns
+                if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+                    try:
+                        annotation = ast.parse(annotation.value, mode="eval").body
+                    except SyntaxError:
+                        continue
+                if isinstance(annotation, ast.Subscript) and self.annotation_name(annotation.value) in {"type", "Type"}:
+                    target = expr_text(annotation.slice)
+                    if target in names:
+                        factories.setdefault(name, set()).add(names[target])
+        def referenced(node):
+            found = set()
+            def visit(child):
+                if id(child) in ignored:
+                    return
+                if isinstance(child, (ast.Name, ast.Attribute)) and (text := expr_text(child)) in names:
+                    found.add(names[text])
+                    return
+                if isinstance(child, ast.Call) and expr_text(child.func) in factories:
+                    found.update(factories[expr_text(child.func)])
+                for nested in ast.iter_child_nodes(child):
+                    visit(nested)
+            visit(node)
+            return found
+        for node in ast.walk(self.tree):
+            if id(node) in ignored:
+                continue
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                invalid.update(referenced(node.value))
+            elif isinstance(node, ast.Call):
+                for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                    invalid.update(referenced(argument))
+                if isinstance(node.func, ast.Attribute):
+                    invalid.update(referenced(node.func.value))
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                if expr_text(node.value) not in names:
+                    invalid.update(referenced(node.value))
+        # An escaped subclass also exposes its bases to arbitrary mutation.
+        pending = list(invalid)
+        while pending:
+            owner = pending.pop()
+            for base in self.classes[owner].bases:
+                target = expr_text(base.value if isinstance(base, ast.Subscript) else base)
+                parent = names.get(target)
+                if parent is not None and parent not in invalid:
+                    invalid.add(parent)
+                    pending.append(parent)
+        self._externally_mutable_classes = invalid
+        return invalid
+
     def class_info(self, owner):
         if owner in self.class_results:
             return self.class_results[owner]
@@ -2064,8 +2276,9 @@ class StaticModule:
         try:
             node = self.classes[owner]
             previous_vars = self.typevars
-            self.typevars = {**self.typevars, **{p.name: self.typevar_info(p.name, p)
-                                               for p in getattr(node, "type_params", [])}}
+            self.typevars = dict(self.typevars)
+            for parameter in getattr(node, "type_params", []):
+                self.typevars[parameter.name] = self.typevar_info(parameter.name, parameter)
             children = {}
             bases = []
             inherited_parameters = None
@@ -2246,6 +2459,19 @@ class StaticModule:
                             if not assignments else {"type-any?": True}}]
                 if populated:
                     constructor["overloads"] = [{"parameters": lookup}]
+                    if (not metaclass and not node.decorator_list and not local_file("enum", self.inspector.roots)
+                            and all(ref.get("type-module") == "enum" and ref.get("type-path") in (
+                                ["Enum"], ["IntEnum"], ["StrEnum"], ["Flag"], ["IntFlag"])
+                                for ref in unresolved_bases)):
+                        for field in assignments:
+                            try:
+                                ast.literal_eval(field.value)
+                            except (ValueError, TypeError):
+                                continue
+                            targets = field.targets if isinstance(field, ast.Assign) else [field.target]
+                            for target in targets:
+                                if isinstance(target, ast.Name) and not target.id.startswith("_") and target.id in children:
+                                    children[target.id]["class-read-only?"] = True
                 constructor_return = None
                 result_from_constructor = False
             dataclass = "dataclass" in self.decorators(node) or bool(transform)
@@ -2254,6 +2480,20 @@ class StaticModule:
                 for fields in reversed(dataclass_bases):
                     inherited_fields.update({field.get("dataclass-field-name", field["name"]): field for field in fields})
                 info["dataclass-fields"] = self.dataclass_parameters(node, list(inherited_fields.values()), transform, include_disabled=True)
+            if (dataclass and len(node.decorator_list) == 1 and not metaclass and not unresolved_bases
+                    and "__setattr__" not in children):
+                decorator = node.decorator_list[0]
+                target = decorator.func if isinstance(decorator, ast.Call) else decorator
+                reference = self.reference(target, owner[:-1])
+                if (reference.get("type-module") == "dataclasses" and reference.get("type-path") == ["dataclass"]
+                        and not local_file("dataclasses", self.inspector.roots)
+                        and isinstance(decorator, ast.Call)
+                        and any(keyword.arg == "frozen" and isinstance(keyword.value, ast.Constant)
+                                and keyword.value.value is True for keyword in decorator.keywords)):
+                    for field in info.get("dataclass-fields", []):
+                        name = field.get("dataclass-field-name", field["name"])
+                        if name in children:
+                            children[name]["instance-read-only?"] = True
             if model:
                 info["pydantic-model?"] = True
             if constructor:
@@ -2286,15 +2526,68 @@ class StaticModule:
                             signature=signature_text(inherited_parameters, info["return-type"]))
             elif not node.bases:
                 info.update(parameters=[], signature=signature_text([], info["return-type"]))
+            info["class-members-complete?"] = bool(complete and owner not in self.externally_mutable_classes()
+                and not metaclass and not node.decorator_list
+                and all(isinstance(statement, (ast.Pass, ast.Expr, ast.Assign, ast.AnnAssign,
+                    ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom))
+                    for statement in self.active_statements(node.body))
+                and not node.keywords and len(bases) == len(node.bases)
+                and all(base.get("class-members-complete?")
+                        or ref.get("type-module") == "builtins" and ref.get("type-path") == ["object"]
+                        for ref, base in zip(bases, base_infos)))
             may_shadow = bool(children.get("__init__") or children.get("__new__") or inherited_parameters
                               or unresolved_bases or len(bases) != len(node.bases))
+            info["instance-members-complete?"] = bool(info["class-members-complete?"] and not may_shadow
+                and "__getattribute__" not in children and "__getattr__" not in children)
             for field in self.active_statements(node.body):
+                if isinstance(field, (ast.Assign, ast.AnnAssign)):
+                    targets = field.targets if isinstance(field, ast.Assign) else [field.target]
+                    descriptor = self.descriptor_methods(field, owner, dataclass, may_shadow)
+                    for target in targets:
+                        if isinstance(target, ast.Name) and target.id in children:
+                            children[target.id].update(descriptor)
+                            if descriptor.get("descriptor-get") and not descriptor["descriptor-instance?"]:
+                                children[target.id] = {key: value for key, value in children[target.id].items()
+                                                      if key not in TYPE_KEYS}
+                                children[target.id]["type-any?"] = True
                 if isinstance(field, ast.AnnAssign) and isinstance(field.target, ast.Name) and field.target.id in children:
+                    setter_type = self.dataclass_descriptor_input(field, owner)
+                    if setter_type is not None:
+                        children[field.target.id]["instance-assignment-type"] = setter_type or {"type-any?": True}
                     read_type = self.descriptor_read_type(field, owner, dataclass, may_shadow)
                     if read_type is not None:
                         children[field.target.id] = {key: value for key, value in children[field.target.id].items()
                                                      if key not in TYPE_KEYS}
                         children[field.target.id].update(read_type)
+                        declared = self.reference(field.annotation, owner)
+                        if declared.get("type-union") or declared.get("nullable?"):
+                            # The simple getter read already distributes through
+                            # every declared storage alternative, including None.
+                            children[field.target.id]["instance-read-type"] = read_type
+                            children[field.target.id]["class-read-type"] = read_type
+                    if children[field.target.id].get("descriptor-instance?") is False:
+                        children[field.target.id] = {key: value for key, value in children[field.target.id].items()
+                                                     if key not in TYPE_KEYS}
+                        children[field.target.id]["type-any?"] = True
+            meta_members = (meta_info or {}).get("members", {})
+            children = metaclass_property_contexts(children, meta_members)
+            unknown_meta = bool(metaclass and (not meta_info or any(
+                ref.get("type-module") != "builtins" or ref.get("type-path") != ["type"]
+                for ref in meta_info.get("unresolved-bases", []))))
+            def known_meta_reader(ref):
+                return (ref.get("type-module") == "builtins" and ref.get("type-path") == ["type"]
+                        or standard_enum and ref.get("type-module") == "enum"
+                        and ref.get("type-path") in (["EnumMeta"], ["EnumType"]))
+            unknown_meta_read = bool(metaclass and (
+                not meta_info and not known_meta_reader(metaclass)
+                or (meta_info or {}).get("enum-metaclass?") and "__new__" in meta_members
+                or any(not known_meta_reader(ref) for ref in (meta_info or {}).get("unresolved-bases", []))))
+            children = dynamic_member_contexts(children,
+                instance_read="__getattribute__" in children,
+                instance_write="__setattr__" in children,
+                class_read=unknown_meta_read or "__getattribute__" in meta_members,
+                class_write=unknown_meta or "__setattr__" in meta_members)
+            info["members"] = children
             if (self.decorators(node) - {"dataclass", "dataclass_transform", "final", "runtime_checkable"}
                     - (self.deprecated_names() if deprecated is not None else set())
                     - self.no_type_check_decorators(node)) and not transform:
@@ -2435,6 +2728,38 @@ class StaticModule:
             return {}
         return {name: value for name, value in candidates[0].items()
                 if all(name in other and expr_text(other[name]) == expr_text(value) for other in candidates[1:])}
+
+    def descriptor_methods(self, field, owner, dataclass, may_shadow):
+        """Keep callable descriptor accessors separate from storage-value types."""
+        if not isinstance(field.value, ast.Call):
+            return {}
+        reference = self.reference(field.value.func, owner)
+        descriptor = self.resolve(reference.get("type-module"), reference.get("type-path", [])) or {}
+        if (descriptor.get("kind") != "class" or not descriptor.get("nominal?")
+                or "constructor-return" in descriptor):
+            return {}
+        declared = self.reference(field.annotation, owner) if isinstance(field, ast.AnnAssign) else {}
+        if (declared.get("type-module"), declared.get("type-path")) == (
+                reference.get("type-module"), reference.get("type-path")):
+            reference = declared
+        bindings = bind_type_parameters(descriptor.get("type-parameters", []), reference.get("type-arguments", []))
+        members = descriptor.get("members", {})
+        getter = members.get("__get__", {})
+        if getter.get("kind") != "function":
+            return {}
+        specialized_getter = self.inspector.substitute(getter, bindings)
+        result = {"descriptor-get": specialized_getter,
+                  "descriptor-instance?": bool("__set__" in members or "__delete__" in members
+                                                or not dataclass and not may_shadow)}
+        if (dataclass and not result["descriptor-instance?"] and not specialized_getter.get("overloads")
+                and type_fields(specialized_getter) == reference):
+            # Dataclass initialization stores either this declared descriptor
+            # value or a default returned with that same declared type.
+            result["instance-read-type"] = reference
+        setter = members.get("__set__", {})
+        if setter.get("kind") == "function":
+            result["descriptor-set"] = self.inspector.substitute(setter, bindings)
+        return result
 
     def descriptor_read_type(self, field, owner, dataclass, may_shadow):
         """A proven descriptor default may replace its declared type on reads."""
@@ -2617,6 +2942,7 @@ class StaticModule:
     def members(self, body, owner=()):
         members = {}
         overloads = {}
+        declarations = {}
         complete = True
         for node in self.active_statements(body):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2628,12 +2954,29 @@ class StaticModule:
                 if accessor is not None and accessor.attr != "getter":
                     # A setter/deleter changes assignment behavior, not the getter's value type.
                     members[node.name] = dict(members[accessor.value.id])
+                    if accessor.attr == "setter":
+                        setter = self.function(node, owner, ("setter",))
+                        parameters = setter.get("parameters", [])
+                        members[node.name].pop("instance-read-only?", None)
+                        members[node.name]["instance-assignment-type"] = (
+                            type_fields(parameters[1]) or {"type-any?": True}
+                            if len(parameters) > 1 else {"type-any?": True})
                     continue
                 info = self.function(node, owner, (accessor.attr,) if accessor is not None else ())
                 if accessor is not None:
                     info.update(kind="property", **{"instance-method?": False})
                     info.pop("parameters", None)
                     info.pop("signature", None)
+                    info.update({key: value for key, value in members[accessor.value.id].items()
+                                 if key in {"instance-assignment-type", "instance-read-only?", "class-read-type"}})
+                elif (owner and info.get("kind") == "property" and not info.get("signature-unknown?")
+                      and node.decorator_list
+                      and (expr_text(node.decorator_list[0]) or "").split(".")[0] not in self.function_declarations
+                      and (expr_text(node.decorator_list[0]) or "").split(".")[0] not in members
+                      and self.reference(node.decorator_list[0], owner) == {
+                          "type-module": "builtins", "type-path": ["property"]}):
+                    info["instance-read-only?"] = True
+                    info["class-read-type"] = runtime_type(property)
                 if "overload" in self.decorators(node):
                     overloads.setdefault(node.name, []).append(info)
                 members[node.name] = info
@@ -2664,6 +3007,16 @@ class StaticModule:
                             returns = node.type_comment
                         except (SyntaxError, ValueError):
                             pass
+                    assignment = dict(declarations.get(target.id, {}))
+                    if isinstance(node, ast.AnnAssign) and not alias or getattr(node, "type_comment", None):
+                        assignment["assignment-type"] = dict(ref) or {"type-any?": True}
+                        if isinstance(node, ast.AnnAssign):
+                            marker = node.annotation.value if isinstance(node.annotation, ast.Subscript) else node.annotation
+                            declared_marker = self.reference(marker, owner)
+                            if (declared_marker.get("type-module") in ("typing", "typing_extensions")
+                                    and declared_marker.get("type-path") == ["Final"]):
+                                assignment["read-only?"] = True
+                        declarations[target.id] = assignment
                     if isinstance(node.value, ast.Constant) and returns is None:
                         returns = annotation(type(node.value.value))
                         ref = runtime_type(type(node.value.value))
@@ -2693,6 +3046,15 @@ class StaticModule:
                                         ref = constructor["constructor-return"]
                                 else:
                                     ref = self.promote_constrained_arguments(candidate, constructor)
+                                    parameters = constructor.get("type-parameters", [])
+                                    if parameters and ("type-arguments" in candidate or not node.value.args and not node.value.keywords):
+                                        bindings = bind_type_parameters(parameters, ref.get("type-arguments", []),
+                                                                        missing_unknown=True)
+                                        template = {"type-module": ref.get("type-module"), "type-path": ref.get("type-path"),
+                                                    "type-arguments": [{"typevar": parameter["typevar"],
+                                                        **({"unpack?": True} if parameter.get("variadic?") else {})}
+                                                       for parameter in parameters]}
+                                        ref = substitute_types(template, bindings)
                                     returns = expr_text(node.value.func)
                     if isinstance(node.value, ast.Subscript) and not ref:
                         ref = self.reference(node.value, owner)
@@ -2701,7 +3063,9 @@ class StaticModule:
                         alias_ref = self.reference(node.value, owner)
                         value = self.resolve(alias_ref.get("type-module"), alias_ref.get("type-path", [])) if alias_ref else None
                         if value:
-                            members[target.id] = {**value, "name": target.id}
+                            members[target.id] = {**{key: item for key, item in value.items()
+                                                        if key not in {"assignment-type", "read-only?", "class-read-only?", "instance-read-only?"}},
+                                                  "name": target.id, **assignment}
                             if value.get("typing-form?"):
                                 members[target.id].update({"type-alias?": True, "alias-type": alias_ref})
                             continue
@@ -2709,7 +3073,7 @@ class StaticModule:
                     if form and form.get("type-any?"):
                         ref = {}
                     members[target.id] = {**self.location(node, target.id), "kind": "variable",
-                                          "return-type": returns, **ref, **(form or {}), "name": target.id}
+                                          "return-type": returns, **ref, **(form or {}), "name": target.id, **assignment}
                     if form:
                         members[target.id].update({"type-alias?": True, "alias-type": self.reference(node.value, owner)})
                     if alias or (isinstance(node.value, ast.Subscript) and find_typevars(ref)):
@@ -2991,6 +3355,11 @@ def _inspect_module(name, roots, enabled, inspector, skip_stubs=False):
             module = importlib.import_module(name)
         members = {key: safe_member(key, value) for key, value in tuple(vars(module).items())
                    if not key.startswith("_")}
+        annotations = vars(module).get("__annotations__", {})
+        if type(annotations) is dict:
+            for key, hint in annotations.items():
+                if key in members:
+                    members[key]["assignment-type"] = runtime_type(hint, name) or {"type-any?": True}
         native = {key for key, value in tuple(vars(module).items())
                   if key in members and native_member(value)
                   and "parameters" not in members[key] and not members[key].get("overloads")}
@@ -3100,7 +3469,7 @@ def metadata_decoder(keyword, persistent_map, vector):
                     value = [persistent_map(item) if type(item) is dict and not item else item
                              for item in value]
                 value = vector(value)
-            elif key in ("type-bound", "type-default", "typed-dict-extra-items", "alias-type") and type(value) is dict and not value:
+            elif key in ("type-bound", "type-default", "typed-dict-extra-items", "alias-type", "assignment-type", "instance-assignment-type") and type(value) is dict and not value:
                 value = persistent_map(value)
             elif key in enum_keys and value is not None:
                 value = intern(value)

@@ -22,37 +22,67 @@ def source_fixture(source):
             "files": {"example.py": source}, "metadata": {"source_file": "example.py"}}
 
 
-def test_error_markers_are_comments_not_strings(harness):
-    assert harness.markers('f("# E: not an assertion")\n# E: actual\nf(0)\n') == {3: ["E: actual"]}
-
-
-def test_python_member_findings_are_scored_without_accepting_lexical_errors(harness):
-    missing = {'type': ':unresolved-symbol', 'message': 'Unresolved Python member: absent'}
-    lexical = {'type': ':unresolved-symbol', 'message': 'Unresolved symbol: local-name'}
-    assert harness.finding_type(missing) == 'unresolved-python-member'
-    assert harness.finding_type(lexical) == 'unresolved-symbol'
-    assert harness.diagnostic_status({'expected_error': True, 'findings': [missing]}) == 'passed'
-    assert harness.diagnostic_status({'expected_error': False, 'findings': [missing]}) == 'failed'
-    assert harness.diagnostic_status({'expected_error': True, 'findings': [lexical, missing]}) == 'error'
-    assert harness.diagnostic_status({'expected_error': False, 'findings': [lexical]}) == 'error'
-    assert harness.diagnostic_status({'expected_error': True, 'expected_diagnostic_types': ['deprecated-var'],
-                                     'findings': [missing]}) is None
-
-
-def test_missing_python_module_member_is_a_real_negative_oracle(harness, tmp_path):
+def test_explicit_mypy_optional_policy_preserves_positive_and_negative_calls(harness, tmp_path):
     import basilisp_tools
     from basilisp.lang.keyword import keyword
     from basilisp.lang.runtime import to_lisp
     engine = importlib.import_module('basilisp_tools.analyzer'), importlib.import_module('basilisp_tools.python'), keyword, to_lisp
-    item = source_fixture('import supplied\nsupplied.absent # E\nsupplied.other\n'
-                          'supplied.ignored # type: ignore[attr-defined]\n')
-    item['files']['supplied.py'] = 'present = 1\n'
+    item = source_fixture('# mypy: implicit-optional\ndef f(x: int = None) -> int: return 1\nf(None)\nf("bad") # E\n')
+    item['provider'] = 'mypy'
     rows = harness.discover(item)
     harness.replay(item, rows, tmp_path, engine)
-    assert [row['status'] for row in rows] == ['passed', 'failed', 'unknown']
-    assert rows[0]['findings'][0]['message'] == 'Unresolved Python member: absent'
-    assert rows[1]['findings'][0]['message'] == 'Unresolved Python member: other'
-    assert rows[2]['findings'] == []
+    assert [row['status'] for row in rows] == ['passed', 'passed']
+    adaptation = item['metadata']['configuration_adaptations'][0]
+    assert adaptation['option'] == 'implicit-optional'
+    assert adaptation['source_sha256'] != adaptation['adapted_sha256']
+
+
+def test_optional_policy_is_explicit_and_checker_scoped(harness):
+    source = '# mypy: implicit-optional\ndef f(x: int = None) -> None: ...\n'
+    assert harness.configured_source(source, 'ty') == (source, [])
+    for directive in ('no-implicit-optional', 'implicit_optional=False', 'strict-optional'):
+        unchanged = source.replace('implicit-optional', directive)
+        assert harness.configured_source(unchanged, 'mypy') == (unchanged, [])
+    text = 'flag = "# mypy: implicit-optional"\ndef f(x: int = None) -> None: ...\n'
+    assert harness.configured_source(text, 'mypy') == (text, [])
+
+
+def test_optional_policy_preserves_future_imports_forward_refs_and_utf8(harness):
+    source = ('"""Δ source"""\nfrom __future__ import annotations\n# mypy: implicit-optional\n'
+              'class __blt_config_typing: pass\n'
+              'def f(π: "str" = None, /, *, named: int = None, required: int) -> int: return required\n')
+    adapted, metadata = harness.configured_source(source, 'mypy')
+    namespace = {}
+    exec(adapted, namespace)
+    assert namespace['f'](None, named=None, required=1) == 1
+    assert '__blt_config_typing_.Optional["str"]' in adapted
+    assert 'required: int' in adapted
+    assert len(metadata[0]['annotations']) == 2
+
+
+def test_pyright_single_parameter_display_uses_declared_paramspec_slots(harness):
+    item = source_fixture('from typing import Generic, ParamSpec, TypeVar\n'
+                          'P = ParamSpec("P")\nT = TypeVar("T")\n'
+                          'class C(Generic[P, T]): pass\n'
+                          'reveal_type(value, expected_text="C[(str), (int)]")\n')
+    item['provider'] = 'pyright'
+    row = next(row for row in harness.discover(item) if row['kind'] == 'return')
+    assert row['display_parameter_slots'] == {'C': [True, False]}
+    assert harness.expected_annotation(row) == 'C[[str], int]'
+    assert harness.expected_annotation({**row, 'expected_annotation': 'C[str, int]'}) == 'C[str, int]'
+    assert harness.expected_annotation({**row, 'expected_display': 'C[(int, str), float]'}) == 'C[[int, str], float]'
+    assert harness.expected_annotation({**row, 'expected_display': 'C[..., float]'}) == 'C[..., float]'
+
+
+def test_display_paramspec_slots_require_actual_typing_provenance(harness):
+    source = ('from typing import ParamSpec, Generic\n'
+              'def ParamSpec(name): return object()\n'
+              'P = ParamSpec("P")\nclass C(Generic[P]): pass\n')
+    assert harness.display_parameter_slots(ast.parse(source)) == {}
+
+
+def test_error_markers_are_comments_not_strings(harness):
+    assert harness.markers('f("# E: not an assertion")\n# E: actual\nf(0)\n') == {3: ["E: actual"]}
 
 
 def test_snapshot_call_diagnostics_are_negative_oracles(harness):
@@ -107,6 +137,31 @@ def test_assignment_targets_are_not_read_assertions(harness):
     calls = [row for row in rows if row["kind"] == "call"]
     assert [row["expression"] for row in calls] == ['x["b"]']
     assert len([row for row in rows if row["kind"] == "non-call-assertion"]) == 2
+
+
+def test_module_assignment_retains_only_explicit_prior_contracts(harness):
+    item = source_fixture('class A: pass\nclass B: pass\nx: A\nx = B() # E\ny = B()\n')
+    rows = harness.discover(item)
+    assert rows[0]['assignment_module_target'] == 'x'
+    assert rows[0]['assignment_statement'] == 'x = B()'
+    assert rows[0]['expected_error']
+    assert 'assignment_target' not in rows[1]
+
+
+def test_module_assignment_uses_native_module_object_and_retains_rhs_type(harness, tmp_path):
+    import basilisp_tools
+    from basilisp.lang.keyword import keyword
+    from basilisp.lang.runtime import to_lisp
+    engine = importlib.import_module('basilisp_tools.analyzer'), importlib.import_module('basilisp_tools.python'), keyword, to_lisp
+    item = source_fixture('from typing import assert_type\nclass A: pass\nx: A\nx = assert_type(A(), A)\n')
+    rows = harness.discover(item)
+    harness.replay(item, rows, tmp_path, engine)
+    row = rows[0]
+    assert row['status'] == 'passed', row
+    assert '(python/__import__ ' in row['basilisp_context']
+    assert ' nil nil #py ["*"])' in row['basilisp_context']
+    assert row['basilisp'].endswith('/A)')
+    assert row['actual']['path'] == ['A']
 
 
 def test_future_rebinding_is_not_imported_as_an_earlier_value(harness):
@@ -515,3 +570,32 @@ def test_attribute_assignment_preserves_the_mutation_target_and_oracle_span(harn
     harness.apply_pyright_oracle(item, [row], {'/fixtures/example.py': [diagnostic]})
     assert row['expected_error']
     assert 'excluded' not in row
+
+
+def test_python_member_findings_are_scored_without_accepting_lexical_errors(harness):
+    missing = {'type': ':unresolved-symbol', 'message': 'Unresolved Python member: absent'}
+    lexical = {'type': ':unresolved-symbol', 'message': 'Unresolved symbol: local-name'}
+    assert harness.finding_type(missing) == 'unresolved-python-member'
+    assert harness.finding_type(lexical) == 'unresolved-symbol'
+    assert harness.diagnostic_status({'expected_error': True, 'findings': [missing]}) == 'passed'
+    assert harness.diagnostic_status({'expected_error': False, 'findings': [missing]}) == 'failed'
+    assert harness.diagnostic_status({'expected_error': True, 'findings': [lexical, missing]}) == 'error'
+    assert harness.diagnostic_status({'expected_error': False, 'findings': [lexical]}) == 'error'
+    assert harness.diagnostic_status({'expected_error': True, 'expected_diagnostic_types': ['deprecated-var'],
+                                     'findings': [missing]}) is None
+
+
+def test_missing_python_module_member_is_a_real_negative_oracle(harness, tmp_path):
+    import basilisp_tools
+    from basilisp.lang.keyword import keyword
+    from basilisp.lang.runtime import to_lisp
+    engine = importlib.import_module('basilisp_tools.analyzer'), importlib.import_module('basilisp_tools.python'), keyword, to_lisp
+    item = source_fixture('import supplied\nsupplied.absent # E\nsupplied.other\n'
+                          'supplied.ignored # type: ignore[attr-defined]\n')
+    item['files']['supplied.py'] = 'present = 1\n'
+    rows = harness.discover(item)
+    harness.replay(item, rows, tmp_path, engine)
+    assert [row['status'] for row in rows] == ['passed', 'failed', 'unknown']
+    assert rows[0]['findings'][0]['message'] == 'Unresolved Python member: absent'
+    assert rows[1]['findings'][0]['message'] == 'Unresolved Python member: other'
+    assert rows[2]['findings'] == []
